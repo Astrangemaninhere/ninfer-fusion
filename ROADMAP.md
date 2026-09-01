@@ -26,13 +26,19 @@
 
 ### 待开发
 - **GGUF（llama.cpp）→ .ninfer**：
-  - 需要 GGUF v3 解析器（头部 + 元数据 + tensor 表，已写雏形并验证：
-    markmonger/Qwen3.6-40B q8_0-v1.gguf = 1290 tensors）
-  - 反量化（q8_0/q4_k_m 等 → bf16）→ 中间表示 → 走 convert.py 量化
-- **40B 变体（Qwen3.6-40B 系）**：
-  - 需注册新 target（架构参数待从 GGUF 元数据解析确认：
-    层数/头数/维度/MoE 或 dense）
-  - 若与 35B-A3B 同族（混合架构）可复用其模板
+  - GGUF v3 解析器已验证（markmonger/Qwen3.6-40B q8_0-v1.gguf =
+    1290 tensors，元数据完整解析）
+  - 反量化（q8_0：f32 scale + int8 block；q4_k_m 等 → bf16）→
+    中间表示 → 走 convert.py 量化
+  - 需要 tensor 布局重排（GGUF → safetensors 布局）
+- **40B 变体（Qwen3.6-vl-40B 系，含 Deckard 等微调）**：
+  - GGUF 元数据实测架构 = **qwen35 族**（与 ninfer 35B-A3B 同族）：
+    block_count=97、embedding=5120、Q 头 24、KV 头 4、
+    key/value_length=256、ffn=17408、full_attention_interval=4、
+    rope base 1e7、context 262144、**Qwen3.6-vl（多模态）**
+  - 注册新 target `qwen3_6_40b`：对比 35B-A3B 的 config.h 参数差异
+    （层数/ffn/rope base），复用其模板
+  - GGUF 输入走反量化链路；HF safetensors 输入（如有）直接 convert
 
 ### 工具
 - `tools/gui/convert_gui.py`：滑块简约风转换 GUI（量化档位 / KV 精度 / 上下文 / 批量宽度）
