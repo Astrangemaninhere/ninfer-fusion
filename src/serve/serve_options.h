@@ -42,14 +42,24 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    std::array<KvCacheStorage, 16> kv_layer_storage{};
+    bool kv_layer_storage_explicit        = false;
+    std::array<bool, 16> kv_residual_layers{};
+    bool kv_residual_explicit             = false;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
+    bool yarn_enabled       = false;
     bool allow_prefix_reuse = true;
     // Issue #142: publish a shared-prefix candidate at the leading
     // system/developer frontier (default on for agent workloads).
     bool auto_system_shared_prefix = true;
+    ColdPolicy cold_policy        = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    std::string cold_disk_path;
+    std::uint64_t cold_disk_bytes = 32ULL << 30;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

@@ -95,6 +95,8 @@ struct SequencePlanningInputs {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     std::array<DType, 16> layer_kv_dtypes{};
+    // Per-layer two-stage residual planes for the NVFP4 tier.
+    std::array<bool, 16> kv_residual_layers{};
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -127,6 +129,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     std::array<DType, 16> layer_kv_dtypes{};
+    // Per-layer two-stage residual planes for the NVFP4 tier.
+    std::array<bool, 16> kv_residual_layers{};
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

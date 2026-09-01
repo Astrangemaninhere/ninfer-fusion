@@ -24,6 +24,8 @@ struct DecoderStateSpec {
     // Per-layer storage table indexed by full-attention layer order.
     // BFloat16 entries inherit kv_dtype; empty (all-BF16) inherits wholesale.
     std::array<DType, 16> layer_kv_dtypes{};
+    // NVFP4 layers that keep a residual plane (indexed like layer_kv_dtypes).
+    std::array<bool, 16> layer_residual{};
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -49,16 +51,13 @@ struct PagedKVCacheLayout {
     std::uint32_t max_cold_pages = 0;
     // Resolved per-layer storage (one entry per full-attention layer).
     std::array<DType, 16> layer_dtypes{};
+    // Layers that keep an NVFP4 residual plane (base + 4) in the page
+    // geometry; empty disables residual planes.
+    std::array<bool, 16> layer_residual{};
     // Plane offset of each layer in the page geometry (prefix sums over
     // per-layer plane counts; mixed BF16/quantized tables have unequal
     // strides).
     std::array<std::uint32_t, 16> layer_plane_base{};
-    // Cold slots per layer: [slot_bytes, kv_heads, 2, max_cold_pages]
-    // plus an I32 validity plane of [kv_heads, 2, max_cold_pages].
-    std::array<TensorRegion, 16> cold_slots;
-    std::array<TensorRegion, 16> cold_slot_valid;
-    std::int32_t cold_slot_bytes = 0;
-    std::uint32_t max_cold_pages = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -93,7 +92,7 @@ public:
     PagedKVCache& operator=(PagedKVCache&&)      = delete;
 
         // Cold-slot pool: fixed raw slots per (layer, kv_head, plane).
-    [[nodiscard]] std::int32_t cold_slot_bytes() const noexcept { return cold_slot_bytes_; }
+    [[nodiscard]] std::int32_t cold_slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::int32_t slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::uint32_t max_cold_pages() const noexcept { return max_cold_pages_; }
     std::int32_t allocate_cold_slot() noexcept;
@@ -133,21 +132,15 @@ private:
 
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
+    std::int32_t quant_group_  = 0;
     std::array<DType, 16> layer_dtypes_{};
+    std::array<bool, 16> layer_residual_{};
     std::array<std::uint32_t, 16> layer_plane_base_{};
-    std::array<Tensor, 16> cold_slots_;
-    std::array<Tensor, 16> cold_slot_valid_;
-    std::int32_t cold_slot_bytes_ = 0;
-    std::uint32_t max_cold_pages_ = 0;
-    std::vector<std::uint8_t> cold_slot_used_;
     std::array<Tensor, 16> cold_slots_;
     std::array<Tensor, 16> cold_slot_valid_;
     std::int32_t slot_bytes_ = 0;
     std::uint32_t max_cold_pages_ = 0;
     std::vector<std::uint8_t> cold_slot_used_;
-    std::array<DType, 16> layer_dtypes_{};
-    std::array<std::uint32_t, 16> layer_plane_base_{};
-    std::int32_t quant_group_  = 0;
 };
 
 struct DecoderStateLayout {

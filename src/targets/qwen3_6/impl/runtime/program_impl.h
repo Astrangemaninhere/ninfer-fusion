@@ -756,7 +756,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       cold_policy(plan.cold_policy), cold_keep_tokens(plan.cold_keep_tokens),
-      cold_host_bytes(plan.cold_host_bytes),
       cold_host_bytes(plan.cold_host_bytes), cold_disk_path(plan.cold_disk_path),
       cold_disk_bytes(plan.cold_disk_bytes),
       graph_capture_ceiling(plan.graph_capture_ceiling),
@@ -849,7 +848,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
-    if (cold_policy == ColdPolicy::Window) {
     if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk) {
         const std::int32_t requant_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
         if (requant_heads > 0) {
@@ -9299,7 +9297,6 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     SharedPrefixSlotRole::Catalogued;
             // A retained source may carry cold-pool pages: warm them back into
             // physical pages before any prefix fork touches the membership.
-            if (private_source_ready && cold_policy == ColdPolicy::Window) {
             if (private_source_ready &&
                 (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk)) {
                 SequenceState& source = continuation_states[transaction.source_index];
@@ -10424,7 +10421,6 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 // decode kernels read cold pages straight from the slots, so no restore is
 // needed on the steady-state path.
 void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
-    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
     if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Disk) ||
         !sequence.kv || decoder == nullptr ||
         !sequence.kv->text.valid() || cold_requant_codes == nullptr) {
@@ -10491,7 +10487,7 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
             ops::cold_i8_slot_pack_raw(
                 static_cast<const std::uint8_t*>(cold_requant_codes),
                 static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
-                k_valid, device.stream);
+                k_valid, view.slot_bytes, device.stream);
             ops::entropy_cold_requant_raw(
                 v_codes, v_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
                 static_cast<std::uint8_t*>(cold_requant_codes),
@@ -10499,7 +10495,7 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
             ops::cold_i8_slot_pack_raw(
                 static_cast<const std::uint8_t*>(cold_requant_codes),
                 static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
-                v_valid, device.stream);
+                v_valid, view.slot_bytes, device.stream);
             if (view.dtype == DType::I8) {
                 // INT8 tier: requant to E2M1 g64 and store the raw nibble slot.
                 ops::entropy_cold_requant_raw(
@@ -10625,32 +10621,6 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
 // release the slot. Shared by the rewrite warm path and the checkpoint
 // restore path (which must repopulate cold pages without a host replica).
 void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t page,
-                                        std::int32_t slot, const DeviceKVPageHandle& physical) {
-    const int kv_heads          = decoder->text_kv.batch_layer_view(0).num_kv_heads;
-    const std::uint32_t layers  = decoder->text_kv.layers();
-    const std::int32_t ph_index = physical.index();
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
-        const Tensor cold_slots          = view.cold_slots;
-        if (cold_slots.data == nullptr || view.dtype != DType::I8) { continue; }
-        auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
-        auto* v_slot_base = k_slot_base + cold_slots.nb[2];
-        auto* k_codes_i8 = static_cast<std::int8_t*>(view.k_pages.data) +
-                           static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
-        auto* v_codes_i8 = static_cast<std::int8_t*>(view.v_pages.data) +
-                           static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
-        auto* k_scales_h = static_cast<void*>(
-            static_cast<std::uint8_t*>(view.k_scale_pages.data) +
-            static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3]);
-        auto* v_scales_h = static_cast<void*>(
-            static_cast<std::uint8_t*>(view.v_scale_pages.data) +
-            static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3]);
-        ops::cold_i8_slot_restore_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
-                                      k_codes_i8, k_scales_h, device.stream);
-        ops::cold_i8_slot_restore_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
-                                      v_codes_i8, v_scales_h, device.stream);
-    }
-    decoder->text_kv.release_cold_slot(slot);
                                         std::int32_t slot, const DeviceKVPageHandle& physical,
                                         bool disk_prefetched) {
     const int kv_heads          = decoder->text_kv.batch_layer_view(0).num_kv_heads;
@@ -10750,8 +10720,6 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
 // Warm-restore the cold prefix of a sequence (rewrite/resume paths only): the
 // steady-state decode path reads cold pages directly from their slots, but a
 // rewrite needs real physical pages so append/fork can mutate them again.
-void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page) {
-    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
 void ProgramImplCore::prefetch_cold_pages(SequenceState& sequence, std::uint32_t pages,
                                           std::span<const std::int32_t> slots) {
     if (cold_policy != ColdPolicy::Disk || cold_disk_staging[0] == nullptr) { return; }
@@ -11181,7 +11149,7 @@ void ProgramImplCore::prepare_graphs() {
                                                     *dflash2_host_egress,
                                                     state_images->continuation_hidden_store()};
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
-        const ops::CausalAttentionExecutionEnvelope code_warm_target{
+        const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
         prepare_representative(code_warm.min, 1);
@@ -11189,9 +11157,6 @@ void ProgramImplCore::prepare_graphs() {
         schedule::dflash2_decode_batch(dflash2_state, 1, draft_window,
                                        dflash2_envelopes(code_warm.min, code_warm.max, draft_window),
                                        code_warm_target, nullptr);
-        const ops::GqaExecutionEnvelope code_warm_target{
-            1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
         std::fprintf(stderr, "[df2diag] prepare_representative min=%u\n", code_warm.min);
         prepare_representative(code_warm.min, 1);
         std::fprintf(stderr, "[df2diag] after prepare_representative\n");
@@ -11217,7 +11182,6 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope target_envelope{
                 const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -11348,7 +11312,6 @@ void ProgramImplCore::extend_ordinary_graphs(std::uint32_t batch_size,
         profile.min_execution_frontier = planned.min;
         profile.max_execution_frontier = planned.max;
         profile.topology_class         = planned.topology_class * max_concurrency + (batch_size - 1U);
-        const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
         const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
         schedule::capture_ordinary_decode_batch(ordinary_state,
                                                 static_cast<std::int32_t>(batch_size), envelope,
@@ -11360,7 +11323,6 @@ void ProgramImplCore::extend_ordinary_graphs(std::uint32_t batch_size,
                          "frontier %u\n",
                  batch_size, missing.size(), frontier);
 }
->>>>>>> pr4/on-demand-graphs
 
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
@@ -12301,7 +12263,6 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
     // Cold-pool maintenance at the round boundary (window policy only).
     // Every active sequence maintains its own retired prefix; multi-lane
     // batches compress each lane's pages independently.
-    if (cold_policy == ColdPolicy::Window) {
     if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk) {
         for (const std::uint32_t lane : lanes) {
             SequenceState& sequence = active_sequence(lane);
@@ -12386,7 +12347,6 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlash2Envelopes envelopes = dflash2_envelopes(0, maximum_frontier, draft_window);
-        ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
@@ -12408,8 +12368,6 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
-            const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
             // Same length demotion as the budget loop above: lanes past the
             // threshold draft nothing this round (dense single-token round).
             const bool lane_beyond_demote = frontier > qwen3_6::kSpecDemoteTokens;

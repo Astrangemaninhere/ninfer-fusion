@@ -771,7 +771,6 @@ public:
         Page& page = require(handle);
         if (page.source_pins != 0 || page.destination_pinned || !page.device_replica ||
             page.cold_compressed || page.writer_references != 0 || page.references == 0) {
-            page.cold_compressed || page.references == 0) {
             throw std::logic_error("logical KV page is not cold-transferable");
         }
         physical_->dematerialize_one(reservation, std::move(*page.device_replica));
@@ -786,16 +785,14 @@ public:
     [[nodiscard]] bool can_cold_transfer(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
-        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
-               !page.destination_pinned && page.device_replica.has_value() &&
-               !page.cold_compressed;
         // Cold-eligible pages are the committed history before the decode
         // frontier (cold_frontier); decode never writes them again, so a live
         // writer flag (which the paged store keeps until page release) does
         // not block the transfer. Pins/fork ties still block, and the page
         // must currently hold its device replica to copy from.
-        return page.references != 0 && page.source_pins == 0 && !page.destination_pinned &&
-               page.device_replica.has_value() && !page.cold_compressed;
+        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
+               !page.destination_pinned && page.device_replica.has_value() &&
+               !page.cold_compressed;
     }
 
     [[nodiscard]] bool cold_compressed(LogicalKVPageHandle handle) const noexcept {

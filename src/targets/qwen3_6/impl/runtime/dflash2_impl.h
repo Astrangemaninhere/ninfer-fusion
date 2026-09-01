@@ -346,7 +346,6 @@ void propose_batch_impl(DFlash2BatchContext& state, qwen3_6::DFlashDecodeState& 
 
 auto dflash2_decode_batch_body(DFlash2BatchContext& state, std::int32_t batch_size,
                                std::uint32_t k, DFlash2Envelopes envelopes,
-                               ops::CausalAttentionExecutionEnvelope target_envelope) {
                                ops::GqaExecutionEnvelope target_envelope) {
     return [&state, batch_size, k, envelopes, target_envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
@@ -464,7 +463,6 @@ void dflash2_append_context(PrefillContext& state, const Tensor& features, const
 
 void capture_dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size,
                                   std::uint32_t k, DFlash2Envelopes envelopes,
-                                  ops::CausalAttentionExecutionEnvelope target_envelope,
                                   ops::GqaExecutionEnvelope target_envelope,
                                   DecodeGraphDefinition& definition) {
     auto body = dflash2_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
@@ -472,7 +470,6 @@ void capture_dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch
 }
 
 void dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                          DFlash2Envelopes envelopes, ops::CausalAttentionExecutionEnvelope target_envelope,
                           DFlash2Envelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
                           DecodeGraphExecutable* executable) {
     auto body = dflash2_decode_batch_body(state, batch_size, k, envelopes, target_envelope);

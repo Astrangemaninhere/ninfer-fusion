@@ -26,6 +26,7 @@ add_library(ninfer_core STATIC
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
+  ops/ple/ple_layout.cpp
   core/decode_graph.cpp
   runtime/engine/admission_policy.cpp
   runtime/engine/context_cost.cpp
@@ -101,6 +102,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/silu_and_mul.cu
   ops/launcher/target_logprobs.cu
   ops/launcher/vision_pos_embed.cu
+  ops/ple/ple_table.cu
   # Softmax Attention and KV-cache state transitions.
   ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
   ops/softmax_attention/dense/causal_cache/small_t.cu

@@ -33,6 +33,8 @@ enum class KvCacheStorage : std::uint8_t {
     Nvfp4Group16,
     Fp8Group16,
     Iso3Group16,
+    // Packed 4-bit E8-lattice K + i4 V, per-64 FP16 scales (int8-kernel path).
+    E8Group64,
 };
 
 // Per-layer table width shared by targets that publish per-layer KV storage.
@@ -143,6 +145,12 @@ struct EngineOptions {
     // the target's full-attention layer count are rejected.
     std::array<KvCacheStorage, kKvLayerStorageSlots> kv_layer_storage{};
     bool kv_layer_storage_explicit = false;
+    // Per-layer two-stage residual planes for the NVFP4 tier (second-stage
+    // E2M1 K / ISO3 V over the first-stage error). Each enabled NVFP4 layer
+    // doubles its plane count — volume parity with Int8Group64; other
+    // storages ignore the table. Empty (default) keeps single-plane KV.
+    std::array<bool, kKvLayerStorageSlots> kv_residual_layers{};
+    bool kv_residual_explicit = false;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

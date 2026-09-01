@@ -1,3 +1,4 @@
+#include "product/kv_options.h"
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
@@ -50,6 +51,9 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
+    if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
+    if (value == "iso3") { return KvCacheStorage::Iso3Group16; }
+    if (value == "e8") { return KvCacheStorage::E8Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -258,6 +262,57 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--kv-layer-storage") {
+            const auto table = product::parse_kv_layer_storage(require_value("--kv-layer-storage"));
+            for (std::size_t i = 0; i < options.kv_layer_storage.size(); ++i) {
+                options.kv_layer_storage[i] = table[i];
+            }
+            options.kv_layer_storage_explicit = true;
+        } else if (arg == "--kv-residual-layers") {
+            const std::string value = require_value("--kv-residual-layers");
+            std::size_t begin = 0;
+            while (begin <= value.size()) {
+                const std::size_t end = value.find(',', begin);
+                const std::string_view token(value.data() + begin,
+                                             (end == std::string::npos ? value.size() : end) - begin);
+                if (!token.empty()) {
+                    const std::size_t layer = parse_u64(std::string(token).c_str(),
+                                                        "kv-residual-layers");
+                    if (layer >= options.kv_residual_layers.size()) {
+                        throw std::invalid_argument("--kv-residual-layers layer out of range");
+                    }
+                    options.kv_residual_layers[layer] = true;
+                }
+                if (end == std::string::npos) { break; }
+                begin = end + 1;
+            }
+            options.kv_residual_explicit = true;
+        } else if (arg == "--cold-policy") {
+            const std::string_view v = require_value("--cold-policy");
+            if (v == "none" || v == "off") { options.cold_policy = ColdPolicy::None; }
+            else if (v == "window") { options.cold_policy = ColdPolicy::Window; }
+            else if (v == "host") { options.cold_policy = ColdPolicy::Host; }
+            else if (v == "disk") { options.cold_policy = ColdPolicy::Disk; }
+            else { throw std::invalid_argument("invalid cold-policy: " + std::string(v)); }
+        } else if (arg == "--cold-disk-path") {
+            options.cold_disk_path = require_value("--cold-disk-path");
+        } else if (arg == "--cold-disk-bytes") {
+            options.cold_disk_bytes =
+                parse_u64(require_value("--cold-disk-bytes"), "cold-disk-bytes");
+            if (options.cold_disk_bytes == 0) {
+                throw std::invalid_argument("--cold-disk-bytes must be positive");
+            }
+        } else if (arg == "--cold-keep-tokens") {
+            options.cold_keep_tokens =
+                parse_u64(require_value("--cold-keep-tokens"), "cold-keep-tokens");
+            if (options.cold_keep_tokens > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--cold-keep-tokens is out of range");
+            }
+        } else if (arg == "--cold-host-bytes") {
+            options.cold_host_bytes =
+                parse_u64(require_value("--cold-host-bytes"), "cold-host-bytes");
+        } else if (arg == "--yarn") {
+            options.yarn_enabled = true;
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

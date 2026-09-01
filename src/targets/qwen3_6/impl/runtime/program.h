@@ -720,10 +720,6 @@ public:
     void* cold_requant_codes       = nullptr;
     void* cold_requant_scales      = nullptr;
     std::uint32_t cold_requant_heads = 0;
-    void enqueue_cold_compressions(SequenceState& sequence);
-    void warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page);
-    void restore_cold_page(SequenceState& sequence, std::uint32_t page, std::int32_t slot,
-                           const DeviceKVPageHandle& physical);
     // ColdPolicy::Disk: per-layer spill files (one fixed stride per slot) and
     // a pinned staging buffer for the D2H/H2D legs. Files live for the
     // process lifetime; the payload is the same compressed slot bytes.

@@ -63,7 +63,6 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-        const std::uint8_t* cold_slots, const std::int32_t* cold_valid, std::int32_t cold_slot_bytes,
         const std::uint8_t* cold_slots, const std::int32_t* cold_valid, std::int32_t slot_bytes,
         __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
@@ -365,7 +364,6 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         // from the raw slot back into int8 codes + fp16 g64 scales, matching
         // the native planes the hot path stages with cp.async.
         const int entry = physical_pages_s[(tile_k0 >> kPagedKVPageShift) - first_page];
-        const bool cold = entry <= -2 && cold_slots != nullptr && cold_slot_bytes >= 1024 + 320 &&
         const bool cold = entry <= -2 && cold_slots != nullptr && slot_bytes >= 1024 + 320 &&
                           cold_valid[(-entry - 2) * (2 * Geometry::KVHeads) + kv_head] != 0 &&
                           cold_valid[(-entry - 2) * (2 * Geometry::KVHeads) + Geometry::KVHeads +
@@ -374,9 +372,6 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int slot_base = -entry - 2;
             const std::int64_t k_off =
                 static_cast<std::int64_t>(slot_base * (2 * Geometry::KVHeads) + kv_head) *
-                cold_slot_bytes;
-            const std::int64_t v_off =
-                k_off + static_cast<std::int64_t>(Geometry::KVHeads) * cold_slot_bytes;
                 slot_bytes;
             const std::int64_t v_off =
                 k_off + static_cast<std::int64_t>(Geometry::KVHeads) * slot_bytes;

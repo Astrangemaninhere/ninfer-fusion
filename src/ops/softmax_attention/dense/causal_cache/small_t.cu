@@ -117,7 +117,6 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             invocation.column_begin, logical_capacity, scale,
             static_cast<const std::uint8_t*>(cache.cold_slots.data),
             static_cast<const std::int32_t*>(cache.cold_slot_valid.data),
-            cache.cold_slot_bytes, static_cast<__nv_bfloat16*>(partial_acc.data),
             cache.slot_bytes, static_cast<__nv_bfloat16*>(partial_acc.data),
             static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
@@ -164,7 +163,6 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 logical_capacity, scale,
                 static_cast<const std::uint8_t*>(cache.cold_slots.data),
                 static_cast<const std::int32_t*>(cache.cold_slot_valid.data),
-                cache.cold_slot_bytes, static_cast<__nv_bfloat16*>(partial_acc.data),
                 cache.slot_bytes, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
@@ -225,7 +223,6 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
         .cold_slots    = cache.cold_slots,
         .cold_slot_valid = cache.cold_slot_valid,
-        .cold_slot_bytes = cache.cold_slot_bytes,
         .slot_bytes = cache.slot_bytes,
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,

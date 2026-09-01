@@ -28,6 +28,7 @@ namespace ninfer::product {
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "fp8") { return KvCacheStorage::Fp8Group16; }
     if (text == "iso3") { return KvCacheStorage::Iso3Group16; }
+    if (text == "e8") { return KvCacheStorage::E8Group64; }
     return std::nullopt;
 }
 

@@ -23,7 +23,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    const std::uint8_t* cold_slots, const std::int32_t* cold_valid, std::int32_t cold_slot_bytes,
     const std::uint8_t* cold_slots, const std::int32_t* cold_valid, std::int32_t slot_bytes,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
@@ -225,7 +224,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         // carry a sentinel (<= -2): decode E2M1 nibbles + E4M3 g16 scales
         // straight from the raw slot into the bf16 tile.
         const int entry = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-        const bool cold = entry <= -2 && cold_slots != nullptr && cold_slot_bytes >= 1024 + 320 &&
         const bool cold = entry <= -2 && cold_slots != nullptr && slot_bytes >= 1024 + 320 &&
                           cold_valid[(-entry - 2) * (2 * Geometry::KVHeads) + kv_head] != 0 &&
                           cold_valid[(-entry - 2) * (2 * Geometry::KVHeads) + Geometry::KVHeads +
@@ -254,10 +252,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                         const std::int64_t k_off =
                             static_cast<std::int64_t>(slot_base * (2 * Geometry::KVHeads) +
                                                       kv_head) *
-                            cold_slot_bytes;
-                        const std::int64_t v_off = k_off + static_cast<std::int64_t>(
-                                                                Geometry::KVHeads) *
-                                                                cold_slot_bytes;
                             slot_bytes;
                         const std::int64_t v_off = k_off + static_cast<std::int64_t>(
                                                                 Geometry::KVHeads) *
@@ -299,10 +293,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                     const std::int64_t k_off =
                         static_cast<std::int64_t>(slot_base * (2 * Geometry::KVHeads) +
                                                   kv_head) *
-                        cold_slot_bytes;
-                    const std::int64_t v_off = k_off + static_cast<std::int64_t>(
-                                                            Geometry::KVHeads) *
-                                                            cold_slot_bytes;
                         slot_bytes;
                     const std::int64_t v_off = k_off + static_cast<std::int64_t>(
                                                             Geometry::KVHeads) *

@@ -4,6 +4,7 @@
 // HTTP transport live in separate translation units; only wire-independent GenerationRequest is
 // passed to GenerationService.
 
+#include "serve/openai_common.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request.h"
 
