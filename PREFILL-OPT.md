@@ -1,5 +1,19 @@
 # Prefill 优化计划（借鉴 SGLang 方法论）
 
+## 调研验证结论（2026-09-02，对 SGLang 上游代码/PR 复核）
+
+| 假设 | 验证结果 | 结论 |
+|---|---|---|
+| prefill 有 CUDA graph | **错**。SGLang 历史上 CUDA graph 只覆盖 decode；prefill graph 后端是 2025 年底才加的（#27988 "Full CUDA Graph Support for Prefill"），小 prefill（30 tok）仅 7.35→4.1ms（~1.7x），收益来自 launch overhead | prefill graph 化是**次要**优化；单 GPU 长 prompt 的瓶颈在算力/带宽，不是 launch |
+| chunked prefill 尺寸影响大 | 确认。2048/8192/131072 都有人用；SGLang 默认 8192（TP）/4096（DP）；DGX Spark 上 Qwen3.8-27B 用 8192 流式最优、2048 长 ctx TTFT 更稳 | 我们的 `--prefill-chunk` 默认 1024 偏小，值得试 2048/4096 |
+| radix prefix cache 是主要收益 | 确认。SGLang 相对 vLLM 的 ~29% 吞吐优势主要来自 RadixAttention 共享前缀；混合 prefill/decode batch 再 +9.4%（#30338） | 已有 #142/#143 前缀共享，无需重做 |
+| SGLang 的 10k+ tok/s 靠什么 | 多请求大 batch + PD 分离 + 手写 kernel（flashinfer）；单请求长 prompt 也就 2-5k | 我们的量级目标要**并发 batch**，不是单请求 |
+| decode 的 CUDA graph 是最大单项 | 确认：关掉 graph decode 慢 ~5x | 已有 decode graph，✓ 保持 |
+
+**修正后的行动优先级**：① chunk 调优（1024→2048/4096，ppl 加参数）② NVFP4 prefill 的 V 解码/scale 开销 ③ 大 batch 并发 prefill 测量 ④（最后才考虑）固定 chunk shape 的 prefill graph。
+
+
+
 目标：把 prefill 吞吐从当前 ~2.0k tok/s（4096 ctx 实测）提升到接近
 SGLang 的 ~10k tok/s 量级（长 context / 大 batch 场景）。
 
