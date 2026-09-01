@@ -143,7 +143,8 @@ class H(BaseHTTPRequestHandler):
         docs = r['documents'][0]
         dists = r['distances'][0]
         for doc, dist in zip(docs, dists):
-            score = max(0.0, 1.0 - dist)
+            # chroma default space is L2; map distance monotonically to [0,1]
+            score = 1.0 / (1.0 + max(0.0, dist))
             if score < th:
                 continue
             pages = sorted(set(int(p) for p in re.findall(r'\[page (\d+)\]', doc)))
