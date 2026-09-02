@@ -111,11 +111,11 @@ setInterval(poll,1500);poll();
 </script></body></html>"""
 
 KV_ARGS = {
-    0: '--kv-dtype', 'bf16',
-    1: '--kv-dtype', 'int8',
-    2: '--kv-dtype', 'fp8',
-    3: '--kv-dtype', 'nvfp4',
-    4: '--kv-layer-storage', '0-9:e8,10-15:nvfp4',
+    0: ['--kv-dtype', 'bf16'],
+    1: ['--kv-dtype', 'int8'],
+    2: ['--kv-dtype', 'fp8'],
+    3: ['--kv-dtype', 'nvfp4'],
+    4: ['--kv-layer-storage', '0-9:e8,10-15:nvfp4'],
 }
 CTX_KB = [8192, 16384, 32768, 65536, 131072, 262144]
 SPEC_ARGS = ['', '--spec mtp', '--spec dflash', '--spec dflash2']
