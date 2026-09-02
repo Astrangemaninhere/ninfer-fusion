@@ -12324,7 +12324,8 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
         // KV cache is shared, so the row stays decode-ready; a fresh request
         // below the threshold simply drafts again.
         const bool lane_beyond_demote =
-            sequence.execution_frontier > qwen3_6::kSpecDemoteTokens;
+            sequence.execution_frontier > qwen3_6::kSpecDemoteTokens ||
+            qwen3_6::dflash2_acceptance_too_low(requests[lane].speculative_stats);
         const std::uint32_t extent =
             lane_beyond_demote
                 ? 0U
@@ -12366,7 +12367,9 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
                                                     : 0U;
             // Same length demotion as the budget loop above: lanes past the
             // threshold draft nothing this round (dense single-token round).
-            const bool lane_beyond_demote = frontier > qwen3_6::kSpecDemoteTokens;
+            const bool lane_beyond_demote =
+                frontier > qwen3_6::kSpecDemoteTokens ||
+                qwen3_6::dflash2_acceptance_too_low(requests[row].speculative_stats);
             const std::uint32_t extent =
                 lane_beyond_demote
                     ? 0U

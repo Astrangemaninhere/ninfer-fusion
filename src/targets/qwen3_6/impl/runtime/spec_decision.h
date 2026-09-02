@@ -21,6 +21,8 @@
 //     the existing spec-degrade resume machinery.
 //   * promotion back to DFlash2 happens only when the engine is fully idle.
 
+#include "ninfer/types.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -28,6 +30,15 @@
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::uint32_t kSpecDemoteTokens = 20480;
+// DFlash2 runtime acceptance floor: once a request has drafted at least
+// kDFlash2AcceptanceSample tokens, an acceptance rate below this floor
+// drafts nothing per round (dense single-token round through the same
+// kernel/graph machinery as the frontier demotion). Measured 2026-09-02:
+// zh-wiki prompt, DFlash2 d7 acceptance falls 24.7% (1.5K) -> 12.7% (12K)
+// while MTP3 holds 43-47%; a length-only policy keeps drafting into the
+// collapse because 12K < kSpecDemoteTokens.
+inline constexpr std::uint64_t kDFlash2AcceptanceSample = 128;
+inline constexpr double kDFlash2MinAcceptance = 0.25;
 
 enum class SpecDecision : std::uint8_t {
     Mtp,
@@ -76,6 +87,19 @@ struct SpecAdmissionInputs {
     if (all_beyond) { return true; }
     return dflash2_footprint_bytes != 0 && free_device_bytes != 0 &&
            dflash2_footprint_bytes > free_device_bytes;
+}
+
+// Per-request acceptance check: DFlash2 with enough drafted tokens and an
+// acceptance rate below the floor stops drafting (extent 0) without leaving
+// the DFlash2 machinery (the target KV stays decode-ready). Low-frequency:
+// once the floor is crossed the request stays dense until the engine idles.
+[[nodiscard]] inline bool dflash2_acceptance_too_low(const SpeculativeStats& stats) noexcept {
+    if (stats.backend != SpeculativeBackend::DFlash2 ||
+        stats.drafted_tokens < kDFlash2AcceptanceSample) {
+        return false;
+    }
+    return static_cast<double>(stats.accepted_tokens) /
+               static_cast<double>(stats.drafted_tokens) < kDFlash2MinAcceptance;
 }
 
 } // namespace ninfer::targets::qwen3_6
