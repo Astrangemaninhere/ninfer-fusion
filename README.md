@@ -18,11 +18,22 @@
 
 默认配置 10L E8 + 6L NVFP4 同时赢精度与速度：E8-lattice K 提供格点增益（H64 旋转对齐 g64 scale 域），NVFP4 层的 ISO3 V 比 i4 更贴值分布。
 
-### 速度曲线（RTX 5090D 实测，2026-09-02）
+### 速度曲线（RTX 5090D 实测，2026-09-02，多次测量取中位数）
 
-Prefill 吞吐 vs Context（ppl score rate，corpus-long 多窗口）：
+Prefill 吞吐 vs Context（ppl score rate；单次测量噪声可达 ±20-40%，
+以下为 2-3 次测量的中位数）：
 
 ![Prefill 吞吐 vs Context](docs/speed-prefill.png)
+
+| Context | 默认 10L E8+6L NVFP4 | 全 INT8 | 全 E8Kv | 全 NVFP4 |
+|---|---:|---:|---:|---:|
+| 4K | 2393 | 2685 | 3126 | 2456 |
+| 8K | 2432 | 2327 | 2564 | 2259 |
+| 16K | 2218 | 2458 | 2175 | 1877 |
+| 32K | 2129 | 2049 | 2375 | 2006 |
+
+注：长文本时混合表与纯配置差异落在噪声带内（32K 各配置 2000-2400 tok/s），
+不存在"混合表系统性变慢"。
 
 投机解码（MTP3 / DFlash2 d7）随 Prompt 长度的 Decode 吞吐与 Draft 接受率：
 
@@ -36,6 +47,10 @@ Prefill 吞吐 vs Context（ppl score rate，corpus-long 多窗口）：
 | 3K | 47.1% | 24.0% | 101.9 tok/s | 65.9 tok/s |
 | 6K | 44.2% | 18.6% | 92.5 tok/s | 51.2 tok/s |
 | 12K | 45.6% | 12.7% | 83.2 tok/s | 37.5 tok/s |
+
+DFlash2 接受率随 prompt 长度崩塌（12K 时 12.7%）而 MTP3 保持 43-47%；
+已加入**接受率监控降级**（drafted ≥ 128 且接受率 < 25% 时该 lane 停止
+草稿，见 docs/SPEC-STRATEGY.md）。
 
 ### 容量（每 head/token）
 
