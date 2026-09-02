@@ -459,7 +459,6 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-        fflush(stderr);
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
@@ -496,9 +495,6 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                                              partial.m, partial.l, out, stream);
         return;
     }
-    // diag: sync after launch
-    cudaStreamSynchronize(stream);
-        fflush(stderr);
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                         cache, out, stream);
 }

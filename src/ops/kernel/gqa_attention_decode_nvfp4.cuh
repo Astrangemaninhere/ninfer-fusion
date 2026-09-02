@@ -373,13 +373,16 @@ _Pragma("unroll 1")
             if constexpr (Iso3V) {
                 const float vscale = fmaxf(vmax / 7.0f, 0.001953125f);
                 if (lane < 8) {
+                    // Byte lane holds the (2*lane, 2*lane+1) channel pair,
+                    // matching gqa_prefill_fill_nvfp4k_iso3v_kernel. v0 is
+                    // channel `lane` (used by the 16-lane max above), so the
+                    // even member must be reloaded here, not v0.
+                    const float ve = __bfloat162float(input_v[src0 + lane * 2]);
+                    const float vo =
+                        __bfloat162float(input_v[src0 + lane * 2 + 1]);
                     cache_v[vcode + lane] =
-                        static_cast<std::uint8_t>(gqa_iso3_nibble(v0, vscale) |
-                                                  (gqa_iso3_nibble(
-                                                       __bfloat162float(
-                                                           input_v[src0 + lane * 2 + 1]),
-                                                       vscale)
-                                                   << 4));
+                        static_cast<std::uint8_t>(gqa_iso3_nibble(ve, vscale) |
+                                                  (gqa_iso3_nibble(vo, vscale) << 4));
                 }
                 if (lane == 0) {
                     cache_v_scale[gqa_kv_nvfp4_scale_index<Geometry>(
@@ -391,7 +394,7 @@ _Pragma("unroll 1")
                     float res[2] = {0.0f, 0.0f};
                     float rmax   = 0.0f;
                     if (lane < 8) {
-                        const float ve = v0;
+                        const float ve = __bfloat162float(input_v[src0 + lane * 2]);
                         const float vo =
                             __bfloat162float(input_v[src0 + lane * 2 + 1]);
                         const std::uint8_t ce = gqa_iso3_nibble(ve, vscale);
@@ -423,13 +426,18 @@ _Pragma("unroll 1")
             } else {
                 const float vscale = fmaxf(vmax / 6.0f, kNvfp4MinScale);
                 if (lane < 8) {
+                    // Even channel 2*lane, paired with odd 2*lane+1 below
+                    // (same byte layout as the ISO3 branch and the prefill
+                    // fill kernels).
                     cache_v[vcode + lane] =
-                        static_cast<std::uint8_t>(gqa_kv_nvfp4_e2m1_nibble(v0 / vscale) |
-                                                  (gqa_kv_nvfp4_e2m1_nibble(
-                                                       __bfloat162float(
-                                                           input_v[src0 + lane * 2 + 1]) /
-                                                       vscale)
-                                                   << 4));
+                        static_cast<std::uint8_t>(
+                            gqa_kv_nvfp4_e2m1_nibble(__bfloat162float(
+                                                         input_v[src0 + lane * 2]) /
+                                                     vscale) |
+                            (gqa_kv_nvfp4_e2m1_nibble(
+                                 __bfloat162float(input_v[src0 + lane * 2 + 1]) /
+                                 vscale)
+                             << 4));
                 }
                 if (lane == 0) {
                     cache_v_scale[gqa_kv_nvfp4_scale_index<Geometry>(
