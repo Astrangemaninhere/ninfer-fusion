@@ -32,8 +32,12 @@ SGLang 0.5.19 小补丁，三项改动：
 1. **DFlash2 Draft KV 降精度（FP8/int8）**：把 draft cache 从 BF16 降到 FP8。
    预期：draft cache 显存减半，长上下文 + DFlash2 的 VRAM 压力缓解；接受率损失小。
 2. **GQA-packed QK/PV 打包**：prefill 优化的一环（与 sglang 调研的 kernel 优化合并执行）。
-3. **State 淘汰策略自查**：确认 GDN state 淘汰不会触发整段 reprefill（对 pressure planner 的
-   state 保留策略做 review；必要时加 state 槽位最低保留水位，类似他们的 max-mamba-cache-size）。
+3. **State 淘汰策略自查（已完成）**：ninfer 的 GDN state 已有完整分层管理——
+   state_store 维护 device/host 双副本（StateReplicaResidency::HostOnly/Both）、checkpoint
+   引用计数、压力感知驱逐（pressure_planner 的 state_slots 双层计数与 update_relief
+   权重）。state 被逐出 device 时可从 host 副本恢复，不触发整段重算；host 副本也被
+   逐出（checkpoint 删除）才走 rewrite，这是有意的容量策略而非 bug。
+   **结论：patch3080 的第三坑我们已覆盖，无需改动。**
 4. **静态 KV 校准流程**（backlog）：用校准集自动生成每层 KV 位宽/scale 配置，替代手调。
 5. lookup 草稿（backlog）：与 PLE/ngram 草稿器计划合并。
 
