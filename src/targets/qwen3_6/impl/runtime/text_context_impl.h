@@ -501,9 +501,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     } else {
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
     }
-                fflush(stderr);
         ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
-                fflush(stderr);
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -1035,7 +1033,6 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
-                                fflush(stderr);
             }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
@@ -1057,7 +1054,6 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
-                                fflush(stderr);
             }
         }
     }
@@ -1206,12 +1202,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 tap.capture_positions(positions, s);
             }
 
-                        fflush(stderr);
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
-                        fflush(stderr);
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
