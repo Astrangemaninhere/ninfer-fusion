@@ -113,13 +113,6 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 : reinterpret_cast<const std::int32_t*>(
                       reinterpret_cast<const std::uint8_t*>(cold_k_valid) +
                       cache.cold_slot_valid.nb[1]);
-        std::fprintf(stderr,
-                     "[dbg-launch] layer=%d dtype=%d res_k=%p res_ks=%p res_v=%p res_vs=%p "
-                     "cold_k=%p cold_v=%p cold_kv=%p cold_vv=%p slot_bytes=%d\n",
-                     cache.layer_index, static_cast<int>(cache.dtype),
-                     cache.k_residual_pages.data, cache.k_residual_scale_pages.data,
-                     cache.v_residual_pages.data, cache.v_residual_scale_pages.data, cold_k,
-                     cold_v, cold_k_valid, cold_v_valid, cache.slot_bytes);
         if (cache.v_dtype == DType::ISO3) {
             gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, DType::NVFP4, DType::ISO3>
                 <<<attention_grid, kNvfp4PrefillThreads, kNvfp4PrefillSmemBytes, stream>>>(

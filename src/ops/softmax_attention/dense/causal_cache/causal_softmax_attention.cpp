@@ -48,9 +48,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    std::fprintf(stderr, "[dbg] validate_cache op=%s dtype=%d qg=%d\n", op,
-                 static_cast<int>(cache.dtype), cache.quant_group);
-    D256KVCacheProfile profile{};
+        D256KVCacheProfile profile{};
     try {
         profile = d256_kv_cache_profile(cache.dtype);
     } catch (const std::invalid_argument&) {
@@ -58,10 +56,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
     if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim ||
         cache.quant_group != profile.quant_group) {
-        std::fprintf(stderr, "[dbg] validate dtype=%d qg=%d profile_qg=%d heads=%d/%d hd=%d\n",
-                     static_cast<int>(cache.dtype), cache.quant_group, profile.quant_group,
-                     cache.num_kv_heads, kv_heads, cache.head_dim);
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
+                throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -111,9 +106,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    std::fprintf(stderr, "[dbg] validate_batch op=%s dtype=%d qg=%d\n", op,
-                 static_cast<int>(cache.dtype), cache.quant_group);
-    D256KVCacheProfile profile{};
+        D256KVCacheProfile profile{};
     try {
         profile = d256_kv_cache_profile(cache.dtype);
     } catch (const std::invalid_argument&) {
@@ -121,10 +114,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim ||
         cache.quant_group != profile.quant_group) {
-        std::fprintf(stderr, "[dbg] validate dtype=%d qg=%d profile_qg=%d heads=%d/%d hd=%d\n",
-                     static_cast<int>(cache.dtype), cache.quant_group, profile.quant_group,
-                     cache.num_kv_heads, kv_heads, cache.head_dim);
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
+                throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];

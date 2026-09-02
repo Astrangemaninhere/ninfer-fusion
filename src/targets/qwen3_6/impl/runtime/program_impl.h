@@ -11157,16 +11157,12 @@ void ProgramImplCore::prepare_graphs() {
         schedule::dflash2_decode_batch(dflash2_state, 1, draft_window,
                                        dflash2_envelopes(code_warm.min, code_warm.max, draft_window),
                                        code_warm_target, nullptr);
-        std::fprintf(stderr, "[df2diag] prepare_representative min=%u\n", code_warm.min);
-        prepare_representative(code_warm.min, 1);
-        std::fprintf(stderr, "[df2diag] after prepare_representative\n");
-        device.synchronize();
-        std::fprintf(stderr, "[df2diag] calling dflash2_decode_batch\n");
-        schedule::dflash2_decode_batch(dflash2_state, 1, draft_window,
+                prepare_representative(code_warm.min, 1);
+                device.synchronize();
+                schedule::dflash2_decode_batch(dflash2_state, 1, draft_window,
                                        dflash2_envelopes(code_warm.min, code_warm.max, draft_window),
                                        code_warm_target, nullptr);
-        std::fprintf(stderr, "[df2diag] after dflash2_decode_batch\n");
-        device.synchronize();
+                device.synchronize();
 
         dflash2_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
@@ -12551,8 +12547,14 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     case DType::FP8_E4M3FN:
         out.kv_cache = KvCacheStorage::Fp8E4M3Row256;
         break;
+    case DType::NVFP4:
+        out.kv_cache = KvCacheStorage::Nvfp4Group16;
+        break;
+    case DType::E8Kv:
+        out.kv_cache = KvCacheStorage::E8Group64;
+        break;
     default:
-        std::terminate();
+        out.kv_cache = KvCacheStorage::BFloat16;
     }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};

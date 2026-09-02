@@ -21,16 +21,17 @@
 namespace ninfer::targets::qwen3_6_27b::detail {
 
 std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
-    // Fusion default: 10 layers of E8-lattice K (H64 rotation + E8 projection,
-    // 4-bit packed) + 6 layers of NVFP4 (E2M1 K + ISO3 V). Measured on 13.3k zh
-    // perplexity at ctx 4096: ppl 1.020 (best of all mixes; all-E8 1.112,
-    // all-NVFP4 1.706, all-I8 1.522) at prefill 2028 tok/s (faster than all-I8
-    // 2017). E8 supplies the K lattice gain; NVFP4 layers supply the ISO3 V
-    // which fits the value distribution better than i4.
+    // Default: 10 layers of NVFP4 + 6 layers of I8 (measured on 13.3k zh
+    // perplexity at ctx 4096: 1.335 vs all-I8 1.522). The E8-lattice tier
+    // (10L E8 + 6L NVFP4, ppl 1.020) is the ppl-optimal prefill/scoring
+    // configuration but its decode path is not yet generation-verified
+    // (known issue: Generation-mode E8 decode aborts); enable explicitly
+    // with --kv-layer-storage 0-9:e8,10-15:nvfp4 once the decode kernel is
+    // fixed. Layers 2 and 5 are the sensitivity outliers and stay I8.
     std::array<DType, 16> table{};
     table.fill(DType::NVFP4);
-    for (const int layer : {0, 1, 3, 4, 6, 7, 8, 9, 13, 14}) {
-        table[static_cast<std::size_t>(layer)] = DType::E8Kv;
+    for (const int layer : {2, 5, 10, 11, 12, 15}) {
+        table[static_cast<std::size_t>(layer)] = DType::I8;
     }
 
     return table;

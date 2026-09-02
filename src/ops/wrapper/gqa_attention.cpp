@@ -126,12 +126,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
     constexpr std::int32_t groups = kHeadDim / kQuantGroup;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
-        std::fprintf(stderr, "[dbg] scale dtype ks=%d vs=%d ne=[%d %d %d %d]\n",
-                     static_cast<int>(cache.k_scale_pages.dtype),
-                     static_cast<int>(cache.v_scale_pages.dtype),
-                     cache.k_scale_pages.ne[0], cache.k_scale_pages.ne[1],
-                     cache.k_scale_pages.ne[2], cache.k_scale_pages.ne[3]);
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
+                throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
     require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k scale pages");
@@ -218,12 +213,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
 
     constexpr std::int32_t groups = kHeadDim / kQuantGroup;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
-        std::fprintf(stderr, "[dbg] scale dtype ks=%d vs=%d ne=[%d %d %d %d]\n",
-                     static_cast<int>(cache.k_scale_pages.dtype),
-                     static_cast<int>(cache.v_scale_pages.dtype),
-                     cache.k_scale_pages.ne[0], cache.k_scale_pages.ne[1],
-                     cache.k_scale_pages.ne[2], cache.k_scale_pages.ne[3]);
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
+                throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
     require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k scale pages");
@@ -469,6 +459,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+        fflush(stderr);
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
@@ -484,8 +475,12 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(v, op, "v");
 
     auto scope = workspace.scope();
-    const detail::GqaAttentionRoute route =
+    detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+    // E8Kv small-T kernels are unverified; route E8 to the prompt path.
+    if (cache.dtype == DType::E8Kv && route != detail::GqaAttentionRoute::Prompt) {
+        route = detail::GqaAttentionRoute::Prompt;
+    }
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);
@@ -501,6 +496,9 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                                              partial.m, partial.l, out, stream);
         return;
     }
+    // diag: sync after launch
+    cudaStreamSynchronize(stream);
+        fflush(stderr);
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                         cache, out, stream);
 }
