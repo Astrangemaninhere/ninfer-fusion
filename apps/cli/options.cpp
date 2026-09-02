@@ -57,6 +57,9 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
+    if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
+    if (text == "iso3") { return KvCacheStorage::Iso3Group16; }
+    if (text == "e8") { return KvCacheStorage::E8Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
