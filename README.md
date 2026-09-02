@@ -18,6 +18,25 @@
 
 默认配置 10L E8 + 6L NVFP4 同时赢精度与速度：E8-lattice K 提供格点增益（H64 旋转对齐 g64 scale 域），NVFP4 层的 ISO3 V 比 i4 更贴值分布。
 
+### 速度曲线（RTX 5090D 实测，2026-09-02）
+
+Prefill 吞吐 vs Context（ppl score rate，corpus-long 多窗口）：
+
+![Prefill 吞吐 vs Context](docs/speed-prefill.png)
+
+投机解码（MTP3 / DFlash2 d7）随 Prompt 长度的 Decode 吞吐与 Draft 接受率：
+
+![投机解码 Decode 吞吐](docs/speed-spec-decode.png)
+
+![Draft 接受率](docs/speed-spec-accept.png)
+
+| Prompt | MTP3 接受率 | DFlash2 接受率 | MTP3 decode | DFlash2 decode |
+|---|---|---:|---:|---:|
+| 1.5K | 43.0% | 24.7% | 96.9 tok/s | 70.6 tok/s |
+| 3K | 47.1% | 24.0% | 101.9 tok/s | 65.9 tok/s |
+| 6K | 44.2% | 18.6% | 92.5 tok/s | 51.2 tok/s |
+| 12K | 45.6% | 12.7% | 83.2 tok/s | 37.5 tok/s |
+
 ### 容量（每 head/token）
 
 | 方案 | 字节 | bit/元素 |

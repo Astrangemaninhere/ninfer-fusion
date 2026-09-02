@@ -72,6 +72,72 @@ int expect_fail(const std::string& what, const std::string& detail) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // "real" mode: validate against an actual Qwen4Exp PLE sidecar (manifest +
+    // data files under the given root). Skips the synthetic cross-check; the
+    // gather is validated for finiteness and non-degeneracy.
+    if (argc >= 3 && std::string_view(argv[1]) == "real") {
+        const std::filesystem::path root_dir = argv[2];
+        std::vector<int32_t> tokens;
+        for (int i = 3; i < argc; ++i) { tokens.push_back(std::atoi(argv[i])); }
+        if (tokens.empty()) { tokens = {5, 7, 7, 9, 100, 200, 300}; }
+        ninfer::ops::ple::PleLayout layout;
+        try {
+            layout = ninfer::ops::ple::PleLayout::from_manifest(
+                (root_dir / "ple-manifest.json").string());
+        } catch (const std::exception& e) {
+            return expect_fail("real manifest parse", e.what());
+        }
+        std::printf("real layout: %u heads, %u parts, %u files, stride %u, rows %llu\n",
+                    layout.n_heads, static_cast<unsigned>(layout.logical_parts.size()),
+                    static_cast<unsigned>(layout.physical_files.size()),
+                    layout.row_stride_bytes,
+                    (unsigned long long)layout.padded_vocabulary_rows);
+        const int32_t eos = 151643; // Qwen3.8 vocabulary EOS
+        std::vector<int32_t> prevs(tokens.size() * 2, eos);
+        std::vector<int32_t> rows(tokens.size() * layout.n_heads);
+        layout.derive_rows(tokens, prevs, eos, rows.data());
+        std::printf("real derived rows (first token):");
+        for (unsigned h = 0; h < layout.n_heads; ++h) { std::printf(" %d", rows[h]); }
+        std::printf("\n");
+        for (size_t i = 0; i < rows.size(); ++i) {
+            uint32_t fi = 0;
+            uint64_t off = 0;
+            if (!layout.row_location((uint64_t)rows[i], fi, off) ||
+                fi >= layout.physical_files.size()) {
+                return expect_fail("real row location", "row out of range");
+            }
+        }
+        std::printf("real row location OK (%zu rows)\n", rows.size());
+
+        ninfer::ops::ple::PleTableOptions opts;
+        opts.sidecar_root = root_dir;
+        opts.cache_bytes = 64ULL << 20;
+        ninfer::ops::ple::PleTable table(opts);
+        const int row_dim = static_cast<int>(layout.embedding_row_dimension);
+        __half* dst = nullptr;
+        cudaMalloc(&dst, tokens.size() * layout.n_heads * row_dim * sizeof(__half));
+        cudaStream_t stream = nullptr;
+        cudaStreamCreate(&stream);
+        table.gather(rows.data(), tokens.size(), dst, stream);
+        cudaStreamSynchronize(stream);
+        std::vector<__half> host(tokens.size() * layout.n_heads * row_dim);
+        cudaMemcpy(host.data(), dst, host.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+        cudaFree(dst);
+        cudaStreamDestroy(stream);
+        size_t nonzero = 0;
+        float min_abs = 1e30f, max_abs = 0.0f;
+        for (float v : host) {
+            if (v != v) { return expect_fail("real gather", "NaN in PLE data"); }
+            const float a = v < 0 ? -v : v;
+            if (a != 0.0f) { ++nonzero; }
+            if (a < min_abs) { min_abs = a; }
+            if (a > max_abs) { max_abs = a; }
+        }
+        std::printf("real gather OK: %zu/%zu nonzero, |v| in [%.4g, %.4g]\n", nonzero,
+                    host.size(), min_abs, max_abs);
+        return nonzero == 0 ? 1 : 0;
+    }
+
     std::filesystem::path fixture;
     if (argc > 1) {
         fixture = argv[1];
