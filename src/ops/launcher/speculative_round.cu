@@ -52,11 +52,16 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
                                              Tensor& lengths, Tensor& anchors,
                                              Tensor& licensed_tokens, Tensor& licensed_counts,
                                              Tensor& accepted, std::int32_t token_domain,
-                                             const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream) {
+                                             const SamplingConfig* configs,
+                                             const Tensor& draft_ids, const Tensor& draft_probs,
+                                             DeviceSpan workspace, cudaStream_t stream) {
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t cols              = drafts.ne[0] + 1;
     const std::int32_t batch             = drafts.ne[1];
+    const std::int32_t* ids_ptr =
+        draft_ids.data != nullptr ? static_cast<const std::int32_t*>(draft_ids.data) : nullptr;
+    const float* probs_ptr =
+        draft_probs.data != nullptr ? static_cast<const float*>(draft_probs.data) : nullptr;
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
     if (!layout.multiblock) {
         speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
@@ -67,8 +72,8 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
             static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
             static_cast<std::int32_t*>(licensed_tokens.data),
             static_cast<std::int32_t*>(licensed_counts.data),
-            static_cast<std::int32_t*>(accepted.data), configs, token_domain, physical_rows,
-            drafts.ne[0]);
+            static_cast<std::int32_t*>(accepted.data), configs, ids_ptr, probs_ptr, token_domain,
+            physical_rows, drafts.ne[0]);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -94,7 +99,8 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
-        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes);
+        configs, ids_ptr, probs_ptr, token_domain, cols, partial_blocks, groups, scratch,
+        layout.bytes);
     CUDA_CHECK(cudaGetLastError());
 }
 

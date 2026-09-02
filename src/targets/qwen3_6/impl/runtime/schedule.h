@@ -147,6 +147,8 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
+    Tensor draft_candidate_ids;
+    Tensor draft_candidate_probs;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
@@ -234,11 +236,6 @@ void dflash2_append_context(PrefillContext& state, const Tensor& features, const
                             ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void capture_dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size,
                                   std::uint32_t k, DFlash2Envelopes envelopes,
-                                  ops::CausalAttentionExecutionEnvelope target_envelope,
-                                  DecodeGraphDefinition& definition);
-void dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                          DFlash2Envelopes envelopes,
-                          ops::CausalAttentionExecutionEnvelope target_envelope,
                                   ops::GqaExecutionEnvelope target_envelope,
                                   DecodeGraphDefinition& definition);
 void dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size, std::uint32_t k,

@@ -339,8 +339,9 @@ void propose_batch_impl(DFlash2BatchContext& state, qwen3_6::DFlashDecodeState& 
         {batch_size, Config::block_drafts, Config::selector_top_k, Config::selector_top_k});
     ops::dflash2_selector(logits, projected, dflash2.selector_predecessor_codebook,
                           dflash2.selector_successor_codebook, anchors, candidates, unary, scores,
-                          flat_drafts, Config::block_drafts, Config::selector_top_k,
-                          state.execution.device.stream);
+                          flat_drafts, frame.sampling, frame.draft_candidate_ids,
+                          frame.draft_candidate_probs, Config::block_drafts,
+                          Config::selector_top_k, state.execution.device.stream);
     state.execution.work.reset();
 }
 
@@ -421,6 +422,8 @@ auto dflash2_decode_batch_body(DFlash2BatchContext& state, std::int32_t batch_si
                                  .licensed_counts = licensed_counts,
                                  .accepted_drafts = accepted,
                                  .selected_hidden = selected_hidden,
+                                 .draft_candidate_ids   = frame.draft_candidate_ids,
+                                 .draft_candidate_probs = frame.draft_candidate_probs,
                                  .replay_records  = state.execution.replay_records,
                                  .sampling        = frame.sampling,
                                  .feature_sink    = &sink,

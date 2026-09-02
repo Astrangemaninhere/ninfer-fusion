@@ -60,7 +60,10 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   Sampling mode applies configs[b] to each valid verification column, accepts draft i with
  *   target probability p_i(draft_i), samples from the residual distribution on first rejection,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. The draft
- *   proposal distribution is one-hot at each greedy draft token.
+ *   proposal distribution is one-hot at each greedy draft token; when `draft_ids`/`draft_probs`
+ *   are non-empty (I32/FP32 [16,K,B], the DFlash2 selector's per-step top-K candidates and
+ *   softmax scores) the accept test becomes u < min(1, p_i/q_i) with q_i the draft's own
+ *   proposal mass, and a rejection resamples from max(p - q, 0).
  *   RNG domains are the speculative accept/correction/bonus SamplePurpose values and logical
  *   positions derived from the old length.
  *
@@ -92,6 +95,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
+                                      const Tensor& draft_ids, const Tensor& draft_probs,
                                       WorkspaceArena& workspace, cudaStream_t stream);
 
 /**

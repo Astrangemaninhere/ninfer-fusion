@@ -12,7 +12,9 @@ void dflash2_selector_launch(const Tensor& unary_logits, const Tensor& projected
                              const Weight& predecessor_codebook,
                              const Weight& successor_codebook, const Tensor& anchors,
                              Tensor& candidates, Tensor& unary, Tensor& scores, Tensor& drafts,
-                             std::int32_t steps, std::int32_t top_k, cudaStream_t stream) {
+                             const SamplingConfig* configs, Tensor& candidate_ids,
+                             Tensor& candidate_probs, std::int32_t steps, std::int32_t top_k,
+                             cudaStream_t stream) {
     if (steps != 7 || top_k != kDflash2SelectorTopK) {
         throw std::invalid_argument("dflash2_selector: registered domain is S=7, K=16");
     }
@@ -40,8 +42,10 @@ void dflash2_selector_launch(const Tensor& unary_logits, const Tensor& projected
 
     dflash2_selector_walk_kernel<<<batch, 32, 0, stream>>>(
         static_cast<const std::int32_t*>(candidates.data),
-        static_cast<const float*>(scores.data), static_cast<std::int32_t*>(drafts.data), batch,
-        steps, top_k);
+        static_cast<const float*>(scores.data), static_cast<std::int32_t*>(drafts.data), configs,
+        candidate_ids.data != nullptr ? static_cast<std::int32_t*>(candidate_ids.data) : nullptr,
+        candidate_probs.data != nullptr ? static_cast<float*>(candidate_probs.data) : nullptr,
+        batch, steps, top_k);
     CUDA_CHECK(cudaGetLastError());
 }
 

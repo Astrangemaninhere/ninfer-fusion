@@ -202,6 +202,13 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
+        constexpr int kDflash2TopK = 16;
+        decode.draft_candidate_ids = add_tensor(builder, DType::I32,
+                                                {kDflash2TopK, columns - 1, batch},
+                                                "DFlash draft candidate ids");
+        decode.draft_candidate_probs = add_tensor(builder, DType::FP32,
+                                                  {kDflash2TopK, columns - 1, batch},
+                                                  "DFlash draft candidate probs");
     }
     layout.complete = true;
 }
@@ -350,6 +357,8 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_logits              = layout.target_logits.bind(backing);
     target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+    draft_candidate_ids        = layout.draft_candidate_ids.bind(backing);
+    draft_candidate_probs      = layout.draft_candidate_probs.bind(backing);
 }
 
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {

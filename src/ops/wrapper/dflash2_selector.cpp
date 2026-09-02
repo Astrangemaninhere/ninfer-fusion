@@ -10,7 +10,9 @@ namespace ninfer::ops {
 void dflash2_selector(const Tensor& unary_logits, const Tensor& projected_hidden,
                       const Weight& predecessor_codebook, const Weight& successor_codebook,
                       const Tensor& anchors, Tensor& candidates, Tensor& unary, Tensor& scores,
-                      Tensor& drafts, std::int32_t steps, std::int32_t top_k, cudaStream_t stream) {
+                      Tensor& drafts, const SamplingConfig* configs, Tensor& candidate_ids,
+                      Tensor& candidate_probs, std::int32_t steps, std::int32_t top_k,
+                      cudaStream_t stream) {
     const auto invalid = [](const char* message) { throw std::invalid_argument(message); };
     if (unary_logits.dtype != DType::BF16 || projected_hidden.dtype != DType::BF16 ||
         anchors.dtype != DType::I32 || candidates.dtype != DType::I32 ||
@@ -41,6 +43,16 @@ void dflash2_selector(const Tensor& unary_logits, const Tensor& projected_hidden
         scores.ne[3] != top_k || drafts.ne[0] != tokens) {
         invalid("dflash2_selector: scratch or draft shapes are inconsistent");
     }
+    if (candidate_ids.data != nullptr) {
+        if (candidate_ids.dtype != DType::I32 || candidate_probs.data == nullptr ||
+            candidate_probs.dtype != DType::FP32 || !contiguous(candidate_ids) ||
+            !contiguous(candidate_probs) || candidate_ids.ne[0] != top_k ||
+            candidate_ids.ne[1] != steps || candidate_ids.ne[2] != batch ||
+            candidate_probs.ne[0] != top_k || candidate_probs.ne[1] != steps ||
+            candidate_probs.ne[2] != batch) {
+            invalid("dflash2_selector: candidate distribution buffers must be [K,S,B]");
+        }
+    }
     if (predecessor_codebook.qtype != QType::BF16_CTRL ||
         successor_codebook.qtype != QType::BF16_CTRL || predecessor_codebook.n != vocab ||
         predecessor_codebook.k != rank || successor_codebook.n != vocab ||
@@ -51,7 +63,7 @@ void dflash2_selector(const Tensor& unary_logits, const Tensor& projected_hidden
 
     detail::dflash2_selector_launch(unary_logits, projected_hidden, predecessor_codebook,
                                     successor_codebook, anchors, candidates, unary, scores, drafts,
-                                    steps, top_k, stream);
+                                    configs, candidate_ids, candidate_probs, steps, top_k, stream);
 }
 
 } // namespace ninfer::ops

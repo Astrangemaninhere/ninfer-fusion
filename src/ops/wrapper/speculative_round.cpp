@@ -111,6 +111,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
+                                      const Tensor& draft_ids, const Tensor& draft_probs,
                                       WorkspaceArena& workspace, cudaStream_t stream) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
@@ -139,13 +140,23 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
     }
+    if (draft_ids.data != nullptr) {
+        constexpr std::int32_t kTopK = 16;
+        if (draft_ids.dtype != DType::I32 || draft_probs.dtype != DType::FP32 ||
+            draft_ids.ne[0] != kTopK || draft_ids.ne[1] != k || draft_ids.ne[2] != batch ||
+            draft_probs.ne[0] != kTopK || draft_probs.ne[1] != k || draft_probs.ne[2] != batch ||
+            !draft_ids.is_contiguous() || !draft_probs.is_contiguous()) {
+            throw std::invalid_argument(
+                "speculative_accept_greedy_drafts: draft distribution must be [16,K,B]");
+        }
+    }
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
         speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream);
+        licensed_counts, accepted, token_domain, configs, draft_ids, draft_probs, scratch, stream);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

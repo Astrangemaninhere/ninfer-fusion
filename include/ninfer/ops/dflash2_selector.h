@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -34,7 +35,16 @@ namespace ninfer::ops {
  * where pred is the anchor token at s=0 and candidate[s-1,p] afterwards; only
  * p=0 is admitted at s=0. The walk starts at previous candidate index 0 and
  * greedily picks the highest-score current candidate at every step (lowest
- * candidate index breaking ties).
+ * candidate index breaking ties). With `configs` non-null and
+ * configs[b].temperature > 0 the walk instead draws each step from the
+ * candidate softmax via the Gumbel-max trick (noise keyed per candidate),
+ * matching the target-side stochastic verification contract.
+ *
+ * `candidate_ids` (I32 [K,S,B]) and `candidate_probs` (FP32 [K,S,B], the
+ * per-step softmax over the previous step's row) receive the walk's candidate
+ * distribution; pass empty Tensors to skip. They let the speculative accept
+ * path run distribution-correct rejection (u < min(1, p/q)) instead of the
+ * one-hot collapse.
  *
  * The registered domain is V=248320, R=256, S=7, B=1..8, K=16. Inputs and
  * weights are unchanged and the Op owns no workspace or persistent state.
@@ -42,6 +52,8 @@ namespace ninfer::ops {
 void dflash2_selector(const Tensor& unary_logits, const Tensor& projected_hidden,
                       const Weight& predecessor_codebook, const Weight& successor_codebook,
                       const Tensor& anchors, Tensor& candidates, Tensor& unary, Tensor& scores,
-                      Tensor& drafts, std::int32_t steps, std::int32_t top_k, cudaStream_t stream);
+                      Tensor& drafts, const ops::SamplingConfig* configs, Tensor& candidate_ids,
+                      Tensor& candidate_probs, std::int32_t steps, std::int32_t top_k,
+                      cudaStream_t stream);
 
 } // namespace ninfer::ops

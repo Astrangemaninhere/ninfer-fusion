@@ -56,6 +56,43 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
     return workspace;
 }
 
+// thread-0 helper for distribution-correct rejection: when the draft carries a
+// proposal distribution q (DFlash2 selector softmax over its top-K row), the
+// residual after a rejection is max(p - q, 0) renormalized. draft_ids/draft_probs
+// are [16, k, batch]; draft_ids == nullptr keeps the one-hot (q=delta) behavior.
+__device__ __forceinline__ int sampling_pick_distributional_residual(
+    const int* cand_idx, const float* prob, int n, const std::int32_t* row_ids,
+    const float* row_probs, float u) {
+    constexpr int kDraftTopK = 16;
+    float mass = 0.0f;
+    float w[kSamplerCandidateCap];
+    for (int j = 0; j < n; ++j) {
+        float q = 0.0f;
+        for (int c = 0; c < kDraftTopK; ++c) {
+            if (row_ids[c] == cand_idx[j]) {
+                q = row_probs[c];
+                break;
+            }
+        }
+        w[j]   = fmaxf(prob[j] - q, 0.0f);
+        mass  += w[j];
+    }
+    if (mass <= 0.0f) {
+        // Degenerate residual (p <= q over the whole support); fall back to the
+        // plain target distribution so the round still commits a token.
+        return sampling_pick_from_support(cand_idx, prob, n, -1, u);
+    }
+    const float goal = u * mass;
+    float acc        = 0.0f;
+    int picked       = -1;
+    for (int j = 0; j < n; ++j) {
+        acc += w[j];
+        picked = cand_idx[j];
+        if (goal < acc) { return picked; }
+    }
+    return picked;
+}
+
 // Commits the round's accepted tokens plus one correction/bonus token, then
 // advances the target length. The greedy branch
 // (config temperature <= 0) is bit-identical to the original argmax accept: keep
@@ -66,15 +103,18 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
 // the truncated target distribution, resample from the masked residual on the
 // first rejection, and draw a bonus from the last column when every draft accepts.
 // The draft-proposal path stays greedy, so q is one-hot and the accept test
-// collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
-// threads; only thread 0 performs the sequential accept/commit while the whole
-// block cooperates on the per-column truncated-distribution build.
+// collapses to `u < p_i(drafts[i])`. When draft_ids is non-null the draft carries
+// its own proposal distribution q (DFlash2 selector walk under sampling), the
+// accept test becomes u < min(1, p/q), and a rejection resamples from
+// max(p - q, 0). Launch with a single block of kSamplerBlock threads; only
+// thread 0 performs the sequential accept/commit while the whole block
+// cooperates on the per-column truncated-distribution build.
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
-    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t k) {
+    const SamplingConfig* configs, const std::int32_t* draft_ids, const float* draft_probs,
+    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t k) {
     const int tid                   = threadIdx.x;
     const int row                   = static_cast<int>(blockIdx.x);
     const int cols                  = k + 1;
@@ -219,15 +259,36 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                         break;
                     }
                 }
+                constexpr int kDraftTopK = 16;
+                const int step_row_base  = kDraftTopK * (i + k * static_cast<int>(blockIdx.x));
+                float qd                 = 0.0f;
+                if (draft_ids != nullptr) {
+                    for (int c = 0; c < kDraftTopK; ++c) {
+                        if (draft_ids[step_row_base + c] == d) {
+                            qd = draft_probs[step_row_base + c];
+                            break;
+                        }
+                    }
+                } else {
+                    qd = 1.0f; // one-hot draft: q(d) = 1 collapses to u < p
+                }
+                const float accept_prob = qd > 0.0f ? fminf(1.0f, pd / qd) : 0.0f;
                 const float u =
                     sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                if (u < pd) {
+                if (u < accept_prob) {
                     a_sh = i + 1; // accept drafts[i], keep verifying
                 } else {
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar_sh       = sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
-                    done_sh        = 1;
+                    if (draft_ids != nullptr && qd > 0.0f) {
+                        tstar_sh = sampling_pick_distributional_residual(
+                            cand_idx, prob, n_support, draft_ids + step_row_base,
+                            draft_probs + step_row_base, ur);
+                    } else {
+                        tstar_sh =
+                            sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
+                    }
+                    done_sh = 1;
                 }
             } else {
                 // Every draft accepted: bonus token from the last verify column.
@@ -333,9 +394,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const std::int32_t* target_tokens, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
-    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
-    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride) {
+    const SamplingConfig* configs, const std::int32_t* draft_ids, const float* draft_probs,
+    std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
+    std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
@@ -517,15 +578,35 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                             break;
                         }
                     }
+                    constexpr int kDraftTopK = 16;
+                    const int step_row_base  = kDraftTopK * (i + k * row);
+                    float qd                 = 0.0f;
+                    if (draft_ids != nullptr) {
+                        for (int c = 0; c < kDraftTopK; ++c) {
+                            if (draft_ids[step_row_base + c] == d) {
+                                qd = draft_probs[step_row_base + c];
+                                break;
+                            }
+                        }
+                    } else {
+                        qd = 1.0f; // one-hot draft
+                    }
+                    const float accept_prob = qd > 0.0f ? fminf(1.0f, pd / qd) : 0.0f;
                     const float u =
                         sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                    if (u < pd) {
+                    if (u < accept_prob) {
                         a = i + 1;
                         continue;
                     }
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar          = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                    if (draft_ids != nullptr && qd > 0.0f) {
+                        tstar = sampling_pick_distributional_residual(
+                            dist_idx, dist_prob, n, draft_ids + step_row_base,
+                            draft_probs + step_row_base, ur);
+                    } else {
+                        tstar = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                    }
                     break;
                 }
                 const float u =

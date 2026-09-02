@@ -4,6 +4,7 @@
 // Match: token-major BF16 logits/projection and the documented scratch layouts.
 
 #include "ops/launcher/dflash2_selector.h"
+#include "ops/kernel/sampling_device.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -156,35 +157,77 @@ __launch_bounds__(Block) __global__ void dflash2_selector_scores_kernel(
 
 __global__ void dflash2_selector_walk_kernel(const std::int32_t* __restrict__ candidates,
                                              const float* __restrict__ scores,
-                                             std::int32_t* __restrict__ drafts, int batch,
+                                             std::int32_t* __restrict__ drafts,
+                                             const SamplingConfig* __restrict__ configs,
+                                             std::int32_t* __restrict__ out_ids,
+                                             float* __restrict__ out_probs, int batch,
                                              int steps, int top_k) {
     constexpr int K = detail::kDflash2SelectorTopK;
     const int b     = static_cast<int>(blockIdx.x);
     const int lane  = static_cast<int>(threadIdx.x);
     constexpr unsigned Mask = 0xffffffffu;
-    int previous            = 0;
+    const SamplingConfig cfg = configs != nullptr ? configs[b] : SamplingConfig{};
+    const bool sample        = cfg.temperature > 0.0f;
+    int previous             = 0;
     for (int s = 0; s < steps; ++s) {
+        const int pred = previous;
+        const auto row_score = [&](int c) {
+            return scores[dflash2_selector_score_offset(b, batch, s, steps, pred, c, top_k)];
+        };
+
+        // Raw row maximum (used for softmax normalization and greedy tie-break).
+        float raw = lane < K ? row_score(lane) : -CUDART_INF_F;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            raw = fmaxf(raw, __shfl_xor_sync(Mask, raw, offset));
+        }
+        const float raw_max = raw;
+
+        // Sampled walk: Gumbel-max over the row (noise keyed by candidate
+        // rank); greedy walk: plain argmax, lowest rank breaking ties.
         float value = -CUDART_INF_F;
         if (lane < K) {
-            value = scores[dflash2_selector_score_offset(b, batch, s, steps, previous, lane,
-                                                         top_k)];
+            if (sample) {
+                const float u = sampling_uniform(cfg.seed, s + 1,
+                                                 kSamplePurposeDFlash2Selector, lane);
+                const float g = -__logf(-__logf(fmaxf(u, 1.0e-12f)));
+                value         = row_score(lane) + g;
+            } else {
+                value = row_score(lane);
+            }
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             value = fmaxf(value, __shfl_xor_sync(Mask, value, offset));
         }
-        const float best     = __shfl_sync(Mask, value, 0);
-        const bool equal     = lane < K && value == best;
+        const float best              = __shfl_sync(Mask, value, 0);
+        const bool equal              = lane < K && value == best;
         const std::int32_t candidate_rank = equal ? lane : K;
-        std::int32_t chosen  = candidate_rank;
+        std::int32_t chosen = candidate_rank;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             chosen = min(chosen, __shfl_xor_sync(Mask, chosen, offset));
         }
-        const std::int32_t token =
+        drafts[b * steps + s] =
             candidates[dflash2_selector_candidate_offset(b, batch, s, steps, chosen)];
-        drafts[b * steps + s] = token;
-        previous              = chosen;
+        previous = chosen;
+
+        // Publish this step's candidate distribution: softmax over the raw row
+        // of the *pre-walk* predecessor rank (the row the accept side reuses).
+        if (out_probs != nullptr && out_ids != nullptr) {
+            float e = lane < K ? __expf(row_score(lane) - raw_max) : 0.0f;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                e = e + __shfl_xor_sync(Mask, e, offset);
+            }
+            const float norm = __shfl_sync(Mask, e, 0);
+            if (lane < K) {
+                const int base  = lane + K * (s + steps * b);
+                out_probs[base] = norm > 0.0f ? __expf(row_score(lane) - raw_max) / norm : 0.0f;
+                out_ids[base] =
+                    candidates[dflash2_selector_candidate_offset(b, batch, s, steps, lane)];
+            }
+        }
     }
 }
 

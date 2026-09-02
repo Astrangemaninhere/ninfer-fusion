@@ -143,6 +143,11 @@ struct DFlashDecodeStateLayout {
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    // DFlash2 candidate walk outputs: per proposal step the top-K candidate
+    // token ids and their softmax scores. Only consumed by the sampling
+    // accept path (distribution-correct rejection); greedy never reads them.
+    TensorRegion draft_candidate_ids;
+    TensorRegion draft_candidate_probs;
 };
 
 struct RoundStateLayout {
@@ -275,6 +280,8 @@ struct DFlashDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    Tensor draft_candidate_ids;
+    Tensor draft_candidate_probs;
 
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
