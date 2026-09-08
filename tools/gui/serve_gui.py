@@ -65,6 +65,19 @@ button{border:0;border-radius:10px;padding:10px 22px;font:inherit;font-weight:60
   <div class="row"><label>多模态</label>
     <input id="vis" type="range" min="0" max="1" value="0" step="1">
     <div class="val" id="vis_v">关</div></div>
+  <div class="row"><label>冷策略</label>
+    <input id="cold" type="range" min="0" max="3" value="0" step="1">
+    <div class="val" id="cold_v">off</div></div>
+  <div class="row"><label>热窗 tokens</label>
+    <input id="hotwin" type="range" min="0" max="8" value="4" step="1">
+    <div class="val" id="hotwin_v">4k</div>
+    <span style="color:var(--mut);font-size:11px">0=引擎默认128</span></div>
+  <div class="row"><label>逐层 KV</label>
+    <input id="kvlayer" type="text" value="" placeholder="0-15:e8,32-63:iso3 (空=默认)">
+  </div>
+  <div class="row"><label>CUDA Graph</label>
+    <input id="graph" type="range" min="0" max="1" value="1" step="1">
+    <div class="val" id="graph_v">开</div></div>
   <div class="row"><label>端口</label>
     <input id="port" type="text" value="8000"></div>
   <div class="btnrow">
@@ -78,17 +91,24 @@ const $=id=>document.getElementById(id);
 const KV=['BF16','INT8','FP8','NVFP4','E8 混合'];
 const CTX=[8,16,32,64,128,256];
 const SPEC=['无','MTP','DFlash','DFlash2'];
+const COLD=['off','window','host','disk'];
+const HOT=[0,128,512,1024,2048,4096,8192,16384,32768];
 $('kv').oninput=e=>$('kv_v').textContent=KV[+e.target.value];
 $('ctx').oninput=e=>$('ctx_v').textContent=CTX[+e.target.value-3]+'k';
 $('spec').oninput=e=>$('spec_v').textContent=SPEC[+e.target.value];
 $('draft').oninput=e=>$('draft_v').textContent=e.target.value;
 $('conc').oninput=e=>$('conc_v').textContent=e.target.value;
 $('vis').oninput=e=>$('vis_v').textContent=+e.target.value?'开':'关';
+$('cold').oninput=e=>$('cold_v').textContent=COLD[+e.target.value];
+$('hotwin').oninput=e=>{const h=HOT[+e.target.value];$('hotwin_v').textContent=h?(h>=1024?(h/1024)+'k':h):'默认';};
+$('graph').oninput=e=>$('graph_v').textContent=+e.target.value?'开':'关';
 async function ctrl(a){
   const r=await fetch('/api/'+a,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({model:$('model').value.trim(),kv:+$('kv').value,
       ctx:+$('ctx').value,spec:+$('spec').value,draft:+$('draft').value,
-      conc:+$('conc').value,vis:+$('vis').value,port:$('port').value.trim()})});
+      conc:+$('conc').value,vis:+$('vis').value,cold:+$('cold').value,
+      hotwin:+$('hotwin').value,kvlayer:$('kvlayer').value.trim(),
+      graph:+$('graph').value,port:$('port').value.trim()})});
   const d=await r.json();
   $('badge').textContent=d.running?'运行中':'未启动';
   $('badge').className='badge '+(d.running?'run':'idle');
@@ -117,6 +137,8 @@ KV_ARGS = {
     3: ['--kv-dtype', 'nvfp4'],
     4: ['--kv-layer-storage', '0-9:e8,10-15:nvfp4'],
 }
+COLD_POLICY = ['', 'window', 'host', 'disk']
+HOT_TOKENS = [0, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 CTX_KB = [8192, 16384, 32768, 65536, 131072, 262144]
 SPEC_ARGS = ['', '--spec mtp', '--spec dflash', '--spec dflash2']
 SERVE_BIN = '/home/user/ninfer-fusion/build/apps/ninfer-serve'
@@ -135,7 +157,17 @@ def build_cmd(req):
         cmd += ['--max-concurrency', str(int(req['conc']))]
     if int(req['vis']):
         cmd += ['--vision']
-    cmd += ['--no-cuda-graph']
+    policy = COLD_POLICY[int(req['cold'])] if int(req.get('cold', 0)) else ''
+    if policy:
+        cmd += ['--cold-policy', policy]
+        keep = HOT_TOKENS[int(req['hotwin'])] if int(req.get('hotwin', 0)) else 0
+        if keep > 0:
+            cmd += ['--cold-keep-tokens', str(keep)]
+    kvlayer = str(req.get('kvlayer', '') or '').strip()
+    if kvlayer:
+        cmd += ['--kv-layer-storage', kvlayer]
+    if not int(req.get('graph', 1)):
+        cmd += ['--no-cuda-graph']
     return cmd
 
 
