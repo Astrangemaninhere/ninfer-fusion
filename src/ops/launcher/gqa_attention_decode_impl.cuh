@@ -15,6 +15,8 @@
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
 #include <cstdint>
+
+#include "ops/common/ft_stats.h"
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -577,6 +579,13 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             launch_reduce.template operator()<Int8, MultiBatch, Masked, true>();
         }
     };
+    if (ft::enabled()) {
+        // FreeToken step-1: 采样本层 partial_l (host 侧 D2H; 观测运行须
+        // --no-cuda-graph)。延迟同步仅在观测模式存在。
+        ft::observe(stream, cache.layer_index,
+                    static_cast<const float*>(partial_l.data),
+                    Geometry::QHeads * invocation.width, splits);
+    }
     const auto launch_for_dtype = [&]<bool Int8>() {
         if (invocation.batch_size == 1) {
             if (masked) {
