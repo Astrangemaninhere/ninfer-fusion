@@ -1,20 +1,32 @@
-// ninfer QPN port: SM70-family NVFP4 skinny GEMM device kernels.
-// Source: v100-skinny kernels/skinny_kernels.cu (Apache-2.0, 1Cat lineage),
-// device section extracted verbatim (no torch dependencies).
+// ninfer QPN port: SM70-family NVFP4 skinny GEMM device kernels + pure-CUDA helpers.
+// Source: v100-skinny kernels/skinny_kernels.cu (Apache-2.0, 1Cat lineage).
 // Packed layout (0.5625 B/weight): codes u8 [N][K/2] e2m1x2, scales u8
-// [N][K/16] e4m3 per-16, gscale f32 epilogue. See qpn_host.cu wrappers.
+// [N][K/16] e4m3 per-16, gscale f32 epilogue. Prepack: qpn_prepack_proto.py.
 #pragma once
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <mma.h>
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 
 namespace ninfer::ops::qpn {
 
+// SM70 skinny NVFP4 dequant-GEMM: y[M,N] = x[M,K] @ W[K,N]
+//
+// Packed format (0.5625 bytes/weight, same density as the marlin path):
+//   codes  uint8 [N][K/2]   two e2m1 codes per byte, low nibble = even k
+//   scales uint8 [N][K/16]  fp8-e4m3 per 16-k group
+//   gscale float            global scale, applied in the epilogue
+//
+// Two kernels, split by where V100 runs out of math:
+//   simt (M<=8):  warp per output row, HFMA2 inner loop, k-pairs in the
+//                 half2 lanes, x chunk in smem with an XOR bank swizzle.
+//   wmma (M>=9):  block dequants a weight tile to smem, tensor cores
+//                 (m16n16k16, fp32 accumulate) do the arithmetic.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
-#include <mma.h>
 
 using namespace nvcuda;
 
@@ -590,5 +602,834 @@ __global__ void skinny_nvfp4_dp4a(const uint8_t *__restrict__ codes,
 // ---------------------------------------------------------------------------
 // Host dispatch
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// MMA8 kernel: Volta mma.sync.m8n8k4 register-fragment path for 2<=M<=8.
+//
+// The 16-row WMMA tile pads M=5 verify batches 3.2x; SIMT carries M FMAs
+// per weight byte and goes compute-bound by M=5. This path streams weights
+// through registers exactly like SIMT but hands the MACs to the tensor
+// cores at their native 8-row tile, so M<=8 all run at the same cost.
+//
+// Fragment maps were derived empirically on V100 (mma8_probe.cu):
+//   A row-major / B col-major: QP lanes {0-3,16-19} hold row/col
+//   (lane&3)+4*(lane>=16), 4 contiguous k each.
+//   C fp32: reg i of lane L -> row (i&2)|(L>=16?4:0)|(L&1),
+//   col (i&1)|(((L>>1)&1)<<1)|((i>>2)<<2).
+// Warp = 8 weight rows; the 4 QPs split K in 64-element superchunks
+// (32B-sector-coalesced code reads), butterfly-reduced once at the end.
+// fp32 accumulation end to end: no fp16 overflow window.
+// ---------------------------------------------------------------------------
+template <int KC>
+__global__ void skinny_nvfp4_mma8(const uint8_t *__restrict__ codes,
+                                  const uint8_t *__restrict__ scales,
+                                  const half *__restrict__ x,
+                                  half *__restrict__ y, int N, int K, int M,
+                                  float gscale) {
+  extern __shared__ char smem_raw[];
+  half2 *xs = reinterpret_cast<half2 *>(smem_raw);  // [8][PITCH] plain k order
+  constexpr int PITCH = KC / 2 + 1;  // odd pitch: 8 rows spread the banks
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int qp = (lane >> 2) & 3;
+  const int idx = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int n0 = (blockIdx.x * (int)(blockDim.x >> 5) + warp) * 8;
+  const uint8_t *crow = codes + (size_t)(n0 + idx) * (K >> 1);
+  const uint8_t *srow = scales + (size_t)(n0 + idx) * (K >> 4);
+
+#ifndef SKINNY_LUT_CVT
+  const half2 gm2 = __float2half2_rn(gscale * 16384.f);
+#else
+  const half2 gm2 = __float2half2_rn(gscale);
+#endif
+
+  float c[8];
+#pragma unroll
+  for (int i = 0; i < 8; i++) c[i] = 0.f;
+
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    __syncthreads();
+    for (int t = threadIdx.x; t < 8 * (KC / 2); t += blockDim.x) {
+      const int m = t / (KC / 2), j = t % (KC / 2);
+      half2 v = __float2half2_rn(0.f);
+      if (m < M)
+        v = *reinterpret_cast<const half2 *>(x + (size_t)m * K + k0 + 2 * j);
+      xs[m * PITCH + j] = v;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int s = 0; s < KC / 64; s++) {
+      const int kb = k0 + s * 64 + qp * 16;  // this QP's 16-k window
+      const uint2 q2 =
+          __ldcs(reinterpret_cast<const uint2 *>(crow + (kb >> 1)));
+      const half2 sc2 = __hmul2(fp8e4m3_to_half2(__ldg(srow + (kb >> 4))), gm2);
+      // A fragments, k-contiguous quads for the 4 mmas of this window.
+      half2 af[4][2];
+#ifndef SKINNY_LUT_CVT
+      half2 wa[4], wb[4];
+      dequant8_tm(q2.x, sc2, wa);  // interleaved pairs (k, k+4)
+      dequant8_tm(q2.y, sc2, wb);
+      af[0][0] = __lows2half2(wa[0], wa[1]);
+      af[0][1] = __lows2half2(wa[2], wa[3]);
+      af[1][0] = __highs2half2(wa[0], wa[1]);
+      af[1][1] = __highs2half2(wa[2], wa[3]);
+      af[2][0] = __lows2half2(wb[0], wb[1]);
+      af[2][1] = __lows2half2(wb[2], wb[3]);
+      af[3][0] = __highs2half2(wb[0], wb[1]);
+      af[3][1] = __highs2half2(wb[2], wb[3]);
+#else
+#pragma unroll
+      for (int j = 0; j < 4; j++) {  // adjacent pairs are already k-order
+        const unsigned qw = (j < 2) ? q2.x : q2.y;
+        af[j][0] = dequant_pair(qw, (j & 1) * 2, sc2);
+        af[j][1] = dequant_pair(qw, (j & 1) * 2 + 1, sc2);
+      }
+#endif
+      const half2 *xrow = xs + idx * PITCH + ((kb - k0) >> 1);
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const half2 b0 = xrow[2 * j], b1 = xrow[2 * j + 1];
+        const unsigned *A = reinterpret_cast<const unsigned *>(af[j]);
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+            "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]),
+              "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+            : "r"(A[0]), "r"(A[1]),
+              "r"(*reinterpret_cast<const unsigned *>(&b0)),
+              "r"(*reinterpret_cast<const unsigned *>(&b1)));
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    c[i] += __shfl_xor_sync(0xffffffffu, c[i], 4);
+    c[i] += __shfl_xor_sync(0xffffffffu, c[i], 8);
+  }
+  if ((lane & 12) == 0) {
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int r = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int cc = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      if (cc < M) y[(size_t)cc * N + n0 + r] = __float2half(c[i]);
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+// Split-K variant: each CTA covers one K-slice, accumulating fp32
+// partials into ypart via atomicAdd (S contenders per element at most).
+// Caller converts ypart * gs_eff -> half. Multiplies grid occupancy by
+// the split factor on N-starved shapes.
+template <int WN, int WM, int KC>
+__global__ void skinny_nvfp4_wmma_ks(const uint8_t *__restrict__ codes,
+                                     const uint8_t *__restrict__ scales,
+                                     const half *__restrict__ x,
+                                     float *__restrict__ ypart, int N, int K,
+                                     int m_real, int k_slice) {
+  constexpr int NT = WN * 16, MT = WM * 16;
+  constexpr int PW = KC + 16, PX = KC + 16;
+  constexpr int NTHREADS = WN * WM * 32;
+  constexpr int CSEG = NT * (KC / 16) / NTHREADS;
+  constexpr int XSEG = MT * (KC / 8) / NTHREADS;
+  static_assert(CSEG * NTHREADS == NT * (KC / 16), "code seg split");
+  static_assert(XSEG * NTHREADS == MT * (KC / 8), "x seg split");
+
+  extern __shared__ char smem_raw[];
+  half *ws = reinterpret_cast<half *>(smem_raw);
+  half *xs = ws + NT * PW;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const int wn = warp % WN, wm = warp / WN;
+  const int nb = blockIdx.x * NT;
+  const int kbeg = blockIdx.y * k_slice;
+  const int kend = min(kbeg + k_slice, K);
+
+  uint2 st_c[CSEG];
+  unsigned char st_s[CSEG];
+  uint4 st_x[XSEG];
+
+  auto load_stage = [&](int k0) {
+#pragma unroll
+    for (int i = 0; i < CSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int n = idx / (KC / 16), s = idx % (KC / 16);
+      st_c[i] = __ldcs(reinterpret_cast<const uint2 *>(
+          codes + (size_t)(nb + n) * (K >> 1) + (k0 >> 1) + s * 8));
+      st_s[i] = __ldcs(scales + (size_t)(nb + n) * (K >> 4) + (k0 >> 4) + s);
+    }
+#pragma unroll
+    for (int i = 0; i < XSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int m = idx / (KC / 8), j4 = idx % (KC / 8);
+      st_x[i] = (m < m_real)
+                    ? *reinterpret_cast<const uint4 *>(x + (size_t)m * K + k0 +
+                                                       j4 * 8)
+                    : make_uint4(0, 0, 0, 0);
+    }
+  };
+  auto store_stage = [&]() {
+#pragma unroll
+    for (int i = 0; i < CSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int n = idx / (KC / 16), s = idx % (KC / 16);
+      const half2 sc2 = fp8e4m3_to_half2(st_s[i]);
+      half2 *wrow = reinterpret_cast<half2 *>(ws + n * PW + s * 16);
+      const unsigned qs[2] = {st_c[i].x, st_c[i].y};
+#pragma unroll
+      for (int w = 0; w < 2; w++) {
+#ifndef SKINNY_LUT_CVT
+        half2 t[4];
+        dequant8_tm(qs[w], sc2, t);
+        const unsigned *tr = reinterpret_cast<const unsigned *>(t);
+        unsigned lin[4] = {__byte_perm(tr[0], tr[1], 0x5410),
+                           __byte_perm(tr[2], tr[3], 0x5410),
+                           __byte_perm(tr[0], tr[1], 0x7632),
+                           __byte_perm(tr[2], tr[3], 0x7632)};
+#pragma unroll
+        for (int pi = 0; pi < 4; pi++)
+          wrow[w * 4 + pi] = *reinterpret_cast<half2 *>(&lin[pi]);
+#else
+#pragma unroll
+        for (int pi = 0; pi < 4; pi++)
+          wrow[w * 4 + pi] = dequant_pair(qs[w], pi, sc2);
+#endif
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < XSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int m = idx / (KC / 8), j4 = idx % (KC / 8);
+      *reinterpret_cast<uint4 *>(xs + m * PX + j4 * 8) = st_x[i];
+    }
+  };
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> cfrag;
+  wmma::fill_fragment(cfrag, 0.f);
+
+  load_stage(kbeg);
+  for (int k0 = kbeg; k0 < kend; k0 += KC) {
+    __syncthreads();
+    store_stage();
+    __syncthreads();
+    if (k0 + KC < kend) load_stage(k0 + KC);
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[2];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b[2];
+    wmma::load_matrix_sync(a[0], ws + wn * 16 * PW, PW);
+    wmma::load_matrix_sync(b[0], xs + wm * 16 * PX, PX);
+#pragma unroll
+    for (int kk = 0; kk < KC / 16; kk++) {
+      const int cur = kk & 1, nxt = cur ^ 1;
+      if (kk + 1 < KC / 16) {
+        wmma::load_matrix_sync(a[nxt], ws + wn * 16 * PW + (kk + 1) * 16, PW);
+        wmma::load_matrix_sync(b[nxt], xs + wm * 16 * PX + (kk + 1) * 16, PX);
+      }
+      wmma::mma_sync(cfrag, a[cur], b[cur], cfrag);
+    }
+  }
+
+  __syncthreads();
+  float *cs = reinterpret_cast<float *>(smem_raw) + warp * 256;
+  wmma::store_matrix_sync(cs, cfrag, 16, wmma::mem_row_major);
+  __syncwarp();
+  for (int e = lane; e < 256; e += 32) {
+    const int i = e >> 4, j = e & 15;
+    const int gm = wm * 16 + j, gn = nb + wn * 16 + i;
+    if (gm < m_real) atomicAdd(&ypart[(size_t)gm * N + gn], cs[e]);
+  }
+}
+
+// Config-selectable WMMA entry for tile sweeps: cfg indexes the
+// (WN, WM, KC) table below. Configs 8-9 exceed the default 48KB smem
+// ceiling and require carveout=true (96KB opt-in). N must divide WN*16.
+static void set_smem_opt(const void *kern, int smem) {
+  cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       96 * 1024);
+  cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout,
+                       100);
+  (void)smem;
+}
+
+
+
+// Split-K entry: returns fp32 partial sums (caller applies gscale and
+// converts). splits CTAs along K; k must divide evenly into
+// KC-aligned slices.
+
+
+
+
+// ---------------------------------------------------------------------------
+// QPN kernel: Volta-native four-quadpair mma.m8n8k4, M 4..16 band.
+//
+// The quadpairs split the N dimension: one warp instruction = four
+// independent 8x8x4 MMAs sharing a single 8x4 activation A tile (the A
+// fragment map depends only on lane-position inside the quadpair, so
+// QP-sibling lanes hold identical A registers). MT template = number of
+// 8-row A tiles (MT=2 decodes B once for M 9..16). Weights arrive
+// PREPACKED in fragment order ([tile N/32][group K/16][lane 32] x 8B,
+// nibbles pre-interleaved so dequant8_tm's (i, i+4) output IS the
+// adjacent-k B register pair) — built once at weight load by the shim's
+// _qpn_prepack; the checkpoint-native layout stays for SIMT/WMMA.
+// No smem in the main loop, no barriers except the cross-warp K-reduce
+// at output (CTA = 4 warps splitting K to keep the grid at N/32).
+// Frontier (qpn_sweep_20260810): simt M<=3, qpn 4..16, wmma 17..64 —
+// 1.28x at M=5, 1.69x at M=8, 1.29x at M=11, 1.22x at M=16 vs the
+// prior best incumbent on the 5-shape production set.
+// ---------------------------------------------------------------------------
+#define MMA_8N8K4(C, A0, A1, B0, B1)                                        \
+  asm volatile(                                                             \
+      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "                    \
+      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "                     \
+      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"                                        \
+      : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]), "+f"(C[4]),         \
+        "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                                  \
+      : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
+
+template <int MT>
+__global__ void skinny_nvfp4_qpn(const uint8_t *__restrict__ qcodes,
+                                 const uint8_t *__restrict__ qscales,
+                                 const half *__restrict__ x,
+                                 half *__restrict__ y, int N, int K, int M,
+                                 float gscale) {
+  constexpr int WARPS = 4;
+  __shared__ float cs[WARPS][MT * 256];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);  // A row & B local col
+  const int G = K >> 4, Gq = G / WARPS;
+  const int g0 = warp * Gq;
+  const uint2 *cb = reinterpret_cast<const uint2 *>(qcodes) +
+                    (size_t)tile * G * 32 + lane;
+  const uint8_t *sb = qscales + (size_t)tile * G * 32 + lane;
+
+  const half2 gm2 = __float2half2_rn(gscale * 16384.f);
+  float c[MT][8];
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) c[t][i] = 0.f;
+
+#pragma unroll 4
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint2 q2 = __ldcs(cb + (size_t)g * 32);
+    const half2 sc2 =
+        __hmul2(fp8e4m3_to_half2(__ldg(sb + (size_t)g * 32)), gm2);
+    half2 b[8];
+    dequant8_tm(q2.x, sc2, b + 0);  // slices 0,1 (k0..7 adjacent pairs)
+    dequant8_tm(q2.y, sc2, b + 4);  // slices 2,3 (k8..15)
+    const unsigned *B = reinterpret_cast<const unsigned *>(b);
+#pragma unroll
+    for (int t = 0; t < MT; t++) {
+      const int ar = t * 8 + r;
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (ar < M) {
+        const half *xrow = x + (size_t)ar * K;
+        a01 = *reinterpret_cast<const uint4 *>(xrow + g * 16);
+        a23 = *reinterpret_cast<const uint4 *>(xrow + g * 16 + 8);
+      }
+      const unsigned *A0 = reinterpret_cast<const unsigned *>(&a01);
+      const unsigned *A1 = reinterpret_cast<const unsigned *>(&a23);
+      MMA_8N8K4(c[t], A0[0], A0[1], B[0], B[1]);
+      MMA_8N8K4(c[t], A0[2], A0[3], B[2], B[3]);
+      MMA_8N8K4(c[t], A1[0], A1[1], B[4], B[5]);
+      MMA_8N8K4(c[t], A1[2], A1[3], B[6], B[7]);
+    }
+  }
+
+  // C map (mma8_probe.cu, roles swapped): reg i of lane L ->
+  //   A-row (i&2)|((L&16)?4:0)|(L&1); B-col (i&1)|(((L>>1)&1)<<1)|((i>>2)<<2)
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      cs[warp][(t * 8 + row) * 32 + qp * 8 + col] = c[t][i];
+    }
+  __syncthreads();  // the only barrier: cross-warp K reduce
+  for (int e = threadIdx.x; e < MT * 256; e += blockDim.x) {
+    const float v = cs[0][e] + cs[1][e] + cs[2][e] + cs[3][e];
+    const int row = e >> 5, col = e & 31;
+    if (row < M)
+      y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
+  }
+}
+
+// QPN-layout SIMT kernel (M<=3): serves the decode band from the SAME
+// prepacked fragment-order buffers as gemm_qpn, so the CT-native stash
+// can be dropped entirely (VLLM_SKINNY_DROP_CT=1 -> weights return to
+// the pre-QPN footprint and the fp32 GDN state cache fits).
+// Geometry mirrors gemm_qpn: CTA = 4 warps on one 32-column tile with K
+// split across warps; lane owns one column, so every warp code load is
+// one 256B line. Whole activation block (M<=3 rows) staged to smem once;
+// korder nibble pairing makes dequant8_tm output the adjacent-k x pairs.
+// fp32 accumulation throughout; single barrier before the cross-warp
+// reduce epilogue.
+template <int M>
+__global__ void skinny_nvfp4_qpn_simt(const uint8_t *__restrict__ qcodes,
+                                      const uint8_t *__restrict__ qscales,
+                                      const half *__restrict__ x,
+                                      half *__restrict__ y, int N, int K,
+                                      float gscale) {
+  constexpr int WARPS = 4;
+  extern __shared__ char smem_raw[];
+  half2 *xs = reinterpret_cast<half2 *>(smem_raw);      // [M][K/2]
+  float *cs = reinterpret_cast<float *>(xs + (size_t)M * (K >> 1));
+  // cs: [WARPS][32][M] fp32 partials
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int G = K >> 4, Gq = G / WARPS;
+  const int g0 = warp * Gq;
+  constexpr int KCH2 = 4096;  // half2 per x chunk (M=3 -> 48KB smem)
+  const uint2 *cb = reinterpret_cast<const uint2 *>(qcodes) +
+                    (size_t)tile * G * 32 + lane;
+  const uint8_t *sb = qscales + (size_t)tile * G * 32 + lane;
+  const half2 gm2 = __float2half2_rn(gscale * 16384.f);
+
+  float acc[M];
+#pragma unroll
+  for (int m = 0; m < M; m++) acc[m] = 0.f;
+
+  // Chunked x staging: whole-x doesn't fit smem at M=3 x K=17408.
+  // Accumulators persist across chunks; each warp consumes only its
+  // K-quarter's groups that fall inside the staged window.
+  for (int c0 = 0; c0 < (K >> 1); c0 += KCH2) {
+    const int clen = min(KCH2, (K >> 1) - c0);
+    __syncthreads();
+    for (int t = threadIdx.x; t < M * clen; t += blockDim.x) {
+      const int m = t / clen, j = t % clen;
+      xs[m * KCH2 + j] =
+          reinterpret_cast<const half2 *>(x)[(size_t)m * (K >> 1) + c0 + j];
+    }
+    __syncthreads();
+    const int ga = max(g0, c0 >> 3);
+    const int gb = min(g0 + Gq, (c0 + clen) >> 3);
+#pragma unroll 4
+    for (int g = ga; g < gb; g++) {
+      const uint2 q2 = __ldcs(cb + (size_t)g * 32);
+      const half2 sc2 =
+          __hmul2(fp8e4m3_to_half2(__ldg(sb + (size_t)g * 32)), gm2);
+      half2 w[8];
+      dequant8_tm(q2.x, sc2, w + 0);  // adjacent-k pairs k0..7
+      dequant8_tm(q2.y, sc2, w + 4);  // k8..15
+#pragma unroll
+      for (int m = 0; m < M; m++) {
+        const half2 *xg = xs + (size_t)m * KCH2 + (g * 8 - c0);
+        float s = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const float2 wf = __half22float2(w[j]);
+          const float2 xf = __half22float2(xg[j]);
+          s += wf.x * xf.x + wf.y * xf.y;
+        }
+        acc[m] += s;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int m = 0; m < M; m++)
+    cs[(warp * 32 + lane) * M + m] = acc[m];
+  __syncthreads();
+  if (warp == 0) {
+#pragma unroll
+    for (int m = 0; m < M; m++) {
+      float v = cs[lane * M + m] + cs[(32 + lane) * M + m] +
+                cs[(64 + lane) * M + m] + cs[(96 + lane) * M + m];
+      y[(size_t)m * N + (size_t)tile * 32 + lane] = __float2half(v);
+    }
+  }
+}
+
+
+
+
+
+
+// ---------------------------------------------------------------------------
+// QPN2 (2026-08-17): the qpn_matrix/qpn_msweep geometry winner. Same QP-N
+// architecture and prepacked fragment layout as skinny_nvfp4_qpn, with
+// SPLITK (warps per CTA splitting K on one N=32 tile) and NACC
+// (independent accumulator fragments across the four k-slice mma.sync
+// ops) as template knobs. Measured frontier (results/
+// qpn_matrix_20260817.csv): split16 for N*K small/mid shapes, split8 for
+// gate_up, split32 for N=2048 — weighted 637 GB/s at M=8 vs 441 for the
+// fixed-4-warp kernel; near-flat in M (704 GB/s weighted at M=1).
+// M <= 8 only; M 9..16 stays on skinny_nvfp4_qpn<2>.
+template <int SPLITK, int NACC>
+__global__ void skinny_nvfp4_qpn2(const uint8_t *__restrict__ bcodes,
+                                  const uint8_t *__restrict__ bscales,
+                                  const half *__restrict__ x,
+                                  half *__restrict__ y, int N, int K, int M,
+                                  float gscale) {
+  __shared__ float cs[SPLITK > 1 ? SPLITK : 1][SPLITK > 1 ? 256 : 1];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / SPLITK;
+  const int g0 = warp * Gq;
+  const uint2 *cb = reinterpret_cast<const uint2 *>(bcodes) +
+                    (size_t)tile * G * 32 + lane;
+  const uint8_t *sb = bscales + (size_t)tile * G * 32 + lane;
+
+  const half2 gm2 = __float2half2_rn(gscale * 16384.f);
+  float c[NACC][8];
+#pragma unroll
+  for (int a = 0; a < NACC; a++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) c[a][i] = 0.f;
+
+#pragma unroll 4
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint2 q2 = __ldcs(cb + (size_t)g * 32);
+    const half2 sc2 =
+        __hmul2(fp8e4m3_to_half2(__ldg(sb + (size_t)g * 32)), gm2);
+    half2 b[8];
+    dequant8_tm(q2.x, sc2, b + 0);
+    dequant8_tm(q2.y, sc2, b + 4);
+    const unsigned *B = reinterpret_cast<const unsigned *>(b);
+    uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+    if (r < M) {
+      const half *xrow = x + (size_t)r * K;
+      a01 = *reinterpret_cast<const uint4 *>(xrow + g * 16);
+      a23 = *reinterpret_cast<const uint4 *>(xrow + g * 16 + 8);
+    }
+    const unsigned *A0 = reinterpret_cast<const unsigned *>(&a01);
+    const unsigned *A1 = reinterpret_cast<const unsigned *>(&a23);
+    MMA_8N8K4(c[0], A0[0], A0[1], B[0], B[1]);
+    MMA_8N8K4(c[1 % NACC], A0[2], A0[3], B[2], B[3]);
+    MMA_8N8K4(c[2 % NACC], A1[0], A1[1], B[4], B[5]);
+    MMA_8N8K4(c[3 % NACC], A1[2], A1[3], B[6], B[7]);
+  }
+
+#pragma unroll
+  for (int a = 1; a < NACC; a++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) c[0][i] += c[a][i];
+
+  if (SPLITK == 1) {
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      if (row < M)
+        y[(size_t)row * N + (size_t)tile * 32 + qp * 8 + col] =
+            __float2half(c[0][i]);
+    }
+    return;
+  }
+
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+    const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+    cs[warp][row * 32 + qp * 8 + col] = c[0][i];
+  }
+  __syncthreads();
+  for (int e = threadIdx.x; e < 256; e += blockDim.x) {
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < SPLITK; w++) v += cs[w][e];
+    const int row = e >> 5, col = e & 31;
+    if (row < M)
+      y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
+  }
+}
+
+
+
+
+// ---------------------------------------------------------------------------
+// QPN8: FP8 (E4M3) weight codec feeding the identical QPN2 dataflow.
+//
+// Same quadpair mapping, same N ownership, same split-K, same accumulators,
+// same m8n8k4, same reduction. Only the storage width (1 byte/weight instead
+// of a nibble) and the decoder change.
+//
+// The shift trick below is the one already used for NVFP4's group scales,
+// exhaustively verified against PyTorch on all 256 byte patterns: exact for
+// every finite E4M3 value including all 14 denormals (only the two NaN
+// encodings map to +-480, which weights never contain). It reproduces
+// value/256; that factor is folded into the per-tile epilogue scale, so the
+// K loop carries no multiply at all -- strictly less work than dequant8_tm.
+//
+// Pairing mirrors dequant8_tm's (i, i+4) interleave so the SAME prepack
+// permutation (korder) serves both codecs.
+DEV_INLINE void fp8x8_to_half2x4(const uint2 q, half2 out[4]) {
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const unsigned b0 = (q.x >> (8 * i)) & 0xFFu;
+    const unsigned b1 = (q.y >> (8 * i)) & 0xFFu;
+    const unsigned h0 = ((b0 & 0x80u) << 8) | ((b0 & 0x7Fu) << 7);
+    const unsigned h1 = ((b1 & 0x80u) << 8) | ((b1 & 0x7Fu) << 7);
+    const unsigned p = h0 | (h1 << 16);
+    out[i] = *reinterpret_cast<const half2 *>(&p);
+  }
+}
+
+// Word-parallel E4M3 decode, mirroring dequant8_tm's style: one PRMT spreads
+// two bytes into 0x00b1_00b0, then a single shift/mask pair per field builds
+// both fp16 lanes at once. 6 ops per half2 vs 14 for the per-byte loop.
+// Requires NATURAL k order in the packed bytes (adjacent-k pairs), i.e. the
+// prepack must use identity korder rather than the (i, i+4) interleave.
+// Word-parallel e4m3 -> fp16 decode.
+//
+// Two things this has to get right, and the original got both wrong:
+//
+//  1. e4m3 is S EEEE MMM, so exp+mantissa is SEVEN bits and occupies fp16
+//     bits 7..13 after the <<7 (the resulting 2^-8 is folded into the
+//     epilogue scale). The mask must stop at bit 13 -- 0x3F80, not 0x7F80.
+//     With 0x7F80, bit 14 catches the SIGN, which lands in the fp16
+//     exponent: every negative weight overflowed to inf and accumulated
+//     to NaN.
+//  2. The consumer expects the SAME pairing the scalar decoder produces,
+//     out[i] = (q.x byte i, q.y byte i) -- the (i, i+4) interleave that
+//     cancels the prepack's korder. Pairing sequentially within a word
+//     instead ((x0,x1),(x2,x3),...) decodes every value correctly and
+//     still gives a garbage GEMM.
+//
+// Only bits 0..7 and 16..23 of the permuted word are read (the shifts and
+// masks ignore the rest), so the two unused byte lanes need no zeroing.
+DEV_INLINE void fp8x8_to_half2x4_fast(const uint2 q, half2 out[4]) {
+  constexpr unsigned S = 0x80008000u, EM = 0x3F803F80u;
+  unsigned p[4];
+  p[0] = __byte_perm(q.x, q.y, 0x0400);   // x0 at b0, y0 at b2
+  p[1] = __byte_perm(q.x, q.y, 0x0501);
+  p[2] = __byte_perm(q.x, q.y, 0x0602);
+  p[3] = __byte_perm(q.x, q.y, 0x0703);
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const unsigned v = ((p[i] << 8) & S) | ((p[i] << 7) & EM);
+    out[i] = *reinterpret_cast<const half2 *>(&v);
+  }
+}
+
+template <int SPLITK, int NACC, bool FASTDEC = false>
+__global__ void skinny_fp8_qpn8(const uint8_t *__restrict__ bcodes,
+                                const float *__restrict__ tscale,
+                                const half *__restrict__ x,
+                                half *__restrict__ y, int N, int K, int M) {
+  __shared__ float cs[SPLITK > 1 ? SPLITK : 1][SPLITK > 1 ? 256 : 1];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / SPLITK;
+  const int g0 = warp * Gq;
+  // 16 bytes per lane per group (vs 8 for FP4): one 128-bit load.
+  const uint4 *cb = reinterpret_cast<const uint4 *>(bcodes) +
+                    (size_t)tile * G * 32 + lane;
+  // CTA-uniform: slice boundaries are 64-aligned so a tile never straddles.
+  const float ws = __ldg(tscale + tile);
+
+  float c[NACC][8];
+#pragma unroll
+  for (int a = 0; a < NACC; a++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) c[a][i] = 0.f;
+
+#pragma unroll 4
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint4 q4 = __ldcs(cb + (size_t)g * 32);
+    half2 b[8];
+    if (FASTDEC) {
+      fp8x8_to_half2x4_fast(make_uint2(q4.x, q4.y), b + 0);
+      fp8x8_to_half2x4_fast(make_uint2(q4.z, q4.w), b + 4);
+    } else {
+      fp8x8_to_half2x4(make_uint2(q4.x, q4.y), b + 0);
+      fp8x8_to_half2x4(make_uint2(q4.z, q4.w), b + 4);
+    }
+    const unsigned *B = reinterpret_cast<const unsigned *>(b);
+    uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+    if (r < M) {
+      const half *xrow = x + (size_t)r * K;
+      a01 = *reinterpret_cast<const uint4 *>(xrow + g * 16);
+      a23 = *reinterpret_cast<const uint4 *>(xrow + g * 16 + 8);
+    }
+    const unsigned *A0 = reinterpret_cast<const unsigned *>(&a01);
+    const unsigned *A1 = reinterpret_cast<const unsigned *>(&a23);
+    MMA_8N8K4(c[0], A0[0], A0[1], B[0], B[1]);
+    MMA_8N8K4(c[1 % NACC], A0[2], A0[3], B[2], B[3]);
+    MMA_8N8K4(c[2 % NACC], A1[0], A1[1], B[4], B[5]);
+    MMA_8N8K4(c[3 % NACC], A1[2], A1[3], B[6], B[7]);
+  }
+
+#pragma unroll
+  for (int a = 1; a < NACC; a++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) c[0][i] += c[a][i];
+
+  if (SPLITK == 1) {
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      if (row < M)
+        y[(size_t)row * N + (size_t)tile * 32 + qp * 8 + col] =
+            __float2half(c[0][i] * ws);
+    }
+    return;
+  }
+
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+    const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+    cs[warp][row * 32 + qp * 8 + col] = c[0][i];
+  }
+  __syncthreads();
+  for (int e = threadIdx.x; e < 256; e += blockDim.x) {
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < SPLITK; w++) v += cs[w][e];
+    const int row = e >> 5, col = e & 31;
+    if (row < M)
+      y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v * ws);
+  }
+}
+
+// ---- MT=2: two m8n8k4 row-tiles against ONE weight stream ----------------
+// m8n8k4 issues 8 rows per tile, so M=9..16 needs two of them. The chunked
+// path runs the whole kernel twice and therefore streams the weights TWICE --
+// that, not the tile quantisation, is what makes the k<=15 verify band cost
+// ~2x the k<=7 band (298 vs 431 GB/s on the production dispatch curve).
+//
+// The kernel is DRAM-bound at M=8 (741 GB/s against ~800 GB/s achievable
+// read, and faster than a pure torch streaming read of the same bytes), so a
+// second row-tile that adds no weight traffic should ride the existing
+// stream. This variant loads the B fragment once and issues both row-tiles
+// against it.
+//
+// Costs: a second accumulator set (2*NACC*8 floats/lane) and a doubled
+// split-K staging buffer (SPLITK*512 floats = 32 KB at SPLITK=16, inside the
+// 48 KB static limit -- which is why SPLITK=32 is not instantiated here).
+template <int SPLITK, int NACC, bool FASTDEC = false>
+__global__ void skinny_fp8_qpn8_mt2(const uint8_t *__restrict__ bcodes,
+                                    const float *__restrict__ tscale,
+                                    const half *__restrict__ x,
+                                    half *__restrict__ y, int N, int K,
+                                    int M) {
+  __shared__ float cs[SPLITK > 1 ? SPLITK : 1][SPLITK > 1 ? 512 : 1];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / SPLITK;
+  const int g0 = warp * Gq;
+  const uint4 *cb = reinterpret_cast<const uint4 *>(bcodes) +
+                    (size_t)tile * G * 32 + lane;
+  const float ws = __ldg(tscale + tile);
+
+  float c[2][NACC][8];
+#pragma unroll
+  for (int t = 0; t < 2; t++)
+#pragma unroll
+    for (int a = 0; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][a][i] = 0.f;
+
+#pragma unroll 4
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint4 q4 = __ldcs(cb + (size_t)g * 32);
+    half2 b[8];
+    if (FASTDEC) {
+      fp8x8_to_half2x4_fast(make_uint2(q4.x, q4.y), b + 0);
+      fp8x8_to_half2x4_fast(make_uint2(q4.z, q4.w), b + 4);
+    } else {
+      fp8x8_to_half2x4(make_uint2(q4.x, q4.y), b + 0);
+      fp8x8_to_half2x4(make_uint2(q4.z, q4.w), b + 4);
+    }
+    const unsigned *B = reinterpret_cast<const unsigned *>(b);
+#pragma unroll
+    for (int t = 0; t < 2; t++) {
+      const int rr = r + (t << 3);
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (rr < M) {
+        const half *xrow = x + (size_t)rr * K;
+        a01 = *reinterpret_cast<const uint4 *>(xrow + g * 16);
+        a23 = *reinterpret_cast<const uint4 *>(xrow + g * 16 + 8);
+      }
+      const unsigned *A0 = reinterpret_cast<const unsigned *>(&a01);
+      const unsigned *A1 = reinterpret_cast<const unsigned *>(&a23);
+      MMA_8N8K4(c[t][0], A0[0], A0[1], B[0], B[1]);
+      MMA_8N8K4(c[t][1 % NACC], A0[2], A0[3], B[2], B[3]);
+      MMA_8N8K4(c[t][2 % NACC], A1[0], A1[1], B[4], B[5]);
+      MMA_8N8K4(c[t][3 % NACC], A1[2], A1[3], B[6], B[7]);
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < 2; t++)
+#pragma unroll
+    for (int a = 1; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][0][i] += c[t][a][i];
+
+  if (SPLITK == 1) {
+#pragma unroll
+    for (int t = 0; t < 2; t++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        const int row =
+            ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1)) + (t << 3);
+        const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        if (row < M)
+          y[(size_t)row * N + (size_t)tile * 32 + qp * 8 + col] =
+              __float2half(c[t][0][i] * ws);
+      }
+    return;
+  }
+
+#pragma unroll
+  for (int t = 0; t < 2; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      cs[warp][(t << 8) + row * 32 + qp * 8 + col] = c[t][0][i];
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < 512; e += blockDim.x) {
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < SPLITK; w++) v += cs[w][e];
+    const int t = e >> 8, rem = e & 255;
+    const int row = (rem >> 5) + (t << 3), col = rem & 31;
+    if (row < M)
+      y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v * ws);
+  }
+}
+
+
+
+
+
+
+
+
+// ninfer host wrapper (defined in qpn_host.cu).
+void gemm_qpn_simt(const void* x_half, const void* codes, const void* scales, float gscale,
+                   void* y_half, int m, int k, int n, cudaStream_t stream);
 
 } // namespace ninfer::ops::qpn
