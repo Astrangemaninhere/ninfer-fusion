@@ -38,10 +38,12 @@ struct Qwen3_6_27BInstance {
     runtime::KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_27B::Program> program;
+    Qwen3_6_27B::WeightsProfile weights_profile;
 
     Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                         runtime::KvCapacityResolution resolution,
-                        Qwen3_6_27B::SequencePlan sequence_plan, DeviceContext& device);
+                        Qwen3_6_27B::SequencePlan sequence_plan,
+                        Qwen3_6_27B::WeightsProfile weights_profile_in, DeviceContext& device);
     ~Qwen3_6_27BInstance();
 
     Qwen3_6_27BInstance(const Qwen3_6_27BInstance&)            = delete;
@@ -67,10 +69,13 @@ struct Qwen3_6_35BA3BInstance {
     runtime::KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_35BA3B::Program> program;
+    Qwen3_6_35BA3B::WeightsProfile weights_profile;
 
     Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                            runtime::KvCapacityResolution resolution,
-                           Qwen3_6_35BA3B::SequencePlan sequence_plan, DeviceContext& device);
+                           Qwen3_6_35BA3B::SequencePlan sequence_plan,
+                           Qwen3_6_35BA3B::WeightsProfile weights_profile_in,
+                           DeviceContext& device);
     ~Qwen3_6_35BA3BInstance();
 
     Qwen3_6_35BA3BInstance(const Qwen3_6_35BA3BInstance&)            = delete;
@@ -97,10 +102,13 @@ struct MuseGlimmer30BInstance {
     runtime::KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<MuseGlimmer30B::Program> program;
+    MuseGlimmer30B::WeightsProfile weights_profile;
 
     MuseGlimmer30BInstance(std::unique_ptr<LoadedMuseGlimmer30B> stable_loaded,
                            runtime::KvCapacityResolution resolution,
-                           MuseGlimmer30B::SequencePlan sequence_plan, DeviceContext& device);
+                           MuseGlimmer30B::SequencePlan sequence_plan,
+                           MuseGlimmer30B::WeightsProfile weights_profile_in,
+                           DeviceContext& device);
     ~MuseGlimmer30BInstance();
 
     MuseGlimmer30BInstance(const MuseGlimmer30BInstance&)            = delete;
@@ -120,6 +128,14 @@ struct ConstructedTarget {
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,
                                                  DeviceContext& device);
+
+// Re-runs the sequence plan (and only the sequence plan) for the loaded target with
+// updated EngineOptions — kv_layer_storage / kv_residual_layers / kv_capacity. The old
+// Program is destroyed first so the new plan's capacity resolution sees the freed KV
+// budget; a failure past that point leaves the instance without a Program (retry or
+// restart needed). Caller contract: no generation may be in flight and none may start
+// until this returns (the serve layer drains before calling).
+void replan_target_kv(ActiveTarget& target, const EngineOptions& options, DeviceContext& device);
 
 } // namespace targets
 } // namespace ninfer

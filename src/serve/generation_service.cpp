@@ -1,16 +1,19 @@
 #include "serve/generation_service.h"
 
+#include "product/kv_options.h"
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
 #include "serve/translate.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace ninfer::serve {
@@ -263,6 +266,13 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
     const auto started = Clock::now();
     {
         std::lock_guard lock(request_capacity_->mutex);
+        // Reload admission gate shares the capacity lock: a request that passes this
+        // check has already been counted before reload_kv_storage may set the flag
+        // under the same lock, so the drain below cannot miss an in-flight request.
+        if (reload_in_progress_.load(std::memory_order_acquire)) {
+            throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
+                                                     "server is reloading the KV layout"));
+        }
         if (request_capacity_->active >= request_capacity_->maximum) {
             throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
                                                      "inference request queue is full"));
@@ -470,6 +480,37 @@ void GenerationService::warmup() {
         write_console_log(ConsoleLogLevel::Warning,
                           std::string("warmup failed (continuing): ") + exception.what());
     }
+}
+
+void GenerationService::reload_kv_storage(std::string_view kv_layer_storage_spec) {
+    // Parse before gating so a malformed spec never disturbs live traffic.
+    const auto table = ninfer::product::parse_kv_layer_storage(kv_layer_storage_spec);
+    std::lock_guard reload_lock(reload_mutex_);
+    reload_in_progress_.store(true, std::memory_order_release);
+    try {
+        // Drain: every admitted request holds capacity->active until its response is
+        // released, and none can be admitted while the flag is set (shared lock).
+        const auto drain_deadline = Clock::now() + std::chrono::seconds(120);
+        for (;;) {
+            {
+                std::lock_guard lock(request_capacity_->mutex);
+                if (request_capacity_->active == 0) { break; }
+            }
+            if (Clock::now() > drain_deadline) {
+                throw_request_error(
+                    ninfer::RequestError(RequestErrorKind::Overloaded,
+                                         "timed out waiting for in-flight requests to "
+                                         "drain before KV relayout"));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        write_console_log(ConsoleLogLevel::Info, "drained; re-running KV sequence plan");
+        engine_->reload_kv_storage(table, {});
+    } catch (...) {
+        reload_in_progress_.store(false, std::memory_order_release);
+        throw;
+    }
+    reload_in_progress_.store(false, std::memory_order_release);
 }
 
 } // namespace ninfer::serve

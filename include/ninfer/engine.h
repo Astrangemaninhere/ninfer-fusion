@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 
+#include <array>
 #include <chrono>
 #include <memory>
 #include <string_view>
@@ -106,6 +107,16 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;
+
+    // Re-runs the KV sequence plan with a new per-layer storage table (FreeToken
+    // observe -> decide -> apply loop). Only layer storage/residual tables may change:
+    // weights, concurrency and context capacities are reused from startup options.
+    // Contract: no request may be in flight or admitted until this returns — the serve
+    // layer drains before calling. The old KV pool is destroyed before the new plan is
+    // resolved, so a failed replan leaves the Engine without a usable Program.
+    void reload_kv_storage(
+        std::array<KvCacheStorage, kKvLayerStorageSlots> layer_storage,
+        std::array<bool, kKvLayerStorageSlots> residual_layers = {});
 
 private:
     class Impl;

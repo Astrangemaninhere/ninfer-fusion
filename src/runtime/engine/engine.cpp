@@ -348,7 +348,8 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreMuse>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -438,7 +439,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
-                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>> ||
+                                 std::is_same_v<CoreState,
+                                                std::unique_ptr<Impl::ScoreCoreMuse>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 auto submission =
@@ -516,6 +519,23 @@ void Engine::reset_memory_peaks() noexcept {
             }
         },
         impl_->core);
+}
+
+void Engine::reload_kv_storage(
+    std::array<KvCacheStorage, kKvLayerStorageSlots> layer_storage,
+    std::array<bool, kKvLayerStorageSlots> residual_layers) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Generation) {
+        throw std::logic_error("reload_kv_storage requires a Generation Engine");
+    }
+    // Generation runs on caller threads with no engine-internal queue; the serve layer's
+    // drain (no active request admitted) is what makes this program swap safe.
+    impl_->device.bind_to_current_thread();
+    impl_->options.kv_layer_storage          = layer_storage;
+    impl_->options.kv_layer_storage_explicit = true;
+    impl_->options.kv_residual_layers        = residual_layers;
+    impl_->options.kv_residual_explicit      = true;
+    targets::replan_target_kv(impl_->active, impl_->options, impl_->device);
 }
 
 } // namespace ninfer

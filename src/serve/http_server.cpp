@@ -408,6 +408,9 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+    server_.Post("/reload_kv", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_reload_kv(req, res);
+    });
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
@@ -428,6 +431,40 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
                     "application/json");
+}
+
+// POST /reload_kv  body: {"kv_layer_storage": "0-11:e8,12-15:nvfp4"} (CLI-flag grammar).
+// Drain-based relayout: new requests are rejected with 503-style errors while in-flight
+// ones finish, then the KV pool is re-planned and swapped. Accepts the same api-key/auth
+// path as every other route (see register_routes middleware).
+void HttpServer::handle_reload_kv(const httplib::Request& req, httplib::Response& res) const {
+    if (service_ == nullptr) {
+        ApiError error;
+        error.status  = 503;
+        error.type    = "server_error";
+        error.message = "model is still loading";
+        write_openai_error(res, error);
+        return;
+    }
+    std::string spec;
+    try {
+        const auto body = nlohmann::json::parse(req.body);
+        spec            = body.value("kv_layer_storage", std::string());
+    } catch (const std::exception&) {
+        spec = req.body; // raw text body fallback
+    }
+    try {
+        service_->reload_kv_storage(spec);
+        res.set_content(
+            nlohmann::json{{"status", "ok"}, {"kv_layer_storage", spec}}.dump(),
+            "application/json");
+    } catch (const std::exception& error) {
+        ApiError api_error;
+        api_error.status  = 400;
+        api_error.type    = "invalid_request_error";
+        api_error.message = std::string("reload_kv failed: ") + error.what();
+        write_openai_error(res, api_error);
+    }
 }
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }

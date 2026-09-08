@@ -10,8 +10,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -124,6 +126,13 @@ public:
 
     void warmup();
 
+    // Drain-based KV relayout (FreeToken apply step): rejects new requests, waits for
+    // in-flight ones to finish, then re-runs the sequence plan with the given
+    // kv-layer-storage spec (same grammar as the CLI flag). Throws on parse errors,
+    // drain timeout, or replan failure; on replan failure the Engine has no usable
+    // Program and the process should exit. Serialized; safe to call while idle.
+    void reload_kv_storage(std::string_view kv_layer_storage_spec);
+
 private:
     enum class CacheParticipation : std::uint8_t {
         Disabled,
@@ -146,6 +155,8 @@ private:
     std::unique_ptr<ninfer::Engine> engine_;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    std::mutex reload_mutex_;
+    std::atomic<bool> reload_in_progress_{false};
 };
 
 } // namespace ninfer::serve

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <type_traits>
 #include <vector>
 #include <cstdint>
 #include <stdexcept>
@@ -182,7 +183,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     }
     auto loaded   = std::make_unique<Loaded>(std::move(model), resolved_options);
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
-                                               std::move(sequence_plan), device);
+                                               std::move(sequence_plan), weights_profile, device);
     device.synchronize();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
 
@@ -204,7 +205,62 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                              .context_cost      = std::move(context_cost.model)};
 }
 
+// Re-run only the sequence plan + program construction for an already-loaded target.
+// Mirrors the cold-start flow (chunk ladder + capacity resolution + plan invariant check)
+// but skips weight materialization: the instance keeps its loaded model and frontend.
+template <class Target, class Instance>
+void replan_instance_kv(Instance& instance, const EngineOptions& options, DeviceContext& device) {
+    const auto weights_profile = instance.weights_profile;
+    const EngineOptions resolved_options =
+        Target::resolved_auto_speculative(options, weights_profile);
+    const auto chunk_candidates = [](std::uint32_t requested) {
+        std::vector<std::uint32_t> ladder{requested, 2048, 1536, 1024, 768, 512};
+        std::sort(ladder.begin(), ladder.end(), std::greater<>());
+        ladder.erase(std::unique(ladder.begin(), ladder.end()), ladder.end());
+        return ladder;
+    };
+    std::exception_ptr last_error;
+    for (const std::uint32_t chunk : chunk_candidates(resolved_options.prefill_chunk)) {
+        if (chunk > resolved_options.prefill_chunk) { continue; }
+        EngineOptions chunk_options = resolved_options;
+        chunk_options.prefill_chunk = chunk;
+        try {
+            auto planner = Target::make_sequence_planner(device, chunk_options, weights_profile);
+            auto resolution = runtime::resolve_kv_capacity(
+                chunk_options.kv_capacity, planner.capacity_curve(), current_free_device_bytes());
+            auto plan = std::move(planner).finalize(resolution.main_page_groups);
+            if (plan.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
+                plan.kv_capacity() != resolution.resolved_tokens) {
+                throw std::logic_error("resolved KV capacity does not match the finalized target plan");
+            }
+            instance.kv_capacity_resolution = resolution;
+            instance.program =
+                Target::create_program(*instance.loaded->model, std::move(plan), device);
+            return;
+        } catch (const std::exception& error) {
+            last_error = std::current_exception();
+            (void)error;
+        }
+    }
+    std::rethrow_exception(last_error);
+}
+
 } // namespace
+
+void replan_target_kv(ActiveTarget& target, const EngineOptions& options, DeviceContext& device) {
+    std::visit(
+        [&](auto& instance_ptr) {
+            using InstanceType = std::remove_cvref_t<decltype(*instance_ptr)>;
+            if (instance_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            // Free the old KV pool first: the new plan's capacity resolution must see the
+            // freed device budget. A throw past this point leaves the instance programless
+            // (documented at the registry.h declaration).
+            instance_ptr->program.reset();
+            device.synchronize();
+            replan_instance_kv<typename InstanceType::Package>(*instance_ptr, options, device);
+        },
+        target);
+}
 
 LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
                                      const EngineOptions& options)
@@ -215,10 +271,12 @@ LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
 Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                                          runtime::KvCapacityResolution resolution,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
+                                         Qwen3_6_27B::WeightsProfile weights_profile_in,
                                          DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)),
+      weights_profile(weights_profile_in) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
@@ -231,10 +289,12 @@ LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
 Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                                                runtime::KvCapacityResolution resolution,
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
+                                               Qwen3_6_35BA3B::WeightsProfile weights_profile_in,
                                                DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)),
+      weights_profile(weights_profile_in) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
@@ -248,10 +308,11 @@ LoadedMuseGlimmer30B::~LoadedMuseGlimmer30B() = default;
 MuseGlimmer30BInstance::MuseGlimmer30BInstance(
     std::unique_ptr<LoadedMuseGlimmer30B> stable_loaded,
     runtime::KvCapacityResolution resolution, MuseGlimmer30B::SequencePlan sequence_plan,
-    DeviceContext& device)
+    MuseGlimmer30B::WeightsProfile weights_profile_in, DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
-      program(MuseGlimmer30B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+      program(MuseGlimmer30B::create_program(*loaded->model, std::move(sequence_plan), device)),
+      weights_profile(weights_profile_in) {}
 
 MuseGlimmer30BInstance::~MuseGlimmer30BInstance() = default;
 
