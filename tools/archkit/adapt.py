@@ -65,6 +65,8 @@ def extract_spec(config_path, model_id):
     spec['multimodal'] = bool(cfg.get('vision_config'))
     spec['rope'] = tc.get('rope_parameters') or {}
     spec['head_dim'] = tc.get('head_dim')
+    # MoE/全键检测用: 保留完整 text_config (catalog 只认显式键会漏检 MoE)
+    spec['raw_text_config'] = tc
     return spec
 
 
@@ -133,7 +135,19 @@ def catalog_gaps(spec):
         out.append(('layers:%d>16' % nlayers, 'hook',
                     'cold_slots 类 per-layer 数组容量核对 (家族已扩 64, 新家族须审计)'))
     if spec.get('multimodal'):
-        out.append(('vision', 'new_op', '瑙嗚鑳嗗(鏂囨湰鍏堣瀹屽彲璺宠繃)'))
+        out.append(('vision', 'new_op', '视觉功能(文本先走可跳过)'))
+    # MoE 检测: 专家数>0 即 routed-expert 架构, 引擎无 MoE 主路径 => new_op 工作包
+    n_experts = (knobs.get('num_experts')
+                 or knobs.get('num_local_experts')
+                 or (spec.get('raw_text_config') or {}).get('num_experts'))
+    if not n_experts:
+        raw = spec.get('raw_text_config') or {}
+        n_experts = raw.get('num_experts') or raw.get('num_local_experts')
+    if n_experts:
+        per_tok = (knobs.get('num_experts_per_tok')
+                   or (spec.get('raw_text_config') or {}).get('num_experts_per_tok') or '?')
+        out.append(('moe:experts=%s,top=%s' % (n_experts, per_tok), 'new_op',
+                    'MoE 路由专家 (swiglu expert kernel + 路由 + 专家并行/卸载)'))
     # 转换后门: 量化 linear 几何注册 (转换产出形状清单后由 recipe 校验脚本对照)
     out.append(('quant_geometry', 'post', '转换后校验: fp8/nvfp4 形状对照几何注册表 (A16 起步)'))
     return out
