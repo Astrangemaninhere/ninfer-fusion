@@ -1,6 +1,10 @@
-// ninfer::ops - split-KV GQA small-T launcher and unified route dispatcher.
-#include "ops/launcher/gqa_attention.h"
+#pragma once
 
+// Shared small-T GQA launch machinery (geometry-independent templates).
+// Split from gqa_attention_decode.cu: each geometry instantiates its own kernel
+// cascade in a separate TU to keep per-TU ptxas memory bounded.
+
+#include "ops/launcher/gqa_attention.h"
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
@@ -10,13 +14,12 @@
 #include "ops/kernel/gqa_attention_decode_nvfp4.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
-
 #include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
-// Defined in gqa_attention_decode_e8.cu: the E8-tier (packed 4-bit) decode
-// instantiations live in their own TU so this file's ptxas stage stays small.
+
+// Defined in gqa_attention_decode_e8.cu (E8-tier instantiations in their own TU).
 void gqa_attention_decode_e8_launch(const Tensor& q, const GqaAppendInput& input,
                                     const Tensor& pos, float scale, PagedKVBatchLayerView cache,
                                     const GqaSmallTInvocation& invocation,
@@ -31,6 +34,7 @@ void gqa_attention_decode_e8_launch(const Tensor& q, const GqaCachedInput& input
                                     std::int32_t implementation_window, std::int32_t splits,
                                     Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                     cudaStream_t stream);
+
 namespace {
 
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
@@ -448,29 +452,6 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 
 } // namespace
 
-bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
-
-std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                          DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 ||
-        (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
-         cache_dtype != DType::NVFP4 && cache_dtype != DType::FP8_E4M3FN &&
-         cache_dtype != DType::ISO3 && cache_dtype != DType::E8Kv) ||
-        envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
-        throw std::invalid_argument("gqa_attention split capacity: invalid profile");
-    }
-    if (q_heads == Gqa27Geometry::QHeads) {
-        return gqa_small_t_launch_capacity<Gqa27Geometry>(envelope, tokens, cache_dtype);
-    }
-    if (q_heads == Gqa35Geometry::QHeads) {
-        return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
-    }
-    if (q_heads == GqaMuseGeometry::QHeads) {
-        return gqa_small_t_launch_capacity<GqaMuseGeometry>(envelope, tokens, cache_dtype);
-    }
-    throw std::invalid_argument("gqa_attention split capacity: unsupported head geometry");
-}
-
 template <typename Geometry, typename CacheInput>
 void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const Tensor& pos,
                                       float scale, PagedKVBatchLayerView cache,
@@ -621,81 +602,6 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         launch_for_dtype.template operator()<false>();
     }
     CUDA_CHECK(cudaGetLastError());
-}
-
-void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                                  const Tensor& pos, const Tensor& valid_columns,
-                                  const Tensor& table_rows, float scale,
-                                  PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                                  std::int32_t column_begin, std::int32_t width,
-                                  Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                  Tensor& out, cudaStream_t stream) {
-    const GqaAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
-                               static_cast<const __nv_bfloat16*>(v.data)};
-    const GqaSmallTInvocation invocation{
-        .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
-        .table_rows    = &table_rows,
-        .full_width    = q.ne[2],
-        .column_begin  = column_begin,
-        .width         = width,
-        .batch_size    = q.ne[3],
-    };
-    if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim) {
-        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
-                                                        envelope, partial_acc, partial_m, partial_l,
-                                                        out, stream);
-        return;
-    }
-    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
-        gqa_attention_small_t_launch_for<GqaMuseGeometry>(q, input, pos, scale, cache, invocation,
-                                                          envelope, partial_acc, partial_m,
-                                                          partial_l, out, stream);
-        return;
-    }
-    if (q.ne[1] == Gqa35Geometry::QHeads && q.ne[0] == Gqa35Geometry::HeadDim) {
-        gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
-                                                        envelope, partial_acc, partial_m,
-                                                        partial_l, out, stream);
-        return;
-    }
-    throw std::invalid_argument(
-        "gqa_attention_small_t_launch: unsupported query-head geometry (" +
-        std::to_string(q.ne[1]) + " q-heads); registered: " +
-        std::to_string(Gqa27Geometry::QHeads) + "/" +
-        std::to_string(GqaMuseGeometry::QHeads) + "/" +
-        std::to_string(Gqa35Geometry::QHeads));
-}
-
-void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
-                                         const PagedKVLayerView& cache,
-                                         GqaExecutionEnvelope envelope, Tensor& partial_acc,
-                                         Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                         cudaStream_t stream) {
-    const GqaCachedInput input{};
-    const GqaSmallTInvocation invocation{
-        .valid_columns = nullptr,
-        .table_rows    = nullptr,
-        .full_width    = q.ne[2],
-        .column_begin  = 0,
-        .width         = q.ne[2],
-        .batch_size    = 1,
-    };
-    const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
-    if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim) {
-        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
-                                                        invocation, envelope, partial_acc,
-                                                        partial_m, partial_l, out, stream);
-        return;
-    }
-    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
-        gqa_attention_small_t_launch_for<GqaMuseGeometry>(q, input, pos, scale, batch_cache,
-                                                          invocation, envelope, partial_acc,
-                                                          partial_m, partial_l, out, stream);
-        return;
-    }
-    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, batch_cache, invocation,
-                                                    envelope, partial_acc, partial_m, partial_l,
-                                                    out, stream);
 }
 
 } // namespace ninfer::ops::detail

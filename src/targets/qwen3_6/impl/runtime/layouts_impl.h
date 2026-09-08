@@ -156,12 +156,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     qwen3_6::StateImageSpec state_image_spec{
         .linear =
             {
-                .layers         = TextConfig::gdn_layers(),
-                .conv_channels  = TextConfig::convolution_dim,
-                .conv_width     = TextConfig::gdn_conv_state_width,
-                .value_heads    = TextConfig::gdn_value_heads,
-                .value_head_dim = TextConfig::gdn_value_head_dim,
-                .key_head_dim   = TextConfig::gdn_key_head_dim,
+                // 纯 softmax 族 (gdn==0) 无线性状态: 池规划要求非零几何,
+                // 用最小假层占位 (运行时永不触碰; qwen 家族不受影响).
+                .layers         = std::max(1, TextConfig::gdn_layers()),
+                .conv_channels  = std::max(1, TextConfig::convolution_dim),
+                .conv_width     = std::max(1, TextConfig::gdn_conv_state_width),
+                .value_heads    = std::max(1, TextConfig::gdn_value_heads),
+                .value_head_dim = std::max(1, TextConfig::gdn_value_head_dim),
+                .key_head_dim   = std::max(1, TextConfig::gdn_key_head_dim),
                 .slot_count     = state_image_slots,
                 .conv_dtype     = DType::BF16,
             },
@@ -194,16 +196,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
+            // Every DSpark layer keeps its own BF16 context-K/V plane pair in
+            // one shared page pool; attention selects the layer plane base.
             KVPageGeometry full_geometry{
                 .page_tokens        = kPagedKVPageSize,
                 .device_plane_order = PagedKVPlaneOrder::HeadMajor,
-                .planes =
-                    {
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                    },
+                .planes             = {},
             };
-            dflash.full = qwen3_6::PagedKVCacheLayout{
+            for (int layer = 0; layer < DFlashConfig::full_layers; ++layer) {
+                full_geometry.planes.push_back(
+                    {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256});
+                full_geometry.planes.push_back(
+                    {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256});
+            }
+            qwen3_6::PagedKVCacheLayout full_layout{
                 .pages = plan_device_kv_page_pool(
                     builder, DeviceKVPagePoolSpec{.page_group_count = physical_pages,
                                                   .geometry         = std::move(full_geometry)}),
@@ -213,13 +219,18 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                         .logical_page_capacity = logical_pages,
                         .table_rows            = static_cast<std::int32_t>(plan.max_concurrency + 1),
                     }),
-                .layers      = 1,
+                .layers      = static_cast<std::uint32_t>(DFlashConfig::full_layers),
                 .max_context = plan.capacity,
                 .kv_heads    = DFlashConfig::kv_heads,
                 .head_dim    = DFlashConfig::head_dim,
                 .dtype       = DType::BF16,
                 .quant_group = 0,
             };
+            for (int layer = 0; layer < DFlashConfig::full_layers; ++layer) {
+                full_layout.layer_plane_base[static_cast<std::size_t>(layer)] =
+                    static_cast<std::uint32_t>(2 * layer);
+            }
+            dflash.full = full_layout;
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},
                 "DFlash prefill target features");
@@ -325,7 +336,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(TextConfig::head_dim, 
                             TextConfig::query_heads, plan.kv_dtype, envelope, batch_size,
                             min_width, max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
@@ -392,7 +403,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(TextConfig::head_dim, 
                             TextConfig::query_heads, plan.kv_dtype, envelope, 1, tokens, tokens));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
@@ -427,7 +438,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         matrix(layout, DType::I32, 3, 1);
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(TextConfig::head_dim, 
                             TextConfig::query_heads, plan.kv_dtype, text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
@@ -510,7 +521,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
                 (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
                 scratch(layout,
-                        ops::gqa_attention_workspace_capacity_bytes(
+                        ops::gqa_attention_workspace_capacity_bytes(TextConfig::head_dim, 
                             TextConfig::query_heads, plan.kv_dtype, text_envelope, batch, width, width));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
@@ -540,9 +551,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     matrix(layout, DType::BF16, DFlashConfig::feature_rows, tokens);
                 }
                 (void)workspace_recipe::dflash_context<DFlashConfig>(layout, tokens);
+                (void)ops::linear_workspace_capacity_bytes(
+                    QType::BF16_CTRL, DFlashConfig::hidden, DFlashConfig::feature_rows,
+                    ops::LinearPolicy::A16Only, tokens, tokens);
                 {
                     auto layer = layout.scope();
                     (void)workspace_recipe::dflash_context_layer<DFlashConfig>(layout, tokens);
+                    (void)ops::linear_workspace_capacity_bytes(
+                        QType::BF16_CTRL, DFlashConfig::kv_size, DFlashConfig::hidden,
+                        ops::LinearPolicy::A16Only, tokens, tokens);
                 }
                 return finish(layout);
             };
@@ -554,28 +571,27 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     auto attention = layout.scope();
                     (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
                     scratch(layout,
-                            std::max(ops::sliding_window_attention_workspace_capacity_bytes(
-                                         {DFlashConfig::head_dim, DFlashConfig::query_heads,
-                                          DFlashConfig::kv_heads},
-                                         DFlashConfig::local_capacity, {0, plan.capacity}, width,
-                                         width, batch),
-                                     ops::context_softmax_attention_workspace_capacity_bytes(
-                                         {DFlashConfig::head_dim, DFlashConfig::query_heads,
-                                          DFlashConfig::kv_heads},
+                            std::max(ops::swa_workspace_capacity_bytes(
+                                         {0, plan.capacity}, width, width, batch,
+                                         DFlashConfig::local_window),
+                                     ops::bidirectional_gqa_attention_workspace_capacity_bytes(
                                          {0, plan.capacity}, width, width, batch)));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::query_size, tokens, tokens));
+                    (void)ops::linear_workspace_capacity_bytes(
+                        QType::BF16_CTRL, DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
+                        DFlashConfig::hidden, ops::LinearPolicy::A16Only, tokens, tokens);
+                    (void)ops::linear_workspace_capacity_bytes(
+                        QType::BF16_CTRL, DFlashConfig::hidden, DFlashConfig::query_size,
+                        ops::LinearPolicy::A16Only, tokens, tokens);
                 }
                 {
                     auto mlp = layout.scope();
                     (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
-                    scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                        DFlashConfig::hidden, tokens, tokens));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::intermediate, tokens, tokens));
+                    (void)ops::linear_workspace_capacity_bytes(
+                        QType::BF16_CTRL, 2 * DFlashConfig::intermediate, DFlashConfig::hidden,
+                        ops::LinearPolicy::A16Only, tokens, tokens);
+                    (void)ops::linear_workspace_capacity_bytes(
+                        QType::BF16_CTRL, DFlashConfig::hidden, DFlashConfig::intermediate,
+                        ops::LinearPolicy::A16Only, tokens, tokens);
                 }
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
@@ -584,6 +600,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 } else {
                     matrix(layout, DType::BF16, TextConfig::output_rows, drafts * batch);
                 }
+                // DSpark Markov-argmax/SVIP per-row scratch.
+                matrix(layout, DType::I32, batch, 1);
+                matrix(layout, DType::I32, batch, 1);
+                matrix(layout, DType::I32, batch, 1);
                 return finish(layout);
             };
 
@@ -801,8 +821,17 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
+    // Multi-GPU gate (see tools/archkit/_GPU_MATRIX.md): this binary is
+    // compiled for the archs in CMAKE_CUDA_ARCHITECTURES; the nvfp4 weight
+    // profile needs fp4 tensor cores (sm_100a/120a) while the groupwise-int
+    // profile targets Turing+ (sm_75+). Until the per-arch dist matrix is
+    // built, the runtime only accepts the native sm_120 build.
     if (device.sm() != 120) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
+        throw std::invalid_argument(
+            "this ninfer build targets compute capability 12.0 only; your GPU is "
+            "sm_" + std::to_string(device.sm()) +
+            " - use the per-arch dist (groupwise-int for sm_75..sm_89, see "
+            "_GPU_MATRIX.md) or rebuild with CMAKE_CUDA_ARCHITECTURES");
     }
 }
 
@@ -896,7 +925,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     validate_target_options(device, options);
     const TargetKVCacheProfile kv_profile = target_kv_cache_profile(options.kv_cache);
 
-    std::array<DType, 16> layer_overrides{};
+    std::array<DType, 64> layer_overrides{};
     const bool has_override = options.kv_layer_storage_explicit;
     if (has_override) {
         for (std::size_t i = 0; i < layer_overrides.size(); ++i) {
@@ -907,11 +936,13 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                                             ? DType::I8
                                             : (v == KvCacheStorage::Nvfp4Group16
                                                    ? DType::NVFP4
-                                                   : (v == KvCacheStorage::E8Group64
-                                                          ? DType::E8Kv
-                                                          : (v == KvCacheStorage::Fp8Group16
-                                                                 ? DType::FP8_E4M3FN
-                                                                 : DType::BF16))));
+                                                   : (v == KvCacheStorage::Iso3Group16
+                                                          ? DType::NVFP4
+                                                          : (v == KvCacheStorage::E8Group64
+                                                                 ? DType::E8Kv
+                                                                 : (v == KvCacheStorage::Fp8Group16
+                                                                        ? DType::FP8_E4M3FN
+                                                                        : DType::BF16)))));
         }
     } else if constexpr (Variant::supports_per_layer_kv_defaults) {
         layer_overrides = Variant::default_layer_kv_dtypes(
@@ -935,7 +966,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .layer_kv_dtypes     = layer_overrides,
         .kv_residual_layers  = options.kv_residual_explicit
                                    ? options.kv_residual_layers
-                                   : std::array<bool, 16>{},
+                                   : std::array<bool, 64>{},
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,

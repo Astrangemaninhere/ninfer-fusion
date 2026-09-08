@@ -9,6 +9,8 @@
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 
 namespace ninfer::ops::detail {
@@ -367,13 +369,24 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (q.ne[1] == Gqa27Geometry::QHeads) {
+    if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
                                                                  metadata, out, stream);
         return;
     }
-    gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
-                                                             out, stream);
+    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
+        gqa_attention_prompt_attention_launch_for<GqaMuseGeometry>(q, positions, scale, cache,
+                                                                   metadata, out, stream);
+        return;
+    }
+    if (q.ne[1] == Gqa35Geometry::QHeads && q.ne[0] == Gqa35Geometry::HeadDim) {
+        gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
+                                                                 metadata, out, stream);
+        return;
+    }
+    throw std::invalid_argument(
+        "gqa_attention_prompt_attention_launch: unsupported q-head geometry (" +
+        std::to_string(q.ne[1]) + ")");
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -384,7 +397,17 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
         gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
         return;
     }
-    gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+    if (cache.head_dim == GqaMuseGeometry::HeadDim) {
+        gqa_kv_append_launch_for<GqaMuseGeometry>(k, v, positions, cache, metadata, stream);
+        return;
+    }
+    if (k.ne[1] == Gqa35Geometry::KVHeads && cache.head_dim == Gqa35Geometry::HeadDim) {
+        gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+        return;
+    }
+    throw std::invalid_argument(
+        "gqa_kv_append_launch: unsupported KV geometry (" + std::to_string(k.ne[1]) +
+        " kv-heads, head-dim " + std::to_string(cache.head_dim) + ")");
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -399,15 +422,26 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
-        if (q.ne[1] == Gqa27Geometry::QHeads) {
+        if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim) {
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
                                                                      metadata, out, stream);
             return;
         }
-        gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
-        gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+        if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
+            gqa_kv_append_launch_for<GqaMuseGeometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<GqaMuseGeometry>(q, positions, scale, cache,
+                                                                       metadata, out, stream);
+            return;
+        }
+        if (q.ne[1] == Gqa35Geometry::QHeads && q.ne[0] == Gqa35Geometry::HeadDim) {
+            gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
+                                                                     metadata, out, stream);
+            return;
+        }
+        throw std::invalid_argument("gqa_attention_prompt_launch: unsupported q-head geometry (" +
+                                    std::to_string(q.ne[1]) + ")");
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

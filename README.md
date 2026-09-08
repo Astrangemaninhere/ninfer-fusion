@@ -1,5 +1,14 @@
 # NInfer Fusion（增强补丁集）
 
+> ## ⚠️ 项目远未完成（WIP）
+> 本仓库处于活跃开发早期：多模型自动适配、多卡（TP/QPN）、sm_70（V100）支持、
+> GUI 与部分文档仍在建设中，接口与行为随时可能变化。请勿用于生产。
+> 承诺中的进行时工作：
+> - **sm_70/V100 NVFP4 内核移植**（QPN 系）：prepack 位精确已验证，内核移植与数值
+>   验证进行中，真机（CUDA 12.x 工具链）验收未完成
+> - 全自动模型适配（验收标准：任意模型拖入 → 自动适配 → serve）
+> - 多卡 TP / 多机；GUI（local-studio 集成）；FreeToken 弹性 KV
+
 基于 [Neroued/ninfer](https://github.com/Neroued/ninfer)（Apache-2.0）的社区增强发行版：把 KV 压缩、冷层、投机解码、长上下文能力合并为单一可维护补丁集，面向 RTX 5090 / sm_120a。
 
 > 全部性能/精度数据均为本项目在 RTX 5090D + WSL2（CUDA 13.3, sm_120a）上的实测结果。
