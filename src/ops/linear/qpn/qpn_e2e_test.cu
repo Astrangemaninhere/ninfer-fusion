@@ -1,4 +1,4 @@
-// qpn_e2e_test.cu — prepack→qpn_simt 端到端 v4: 机器实证映射 (qpn_map.cuh, 2048/2048).
+﻿// qpn_e2e_test.cu — prepack→qpn_simt 端到端 v4: 机器实证映射 (qpn_map.cuh, 2048/2048).
 // probe5 实证 (g0 段, lane 0/5/10/15 抽样):
 //   ci 0..7  -> col 2L,      k = 8*(ci/8) + 4*((ci/2)%2)*? 实测: ci0->k0, ci1->k4,
 //              ci4->k8, (ci2->k? 未采; 结构推断 k = (ci%2)*4 + (ci/2>=2)*8 + (ci/4==1)*? )
@@ -151,3 +151,5 @@ int main() {
                 bad == 0 ? "PASS" : "FAIL");
     return bad == 0 ? 0 : 1;
 }
+
+
