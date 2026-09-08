@@ -225,6 +225,15 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 
+void Variant::post_mixer_double_norm(const Tensor&, const PostMixerWeights&, const Tensor&,
+                                     Tensor&, qwen3_6::TextPhase, WorkspaceArena&,
+                                     cudaStream_t) {
+    // Single-norm architecture: the compile-time branch never selects this
+    // leaf (double-norm layer graphs only). Kept as a declared interface so
+    // the shared runtime compiles for every variant.
+    throw std::logic_error("post_mixer_double_norm is not enabled for this target");
+}
+
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);

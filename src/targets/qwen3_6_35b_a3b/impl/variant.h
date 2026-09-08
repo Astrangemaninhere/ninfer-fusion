@@ -93,6 +93,14 @@ struct Variant {
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
+    // Double-norm layer graphs (Muse): swiglu MLP, then normalize
+    // the MLP output before the residual add.
+    static void post_mixer_double_norm(const Tensor& hidden,
+                                       const PostMixerWeights& weights,
+                                       const Tensor& post_ff_norm, Tensor& residual,
+                                       qwen3_6::TextPhase phase,
+                                       WorkspaceArena& workspace,
+                                       cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 

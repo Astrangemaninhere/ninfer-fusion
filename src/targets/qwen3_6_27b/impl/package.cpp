@@ -2,11 +2,16 @@
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include <cuda_runtime.h>
+
 #include "artifact/reader.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
 #include <stdexcept>
+#include <vector>
+#include <cstdlib>
+#include <cstdio>
 #include <utility>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
@@ -95,6 +100,9 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-dspark") {
+        return WeightsProfile::Qwen38Nvfp4Dspark;
+    }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-dflash2") {
         return WeightsProfile::Qwen38Nvfp4DFlash2;
     }
@@ -115,6 +123,10 @@ EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
     if (weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2 &&
         !options.enable_vision) {
         resolved.speculative.backend = SpeculativeBackend::DFlash2;
+        if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 7; }
+    } else if (weights_profile == detail::WeightsProfile::Qwen38Nvfp4Dspark &&
+               !options.enable_vision) {
+        resolved.speculative.backend = SpeculativeBackend::DFlash;
         if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 7; }
     } else {
         resolved.speculative.backend = SpeculativeBackend::Mtp;
@@ -162,6 +174,34 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return qwen3_6::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
+}
+
+void Package::export_head_weights(const LoadedModel& model, const char* directory) {
+    if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    const auto& view = model.impl_->data.runtime;
+    const auto dump = [&](const char* name, const Weight& weight) {
+        if (weight.qdata == nullptr || weight.n <= 0 || weight.k <= 0) {
+            throw std::runtime_error(std::string("head export: ") + name + " is unavailable");
+        }
+        const std::string base = std::string(directory) + "/" + name;
+        const std::size_t code_bytes =
+            static_cast<std::size_t>(weight.n) * static_cast<std::size_t>(weight.k);
+        const std::size_t scale_bytes = static_cast<std::size_t>(weight.n) * 2;
+        std::vector<std::byte> codes(code_bytes);
+        std::vector<std::byte> scales(scale_bytes);
+        CUDA_CHECK(cudaMemcpy(codes.data(), weight.qdata, code_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(scales.data(), weight.scales, scale_bytes, cudaMemcpyDeviceToHost));
+        std::FILE* f = std::fopen((base + "_codes.bin").c_str(), "wb");
+        if (f == nullptr) { throw std::runtime_error("cannot open " + base + "_codes.bin"); }
+        std::fwrite(codes.data(), 1, codes.size(), f);
+        std::fclose(f);
+        f = std::fopen((base + "_scales.bin").c_str(), "wb");
+        if (f == nullptr) { throw std::runtime_error("cannot open " + base + "_scales.bin"); }
+        std::fwrite(scales.data(), 1, scales.size(), f);
+        std::fclose(f);
+    };
+    dump("embed", view.token_embedding);
+    dump("head", view.output_head);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

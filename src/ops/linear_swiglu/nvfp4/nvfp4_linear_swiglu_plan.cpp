@@ -7,6 +7,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstddef>
 #include <stdexcept>
 
@@ -33,8 +34,15 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
         throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
     }
-    if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
-    if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
+    if (tokens == 1 && std::getenv("NINFER_T1_W4A4") == nullptr) {
+        return Nvfp4LinearSwiGluRoute::DecodeFusedA16;
+    }
+    if (tokens <= 4 && std::getenv("NINFER_T1_W4A4") == nullptr) {
+        return Nvfp4LinearSwiGluRoute::SmallTFusedA16;
+    }
+    if (tokens == 1 && std::getenv("NINFER_T1_W4A4") != nullptr) {
+        return Nvfp4LinearSwiGluRoute::FusedW4A4;
+    }
     if (tokens <= 48) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
     if (tokens >= kTmaBlockM && (tokens % kTmaBlockM) == 0) {
         return Nvfp4LinearSwiGluRoute::TmaFusedW4A4;
@@ -112,7 +120,42 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
-    switch (resolve_route(policy, x.ne[1])) {
+    const Nvfp4LinearSwiGluRoute route = resolve_route(policy, x.ne[1]);
+    const std::int32_t tokens          = x.ne[1];
+    if (route == Nvfp4LinearSwiGluRoute::LinearW4A4Post && tokens >= 2 * kTmaBlockM) {
+        // A misaligned batch otherwise runs the whole column range on the baseline
+        // (two separate linears). Split it so the bulk rides the fused TMA route
+        // and only the sub-256 tail falls back; the workspace planner already
+        // budgets the largest aligned fused prefix.
+        const std::int32_t head = tokens & ~(kTmaBlockM - 1);
+        const std::int32_t tail = tokens - head;
+        {
+            auto scope                       = workspace.scope();
+            const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, head);
+            launch_nvfp4_w4a4_quantize(x.slice(1, 0, head), weight, scratch, true, stream);
+            const float alpha =
+                1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+            launch_nvfp4_linear_swiglu_w4a4_tma(
+                scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales),
+                static_cast<__nv_bfloat16*>(out.slice(1, 0, head).data), head, alpha, stream);
+        }
+        if (tail > 0) {
+            auto scope                         = workspace.scope();
+            Nvfp4LinearSwiGluWorkspace scratch = allocate_baseline_workspace(workspace, tail);
+            WorkspaceArena linear_workspace(scratch.linear);
+            Tensor tail_x = x.slice(1, head, tail);
+            linear(tail_x, weight, scratch.projected, LinearPolicy::AllowA4, linear_workspace,
+                   stream);
+            constexpr std::int32_t kIntermediate = Nvfp4MlpGateUpGeometry::kOutputRows / 2;
+            Tensor gate = scratch.projected.slice(0, 0, kIntermediate);
+            Tensor up   = scratch.projected.slice(0, kIntermediate, kIntermediate);
+            Tensor tail_out = out.slice(1, head, tail);
+            silu_mul(gate, up, tail_out, stream);
+        }
+        return;
+    }
+    switch (route) {
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
         return;
@@ -125,7 +168,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::TmaFusedW4A4: {
         auto scope                       = workspace.scope();
         const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
-        launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
+        // Inside the TMA case, so this route always reads tile-contiguous scales. Note its own
+        // predicate admits every multiple of 256 from 256 up, which is wider than the shared one.
+        launch_nvfp4_w4a4_quantize(x, weight, scratch, true, stream);
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_linear_swiglu_w4a4_tma(
             scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),

@@ -2,9 +2,12 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
+#include "core/dtype.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/bidirectional_gqa_attention.h"
+#include "ninfer/ops/dspark_markov_argmax.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
@@ -13,13 +16,13 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
+#include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scalar.h"
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/sliding_window_attention.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/swa.h"
 
 #include <cuda_runtime.h>
 
@@ -102,7 +105,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             table_rows.ne[0] != batch) {
             throw std::invalid_argument("DFlash context append inputs are invalid");
         }
-        const bool replace_local_window = batch == 1 && width > Config::local_capacity;
+        const bool replace_local_window =
+            !Config::full_only && batch == 1 && width > Config::local_capacity;
         if (replace_local_window && (envelope.min_count != static_cast<std::uint32_t>(width) ||
                                      envelope.max_count != static_cast<std::uint32_t>(width))) {
             throw std::invalid_argument(
@@ -140,7 +144,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             auto layer_scope = state.execution.work.scope();
             const auto& weight =
                 state.execution.model.dflash->layers.at(static_cast<std::size_t>(layer));
-            const bool local_layer  = layer < Config::local_layers;
+            const bool local_layer = !Config::full_only && layer < Config::local_layers;
+            const int full_index   = Config::full_only ? layer : layer - Config::local_layers;
             const int layer_width   = local_layer ? local_width : width;
             const int layer_columns = layer_width * batch;
             Tensor layer_context    = local_layer && replace_local_window
@@ -157,8 +162,15 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 layer_roots.value.view({Config::head_dim, Config::kv_heads, layer_columns});
             Tensor key_flat   = key_raw.view({Config::kv_size, layer_columns});
             Tensor value_flat = value.view({Config::kv_size, layer_columns});
-            ops::linear_pair(layer_context, weight.context_key, weight.context_value, key_flat,
-                             value_flat, state.execution.device.stream);
+            if constexpr (Config::bf16_weights) {
+                ops::linear(layer_context, weight.context_key, key_flat,
+                            state.execution.device.stream);
+                ops::linear(layer_context, weight.context_value, value_flat,
+                            state.execution.device.stream);
+            } else {
+                ops::linear_pair(layer_context, weight.context_key, weight.context_value, key_flat,
+                                 value_flat, state.execution.device.stream);
+            }
             Tensor key = layer_roots.key.view({Config::head_dim, Config::kv_heads, layer_columns});
             ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
                          state.execution.device.stream);
@@ -172,11 +184,12 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 ops::kv_cache_append_prefix(
                     key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
                     dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                    Config::local_capacity, state.execution.device.stream);
+                    Config::local_window, state.execution.device.stream);
             } else {
                 ops::kv_cache_append_prefix(
                     key_batch, value_batch, position_batch, commit_counts, table_rows, envelope,
-                    dflash_state(state).full_batch_layer(0), state.execution.device.stream);
+                    dflash_state(state).full_batch_layer(static_cast<std::uint32_t>(full_index)),
+                    state.execution.device.stream);
             }
         }
     }
@@ -196,14 +209,25 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
         Tensor valid_columns      = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
+        Tensor lanes              = frame.active_lanes.slice(0, 0, batch_size);
         Tensor full_rows          = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
         Tensor ids                = frame.proposal_ids.slice(1, 0, batch_size);
         Tensor positions          = frame.proposal_positions.slice(1, 0, batch_size);
         Tensor drafts             = frame.draft_tokens.slice(1, 0, batch_size);
 
+        // DSpark mirrors HF spec_generate: the draft block has exactly `k`
+        // noise rows (anchor + k-1 masks) and predicts k rows, while the
+        // target verify consumes width = k+1 (including the bonus token).
+        // The legacy W8 DFlash path keeps its own width semantics.
         state.execution.work.reset();
-        ops::prepare_masked_block(anchors, frontiers, valid_columns, Config::mask_token, ids,
+        Tensor attention_valid = valid_columns;
+        if constexpr (Config::bf16_weights) {
+            attention_valid = state.execution.work.alloc(DType::I32, {batch_size});
+            ops::set_i32_scalar(attention_valid, static_cast<std::int32_t>(k),
+                                state.execution.device.stream);
+        }
+
+        ops::prepare_masked_block(anchors, frontiers, attention_valid, Config::mask_token, ids,
                                   positions, state.execution.device.stream);
         Tensor residual = state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
         ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
@@ -230,8 +254,36 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor query_flat = query_raw.view({Config::query_size, columns});
                 Tensor key_flat   = key_raw.view({Config::kv_size, columns});
                 Tensor value_flat = value.view({Config::kv_size, columns});
-                ops::attn_input_proj(roots.hidden, weight.query_key_value, query_flat, key_flat,
-                                     value_flat, state.execution.device.stream);
+                if constexpr (Config::bf16_weights) {
+                    // The fused [query_size + 2*kv_size, K] object is stored as
+                    // contiguous Q/K/V row groups. Linear writes each token's
+                    // N outputs contiguously, so a fused output buffer would
+                    // interleave Q, K, and V per token; split the weight rows
+                    // and run three projections into the per-token buffers.
+                    const Weight qkv_weight   = weight.query_key_value;
+                    const std::size_t row_len = static_cast<std::size_t>(qkv_weight.k) *
+                                                dtype_size(DType::BF16);
+                    Weight query_weight = qkv_weight;
+                    query_weight.n      = Config::query_size;
+                    Weight key_weight   = qkv_weight;
+                    key_weight.n        = Config::kv_size;
+                    key_weight.qdata    = static_cast<const std::byte*>(qkv_weight.qdata) +
+                                       static_cast<std::size_t>(Config::query_size) * row_len;
+                    Weight value_weight = qkv_weight;
+                    value_weight.n      = Config::kv_size;
+                    value_weight.qdata =
+                        static_cast<const std::byte*>(qkv_weight.qdata) +
+                        static_cast<std::size_t>(Config::query_size + Config::kv_size) * row_len;
+                    ops::linear(roots.hidden, query_weight, query_flat,
+                                state.execution.device.stream);
+                    ops::linear(roots.hidden, key_weight, key_flat,
+                                state.execution.device.stream);
+                    ops::linear(roots.hidden, value_weight, value_flat,
+                                state.execution.device.stream);
+                } else {
+                    ops::attn_input_proj(roots.hidden, weight.query_key_value, query_flat,
+                                         key_flat, value_flat, state.execution.device.stream);
+                }
                 Tensor query = roots.query.view({Config::head_dim, Config::query_heads, columns});
                 Tensor key   = roots.key.view({Config::head_dim, Config::kv_heads, columns});
                 ops::rmsnorm(query_raw, weight.query_norm, Config::rms_epsilon, false, query,
@@ -248,26 +300,103 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     value.view({Config::head_dim, Config::kv_heads, width, batch_size});
                 Tensor attention_batch = roots.attention.view(
                     {Config::head_dim, Config::query_heads, width, batch_size});
-                if (layer < Config::local_layers) {
-                    ops::sliding_window_attention(
-                        query_batch, key_batch, value_batch, positions, valid_columns,
-                        state_destinations,
-                        {Config::head_dim, Config::query_heads, Config::kv_heads},
-                        Config::local_capacity, Config::attention_scale,
-                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                        envelopes.local, state.execution.work, attention_batch,
-                        state.execution.device.stream);
+                const bool local_layer = !Config::full_only && layer < Config::local_layers;
+                const int full_index   = Config::full_only ? layer : layer - Config::local_layers;
+                if (local_layer) {
+                    ops::swa(query_batch, key_batch, value_batch, positions, attention_valid,
+                             lanes, Config::attention_scale,
+                             dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                             envelopes.local, Config::local_window, state.execution.work,
+                             attention_batch, state.execution.device.stream);
                 } else {
-                    ops::context_softmax_attention(
-                        query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
-                        {Config::head_dim, Config::query_heads, Config::kv_heads},
-                        Config::attention_scale, dflash_state(state).full_batch_layer(0),
-                        envelopes.full, state.execution.work, attention_batch,
-                        state.execution.device.stream);
-                }
-                ops::linear_add(roots.attention.view({Config::query_size, columns}),
-                                weight.attention_output, residual, state.execution.work,
+                    if constexpr (Config::query_heads == 32 && Config::kv_heads == 8) {
+                        ops::bidirectional_gqa_attention(
+                            query_batch, key_batch, value_batch, frontiers, attention_valid,
+                            full_rows, Config::attention_scale,
+                            dflash_state(state).full_batch_layer(
+                                static_cast<std::uint32_t>(full_index)),
+                            envelopes.full, state.execution.work, attention_batch,
+                            state.execution.device.stream);
+                    } else if constexpr (Config::query_heads == 40 && Config::kv_heads == 8) {
+                        // DSpark GQA group is 5 (head h -> KV head h/5), while the
+                        // 32/8 bidirectional op uses group 4. Two 32-head calls
+                        // cover the 40 real heads: call A places real heads
+                        // 5g..5g+3 in padded slots 4g..4g+3 (both map to KV head
+                        // g), and call B places real head 5g+4 in padded slot 4g.
+                        // Unused padded slots are never copied back, so their
+                        // stale query rows do not affect the result.
+                        const auto full_context = dflash_state(state).full_batch_layer(
+                            static_cast<std::uint32_t>(full_index));
+                        Tensor padded_query =
+                            roots.padded_query.view({Config::head_dim, 32, width, batch_size});
+                        Tensor padded_attention =
+                            roots.padded_attention.view({Config::head_dim, 32, width, batch_size});
+                        const std::size_t elem_bytes = dtype_size(DType::BF16);
+                        const std::size_t head_bytes =
+                            static_cast<std::size_t>(Config::head_dim) * elem_bytes;
+                        const std::size_t token_rows =
+                            static_cast<std::size_t>(width) * static_cast<std::size_t>(batch_size);
+                        const auto copy_heads = [&](const Tensor& dst, std::int32_t dst_head,
+                                                    std::int32_t count, const Tensor& src,
+                                                    std::int32_t src_head) {
+                            const std::size_t dst_pitch =
+                                static_cast<std::size_t>(Config::head_dim) * dst.ne[1] * elem_bytes;
+                            const std::size_t src_pitch =
+                                static_cast<std::size_t>(Config::head_dim) * src.ne[1] * elem_bytes;
+                            void* dst_ptr = static_cast<std::byte*>(dst.data) +
+                                            static_cast<std::size_t>(dst_head) * head_bytes;
+                            const void* src_ptr =
+                                static_cast<const std::byte*>(src.data) +
+                                static_cast<std::size_t>(src_head) * head_bytes;
+                            CUDA_CHECK(cudaMemcpy2DAsync(
+                                dst_ptr, dst_pitch, src_ptr, src_pitch,
+                                head_bytes * static_cast<std::size_t>(count), token_rows,
+                                cudaMemcpyDeviceToDevice, state.execution.device.stream));
+                        };
+                        const auto run_attention = [&]() {
+                            ops::bidirectional_gqa_attention(
+                                padded_query, key_batch, value_batch, frontiers, attention_valid,
+                                full_rows, Config::attention_scale, full_context, envelopes.full,
+                                state.execution.work, padded_attention,
                                 state.execution.device.stream);
+                        };
+                        {
+                            auto call_scope = state.execution.work.scope();
+                            for (std::int32_t group = 0; group < 8; ++group) {
+                                copy_heads(padded_query, group * 4, 4, query_batch, group * 5);
+                            }
+                            run_attention();
+                            for (std::int32_t group = 0; group < 8; ++group) {
+                                copy_heads(attention_batch, group * 5, 4, padded_attention,
+                                           group * 4);
+                            }
+                        }
+                        {
+                            auto call_scope = state.execution.work.scope();
+                            for (std::int32_t group = 0; group < 8; ++group) {
+                                copy_heads(padded_query, group * 4, 1, query_batch, group * 5 + 4);
+                            }
+                            run_attention();
+                            for (std::int32_t group = 0; group < 8; ++group) {
+                                copy_heads(attention_batch, group * 5 + 4, 1, padded_attention,
+                                           group * 4);
+                            }
+                        }
+                    } else {
+                        static_assert(Config::query_heads == 32 && Config::kv_heads == 8,
+                                      "unsupported DFlash attention geometry");
+                    }
+                }
+                if constexpr (Config::bf16_weights) {
+                    Tensor delta = roots.attention_delta.view({Config::hidden, columns});
+                    ops::linear(roots.attention.view({Config::query_size, columns}),
+                                weight.attention_output, delta, state.execution.device.stream);
+                    ops::residual_add(delta, residual, state.execution.device.stream);
+                } else {
+                    ops::linear_add(roots.attention.view({Config::query_size, columns}),
+                                    weight.attention_output, residual, state.execution.work,
+                                    state.execution.device.stream);
+                }
             }
             {
                 nvtx::ScopedRange mlp_range(nvtx::Name::DFlashMlp, nvtx::Category::PostMixer,
@@ -276,10 +405,23 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 auto roots = workspace_recipe::dflash_mlp<Config>(state.execution.work, columns);
                 ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon, false,
                              roots.hidden, state.execution.device.stream);
-                ops::linear_swiglu(roots.hidden, weight.gate_up, roots.intermediate,
-                                   state.execution.work, state.execution.device.stream);
-                ops::linear_add(roots.intermediate, weight.down, residual, state.execution.work,
+                if constexpr (Config::bf16_weights) {
+                    Tensor gate_up = roots.gate_up.view({2 * Config::intermediate, columns});
+                    ops::linear(roots.hidden, weight.gate_up, gate_up,
                                 state.execution.device.stream);
+                    ops::silu_mul(gate_up.slice(0, 0, Config::intermediate),
+                                  gate_up.slice(0, Config::intermediate, Config::intermediate),
+                                  roots.intermediate, state.execution.device.stream);
+                    Tensor delta = roots.delta.view({Config::hidden, columns});
+                    ops::linear(roots.intermediate, weight.down, delta,
+                                state.execution.device.stream);
+                    ops::residual_add(delta, residual, state.execution.device.stream);
+                } else {
+                    ops::linear_swiglu(roots.hidden, weight.gate_up, roots.intermediate,
+                                       state.execution.work, state.execution.device.stream);
+                    ops::linear_add(roots.intermediate, weight.down, residual, state.execution.work,
+                                    state.execution.device.stream);
+                }
             }
         }
 
@@ -290,8 +432,13 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             static_cast<std::size_t>(Config::hidden) * static_cast<std::size_t>(k) * element_bytes;
         const std::size_t source_pitch =
             static_cast<std::size_t>(Config::hidden) * width * element_bytes;
-        const auto* source = static_cast<const std::byte*>(residual.data) +
-                             static_cast<std::size_t>(Config::hidden) * element_bytes;
+        const auto* source = static_cast<const std::byte*>(residual.data);
+        std::size_t source_column_offset = 0;
+        if constexpr (!Config::bf16_weights) {
+            // Legacy DFlash keeps the anchor column out of the proposal rows.
+            source_column_offset = 1;
+        }
+        source += source_column_offset * static_cast<std::size_t>(Config::hidden) * element_bytes;
         CUDA_CHECK(cudaMemcpy2DAsync(packed.data, row_bytes, source, source_pitch, row_bytes,
                                      static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                                      state.execution.device.stream));
@@ -305,8 +452,28 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 DType::BF16, {TextConfig::output_rows, static_cast<std::int32_t>(k) * batch_size});
             ops::linear(proposal_hidden, state.execution.model.output_head, logits,
                         state.execution.device.stream);
-            ops::argmax(logits, flat_drafts, TextConfig::token_domain,
-                        state.execution.device.stream);
+            if (state.execution.model.dflash->markov_w1.has_value() &&
+                state.execution.model.dflash->markov_w2.has_value()) {
+                Tensor best_value = state.execution.work.alloc(DType::I32, {batch_size});
+                Tensor best_index = state.execution.work.alloc(DType::I32, {batch_size});
+                Tensor extents    = state.execution.work.alloc(DType::I32, {batch_size});
+                CUDA_CHECK(cudaMemcpyAsync(
+                    extents.data, frame.proposal_extents.slice(0, 0, batch_size).data,
+                    static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),
+                    cudaMemcpyDeviceToDevice, state.execution.device.stream));
+                ops::dspark_markov_argmax(logits, *state.execution.model.dflash->markov_w1,
+                                          *state.execution.model.dflash->markov_w2, anchors,
+                                          flat_drafts, best_value, best_index, extents,
+                                          state.svip_entropy_threshold,
+                                          state.execution.device.stream);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    frame.proposal_extents.slice(0, 0, batch_size).data, extents.data,
+                    static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),
+                    cudaMemcpyDeviceToDevice, state.execution.device.stream));
+            } else {
+                ops::argmax(logits, flat_drafts, TextConfig::token_domain,
+                            state.execution.device.stream);
+            }
         } else {
             if (!state.execution.model.optimized_proposal.has_value()) {
                 throw std::logic_error("optimized DFlash proposal head is unavailable");
@@ -368,7 +535,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                    context_starts, frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
-                                     state_destinations, dflash_rows, envelopes.append);
+                                     active_lanes, dflash_rows, envelopes.append);
 
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
         ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
@@ -409,6 +576,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                  },
                                  target_envelope);
         }
+        CUDA_CHECK(cudaMemcpyAsync(
+            frame.egress_proposal_extents.slice(0, 0, batch_size).data, extents.data,
+            static_cast<std::size_t>(batch_size) * sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
+            state.execution.device.stream));
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));

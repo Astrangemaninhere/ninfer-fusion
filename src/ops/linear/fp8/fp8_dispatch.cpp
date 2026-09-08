@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -20,6 +21,8 @@ enum class Fp8LinearRoute : std::uint8_t {
 Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, LinearPolicy policy,
                              std::int32_t tokens) {
     if (tokens <= 0 || !is_fp8_linear_problem(output_rows, input_rows)) {
+        std::fprintf(stderr, "[fp8-linear] unsupported shape output_rows=%d input_rows=%d tokens=%d\n",
+                     output_rows, input_rows, tokens);
         throw std::invalid_argument("fp8 linear: unsupported shape");
     }
     const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
@@ -42,6 +45,13 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     case Fp8Problem::MlpGateUp:
         return tokens == 1 || tokens >= 5 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::MuseQuery:
+    case Fp8Problem::MuseKeyValue:
+    case Fp8Problem::MuseAttentionOut:
+    case Fp8Problem::MuseMlpGateUp:
+    case Fp8Problem::MuseMlpDown:
+        // Muse geometries currently keep the A16 (BF16 activation) route for
+        // every token count; A8 schedules await Muse-specific measurement.
         return Fp8LinearRoute::A16;
     case Fp8Problem::Residual6144:
     case Fp8Problem::Residual17408:
@@ -87,6 +97,11 @@ bool interval_uses_a8(Fp8Problem problem, LinearPolicy policy, std::int32_t min_
     case Fp8Problem::MlpGateUp:
         return min_tokens == 1 || max_tokens >= 5;
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::MuseQuery:
+    case Fp8Problem::MuseKeyValue:
+    case Fp8Problem::MuseAttentionOut:
+    case Fp8Problem::MuseMlpGateUp:
+    case Fp8Problem::MuseMlpDown:
         return false;
     case Fp8Problem::Residual6144:
     case Fp8Problem::Residual17408:

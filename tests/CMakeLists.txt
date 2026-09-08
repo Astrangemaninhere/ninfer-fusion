@@ -231,6 +231,7 @@ set(ninfer_op_tests
   silu_mul
   residual_add
   sigmoid_mul
+  logit_policy
   rmsnorm
   gated_rmsnorm
   l2norm
@@ -275,8 +276,15 @@ ninfer_add_op_test(ninfer_prepare_masked_block_test
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_ple_layout_test
+  SOURCES test_ple_layout.cpp
+  LIBRARIES ninfer_ops
+  NEEDS_SOURCE_DIR)
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dspark_markov_argmax_test
+  SOURCES ops/test_dspark_markov_argmax.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_mtp_round_test
   SOURCES ops/test_mtp_round.cpp

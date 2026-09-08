@@ -12,8 +12,11 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
     if (local.layer_count() != DFlashConfig::local_layers ||
-        local.capacity() != DFlashConfig::local_capacity || full.layers() != 1 ||
-        full.max_context() != layout.full.max_context || full.page_pool().plane_count() != 2 ||
+        local.capacity() != DFlashConfig::local_capacity ||
+        full.layers() != static_cast<std::uint32_t>(DFlashConfig::full_layers) ||
+        full.max_context() != layout.full.max_context ||
+        full.page_pool().plane_count() !=
+            static_cast<std::size_t>(2 * DFlashConfig::full_layers) ||
         local.num_kv_heads() != DFlashConfig::kv_heads ||
         local.head_dim() != DFlashConfig::head_dim ||
         full.page_pool().plane(0).dtype != DType::BF16 ||

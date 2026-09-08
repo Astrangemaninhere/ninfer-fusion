@@ -3,10 +3,13 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <dlfcn.h>
 #include <limits>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <chrono>
+#include <thread>
 
 namespace ninfer {
 namespace {
@@ -59,7 +62,7 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+        throw std::runtime_error(cuda_error_message(("cudaMalloc failed (" + std::to_string(bytes) + " B)").c_str(), err));
     }
     p = ptr;
 }
@@ -136,15 +139,29 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
     }
 
-    void* ptr             = nullptr;
-    const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+    // WSL2 GPU-PV 下大块 cudaMalloc 偶发瞬时失败: 与 DeviceBuffer 相同重试策略.
+    cudaError_t err = cudaErrorMemoryAllocation;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        void* ptr = nullptr;
+        err       = cudaMalloc(&ptr, capacity_bytes);
+        if (err == cudaSuccess) {
+            base_ = ptr;
+            cap_  = capacity_bytes;
+            off_  = 0;
+            return;
+        }
+        if (attempt < 5) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        }
     }
-
-    base_ = ptr;
-    cap_  = capacity_bytes;
-    off_  = 0;
+    std::size_t free_b  = 0;
+    std::size_t total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    throw std::runtime_error(cuda_error_message(
+        ("cudaMalloc failed (" + std::to_string(capacity_bytes) + " B; free " +
+         std::to_string(free_b) + " B / total " + std::to_string(total_b) + " B)")
+            .c_str(),
+        err));
 }
 
 DeviceArena::DeviceArena(DeviceSpan storage)
@@ -191,7 +208,17 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
     if (!is_power_of_two(align)) {
         throw std::invalid_argument("arena alignment must be a nonzero power of two");
     }
-    if (bytes == 0) { throw std::invalid_argument("arena allocation must be nonzero"); }
+    if (bytes == 0) {
+        void* caller = __builtin_return_address(0);
+        Dl_info info{};
+        if (dladdr(caller, &info) != 0 && info.dli_sname != nullptr) {
+            std::fprintf(stderr, "arena alloc-zero caller %s+%p\n", info.dli_sname,
+                         static_cast<char*>(caller) - static_cast<char*>(info.dli_saddr));
+        } else {
+            std::fprintf(stderr, "arena alloc-zero caller %p\n", caller);
+        }
+        throw std::invalid_argument("arena allocation must be nonzero");
+    }
 
     const std::uintptr_t base_addr           = reinterpret_cast<std::uintptr_t>(base_);
     const std::uintptr_t current_addr        = checked_add_uintptr(base_addr, off_);

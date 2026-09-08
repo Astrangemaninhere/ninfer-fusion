@@ -132,6 +132,7 @@ struct Package {
                                                                WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
+    static void export_head_weights(const LoadedModel&, const char*) {}
 };
 
 } // namespace targets::qwen3_6_35b_a3b

@@ -7,6 +7,7 @@
 #include "core/device.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/swa.h"
@@ -86,6 +87,10 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // DSpark self-verification length policy (SVIP): drafting stops at the
+    // first position whose base-logit entropy sqrt(H) exceeds this threshold.
+    // A non-positive value disables the entropy cap (full draft window).
+    float svip_entropy_threshold = 2.5F;
 };
 
 struct DFlashAppendContext {
@@ -115,8 +120,10 @@ struct MtpCausalAttentionEnvelopes {
 };
 
 struct DFlashEnvelopes {
-    ops::SlidingWindowAttentionExecutionEnvelope local;
-    ops::ContextAttentionExecutionEnvelope full;
+    // DSpark (BF16 masked-block draft): local layers use the swa kernel and
+    // full-context layers use the bidirectional GQA kernel.
+    ops::SwaContextExecutionEnvelope local;
+    ops::GqaContextExecutionEnvelope full;
     ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 

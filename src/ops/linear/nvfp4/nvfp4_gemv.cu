@@ -49,6 +49,15 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
     case Nvfp4Problem::Residual17408:
         launch_exact<Nvfp4Residual17408Geometry>(x, weight, out, stream);
         return;
+    case Nvfp4Problem::MuseMlpGateUp:
+        launch_exact<Nvfp4MuseMlpGateUpGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::MuseMlpDown:
+        launch_exact<Nvfp4MuseMlpDownGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::MuseVocabulary:
+        launch_exact<Nvfp4MuseVocabularyGeometry>(x, weight, out, stream);
+        return;
     }
 }
 

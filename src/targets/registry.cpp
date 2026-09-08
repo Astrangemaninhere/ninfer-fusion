@@ -7,7 +7,11 @@
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/context_cost.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <exception>
+#include <vector>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -110,12 +114,47 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         context_cost_identity, options.context_cost.preset_path);
 
     artifact::Binder binder(reader);
-    auto load_plan        = Target::plan_load(binder, resolved_options, weights_profile);
-    auto sequence_planner = Target::make_sequence_planner(device, resolved_options, weights_profile);
-    const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
+    auto load_plan = Target::plan_load(binder, resolved_options, weights_profile);
     const std::size_t preflight_runtime_bytes =
         runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
-    (void)runtime::resolve_kv_capacity(resolved_options.kv_capacity, curve, preflight_runtime_bytes);
+
+    // Memory-adaptive prefill chunk: the runtime workspace reservation grows with
+    // the prefill chunk, so when the device budget cannot fit the requested chunk
+    // the layout is retried at successively smaller chunks before failing. The
+    // finalized plan carries the reduced chunk into the prefill loop.
+    const auto chunk_candidates = [](std::uint32_t requested) {
+        std::vector<std::uint32_t> ladder{requested, 2048, 1536, 1024, 768, 512};
+        std::sort(ladder.begin(), ladder.end(), std::greater<>());
+        ladder.erase(std::unique(ladder.begin(), ladder.end()), ladder.end());
+        return ladder;
+    };
+    const auto build_planner_at = [&](std::uint32_t chunk) {
+        EngineOptions chunk_options = resolved_options;
+        chunk_options.prefill_chunk = chunk;
+        return Target::make_sequence_planner(device, chunk_options, weights_profile);
+    };
+    const auto resolve_with_fallback = [&](std::size_t budget, std::uint32_t start_chunk,
+                                           std::uint32_t& chosen_chunk) {
+        std::exception_ptr last_error;
+        for (const std::uint32_t chunk : chunk_candidates(resolved_options.prefill_chunk)) {
+            if (chunk > start_chunk) { continue; }
+            auto planner = build_planner_at(chunk);
+            try {
+                auto resolution = runtime::resolve_kv_capacity(
+                    resolved_options.kv_capacity, planner.capacity_curve(), budget);
+                chosen_chunk = chunk;
+                return resolution;
+            } catch (const std::invalid_argument& error) {
+                last_error = std::current_exception();
+                (void)error;
+            }
+        }
+        std::rethrow_exception(last_error);
+    };
+
+    std::uint32_t active_chunk = resolved_options.prefill_chunk;
+    (void)resolve_with_fallback(preflight_runtime_bytes, resolved_options.prefill_chunk,
+                                active_chunk);
 
     auto progress     = artifact_progress(resolved_options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
@@ -124,8 +163,18 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
+    if (const char* head_dir = std::getenv("NINFER_EXPORT_HEAD_DIR")) {
+        Target::export_head_weights(*model, head_dir);
+    }
     runtime::KvCapacityResolution capacity_resolution =
-        runtime::resolve_kv_capacity(resolved_options.kv_capacity, curve, current_free_device_bytes());
+        resolve_with_fallback(current_free_device_bytes(), active_chunk, active_chunk);
+    if (active_chunk != resolved_options.prefill_chunk) {
+        std::fprintf(stderr,
+                     "ninfer: reduced prefill chunk to %u (the requested %u does not fit the "
+                     "device runtime budget)\n",
+                     active_chunk, resolved_options.prefill_chunk);
+    }
+    auto sequence_planner = build_planner_at(active_chunk);
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
@@ -189,6 +238,23 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
+
+LoadedMuseGlimmer30B::LoadedMuseGlimmer30B(
+    std::unique_ptr<MuseGlimmer30B::LoadedModel> stable_model, const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(MuseGlimmer30B::make_frontend(*model, options)) {}
+
+LoadedMuseGlimmer30B::~LoadedMuseGlimmer30B() = default;
+
+MuseGlimmer30BInstance::MuseGlimmer30BInstance(
+    std::unique_ptr<LoadedMuseGlimmer30B> stable_loaded,
+    runtime::KvCapacityResolution resolution, MuseGlimmer30B::SequencePlan sequence_plan,
+    DeviceContext& device)
+    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+      capacity(sequence_plan.capacity()),
+      program(MuseGlimmer30B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+
+MuseGlimmer30BInstance::~MuseGlimmer30BInstance() = default;
+
 ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device) {
     validate_options(options);
     const auto load_start = Clock::now();
@@ -207,7 +273,11 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
             options, device, reader, load_start, Qwen3_6_35BA3B::target_key);
     }
-    throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
+    if (identity.model_id == MuseGlimmer30B::model_id) {
+        return construct_registered<MuseGlimmer30B, LoadedMuseGlimmer30B, MuseGlimmer30BInstance>(
+            options, device, reader, load_start, MuseGlimmer30B::target_key);
+    }
+        throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");
 }
 

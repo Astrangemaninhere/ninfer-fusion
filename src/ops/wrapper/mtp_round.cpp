@@ -43,13 +43,30 @@ void require_row_pitched_matrix(const Tensor& t, std::int32_t rows, std::int32_t
 
 } // namespace
 
+void mtp_svip_entropy_extents(const Tensor& logits, const Tensor& accepted, Tensor& cuts,
+                              float threshold, cudaStream_t stream) {
+    constexpr const char* op = "mtp_svip_entropy_extents";
+    if (!(logits.dtype == DType::BF16 && logits.ne[3] == 1 && logits.is_contiguous() &&
+          logits.data != nullptr)) {
+        throw std::invalid_argument(std::string(op) + ": invalid logits tensor");
+    }
+    const int batch = logits.ne[2];
+    if (batch < 1) { throw std::invalid_argument(std::string(op) + ": empty batch"); }
+    require_vector(accepted, DType::I32, batch, op, "accepted");
+    require_vector(cuts, DType::I32, batch, op, "cuts");
+    if (!(threshold > 0.0F)) {
+        throw std::invalid_argument(std::string(op) + ": threshold must be positive");
+    }
+    detail::mtp_svip_entropy_extents_launch(logits, accepted, cuts, threshold, stream);
+}
+
 void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors,
                             const Tensor& accepted, const Tensor& updated_frontiers,
                             const Tensor& remaining_budgets, const Tensor& licensed_counts,
                             const Tensor& rope_deltas, Tensor& alignment_ids, Tensor& next_extents,
                             Tensor& ar_positions, Tensor& ar_rope_positions,
                             Tensor& ar_valid_columns, std::int32_t max_context,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const Tensor* svip_cuts) {
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
@@ -78,10 +95,14 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
         throw std::invalid_argument(
             "mtp_prepare_next_round: AR outputs must share one step stride");
     }
+    if (svip_cuts != nullptr) {
+        require_vector(*svip_cuts, DType::I32, batch, op, "svip_cuts");
+    }
     detail::mtp_prepare_next_round_launch(verify_ids, next_anchors, accepted, updated_frontiers,
                                           remaining_budgets, licensed_counts, rope_deltas,
                                           alignment_ids, next_extents, ar_positions,
-                                          ar_rope_positions, ar_valid_columns, max_context, stream);
+                                          ar_rope_positions, ar_valid_columns, max_context, stream,
+                                          svip_cuts);
 }
 
 } // namespace ninfer::ops

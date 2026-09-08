@@ -17,6 +17,11 @@ inline constexpr std::size_t kTokenDomain = 248077;
 
 struct FrontendOptions {
     bool vision_enabled                    = true;
+    // Registered artifact profile: Qwen3.6 official checkpoints keep the family
+    // defaults (248077-token domain, official vision/audio special IDs); other
+    // family members override with their own tokenizer geometry.
+    std::size_t token_domain               = kTokenDomain;
+    bool validate_official_special_ids     = true;
     std::uint32_t max_context              = 2'048;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;

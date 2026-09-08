@@ -370,7 +370,7 @@ int run(const Options& options) {
           {"device", options.device},
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
-          {"prefill_chunk_tokens", 1024},
+          {"prefill_chunk_tokens", 3072},
           {"score_tile_tokens", 1024},
           {"kv_dtype", kv_name(options.kv)}}},
         {"timing",

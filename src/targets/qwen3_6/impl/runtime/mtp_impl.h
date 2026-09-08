@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
@@ -152,11 +153,28 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         {
             nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
                                           static_cast<std::uint64_t>(k) * batch_size);
+            // SVIP entropy cap: stop drafting before the first verify column whose
+            // base-logit softmax entropy exceeds the threshold. Off by default;
+            // set NINFER_SVIP_THRESHOLD to enable (value is threshold^2, e.g. 6.25
+            // for the DFlashConfig default 2.5).
+            static const float kSvipThreshold = [] {
+                const char* env = std::getenv("NINFER_SVIP_THRESHOLD");
+                return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0F;
+            }();
+            const Tensor* svip_cuts_arg = nullptr;
+            Tensor svip_cuts_storage;
+            if (kSvipThreshold > 0.0F) {
+                auto scope = state.execution.work.scope();
+                svip_cuts_storage = state.execution.work.alloc(DType::I32, {batch_size});
+                ops::mtp_svip_entropy_extents(target_logits, accepted, svip_cuts_storage,
+                                              kSvipThreshold, state.execution.device.stream);
+                svip_cuts_arg = &svip_cuts_storage;
+            }
             ops::mtp_prepare_next_round(verify_ids, anchors, accepted, frontiers, budgets,
                                         licensed_counts, rope_deltas, alignment_ids, next_extents,
                                         ar_positions, ar_rope_positions, ar_valid_columns,
                                         static_cast<std::int32_t>(state.text_cache.max_context()),
-                                        state.execution.device.stream);
+                                        state.execution.device.stream, svip_cuts_arg);
             card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
                                           target_rope, licensed_counts, mtp_rows, envelopes.batch,
                                           alignment_hidden);

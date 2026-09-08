@@ -10,6 +10,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/logit_policy.h"
 #include "ninfer/ops/softmax_attention.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -66,6 +67,101 @@ struct ModelConfig {
     }
 
     [[nodiscard]] static constexpr int gdn_idx(int layer) { return TextConfig::gdn_index(layer); }
+
+    // Generic architecture knobs: detection-idiom defaults keep existing
+    // behavior when an arch TextConfig does not declare them; arch configs
+    // that declare per-layer rope theta / output multiplier / softcap are
+    // honored automatically (auto-adaptation contract).
+    template <class TC>
+    static constexpr float rope_theta_at_impl(int layer) {
+        if constexpr (requires { TC::rope_theta_at(0); }) {
+            return TC::rope_theta_at(layer);
+        } else {
+            return TC::rope_theta;
+        }
+    }
+    template <class TC>
+    static constexpr int layer_of_full_impl(int fidx) {
+        if constexpr (requires { TC::layer_of_full_index(0); }) {
+            return TC::layer_of_full_index(fidx);
+        } else {
+            return fidx * qwen3_6::kHybridAttentionInterval +
+                   (qwen3_6::kHybridAttentionInterval - 1);
+        }
+    }
+    template <class TC>
+    static constexpr float output_multiplier_impl() {
+        if constexpr (requires { TC::output_multiplier(); }) {
+            return TC::output_multiplier();
+        } else {
+            return 1.0f;
+        }
+    }
+    template <class TC>
+    static constexpr float softcap_impl() {
+        if constexpr (requires { TC::final_logit_softcapping; }) {
+            return TC::final_logit_softcapping;
+        } else {
+            return 0.0f;
+        }
+    }
+    [[nodiscard]] static constexpr float rope_theta_at(int layer) {
+        return rope_theta_at_impl<TextConfig>(layer);
+    }
+    [[nodiscard]] static constexpr int layer_of_full(int fidx) {
+        return layer_of_full_impl<TextConfig>(fidx);
+    }
+    [[nodiscard]] static constexpr float output_multiplier() {
+        return output_multiplier_impl<TextConfig>();
+    }
+    [[nodiscard]] static constexpr float final_logit_softcapping() {
+        return softcap_impl<TextConfig>();
+    }
+
+    // Auto-adaptation contract: every lm_head logits production site applies
+    // the architecture's final-logit policy (output_multiplier, then tanh
+    // softcap when final_logit_softcapping > 0). Compile-time no-op for
+    // architectures that declare neither (qwen3 family keeps zero overhead).
+    static void apply_final_logit_policy(Tensor& logits, cudaStream_t stream) {
+        if constexpr (final_logit_softcapping() > 0.0F || output_multiplier() != 1.0F) {
+            ops::logit_policy(logits, output_multiplier(), final_logit_softcapping(), stream);
+        }
+    }
+
+    // Auto-adaptation: double-norm layer graphs (e.g. Muse: the attention
+    // output is normalized again before the residual add, and the MLP output
+    // likewise). Compile-time no-ops for single-norm architectures (qwen3
+    // family keeps the exact previous call sequence).
+    template <class TC>
+    static constexpr bool double_norm_attn_impl() {
+        if constexpr (requires { TC::attn_out_post_norm(); }) {
+            return TC::attn_out_post_norm();
+        }
+        return false;
+    }
+    template <class TC>
+    static constexpr bool double_norm_mlp_impl() {
+        if constexpr (requires { TC::mlp_out_post_norm(); }) {
+            return TC::mlp_out_post_norm();
+        }
+        return false;
+    }
+    template <class TC>
+    static constexpr float post_eps_impl() {
+        if constexpr (requires { TC::post_norm_eps; }) {
+            return TC::post_norm_eps;
+        }
+        return TC::rms_epsilon;
+    }
+    [[nodiscard]] static constexpr bool attn_out_double_norm() {
+        return double_norm_attn_impl<TextConfig>();
+    }
+    [[nodiscard]] static constexpr bool mlp_out_double_norm() {
+        return double_norm_mlp_impl<TextConfig>();
+    }
+    [[nodiscard]] static constexpr float post_norm_epsilon() {
+        return post_eps_impl<TextConfig>();
+    }
 };
 
 inline constexpr ModelConfig kCfg{};
@@ -74,6 +170,10 @@ inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
 struct MlpW {
     const MlpWeights* payload = nullptr;
+    // Double-norm layer graphs: normalization applied to the MLP output
+    // before the residual add (Muse post_feedforward_layernorm). Null for
+    // single-norm architectures (qwen3 family).
+    const Tensor* post_ff_norm = nullptr;
 };
 
 struct FullLayerW {
@@ -83,6 +183,10 @@ struct FullLayerW {
     const Tensor* q_norm                             = nullptr;
     const Tensor* k_norm                             = nullptr;
     const Tensor* post_attn_norm                     = nullptr;
+    // Double-norm layer graphs: normalization applied to the attention
+    // output (o_proj result) before the residual add (Muse
+    // post_attention_layernorm). Null for single-norm architectures.
+    const Tensor* post_attn_out_norm                 = nullptr;
     MlpW mlp;
 };
 
@@ -152,6 +256,10 @@ class VisionPrefillSession;
 
 class TextContext {
 public:
+    void set_graph_segment(std::int32_t segment, std::int32_t segments) noexcept {
+        active_graph_segment_  = segment;
+        active_graph_segments_ = segments;
+    }
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
@@ -310,6 +418,13 @@ private:
     const ops::GqaExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;
     std::int32_t active_sequence_width_                                            = 0;
+    // Optional layer window for segmented graph capture. last < first disables.
+    std::int32_t active_layer_first_                                               = 0;
+    std::int32_t active_layer_last_                                                = -1;
+    // Segmented decode state: when active_graph_segments_ > 1 each
+    // ordinary_decode_batch call executes only its slice of the forward pass.
+    std::int32_t active_graph_segment_                                             = 0;
+    std::int32_t active_graph_segments_                                            = 1;
     std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;

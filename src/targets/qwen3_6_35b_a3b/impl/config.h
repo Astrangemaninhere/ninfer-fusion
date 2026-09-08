@@ -72,7 +72,9 @@ struct DFlashConfig {
     static constexpr bool supported        = true;
     static constexpr bool bf16_weights     = false;
     static constexpr int layers            = 6;
+    static constexpr bool full_only        = false;
     static constexpr int local_layers      = 5;
+    static constexpr int full_layers       = full_only ? layers : layers - local_layers;
     static constexpr int feature_layers    = 8;
     static constexpr int feature_rows      = feature_layers * TextConfig::hidden;
     static constexpr int hidden            = TextConfig::hidden;
@@ -83,10 +85,12 @@ struct DFlashConfig {
     static constexpr int query_size        = query_heads * head_dim;
     static constexpr int kv_size           = kv_heads * head_dim;
     static constexpr int local_capacity    = 4096;
+    static constexpr std::uint32_t local_window = 4096;
     static constexpr int mask_token        = 248077;
     static constexpr float rms_epsilon     = 1.0e-6F;
     static constexpr float rope_theta      = 1.0e7F;
     static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr float svip_entropy_threshold = 2.5F;
     static constexpr std::array<int, feature_layers> target_feature_layers{1,  6,  11, 16,
                                                                            22, 27, 32, 37};
 };

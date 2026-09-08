@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/dtype.h"
@@ -326,6 +327,7 @@ void propose_batch_impl(DFlash2BatchContext& state, qwen3_6::DFlashDecodeState& 
         DType::BF16, {TextConfig::output_rows, static_cast<std::int32_t>(k) * batch_size});
     ops::linear(proposal_hidden, state.execution.model.output_head, logits,
                 state.execution.device.stream);
+    kCfg.apply_final_logit_policy(logits, state.execution.device.stream);
     Tensor projected = state.execution.work.alloc(
         DType::BF16, {Config::selector_rank, static_cast<std::int32_t>(k) * batch_size});
     ops::linear(proposal_hidden, dflash2.selector_hidden_projection, projected,

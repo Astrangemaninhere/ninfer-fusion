@@ -23,6 +23,12 @@ struct FullAttentionWeights {
     Tensor key_norm;
     Weight output;
     Tensor post_attention_norm;
+    // Double-norm layer graphs (Muse): normalization applied to the attention
+    // output before the residual add (post_attention_layernorm) and to the
+    // MLP output (post_feedforward_layernorm). Empty for single-norm
+    // architectures (qwen3 family) and never dereferenced there.
+    Tensor post_attn_out_norm;
+    Tensor post_mlp_out_norm;
     PostMixerPayload post_mixer;
 };
 
@@ -76,6 +82,8 @@ struct DFlashWeights {
     Tensor context_norm;
     std::array<DFlashLayerWeights, Layers> layers;
     Tensor final_norm;
+    std::optional<Weight> markov_w1;
+    std::optional<Weight> markov_w2;
 };
 
 struct DFlash2LayerWeights {

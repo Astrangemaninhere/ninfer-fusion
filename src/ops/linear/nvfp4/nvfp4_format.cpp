@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <cstdio>
 #include <string>
 
 namespace ninfer::ops::detail {
@@ -60,6 +61,18 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
         !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F ||
         !std::isfinite(weight.input_scale_divisor) || weight.input_scale_divisor <= 0.0F ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
+        std::fprintf(stderr,
+                     "[nvfp4] invalid weight n=%d k=%d qtype=%d layout=%d scale_dt=%d gs=%d g=%d "
+                     "ndim=%d sh=(%d,%d) pad=(%d,%d) payload=%d req=%llu wsdiv=%g isdiv=%g "
+                     "algn=%d/%d qhigh=%d hpb=%d\n",
+                     weight.n, weight.k, static_cast<int>(weight.qtype),
+                     static_cast<int>(weight.layout), static_cast<int>(weight.scale_dtype),
+                     weight.group_size, weight.group, weight.ndim, weight.shape[0], weight.shape[1],
+                     weight.padded_shape[0], weight.padded_shape[1], weight.payload != nullptr,
+                     static_cast<unsigned long long>(geometry.required_payload_bytes),
+                     weight.weight_scale_divisor, weight.input_scale_divisor,
+                     aligned_to(weight.qdata, 16), aligned_to(weight.scales, 16),
+                     weight.qhigh != nullptr, weight.high_plane_bytes);
         throw std::invalid_argument(std::string(operation) + ": invalid NVFP4 weight");
     }
 

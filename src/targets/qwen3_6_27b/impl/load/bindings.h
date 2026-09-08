@@ -105,6 +105,27 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
+struct DFlashLayerPlan {
+    artifact::ObjectHandle input_norm;
+    WeightPlan query_key_value;
+    WeightPlan context_key;
+    WeightPlan context_value;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    WeightPlan attention_output;
+    artifact::ObjectHandle post_attention_norm;
+    MlpPlan mlp;
+};
+
+struct DFlashPlan {
+    WeightPlan feature_projection;
+    artifact::ObjectHandle context_norm;
+    std::array<DFlashLayerPlan, DFlashConfig::layers> layers;
+    artifact::ObjectHandle final_norm;
+    WeightPlan markov_w1;
+    WeightPlan markov_w2;
+};
+
 struct DFlash2LayerPlan {
     artifact::ObjectHandle input_norm;
     WeightPlan query_key_value;
@@ -142,6 +163,7 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
+    DFlashPlan dflash;
     DFlash2Plan dflash2;
 
     qwen3_6::VisionBackbonePlan vision_backbone;
@@ -217,18 +239,21 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<DFlashConfig::layers>,
                        qwen3_6::DFlash2Weights<DFlash2Config::layers>, kFullAttentionLayers,
                        kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
+using DFlashWeights        = RuntimeModelView::DFlash;
+using DFlashLayerWeights   = qwen3_6::DFlashLayerWeights;
 using DFlash2Weights       = RuntimeModelView::DFlash2;
 using DFlash2LayerWeights  = qwen3_6::DFlash2LayerWeights;
 
 class LoadedModelData {
 public:
-    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    LoadedModelData(WeightsProfile weights_profile, BindingPlan plan,
+                    artifact::MaterializedArtifact materialized);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
@@ -244,7 +269,8 @@ class LoadedModel::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
          artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+        : weights_profile(weights_profile_in),
+          data(weights_profile_in, std::move(plan), std::move(materialized)) {}
 
     WeightsProfile weights_profile;
     LoadedModelData data;

@@ -3,6 +3,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include <cstdio>
 
 namespace ninfer {
 namespace {
@@ -62,6 +63,10 @@ Tensor::Tensor(void* data_in, DType dtype_in, std::initializer_list<std::int32_t
     : data(data_in), dtype(dtype_in) {
     const auto normalized = normalize_shape(shape);
     for (int i = 0; i < 4; ++i) { ne[i] = normalized[i]; }
+    if (static_cast<int>(dtype) > 10) {
+        std::fprintf(stderr, "[tensor] ctor unmapped dtype=%d shape=%d,%d,%d,%d\n",
+                     static_cast<int>(dtype), ne[0], ne[1], ne[2], ne[3]);
+    }
     set_contiguous_strides(*this);
 }
 

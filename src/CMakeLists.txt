@@ -66,7 +66,11 @@ target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cu
 add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
+  ops/launcher/suffix_lookup.cu
+  ops/launcher/vocab_topk16.cu
+  ops/split_attention.cu
   ops/launcher/bidirectional_gqa_attention.cu
+  ops/launcher/dspark_markov_argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/dflash2_grouped_conv.cu
@@ -99,6 +103,7 @@ add_library(ninfer_ops STATIC
   ops/kernel/gqa_isoquant_row_scale.cu
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
+  ops/launcher/logit_policy.cu
   ops/launcher/silu_and_mul.cu
   ops/launcher/target_logprobs.cu
   ops/launcher/vision_pos_embed.cu
@@ -253,7 +258,9 @@ add_library(ninfer_ops STATIC
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
+  ops/wrapper/suffix_lookup.cpp
   ops/wrapper/bidirectional_gqa_attention.cpp
+  ops/wrapper/dspark_markov_argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/dflash2_grouped_conv.cpp
@@ -287,6 +294,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/scalar.cpp
   ops/wrapper/scatter.cpp
   ops/wrapper/sigmoid_mul.cpp
+  ops/wrapper/logit_policy.cpp
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/target_logprobs.cpp
@@ -340,6 +348,7 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_6_35b_a3b)
+add_subdirectory(targets/muse_glimmer_30b)
 
 target_link_libraries(ninfer_engine
   PRIVATE

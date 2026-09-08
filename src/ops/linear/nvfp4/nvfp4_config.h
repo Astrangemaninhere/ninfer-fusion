@@ -111,6 +111,11 @@ using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
 
+// Muse-Glimmer-30B geometries (hidden 6656 MLP + NVFP4 output head).
+using Nvfp4MuseMlpGateUpGeometry = Nvfp4GemvGeometry<19968, 6656>;
+using Nvfp4MuseMlpDownGeometry   = Nvfp4GemvGeometry<6656, 19968>;
+using Nvfp4MuseVocabularyGeometry = Nvfp4GemvGeometry<202112, 6656>;
+
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
@@ -121,6 +126,9 @@ enum class Nvfp4Problem : std::uint8_t {
     MlpGateUp,
     Residual6144,
     Residual17408,
+    MuseMlpGateUp,
+    MuseMlpDown,
+    MuseVocabulary,
 };
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -133,7 +141,13 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
             input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
            (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows);
+            input_rows == Nvfp4Residual17408Geometry::kInputRows) ||
+           (output_rows == Nvfp4MuseMlpGateUpGeometry::kOutputRows &&
+            input_rows == Nvfp4MuseMlpGateUpGeometry::kInputRows) ||
+           (output_rows == Nvfp4MuseMlpDownGeometry::kOutputRows &&
+            input_rows == Nvfp4MuseMlpDownGeometry::kInputRows) ||
+           (output_rows == Nvfp4MuseVocabularyGeometry::kOutputRows &&
+            input_rows == Nvfp4MuseVocabularyGeometry::kInputRows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -156,6 +170,18 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
     if (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
         input_rows == Nvfp4Residual17408Geometry::kInputRows) {
         return Nvfp4Problem::Residual17408;
+    }
+    if (output_rows == Nvfp4MuseMlpGateUpGeometry::kOutputRows &&
+        input_rows == Nvfp4MuseMlpGateUpGeometry::kInputRows) {
+        return Nvfp4Problem::MuseMlpGateUp;
+    }
+    if (output_rows == Nvfp4MuseMlpDownGeometry::kOutputRows &&
+        input_rows == Nvfp4MuseMlpDownGeometry::kInputRows) {
+        return Nvfp4Problem::MuseMlpDown;
+    }
+    if (output_rows == Nvfp4MuseVocabularyGeometry::kOutputRows &&
+        input_rows == Nvfp4MuseVocabularyGeometry::kInputRows) {
+        return Nvfp4Problem::MuseVocabulary;
     }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }

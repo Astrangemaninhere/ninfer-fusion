@@ -253,6 +253,8 @@ struct DFlashAttentionRoots {
     Tensor key;
     Tensor attention;
     Tensor attention_delta;
+    Tensor padded_query;
+    Tensor padded_attention;
 };
 
 template <class Config, class Allocator>
@@ -260,6 +262,15 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
     Tensor attention_delta;
     if constexpr (Config::bf16_weights) {
         attention_delta = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    }
+    Tensor padded_query;
+    Tensor padded_attention;
+    if constexpr (Config::query_heads == 40 && Config::kv_heads == 8) {
+        // bidirectional_gqa_attention executes a 32/8 GQA geometry. The DSpark
+        // draft's extra 8 query heads (group 5 of KV head 0) run as a second
+        // 32-head invocation with 24 zero-padded heads.
+        padded_query     = matrix(allocator, DType::BF16, 32 * Config::head_dim, tokens);
+        padded_attention = matrix(allocator, DType::BF16, 32 * Config::head_dim, tokens);
     }
     return {
         matrix(allocator, DType::BF16, Config::hidden, tokens),
@@ -270,6 +281,8 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
         attention_delta,
+        padded_query,
+        padded_attention,
     };
 }
 

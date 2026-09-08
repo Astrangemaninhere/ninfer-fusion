@@ -129,6 +129,14 @@ using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
 using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
 using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
 
+// Muse-Glimmer-30B geometries (muse_glimmer family; separate 32-head query /
+// 2-head key-value projections at 128-dim heads, hidden 6656).
+using Fp8MuseQueryGeometry     = Fp8Geometry<4096, 6656>;
+using Fp8MuseKeyValueGeometry  = Fp8Geometry<256, 6656>;
+using Fp8MuseAttentionOutGeometry = Fp8Geometry<6656, 4096>;
+using Fp8MuseMlpGateUpGeometry = Fp8Geometry<19968, 6656>;
+using Fp8MuseMlpDownGeometry   = Fp8Geometry<6656, 19968>;
+
 inline constexpr std::int32_t kFp8VocabularyFirstA16SmallTMmaT = 1;
 inline constexpr std::int32_t kFp8VocabularyLastA16SmallTMmaT  = 48;
 inline constexpr std::int32_t kFp8VocabularyFirstA16GemmT      = 42;
@@ -156,6 +164,11 @@ enum class Fp8Problem : std::uint8_t {
     Vocabulary,
     Residual6144,
     Residual17408,
+    MuseQuery,
+    MuseKeyValue,
+    MuseAttentionOut,
+    MuseMlpGateUp,
+    MuseMlpDown,
 };
 
 inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -170,7 +183,17 @@ inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32
            (output_rows == Fp8Residual6144Geometry::kOutputRows &&
             input_rows == Fp8Residual6144Geometry::kInputRows) ||
            (output_rows == Fp8Residual17408Geometry::kOutputRows &&
-            input_rows == Fp8Residual17408Geometry::kInputRows);
+            input_rows == Fp8Residual17408Geometry::kInputRows) ||
+           (output_rows == Fp8MuseQueryGeometry::kOutputRows &&
+            input_rows == Fp8MuseQueryGeometry::kInputRows) ||
+           (output_rows == Fp8MuseKeyValueGeometry::kOutputRows &&
+            input_rows == Fp8MuseKeyValueGeometry::kInputRows) ||
+           (output_rows == Fp8MuseAttentionOutGeometry::kOutputRows &&
+            input_rows == Fp8MuseAttentionOutGeometry::kInputRows) ||
+           (output_rows == Fp8MuseMlpGateUpGeometry::kOutputRows &&
+            input_rows == Fp8MuseMlpGateUpGeometry::kInputRows) ||
+           (output_rows == Fp8MuseMlpDownGeometry::kOutputRows &&
+            input_rows == Fp8MuseMlpDownGeometry::kInputRows);
 }
 
 inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -197,6 +220,26 @@ inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t inp
     if (output_rows == Fp8Residual17408Geometry::kOutputRows &&
         input_rows == Fp8Residual17408Geometry::kInputRows) {
         return Fp8Problem::Residual17408;
+    }
+    if (output_rows == Fp8MuseQueryGeometry::kOutputRows &&
+        input_rows == Fp8MuseQueryGeometry::kInputRows) {
+        return Fp8Problem::MuseQuery;
+    }
+    if (output_rows == Fp8MuseKeyValueGeometry::kOutputRows &&
+        input_rows == Fp8MuseKeyValueGeometry::kInputRows) {
+        return Fp8Problem::MuseKeyValue;
+    }
+    if (output_rows == Fp8MuseAttentionOutGeometry::kOutputRows &&
+        input_rows == Fp8MuseAttentionOutGeometry::kInputRows) {
+        return Fp8Problem::MuseAttentionOut;
+    }
+    if (output_rows == Fp8MuseMlpGateUpGeometry::kOutputRows &&
+        input_rows == Fp8MuseMlpGateUpGeometry::kInputRows) {
+        return Fp8Problem::MuseMlpGateUp;
+    }
+    if (output_rows == Fp8MuseMlpDownGeometry::kOutputRows &&
+        input_rows == Fp8MuseMlpDownGeometry::kInputRows) {
+        return Fp8Problem::MuseMlpDown;
     }
     throw std::invalid_argument("unsupported FP8 problem");
 }
@@ -231,6 +274,33 @@ struct Fp8LinearDecodeProductionSchedule<Fp8Residual17408Geometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
 };
 
+// Muse geometries: schedule inherited from the measured AttnInput winner until
+// Muse-specific measurement replaces it (correctness identical).
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8MuseQueryGeometry> {
+    using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8MuseKeyValueGeometry> {
+    using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8MuseAttentionOutGeometry> {
+    using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8MuseMlpGateUpGeometry> {
+    using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8MuseMlpDownGeometry> {
+    using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+};
+
 inline constexpr std::int32_t kFp8FirstSmallT = 2;
 inline constexpr std::int32_t kFp8LastSmallT  = 24;
 
@@ -252,6 +322,21 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual6144Geometry> = kFp
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual17408Geometry> = kFp8LastSmallT;
 
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MuseQueryGeometry> = 11;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MuseKeyValueGeometry> = 11;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MuseAttentionOutGeometry> = 11;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MuseMlpGateUpGeometry> = 11;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MuseMlpDownGeometry> = 11;
+
 inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     switch (problem) {
     case Fp8Problem::AttnInput:
@@ -266,6 +351,16 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
         return kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
     case Fp8Problem::Residual17408:
         return kFp8LinearSmallTMax<Fp8Residual17408Geometry>;
+    case Fp8Problem::MuseQuery:
+        return kFp8LinearSmallTMax<Fp8MuseQueryGeometry>;
+    case Fp8Problem::MuseKeyValue:
+        return kFp8LinearSmallTMax<Fp8MuseKeyValueGeometry>;
+    case Fp8Problem::MuseAttentionOut:
+        return kFp8LinearSmallTMax<Fp8MuseAttentionOutGeometry>;
+    case Fp8Problem::MuseMlpGateUp:
+        return kFp8LinearSmallTMax<Fp8MuseMlpGateUpGeometry>;
+    case Fp8Problem::MuseMlpDown:
+        return kFp8LinearSmallTMax<Fp8MuseMlpDownGeometry>;
     }
     throw std::logic_error("FP8 vocabulary uses its A16 MMA route");
 }

@@ -1,16 +1,29 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
+# Multi-GPU build matrix (sm_75 .. sm_121, see tools/archkit/_GPU_MATRIX.md).
+# Defaults to the native Blackwell target. A semicolon list is accepted; each
+# entry must be a CUDA arch >= 75 with an optional 'a' suffix. Note: the
+# nvfp4 TMA kernels are sm_100a/120a-only (guarded at compile time); building
+# a list that includes older archs is only meaningful for the groupwise-int
+# profile until those guards land.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
-  message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
-endif()
+foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX MATCH "^([0-9]+)([0-9])a?$" _arch_match "${_arch}")
+  if(NOT _arch_match)
+    message(FATAL_ERROR
+      "NInfer: bad CUDA arch '${_arch}' (expected e.g. 75, 86, 89, 120a)")
+  endif()
+  string(REGEX REPLACE "^([0-9]+)([0-9])a?$" "\\1\\2" _arch_num "${_arch}")
+  if(_arch_num LESS 75)
+    message(FATAL_ERROR
+      "NInfer: arch ${_arch} is below the CUDA-13 toolchain floor (sm_75)")
+  endif()
+endforeach()
+unset(_arch)
+unset(_arch_match)
+unset(_arch_num)
 
 project(ninfer LANGUAGES C CXX CUDA)
 

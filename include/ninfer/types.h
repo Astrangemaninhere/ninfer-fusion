@@ -137,7 +137,7 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t prefill_chunk        = 3072;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // Per-layer KV storage override, indexed by full-attention layer order.
     // BFloat16 entries inherit kv_cache. Any non-BFloat16 entry replaces the

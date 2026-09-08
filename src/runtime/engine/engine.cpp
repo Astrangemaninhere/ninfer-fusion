@@ -25,7 +25,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::CausalScoring:
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
-        options.prefill_chunk        = 1024;
+        options.prefill_chunk        = 3072;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
@@ -208,10 +208,13 @@ class Engine::Impl {
 public:
     using Core27      = runtime::EngineCore<targets::Qwen3_6_27BInstance>;
     using Core35      = runtime::EngineCore<targets::Qwen3_6_35BA3BInstance>;
+    using CoreMuse    = runtime::EngineCore<targets::MuseGlimmer30BInstance>;
     using ScoreCore27 = runtime::CausalScoreCore<targets::Qwen3_6_27BInstance>;
     using ScoreCore35 = runtime::CausalScoreCore<targets::Qwen3_6_35BA3BInstance>;
+    using ScoreCoreMuse = runtime::CausalScoreCore<targets::MuseGlimmer30BInstance>;
     using Core = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>,
-                              std::unique_ptr<ScoreCore27>, std::unique_ptr<ScoreCore35>>;
+                              std::unique_ptr<CoreMuse>, std::unique_ptr<ScoreCore27>,
+                              std::unique_ptr<ScoreCore35>, std::unique_ptr<ScoreCoreMuse>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
@@ -231,12 +234,19 @@ public:
                     }
                     return std::make_unique<Core27>(*target_ptr, device, options,
                                                                  std::move(constructed.context_cost));
-                } else {
+                } else if constexpr (std::is_same_v<Instance,
+                                                    targets::Qwen3_6_35BA3BInstance>) {
                     if (options.purpose == EnginePurpose::CausalScoring) {
                         return std::make_unique<ScoreCore35>(*target_ptr, device);
                     }
                     return std::make_unique<Core35>(*target_ptr, device, options,
-                                                                 std::move(constructed.context_cost));
+                                                    std::move(constructed.context_cost));
+                } else {
+                    if (options.purpose == EnginePurpose::CausalScoring) {
+                        return std::make_unique<ScoreCoreMuse>(*target_ptr, device);
+                    }
+                    return std::make_unique<CoreMuse>(*target_ptr, device, options,
+                                                      std::move(constructed.context_cost));
                 }
             },
             active);

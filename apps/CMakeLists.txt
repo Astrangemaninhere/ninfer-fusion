@@ -17,6 +17,9 @@ target_include_directories(ninfer-serve PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_load_progress)
+if(UNIX)
+  target_link_options(ninfer-serve PRIVATE -rdynamic)
+endif()
 
 add_executable(ninfer-perplexity
   perplexity/main.cpp

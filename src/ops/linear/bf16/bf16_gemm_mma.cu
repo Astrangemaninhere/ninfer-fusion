@@ -61,6 +61,22 @@ void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
         launch_geometry<Bf16GemvGeometry<5120, 25600>>(x, weight, out, stream);
         return;
     }
+    if (weight.n == 7168 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<7168, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<5120, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 20480 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<20480, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 10240) {
+        launch_geometry<Bf16GemvGeometry<5120, 10240>>(x, weight, out, stream);
+        return;
+    }
     if (weight.n == 6144 && weight.k == 5120) {
         launch_geometry<Bf16GemvGeometry<6144, 5120>>(x, weight, out, stream);
         return;

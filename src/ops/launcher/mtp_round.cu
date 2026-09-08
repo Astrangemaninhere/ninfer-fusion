@@ -9,13 +9,28 @@
 
 namespace ninfer::ops::detail {
 
+void mtp_svip_entropy_extents_launch(const Tensor& logits, const Tensor& accepted,
+                                       Tensor& cuts, float threshold, cudaStream_t stream) {
+    const int vocab = logits.ne[0];
+    const int cols  = logits.ne[1];
+    const int batch = logits.ne[2];
+    constexpr int kBlock = 256;
+    const dim3 grid(static_cast<unsigned int>(batch));
+    mtp_svip_entropy_extents_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data),
+        static_cast<const std::int32_t*>(accepted.data),
+        static_cast<std::int32_t*>(cuts.data), vocab, cols, batch, threshold);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
                                    const Tensor& remaining_budgets, const Tensor& licensed_counts,
                                    const Tensor& rope_deltas, Tensor& alignment_ids,
                                    Tensor& next_extents, Tensor& ar_positions,
                                    Tensor& ar_rope_positions, Tensor& ar_valid_columns,
-                                   std::int32_t max_context, cudaStream_t stream) {
+                                   std::int32_t max_context, cudaStream_t stream,
+                                   const Tensor* svip_cuts) {
     constexpr int kBlock = 32;
     const int k          = verify_ids.ne[0] - 1;
     const int batch      = verify_ids.ne[1];
@@ -35,7 +50,8 @@ void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_
         static_cast<std::int32_t*>(next_extents.data),
         static_cast<std::int32_t*>(ar_positions.data),
         static_cast<std::int32_t*>(ar_rope_positions.data),
-        static_cast<std::int32_t*>(ar_valid_columns.data), k, ar_step_stride, max_context);
+        static_cast<std::int32_t*>(ar_valid_columns.data), k, ar_step_stride, max_context,
+        svip_cuts != nullptr ? static_cast<const std::int32_t*>(svip_cuts->data) : nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -599,6 +599,19 @@ schedule::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32
     return out;
 }
 
+// DSpark SVIP entropy threshold in sqrt-entropy units (the dspark_markov_argmax
+// op compares sqrt(H) > threshold). Absent env -> DFlashConfig default (2.5);
+// NINFER_DFLASH_SVIP_THRESHOLD=0 disables the cap (never triggers).
+float resolved_dspark_svip_threshold() {
+    static const float kThreshold = [] {
+        const char* env = std::getenv("NINFER_DFLASH_SVIP_THRESHOLD");
+        if (env == nullptr || *env == '\0') { return DFlashConfig::svip_entropy_threshold; }
+        const float value = static_cast<float>(std::atof(env));
+        return value > 0.0F ? value : 64.0F;
+    }();
+    return kThreshold;
+}
+
 schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
                                            std::uint32_t k) {
     (void)min_frontier;
@@ -11101,6 +11114,7 @@ void ProgramImplCore::prepare_graphs() {
                                                   *dflash_host_ingress,
                                                   *dflash_host_egress,
                                                   state_images->continuation_hidden_store()};
+        dflash_state.svip_entropy_threshold = resolved_dspark_svip_threshold();
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -11436,7 +11450,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) const {
     for (const TokenId token : tokens) {
         if (token < 0 || token >= TextConfig::token_domain) {
-            throw std::runtime_error("target returned a token outside the 248077-token domain");
+            throw std::runtime_error("target returned a token outside the registered token domain");
         }
     }
 }
@@ -12175,6 +12189,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     *dflash_host_ingress,
                                                     *dflash_host_egress,
                                                     state_images->continuation_hidden_store()};
+        schedule_state.svip_entropy_threshold = resolved_dspark_svip_threshold();
 
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -12196,10 +12211,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t base_S    = sequence.ledger_frontier;
             const std::int32_t count_i    = dflash_host_egress->licensed_counts[row];
             const std::int32_t accepted_i = dflash_host_egress->accepted_drafts[row];
-            const std::uint32_t extent =
+            const std::uint32_t requested_extent =
                 static_cast<std::uint32_t>(dflash_host_ingress->proposal_extents[row]);
+            const std::uint32_t extent =
+                static_cast<std::uint32_t>(dflash_host_egress->proposal_extents[row]);
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || accepted_i > static_cast<std::int32_t>(extent) ||
+                extent > width || extent > requested_extent ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
                 static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
                     capacity) {

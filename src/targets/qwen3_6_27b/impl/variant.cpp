@@ -199,9 +199,20 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     return graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
-                                                                  std::uint32_t) {
-    return {};
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+                                                                   std::uint32_t draft_window,
+                                                                   std::uint32_t batch_size) {
+    std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
+    for (GraphExecutionProfile& profile : profiles) {
+        const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
+        const bool chunked_target =
+            dflash_target_uses_chunked_small_t(draft_window, batch_size, target_max);
+        // DSpark has no local SWA layer, so there is no split-SWA bit; the
+        // chunked-target bit remains topology class 2 for multi-token verify.
+        profile.topology_class = chunked_target ? 2U : 0U;
+    }
+    return profiles;
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash2_graph_profiles(std::uint32_t capacity,
@@ -365,6 +376,15 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                     stream);
 }
 
+void Variant::post_mixer_double_norm(const Tensor&, const PostMixerWeights&, const Tensor&,
+                                     Tensor&, qwen3_6::TextPhase, WorkspaceArena&,
+                                     cudaStream_t) {
+    // Single-norm architecture: the compile-time branch never selects this
+    // leaf (double-norm layer graphs only). Kept as a declared interface so
+    // the shared runtime compiles for every variant.
+    throw std::logic_error("post_mixer_double_norm is not enabled for this target");
+}
+
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
@@ -413,6 +433,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, kFp8TextPolicy, first, last);
@@ -434,6 +455,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
                                                         TextConfig::query_size, kNvfp4TextPolicy,
                                                         first, last);
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::query_size,
@@ -455,6 +477,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
@@ -479,6 +502,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -505,6 +529,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -529,6 +554,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::value_dim,
@@ -556,6 +582,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
                                           last);
     case WeightsProfile::Qwen38Nvfp4: {
+    case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
         const std::size_t nvfp4 =
             post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);

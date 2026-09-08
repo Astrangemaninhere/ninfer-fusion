@@ -155,8 +155,14 @@ void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Work
     case Fp8Problem::Residual17408:
         launch_problem<Fp8Residual17408Geometry>(weight, out, workspace, tokens, stream);
         return;
+    case Fp8Problem::MuseQuery:
+    case Fp8Problem::MuseKeyValue:
+    case Fp8Problem::MuseAttentionOut:
+    case Fp8Problem::MuseMlpGateUp:
+    case Fp8Problem::MuseMlpDown:
+        break;
     }
-    throw std::logic_error("FP8 vocabulary has no A8 route");
+    throw std::logic_error("FP8 vocabulary and Muse geometries have no A8 route");
 }
 
 } // namespace ninfer::ops::detail

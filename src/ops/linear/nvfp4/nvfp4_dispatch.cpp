@@ -37,6 +37,12 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
         return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::MuseMlpGateUp:
+    case Nvfp4Problem::MuseMlpDown:
+    case Nvfp4Problem::MuseVocabulary:
+        // Muse geometries keep the A16 (w4a16) route for every token count;
+        // W4A4 schedules await Muse-specific measurement.
+        return Nvfp4LinearRoute::A16;
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }

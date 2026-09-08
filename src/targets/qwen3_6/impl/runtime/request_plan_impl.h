@@ -225,7 +225,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     }
     for (const TokenId id : prompt.token_ids) {
         if (id < 0 || id >= TextConfig::token_domain) {
-            throw std::invalid_argument("prompt contains token outside the 248077-token domain");
+            throw std::invalid_argument("prompt contains token outside the registered token domain");
         }
     }
     if (prompt.token_types.size() != prompt.token_ids.size() ||

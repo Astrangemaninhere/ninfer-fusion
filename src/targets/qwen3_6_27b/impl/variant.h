@@ -41,6 +41,10 @@ struct Variant {
     static constexpr bool supports_dflash2                     = DFlash2Config::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
+    [[nodiscard]] static constexpr bool dspark_weights(WeightsProfile profile) {
+        return profile == WeightsProfile::Qwen38Nvfp4Dspark;
+    }
+
     [[nodiscard]] static constexpr bool dflash2_weights(WeightsProfile profile) {
         return profile == WeightsProfile::Qwen38Nvfp4DFlash2;
     }
@@ -88,6 +92,14 @@ struct Variant {
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
+    // Double-norm layer graphs (Muse): swiglu MLP, then normalize
+    // the MLP output before the residual add.
+    static void post_mixer_double_norm(const Tensor& hidden,
+                                       const PostMixerWeights& weights,
+                                       const Tensor& post_ff_norm, Tensor& residual,
+                                       qwen3_6::TextPhase phase,
+                                       WorkspaceArena& workspace,
+                                       cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t

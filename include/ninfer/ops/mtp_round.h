@@ -36,6 +36,19 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
                             const Tensor& rope_deltas, Tensor& alignment_ids, Tensor& next_extents,
                             Tensor& ar_positions, Tensor& ar_rope_positions,
                             Tensor& ar_valid_columns, std::int32_t max_context,
-                            cudaStream_t stream);
+                            cudaStream_t stream, const Tensor* svip_cuts = nullptr);
+
+/**
+ * Op: mtp_svip_entropy_extents
+ *
+ * SVIP self-verification cap. logits are the BF16 target verify logits shaped
+ * [vocab, cols, batch]; accepted is I32 [batch]. For each row the kernel finds
+ * the first verify column c > accepted[row] whose softmax entropy (nats)
+ * exceeds `threshold` and atomically writes cuts[row] = c - accepted[row] - 1
+ * (initialized by the caller to the maximum draft count). Passing the result as
+ * svip_cuts to mtp_prepare_next_round caps the next round's draft extent.
+ */
+void mtp_svip_entropy_extents(const Tensor& logits, const Tensor& accepted, Tensor& cuts,
+                              float threshold, cudaStream_t stream);
 
 } // namespace ninfer::ops

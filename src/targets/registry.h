@@ -4,6 +4,7 @@
 #include "runtime/engine/context_cost.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
+#include <ninfer/targets/muse_glimmer_30b/package.h>
 
 #include <memory>
 #include <variant>
@@ -16,6 +17,7 @@ namespace targets {
 
 using Qwen3_6_27B    = qwen3_6_27b::Package;
 using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
+using MuseGlimmer30B = muse_glimmer_30b::Package;
 
 struct LoadedQwen3_6_27B {
     std::unique_ptr<Qwen3_6_27B::LoadedModel> model;
@@ -75,8 +77,39 @@ struct Qwen3_6_35BA3BInstance {
     Qwen3_6_35BA3BInstance& operator=(const Qwen3_6_35BA3BInstance&) = delete;
 };
 
-using ActiveTarget =
-    std::variant<std::unique_ptr<Qwen3_6_27BInstance>, std::unique_ptr<Qwen3_6_35BA3BInstance>>;
+
+struct LoadedMuseGlimmer30B {
+    std::unique_ptr<MuseGlimmer30B::LoadedModel> model;
+    MuseGlimmer30B::Frontend frontend;
+
+    LoadedMuseGlimmer30B(std::unique_ptr<MuseGlimmer30B::LoadedModel> stable_model,
+                         const EngineOptions& options);
+    ~LoadedMuseGlimmer30B();
+
+    LoadedMuseGlimmer30B(const LoadedMuseGlimmer30B&)            = delete;
+    LoadedMuseGlimmer30B& operator=(const LoadedMuseGlimmer30B&) = delete;
+};
+
+struct MuseGlimmer30BInstance {
+    using Package = MuseGlimmer30B;
+
+    std::unique_ptr<LoadedMuseGlimmer30B> loaded;
+    runtime::KvCapacityResolution kv_capacity_resolution;
+    const std::uint32_t capacity;
+    std::unique_ptr<MuseGlimmer30B::Program> program;
+
+    MuseGlimmer30BInstance(std::unique_ptr<LoadedMuseGlimmer30B> stable_loaded,
+                           runtime::KvCapacityResolution resolution,
+                           MuseGlimmer30B::SequencePlan sequence_plan, DeviceContext& device);
+    ~MuseGlimmer30BInstance();
+
+    MuseGlimmer30BInstance(const MuseGlimmer30BInstance&)            = delete;
+    MuseGlimmer30BInstance& operator=(const MuseGlimmer30BInstance&) = delete;
+};
+
+using ActiveTarget = std::variant<std::unique_ptr<Qwen3_6_27BInstance>,
+                                              std::unique_ptr<Qwen3_6_35BA3BInstance>,
+                                              std::unique_ptr<MuseGlimmer30BInstance>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

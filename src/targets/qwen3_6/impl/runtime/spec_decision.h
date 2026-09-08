@@ -37,8 +37,8 @@ inline constexpr std::uint32_t kSpecDemoteTokens = 20480;
 // zh-wiki prompt, DFlash2 d7 acceptance 21-28% even on full-precision
 // (all:bf16) KV, while MTP3 holds 43-56%; a length-only policy keeps
 // drafting into the collapse because 12K < kSpecDemoteTokens. The floor
-// must stay far below the measured DFlash2 band (21-28%): the earlier
-// 0.25 threshold misjudged that level as a collapse and force-densed
+// must stay far below the healthy DFlash2 band (22-28%): the earlier
+// 0.25 threshold misjudged that normal level as a collapse and force-densed
 // the request after ~19 rounds (drafted >= 128), cutting decode from ~53 to
 // ~24 tok/s @4K (218 fallback steps vs 0). Drafting is the correct default;
 // the frontier demotion at kSpecDemoteTokens still bounds runaway contexts.

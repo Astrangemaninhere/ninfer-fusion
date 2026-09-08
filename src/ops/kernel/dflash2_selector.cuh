@@ -23,6 +23,34 @@ __device__ __forceinline__ int dflash2_selector_score_offset(int b, int batch, i
     return b + batch * (s + steps * (p + top_k * c));
 }
 
+__device__ __forceinline__ void dflash2_selector_merge16(
+    const float* __restrict__ a, const std::int32_t* __restrict__ ai, int na,
+    const float* __restrict__ b, const std::int32_t* __restrict__ bi, int nb,
+    float* __restrict__ out, std::int32_t* __restrict__ outi, int k) {
+    // Merge two descending (value, -id) lists, keeping the top k entries.
+    int ia = 0;
+    int ib = 0;
+    for (int slot = 0; slot < k; ++slot) {
+        bool take_a;
+        if (ia >= na) {
+            take_a = false;
+        } else if (ib >= nb) {
+            take_a = true;
+        } else {
+            take_a = a[ia] > b[ib] || (a[ia] == b[ib] && ai[ia] < bi[ib]);
+        }
+        if (take_a) {
+            out[slot]  = a[ia];
+            outi[slot] = ai[ia];
+            ++ia;
+        } else {
+            out[slot]  = b[ib];
+            outi[slot] = bi[ib];
+            ++ib;
+        }
+    }
+}
+
 template <int Block, int K>
 __launch_bounds__(Block) __global__ void dflash2_selector_topk_kernel(
     const __nv_bfloat16* __restrict__ logits, std::int32_t* __restrict__ candidates,
@@ -31,6 +59,7 @@ __launch_bounds__(Block) __global__ void dflash2_selector_topk_kernel(
     const int tid    = static_cast<int>(threadIdx.x);
     if (column >= columns) { return; }
 
+    // Per-thread top-K over a strided slice of the vocabulary column.
     float local_value[K];
     std::int32_t local_index[K];
 #pragma unroll
@@ -41,7 +70,11 @@ __launch_bounds__(Block) __global__ void dflash2_selector_topk_kernel(
     const __nv_bfloat16* col_logits = logits + static_cast<std::int64_t>(column) * vocab;
     for (int v = tid; v < vocab; v += Block) {
         const float value = __bfloat162float(col_logits[v]);
-        // Insertion into the sorted list while keeping (value, -id) ordering.
+        // Fast reject: below the current K-th best (with id tie-break).
+        if (value < local_value[K - 1] ||
+            (value == local_value[K - 1] && v >= local_index[K - 1])) {
+            continue;
+        }
         for (int k = 0; k < K; ++k) {
             const bool better =
                 value > local_value[k] || (value == local_value[k] && v < local_index[k]);
@@ -57,6 +90,7 @@ __launch_bounds__(Block) __global__ void dflash2_selector_topk_kernel(
         }
     }
 
+    // Parallel tree reduction of the Block per-thread top-K lists.
     __shared__ float shared_value[Block][K];
     __shared__ std::int32_t shared_index[Block][K];
 #pragma unroll
@@ -66,41 +100,29 @@ __launch_bounds__(Block) __global__ void dflash2_selector_topk_kernel(
     }
     __syncthreads();
 
-    if (tid == 0) {
-        float merged_value[K];
-        std::int32_t merged_index[K];
+    for (int stride = Block / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float merged_value[K];
+            std::int32_t merged_index[K];
+            dflash2_selector_merge16(shared_value[tid], shared_index[tid], K,
+                                     shared_value[tid + stride], shared_index[tid + stride], K,
+                                     merged_value, merged_index, K);
 #pragma unroll
-        for (int k = 0; k < K; ++k) {
-            merged_value[k] = -CUDART_INF_F;
-            merged_index[k] = vocab;
-        }
-        for (int thread = 0; thread < Block; ++thread) {
             for (int k = 0; k < K; ++k) {
-                const float value = shared_value[thread][k];
-                const std::int32_t index = shared_index[thread][k];
-                for (int slot = 0; slot < K; ++slot) {
-                    const bool better =
-                        value > merged_value[slot] ||
-                        (value == merged_value[slot] && index < merged_index[slot]);
-                    if (better) {
-                        for (int tail = K - 1; tail > slot; --tail) {
-                            merged_value[tail] = merged_value[tail - 1];
-                            merged_index[tail] = merged_index[tail - 1];
-                        }
-                        merged_value[slot] = value;
-                        merged_index[slot] = index;
-                        break;
-                    }
-                }
+                shared_value[tid][k] = merged_value[k];
+                shared_index[tid][k] = merged_index[k];
             }
         }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
         const int b = column / steps;
         const int s = column - b * steps;
         for (int k = 0; k < K; ++k) {
-            const int offset =
-                dflash2_selector_candidate_offset(b, batch, s, steps, k);
-            candidates[offset] = merged_index[k];
-            unary[offset]      = merged_value[k];
+            const int offset = dflash2_selector_candidate_offset(b, batch, s, steps, k);
+            candidates[offset] = shared_index[0][k];
+            unary[offset]      = shared_value[0][k];
         }
     }
 }

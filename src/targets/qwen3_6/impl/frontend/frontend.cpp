@@ -246,11 +246,13 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
                        "prepared prompt exceeds Engine max_context " + std::to_string(max_context));
 }
 
-void validate_registered_tokenizer(const fi::Tokenizer& tokenizer) {
-    if (!tokenizer.has_exact_token_domain(kTokenDomain)) {
-        throw std::invalid_argument(
-            "artifact tokenizer does not expose the registered 248077-token domain");
+void validate_registered_tokenizer(const fi::Tokenizer& tokenizer, std::size_t token_domain,
+                                    bool validate_official_special_ids) {
+    if (!tokenizer.has_exact_token_domain(token_domain)) {
+        throw std::invalid_argument("artifact tokenizer does not expose the registered " +
+                                    std::to_string(token_domain) + "-token domain");
     }
+    if (!validate_official_special_ids) { return; }
     for (const auto& [text, expected] : kVisionSpecialTokens) {
         const std::vector<int> encoded = tokenizer.encode(text);
         if (encoded.size() != 1 || encoded.front() != expected) {
@@ -868,7 +870,8 @@ public:
         }
         if (registered_checkpoint) {
             validate_registered_processor(processor);
-            validate_registered_tokenizer(*tokenizer);
+            validate_registered_tokenizer(*tokenizer, options.token_domain,
+                                           options.validate_official_special_ids);
         }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {

@@ -33,6 +33,7 @@ enum class WeightsProfile : std::uint8_t {
     Qwen38GroupwiseInt,
     Qwen36Nvfp4,
     Qwen38Nvfp4,
+    Qwen38Nvfp4Dspark,
     Qwen38Nvfp4DFlash2,
 };
 
@@ -139,6 +140,9 @@ struct Package {
                                                                WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
+    // Writes the loaded token-embedding / output-head payloads (fp8 row-scale)
+    // as raw codes+scales files for offline teacher-weight export.
+    static void export_head_weights(const LoadedModel& model, const char* directory);
 };
 
 } // namespace targets::qwen3_6_27b

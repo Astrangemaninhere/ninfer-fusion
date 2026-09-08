@@ -1,14 +1,26 @@
+#include <cuda_bf16.h>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/argmax.h"
+#include "ninfer/ops/vocab_topk16.h"
+namespace { constexpr int kDumpTopK = 16; }
+
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
@@ -70,6 +82,136 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     }
 }
 
+// Hidden-state dump mode (DFlash2 finetune data collection): when
+// NINFER_HS_DUMP_DIR is set, every dflash/dflash2 prefill chunk appends a raw
+// record file (chunk_%06d.bin): magic "NHS1", i32 tokens, i32 ids[tokens],
+// u16 bf16 feat[feature_rows x tokens] (five target layers concatenated in
+// capture order), u16 bf16 last[hidden x tokens] (post-final-norm hidden).
+void dump_prefill_chunk(const PrefillContext& state, std::span<const TokenId> ids,
+                        std::uint32_t chunk_base, std::int32_t tokens, cudaStream_t stream) {
+    static const char* dump_dir = std::getenv("NINFER_HS_DUMP_DIR");
+    if (dump_dir == nullptr || *dump_dir == '\0' || tokens <= 0) { return; }
+    static std::atomic<std::uint32_t> counter{0};
+    const Tensor* features = nullptr;
+    if (state.dflash != nullptr) { features = &state.dflash->prefill_features; }
+    if (state.dflash2 != nullptr) { features = &state.dflash2->prefill_features; }
+    if (features == nullptr || features->dtype != DType::BF16 || tokens > features->ne[1] ||
+        state.execution.prefill_hidden.ne[1] < tokens) {
+        throw std::logic_error("HS dump prefill buffers are invalid");
+    }
+    const std::int32_t feature_rows = features->ne[0];
+    const std::size_t token_bytes =
+        static_cast<std::size_t>(tokens) * sizeof(std::int32_t);
+    const std::size_t feat_bytes =
+        static_cast<std::size_t>(feature_rows) * static_cast<std::size_t>(tokens) * 2;
+    const std::size_t last_bytes =
+        static_cast<std::size_t>(state.execution.prefill_hidden.ne[0]) *
+        static_cast<std::size_t>(tokens) * 2;
+    std::vector<std::int32_t> ids_host(static_cast<std::size_t>(tokens));
+    for (std::int32_t i = 0; i < tokens; ++i) {
+        ids_host[static_cast<std::size_t>(i)] = ids[chunk_base + static_cast<std::size_t>(i)];
+    }
+    std::vector<std::byte> feat_host(feat_bytes);
+    std::vector<std::byte> last_host(last_bytes);
+    CUDA_CHECK(cudaMemcpyAsync(feat_host.data(), features->data, feat_bytes,
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(last_host.data(), state.execution.prefill_hidden.data, last_bytes,
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::uint32_t id = counter.fetch_add(1);
+    const std::string path =
+        std::string(dump_dir) + "/chunk_" + std::to_string(id / 1000000 % 10) +
+        std::to_string(id / 100000 % 10) + std::to_string(id / 10000 % 10) +
+        std::to_string(id / 1000 % 10) + std::to_string(id / 100 % 10) +
+        std::to_string(id / 10 % 10) + std::to_string(id % 10) + ".bin";
+    std::FILE* file = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) { throw std::runtime_error("HS dump cannot open " + path); }
+    const std::uint32_t magic = 0x4E485331U;
+    std::fwrite(&magic, sizeof(magic), 1, file);
+    std::fwrite(&tokens, sizeof(tokens), 1, file);
+    std::fwrite(ids_host.data(), sizeof(std::int32_t), ids_host.size(), file);
+    std::fwrite(feat_host.data(), 1, feat_host.size(), file);
+    std::fwrite(last_host.data(), 1, last_host.size(), file);
+    // Validation mode (NINFER_HS_DUMP_TOPK=1): engine-internal ground truth —
+    // per-column argmax over the full vocab using the engine's own head on the
+    // post-norm hidden, appended as i32[tokens]. Offline tools compare this to
+    // ids[pos+1] to decide whether dump semantics or offline head decode is
+    // responsible for any teacher misalignment.
+    if (std::getenv("NINFER_HS_DUMP_TOPK") != nullptr && tokens <= 256) {
+        const std::int32_t vocab = state.execution.model.output_head.n;
+        Tensor xwin = state.execution.prefill_hidden.slice(1, 0, tokens);
+        Tensor normed = state.execution.work.alloc(DType::BF16,
+                                                   {TextConfig::hidden, tokens});
+        Tensor logits = state.execution.work.alloc(DType::BF16, {vocab, tokens});
+        ops::rmsnorm(xwin, state.execution.model.final_norm,
+                     TextConfig::rms_epsilon, false, normed, stream);
+        ops::linear(normed, state.execution.model.output_head, logits, stream);
+        kCfg.apply_final_logit_policy(logits, stream);
+        const std::size_t lg_bytes =
+            static_cast<std::size_t>(vocab) * static_cast<std::size_t>(tokens) * 2;
+        std::vector<std::uint16_t> lg_host(lg_bytes / 2);
+        CUDA_CHECK(cudaMemcpyAsync(lg_host.data(), logits.data, lg_bytes,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // top1 sanity
+        std::vector<std::int32_t> top1_host(static_cast<std::size_t>(tokens));
+        for (int t = 0; t < tokens; ++t) {
+            float best = -1e30f;
+            int bid = 0;
+            for (int v = 0; v < vocab; ++v) {
+                const std::uint32_t b =
+                    static_cast<std::uint32_t>(lg_host[static_cast<std::size_t>(t) * vocab + v])
+                    << 16;
+                float f;
+                std::memcpy(&f, &b, 4);
+                if (f > best) { best = f; bid = v; }
+            }
+            top1_host[static_cast<std::size_t>(t)] = bid;
+        }
+        // host top-16 per column
+        constexpr int kDumpTopK = 16;
+        std::vector<std::int32_t> ids16(static_cast<std::size_t>(tokens * kDumpTopK));
+        std::vector<std::uint16_t> vals16(static_cast<std::size_t>(tokens * kDumpTopK));
+        for (int t = 0; t < tokens; ++t) {
+            float topv[kDumpTopK];
+            int topi[kDumpTopK];
+            for (int k = 0; k < kDumpTopK; ++k) { topv[k] = -1e30f; topi[k] = -1; }
+            for (int v = 0; v < vocab; ++v) {
+                const std::uint32_t b =
+                    static_cast<std::uint32_t>(lg_host[static_cast<std::size_t>(t) * vocab + v])
+                    << 16;
+                float f;
+                std::memcpy(&f, &b, 4);
+                for (int k = 0; k < kDumpTopK; ++k) {
+                    if (f > topv[k] || (f == topv[k] && (topi[k] < 0 || v < topi[k]))) {
+                        for (int j = kDumpTopK - 1; j > k; --j) {
+                            topv[j] = topv[j - 1];
+                            topi[j] = topi[j - 1];
+                        }
+                        topv[k] = f;
+                        topi[k] = v;
+                        break;
+                    }
+                }
+            }
+            for (int k = 0; k < kDumpTopK; ++k) {
+                ids16[static_cast<std::size_t>(t * kDumpTopK + k)] = topi[k];
+                const std::uint32_t b = topv[k] < 0 ? 0u : 0u;
+                (void)b;
+                vals16[static_cast<std::size_t>(t * kDumpTopK + k)] =
+                    static_cast<std::uint16_t>(
+                        (std::bit_cast<std::uint32_t>(topv[k]) >> 16));
+            }
+        }
+        std::fwrite(top1_host.data(), sizeof(std::int32_t), top1_host.size(), file);
+        const std::int32_t marker = kDumpTopK;
+        std::fwrite(&marker, sizeof(marker), 1, file);
+        std::fwrite(ids16.data(), sizeof(std::int32_t), ids16.size(), file);
+        std::fwrite(vals16.data(), sizeof(std::uint16_t), vals16.size(), file);
+    }
+    std::fclose(file);
+}
+
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
@@ -84,12 +226,21 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
+    PrefillChunkResult result;
     if (state.dflash != nullptr || state.dflash2 != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
-        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
-                                  sink);
+        result = card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                    sink);
+    } else {
+        result = card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
     }
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+    if (std::getenv("NINFER_HS_DUMP_DIR") != nullptr &&
+        (state.dflash != nullptr || state.dflash2 != nullptr)) {
+        dump_prefill_chunk(state, ids, state.text_kv_base,
+                           static_cast<std::int32_t>(result.processed_tokens),
+                           state.execution.device.stream);
+    }
+    return result;
 }
 
 PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
@@ -158,6 +309,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
     ops::linear(hidden, state.execution.model.output_head, logits, state.execution.device.stream);
+    kCfg.apply_final_logit_policy(logits, state.execution.device.stream);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
