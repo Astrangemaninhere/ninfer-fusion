@@ -351,12 +351,14 @@ void launch_tc_partial_nvfp4(const Tensor& q, const __nv_bfloat16* input_k,
         // Matches the arena layout in gqa_attention_decode_nvfp4_tiled_kernel:
         // two ping-pong tiles (k_pk/v_pk Bc*128 each + k_sf/v_sf Bc*16 each),
         // psc_s (Br*64 bytes, 64-byte row stride over RowTiles*16 rows),
-        // repack_a/repack_b (Wc*16*64 each).
+        // repack_a/repack_b (Wc*16*64 each, native-PV path only — absent when
+        // Iso3V so TT6 stays inside the sm_120 per-block opt-in limit).
         constexpr int kTileBytes = 4 * KeyBlock * 128 + 4 * KeyBlock * 16;
         constexpr int kRowTiles  = (TokenTile * Geometry::GroupSize + 15) / 16;
+        constexpr std::size_t kRepackBytes =
+            Iso3V ? 0ULL : static_cast<std::size_t>(2 * WarpsPerCta * 16 * 64);
         constexpr std::size_t kRBytes =
-            static_cast<std::size_t>(2 * kTileBytes + kRowTiles * 16 * 64 +
-                                     2 * WarpsPerCta * 16 * 64);
+            static_cast<std::size_t>(2 * kTileBytes + kRowTiles * 16 * 64) + kRepackBytes;
         constexpr std::size_t kVDynamicBytes =
             Iso3V ? static_cast<std::size_t>(KeyBlock) * 256ULL * 2ULL : 0ULL;
         constexpr std::size_t kDynamicBytes =

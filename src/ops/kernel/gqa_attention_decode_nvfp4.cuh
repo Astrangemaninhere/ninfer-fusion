@@ -172,23 +172,29 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     //   psc_s      Br*64  P*V fold scales (4 bytes per row/dg)
     //   repack_a/b Wc*1024 per-warp P/V operand repack tiles
     constexpr int kTileBytes = 4 * Bc * 128 + 4 * Bc * 16;
+    // The per-warp P/V repack tiles exist only for the native mxf4nvf4 PV path.
+    // The Iso3V branch decodes V into v_bf16 and runs BF16 mma instead, so the
+    // repack bytes are dead weight there; dropping them keeps TT6 (Wc=12) inside
+    // the sm_120 per-block opt-in limit (99 KiB) instead of 102.9 KiB.
+    constexpr int kRepackBytes = Iso3V ? 0 : 2 * Wc * 16 * 64;
     __shared__ __align__(16) std::uint8_t q_a[Br * 128];
     __shared__ __align__(16) std::uint8_t q_sf[Br * 16];
     __shared__ __align__(16) std::uint8_t static_r_s[DynamicArena
                                                         ? 16
                                                         : 2 * kTileBytes + Br * 16 * 4 +
-                                                              2 * Wc * 16 * 64];
+                                                              kRepackBytes];
     extern __shared__ __align__(16) std::uint8_t nvfp4_dynamic_r_s[];
     std::uint8_t* r_s      = DynamicArena ? nvfp4_dynamic_r_s : static_r_s;
     std::uint8_t* psc_s    = r_s + 2 * kTileBytes;
-    std::uint8_t* repack_a = psc_s + Br * 16 * 4;
-    std::uint8_t* repack_b = repack_a + Wc * 16 * 64;
+    // Native-PV only: never dereferenced on the Iso3V path.
+    std::uint8_t* repack_a = Iso3V ? r_s : psc_s + Br * 16 * 4;
+    std::uint8_t* repack_b = Iso3V ? r_s : repack_a + Wc * 16 * 64;
     __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
     __shared__ float alpha_s[Br];
     __shared__ std::int32_t physical_pages_s[PageIds];
     // Hybrid V path decodes the packed ISO3 V tile into BF16 with the exact
     // full-D tc swizzle the ldmatrix PV path expects.
-    constexpr int kRBytes = 2 * kTileBytes + Br * 16 * 4 + 2 * Wc * 16 * 64;
+    constexpr int kRBytes = 2 * kTileBytes + Br * 16 * 4 + kRepackBytes;
     __nv_bfloat16* v_bf16 =
         reinterpret_cast<__nv_bfloat16*>(DynamicArena ? nvfp4_dynamic_r_s + kRBytes
                                                       : nvfp4_dynamic_r_s);

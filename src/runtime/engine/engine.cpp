@@ -554,6 +554,20 @@ void Engine::reload_kv_storage(
     impl_->options.kv_residual_layers        = residual_layers;
     impl_->options.kv_residual_explicit      = true;
     targets::replan_target_kv(impl_->active, impl_->options, impl_->device);
+    // The replan destroyed the previous Program, so every catalogued
+    // continuation handle (context cache / prefix reuse) is stale. Drop the
+    // catalog: the next planning pass must not hand a stale owner to the new
+    // Program's checkpoint cost model.
+    std::visit(
+        [](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
+                if constexpr (requires { core->clear_context_catalog_after_replan(); }) {
+                    core->clear_context_catalog_after_replan();
+                }
+            }
+        },
+        impl_->core);
 }
 
 } // namespace ninfer
