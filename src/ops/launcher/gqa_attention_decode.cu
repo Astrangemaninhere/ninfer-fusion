@@ -1,6 +1,7 @@
 // ninfer::ops - split-KV GQA small-T launcher and unified route dispatcher.
 #include "ops/launcher/gqa_attention.h"
 
+#include "ops/common/ft_stats.h"
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
@@ -398,6 +399,12 @@ void launch_tc_partial_nvfp4(const Tensor& q, const __nv_bfloat16* input_k,
                 invocation.batch_size, masked, writes_cache);
     };
     // Minimal production schedule set for the first NVFP4 revision.
+    if (ft::enabled()) {
+        // FreeToken step-1: sample this layer's partial_l (host-side D2H; observation runs use
+        // --no-cuda-graph). The extra sync exists only in observation mode.
+        ft::observe(stream, cache.layer_index, static_cast<const float*>(partial_l.data),
+                    Geometry::QHeads * invocation.width, splits);
+    }
     if constexpr (Geometry::GroupSize == 16) {
         // Muse: RowTiles = TokenTile (16 rows/token); Wc table keeps
         // Wc % TokenTile == 0 with PVNt in {4,8}.
