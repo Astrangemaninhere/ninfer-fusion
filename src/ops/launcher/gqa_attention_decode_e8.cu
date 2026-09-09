@@ -60,7 +60,14 @@ void launch_tc_partial_i8_e8(const Tensor& q, CacheInput input, const Tensor& po
                 logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
-    if constexpr (TokenTile == 6) {
+    if constexpr (Geometry::GroupSize == 16) {
+        // Muse (32q/2kv): RowTiles == TokenTile, so the generic schedule table's
+        // Wc values violate Wc % RowTiles == 0. Same rule as the nvfp4 and i8
+        // Muse branches: Wc keeps Wc % TokenTile == 0 with PVNt in {4,8}.
+        constexpr int kWc = TokenTile == 1 ? 4 : TokenTile == 2 ? 8 : TokenTile == 3 ? 6
+                          : TokenTile == 4 ? 8 : TokenTile == 5 ? 10 : 12;
+        launch.template operator()<kWc, 1, 32, false>();
+    } else if constexpr (TokenTile == 6) {
         if (implementation_window > 128 && implementation_window <= 160) {
             launch.template operator()<24, 1, 32, false>();
         } else if (implementation_window <= 2054) {
@@ -173,6 +180,15 @@ void gqa_attention_decode_e8_launch(const Tensor& q, const GqaAppendInput& input
                                      partial_l, stream);
         return;
     }
+    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
+        launch_e8_for<GqaMuseGeometry>(q, input, pos, scale, cache, invocation, logical_capacity,
+                                       implementation_window, splits, partial_acc, partial_m,
+                                       partial_l, stream);
+        return;
+    }
+    if (q.ne[1] != Gqa35Geometry::QHeads || q.ne[0] != Gqa35Geometry::HeadDim) {
+        throw std::invalid_argument("E8 decode launch: unsupported query-head geometry");
+    }
     launch_e8_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation, logical_capacity,
                                  implementation_window, splits, partial_acc, partial_m, partial_l,
                                  stream);
@@ -190,6 +206,15 @@ void gqa_attention_decode_e8_launch(const Tensor& q, const GqaCachedInput& input
                                      implementation_window, splits, partial_acc, partial_m,
                                      partial_l, stream);
         return;
+    }
+    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
+        launch_e8_for<GqaMuseGeometry>(q, input, pos, scale, cache, invocation, logical_capacity,
+                                       implementation_window, splits, partial_acc, partial_m,
+                                       partial_l, stream);
+        return;
+    }
+    if (q.ne[1] != Gqa35Geometry::QHeads || q.ne[0] != Gqa35Geometry::HeadDim) {
+        throw std::invalid_argument("E8 decode launch (batch): unsupported query-head geometry");
     }
     launch_e8_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation, logical_capacity,
                                  implementation_window, splits, partial_acc, partial_m, partial_l,

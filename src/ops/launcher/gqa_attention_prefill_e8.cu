@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -100,6 +101,14 @@ void gqa_attention_prefill_e8_launch(const Tensor& q, const Tensor& positions,
             attention_e8_for<Gqa27Geometry>(q, positions, scale, cache, metadata, out, stream);
             return;
         }
+        if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
+            attention_e8_for<GqaMuseGeometry>(q, positions, scale, cache, metadata, out, stream);
+            return;
+        }
+        if (q.ne[1] != Gqa35Geometry::QHeads || q.ne[0] != Gqa35Geometry::HeadDim) {
+            throw std::invalid_argument(
+                "gqa_attention_prefill_e8_launch: unsupported query-head geometry");
+        }
         attention_e8_for<Gqa35Geometry>(q, positions, scale, cache, metadata, out, stream);
     };
     if (masked) {
@@ -124,6 +133,14 @@ void gqa_kv_append_e8_launch(const Tensor& k, const Tensor& v, const Tensor& pos
         if (k.ne[1] == Gqa27Geometry::KVHeads) {
             append_e8_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             return;
+        }
+        if (k.ne[1] == GqaMuseGeometry::KVHeads && k.ne[0] == GqaMuseGeometry::HeadDim) {
+            append_e8_for<GqaMuseGeometry>(k, v, positions, cache, metadata, stream);
+            return;
+        }
+        if (k.ne[1] != Gqa35Geometry::KVHeads || k.ne[0] != Gqa35Geometry::HeadDim) {
+            throw std::invalid_argument(
+                "gqa_kv_append_e8_launch: unsupported kv-head geometry");
         }
         append_e8_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
     };
@@ -164,6 +181,13 @@ void gqa_kv_append_e8_launch_single(const Tensor& k, const Tensor& v, const Tens
         append_e8_for<Gqa27Geometry>(k, v, positions, batch_view, metadata, stream);
         return;
     }
+    if (k.ne[1] == GqaMuseGeometry::KVHeads && k.ne[0] == GqaMuseGeometry::HeadDim) {
+        append_e8_for<GqaMuseGeometry>(k, v, positions, batch_view, metadata, stream);
+        return;
+    }
+    if (k.ne[1] != Gqa35Geometry::KVHeads || k.ne[0] != Gqa35Geometry::HeadDim) {
+        throw std::invalid_argument("gqa_kv_append_e8_launch_single: unsupported kv-head geometry");
+    }
     append_e8_for<Gqa35Geometry>(k, v, positions, batch_view, metadata, stream);
 }
 
@@ -197,6 +221,14 @@ void gqa_attention_prefill_e8_launch_single(const Tensor& q, const Tensor& posit
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         attention_e8_for<Gqa27Geometry>(q, positions, scale, batch_view, metadata, out, stream);
         return;
+    }
+    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
+        attention_e8_for<GqaMuseGeometry>(q, positions, scale, batch_view, metadata, out, stream);
+        return;
+    }
+    if (q.ne[1] != Gqa35Geometry::QHeads || q.ne[0] != Gqa35Geometry::HeadDim) {
+        throw std::invalid_argument(
+            "gqa_attention_prefill_e8_launch_single: unsupported query-head geometry");
     }
     attention_e8_for<Gqa35Geometry>(q, positions, scale, batch_view, metadata, out, stream);
 }
