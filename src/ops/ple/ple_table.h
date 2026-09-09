@@ -47,9 +47,11 @@ public:
                      std::span<const std::int32_t> prevs, std::int32_t eos,
                      std::int32_t* rows_out) const noexcept;
 
-    // Gathers 16 * n_tokens rows into dst (device, [n_heads * row_dim, n_tokens],
-    // BF16, contiguous). Blocks until the touched rows are resident in the
-    // pinned cache (faults are satisfied synchronously).
+    // Gathers 16 * n_tokens rows into dst (device, BF16, contiguous, token-major:
+    // token t occupies [t * n_heads * row_dim, (t+1) * n_heads * row_dim) with
+    // head h at h * row_dim — matches HF's PLE embedding flatten(-2) layout).
+    // Blocks until the touched rows are resident in the pinned cache (faults
+    // are satisfied synchronously).
     void gather(const std::int32_t* rows, std::size_t n_tokens, void* dst,
                 cudaStream_t stream);
 
@@ -60,6 +62,9 @@ private:
         std::uint64_t bytes;
         void* pinned; // cudaHostAlloc(..., cudaHostAllocMapped)
         std::size_t last_use_seq;
+        // Faults made during the current gather() must not be evicted before
+        // the gather kernel runs: their device pointers are already recorded.
+        std::uint64_t gather_epoch;
     };
 
     void open_files();
@@ -76,6 +81,10 @@ private:
     std::unordered_map<std::uint64_t, std::unique_ptr<CacheEntry>> cache_;
     std::uint64_t cache_bytes_used_ = 0;
     std::size_t use_seq_ = 0;
+    // Bumped by every gather(); entries faulted in during the current epoch are
+    // exempt from eviction until that gather has finished (UVA pointers are
+    // captured before the kernel launch).
+    std::uint64_t gather_epoch_ = 0;
 };
 
 } // namespace ninfer::ops::ple

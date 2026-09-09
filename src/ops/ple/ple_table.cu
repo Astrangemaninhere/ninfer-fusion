@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
@@ -105,8 +106,9 @@ void* PleTable::fault_in(std::uint32_t file_index, std::uint64_t offset,
     check_cuda(cudaHostAlloc(&mapped, bytes, cudaHostAllocMapped | cudaHostAllocPortable),
                "PLE cache cudaHostAlloc");
 
-    // Read the span from disk. Partial reads (tail alignment beyond EOF) are
-    // zero-filled by the allocation already.
+    // Read the span from disk. A short read means the aligned tail runs past
+    // EOF; cudaHostAlloc does NOT guarantee zeroed memory, so zero the tail
+    // explicitly (the padding rows must read as zeros, not stale heap).
     std::size_t done = 0;
     while (done < bytes) {
         const ssize_t got = ::pread(file_fds_[file_index], static_cast<char*>(mapped) + done,
@@ -118,6 +120,9 @@ void* PleTable::fault_in(std::uint32_t file_index, std::uint64_t offset,
         if (got == 0) { break; }
         done += static_cast<std::size_t>(got);
     }
+    if (done < bytes) {
+        std::memset(static_cast<char*>(mapped) + done, 0, bytes - done);
+    }
 
     auto entry = std::make_unique<CacheEntry>();
     entry->file_index = file_index;
@@ -125,10 +130,12 @@ void* PleTable::fault_in(std::uint32_t file_index, std::uint64_t offset,
     entry->bytes = bytes;
     entry->pinned = mapped;
     entry->last_use_seq = 0;
+    entry->gather_epoch = 0;
 
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         const std::uint64_t key = (static_cast<std::uint64_t>(file_index) << 56) | offset;
+        entry->gather_epoch = gather_epoch_;
         auto [it, inserted] = cache_.emplace(key, std::move(entry));
         if (!inserted) {
             // Lost a race; keep the existing entry and free ours.
@@ -140,14 +147,21 @@ void* PleTable::fault_in(std::uint32_t file_index, std::uint64_t offset,
         use_seq_++;
         it->second->last_use_seq = use_seq_;
 
-        // Evict LRU entries until the budget is respected.
+        // Evict LRU entries until the budget is respected. Entries faulted in
+        // during this gather are exempt: their UVA device pointers are already
+        // recorded by the caller and would dangle if freed here.
         while (cache_bytes_used_ > options_.cache_bytes && cache_.size() > 1) {
             auto victim = std::min_element(
                 cache_.begin(), cache_.end(),
-                [](const auto& a, const auto& b) {
+                [&](const auto& a, const auto& b) {
+                    const bool a_cur = a.second->gather_epoch == gather_epoch_;
+                    const bool b_cur = b.second->gather_epoch == gather_epoch_;
+                    if (a_cur != b_cur) { return !a_cur; } // prefer evicting older epochs
                     return a.second->last_use_seq < b.second->last_use_seq;
                 });
-            if (victim == it) { break; } // never evict the entry we just inserted
+            if (victim == it || victim->second->gather_epoch == gather_epoch_) {
+                break; // only current-gather entries left: keep them all
+            }
             cache_bytes_used_ -= victim->second->bytes;
             check_cuda(cudaFreeHost(victim->second->pinned), "PLE cache free");
             cache_.erase(victim);
@@ -160,6 +174,12 @@ void PleTable::gather(const std::int32_t* rows, std::size_t n_tokens, void* dst,
                       cudaStream_t stream) {
     const std::size_t total = n_tokens * layout_.n_heads;
     const std::size_t row_bytes = layout_.row_stride_bytes;
+    {
+        // New epoch: faults made from here on are exempt from eviction until
+        // this gather has captured every UVA pointer.
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        ++gather_epoch_;
+    }
 
     // Deduplicate rows so a hot n-gram span is faulted in once.
     std::vector<std::uint64_t> row_keys(total);
