@@ -151,6 +151,10 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 3072;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // True when kv_cache came from an explicit --kv-dtype. Without a per-layer table this makes
+    // the global dtype win over the target's registered per-layer default table, so e.g.
+    // --kv-dtype bf16 really selects a BF16 KV pool (see _TODO.md 97).
+    bool kv_cache_explicit = false;
     // Per-layer KV storage override, indexed by full-attention layer order.
     // BFloat16 entries inherit kv_cache. Any non-BFloat16 entry replaces the
     // target's registered per-layer default table wholesale; entries outside

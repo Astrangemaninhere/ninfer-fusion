@@ -238,6 +238,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.kv_cache_explicit        = options_.kv_cache_explicit;
     engine_options.kv_layer_storage         = options_.kv_layer_storage;
     engine_options.kv_layer_storage_explicit = options_.kv_layer_storage_explicit;
     engine_options.enable_vision            = options_.enable_vision;

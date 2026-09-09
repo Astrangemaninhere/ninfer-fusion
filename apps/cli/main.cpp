@@ -285,6 +285,7 @@ int main(int argc, char** argv) {
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.yarn_enabled  = cli.yarn_enabled;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
+        engine_options.kv_cache_explicit = cli.kv_cache_explicit;
         if (cli.kv_layer_storage_explicit) {
             const auto table = ninfer::product::parse_kv_layer_storage(cli.kv_layer_storage_spec);
             for (std::size_t i = 0; i < table.size(); ++i) {

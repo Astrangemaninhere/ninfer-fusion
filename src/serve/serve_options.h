@@ -42,6 +42,7 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    bool kv_cache_explicit                 = false;
     std::array<KvCacheStorage, 64> kv_layer_storage{};
     bool kv_layer_storage_explicit        = false;
     std::array<bool, 16> kv_residual_layers{};

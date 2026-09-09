@@ -140,6 +140,7 @@ Options parse_options(int argc, char** argv) {
             options.device = parse_device(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
+            options.kv_cache_explicit = true;
                 } else if (arg == "--kv-layer-storage") {
             options.kv_layer_storage_spec = value(arg);
             options.kv_layer_storage_explicit = true;

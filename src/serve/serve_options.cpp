@@ -262,6 +262,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+            options.kv_cache_explicit = true;
         } else if (arg == "--kv-layer-storage") {
             const auto table = product::parse_kv_layer_storage(require_value("--kv-layer-storage"));
             for (std::size_t i = 0; i < options.kv_layer_storage.size(); ++i) {

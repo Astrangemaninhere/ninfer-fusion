@@ -729,6 +729,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
                   out.dflash_context, out.dflash_round, out.dflash2_context, out.dflash2_round,
                   out.causal_score});
+    // Stopgap for the Muse multi-chunk prefill bad_alloc (see _TODO.md 89): the text_prefill
+    // recipe under-estimates the per-call peak (34.5 MiB planned vs >=55 MiB used at
+    // prefill_chunk=512), so the bump arena ran out. The recipe still needs reconciling; until
+    // then the arena gets headroom, which is safe because every buffer keeps its own size.
+    // NINFER_WS_HEADROOM_PCT overrides the default 100% (i.e. 2x) for experiments.
+    {
+        static const std::uint32_t headroom_pct = [] {
+            const char* value = std::getenv("NINFER_WS_HEADROOM_PCT");
+            const long parsed = value == nullptr ? 100 : std::atol(value);
+            return parsed >= 0 && parsed <= 1000 ? static_cast<std::uint32_t>(parsed) : 100U;
+        }();
+        out.general_capacity += out.general_capacity * headroom_pct / 100U;
+    }
     out.capacity = out.general_capacity;
     if (std::getenv("NINFER_WS_DUMP") != nullptr) {
         std::fprintf(stderr,
@@ -934,8 +947,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
 
     std::array<DType, 64> layer_overrides{};
     const bool has_override = options.kv_layer_storage_explicit;
-    if (has_override) {
-        for (std::size_t i = 0; i < layer_overrides.size(); ++i) {
+    if (has_override) {        for (std::size_t i = 0; i < layer_overrides.size(); ++i) {
             const auto v = options.kv_layer_storage[i];
             layer_overrides[i] = v == KvCacheStorage::BFloat16
                                      ? DType::BF16
@@ -951,6 +963,11 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                                                                         ? DType::FP8_E4M3FN
                                                                         : DType::BF16)))));
         }
+    } else if (options.kv_cache_explicit) {
+        // An explicit global --kv-dtype replaces the target's registered per-layer default table
+        // for every layer (the table is only consulted when the user pinned layers). Without
+        // this the global dtype never reached the KV page geometry (_TODO.md 97).
+        layer_overrides.fill(kv_profile.dtype);
     } else if constexpr (Variant::supports_per_layer_kv_defaults) {
         layer_overrides = Variant::default_layer_kv_dtypes(
             weights_profile);
