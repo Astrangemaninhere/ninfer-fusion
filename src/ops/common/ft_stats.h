@@ -15,6 +15,19 @@ namespace ninfer::ops::ft {
 inline constexpr int kMaxLayers = 64;
 inline constexpr int kSampleHeads = 32;
 
+// Per-layer energy sample (FreeToken step 2 consumers read this in-process
+// instead of parsing the stderr lines).
+struct EnergySample {
+    int layer = 0;
+    double mean_l = 0.0;
+    std::uint64_t rounds = 0;
+};
+
+namespace detail {
+inline double g_sum[kMaxLayers] = {};
+inline std::uint64_t g_count[kMaxLayers] = {};
+} // namespace detail
+
 inline bool enabled() {
     static const bool on = [] {
         const char* e = std::getenv("NINFER_FT_STATS");
@@ -42,17 +55,30 @@ inline void observe(cudaStream_t stream, int layer, const float* partial_l_devic
     cudaMemcpyAsync(host, partial_l_device, sizeof(float) * n,
                     cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
-    static double sum[kMaxLayers] = {};
-    static std::uint64_t cnt[kMaxLayers] = {};
     double acc = 0.0;
     for (int i = 0; i < n; ++i) { acc += host[i]; }
-    sum[layer] += acc / n;
-    cnt[layer] += 1;
-    if (cnt[layer] % static_cast<std::uint64_t>(period()) == 0) {
+    detail::g_sum[layer] += acc / n;
+    detail::g_count[layer] += 1;
+    if (detail::g_count[layer] % static_cast<std::uint64_t>(period()) == 0) {
         std::fprintf(stderr, "[ft] layer=%d mean_l=%.4g rounds=%llu\n", layer,
-                     sum[layer] / static_cast<double>(cnt[layer]),
-                     static_cast<unsigned long long>(cnt[layer]));
+                     detail::g_sum[layer] / static_cast<double>(detail::g_count[layer]),
+                     static_cast<unsigned long long>(detail::g_count[layer]));
     }
+}
+
+// Snapshot of the observed layers (ascending layer order); returns the number
+// of entries written. Layers with no observation are skipped.
+inline int snapshot(EnergySample* out, int max_out) {
+    if (out == nullptr || max_out <= 0) { return 0; }
+    int count = 0;
+    for (int layer = 0; layer < kMaxLayers && count < max_out; ++layer) {
+        if (detail::g_count[layer] == 0) { continue; }
+        out[count].layer  = layer;
+        out[count].mean_l = detail::g_sum[layer] / static_cast<double>(detail::g_count[layer]);
+        out[count].rounds = detail::g_count[layer];
+        ++count;
+    }
+    return count;
 }
 
 } // namespace ninfer::ops::ft

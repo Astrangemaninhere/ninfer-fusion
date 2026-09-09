@@ -2,6 +2,7 @@
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
+#include "serve/kv_auto_relayout.h"
 #include "serve/serve_options.h"
 
 #include <atomic>
@@ -79,6 +80,27 @@ int main(int argc, char** argv) {
         loaded << "model loaded in "
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
+
+        // FreeToken step 2: periodic KV relayout from the ft energy table
+        // (NINFER_FT_RELOAD_SECS>0 enables it; NINFER_FT_STATS must be on for
+        // observations to exist). Deep layers keep nvfp4; the rest follow the
+        // energy tertiles with two-cycle hysteresis.
+        auto relayout_config                  = ninfer::serve::KvAutoRelayout::from_env();
+        relayout_config.current_table         = options.kv_layer_storage;
+        relayout_config.current_table_explicit = options.kv_layer_storage_explicit;
+        ninfer::serve::KvAutoRelayout auto_relayout(
+            std::move(relayout_config), [&service](std::string_view spec) {
+                try {
+                    service.reload_kv_storage(spec);
+                    return true;
+                } catch (const std::exception& error) {
+                    ninfer::serve::write_console_log(
+                        ninfer::serve::ConsoleLogLevel::Warning,
+                        std::string("ft auto-relayout rejected: ") + error.what());
+                    return false;
+                }
+            });
+        auto_relayout.start();
 
         const ninfer::MemorySummary memory            = service.memory_summary();
         const ninfer::ContextCostSummary context_cost = service.load_summary().context_cost;
