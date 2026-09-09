@@ -228,9 +228,43 @@ def sample_tokens(count: int, vocab: int = 248320, eos: int = 248044) -> list[in
     return tokens
 
 
+def fnv1a64(data: bytes, seed: int = 0xCBF29CE484222325) -> int:
+    """与 CUDA 对拍工具共用的 64 位 FNV-1a (避免在 .cu 里塞 SHA-256)。"""
+    value = seed
+    for byte in data:
+        value ^= byte
+        value = (value * 0x100000001B3) & MASK64
+    return value
+
+
+def emit_spec(manifest: dict, path: Path, tokens: list[int], eos: int) -> None:
+    """写 C++/CUDA 侧易读的扁平规格文件 (避免在 .cu 里写 JSON 解析)。"""
+    lines = [
+        f"ngram {int(manifest['ngram_size'])}",
+        f"heads_per_ngram {int(manifest['heads_per_ngram'])}",
+        f"n_heads {int(manifest['number_of_ngram_heads'])}",
+        f"row_stride {int(manifest['row_stride_bytes'])}",
+        f"row_dim {int(manifest['embedding_row_dimension'])}",
+        f"usable_rows {int(manifest['usable_vocabulary_rows'])}",
+        f"eos {eos}",
+        "mult " + " ".join(str(int(m)) for m in manifest["layer_multipliers"]),
+        "sizes " + " ".join(str(int(s)) for s in manifest["per_head_vocabulary_sizes"]),
+        "offsets " + " ".join(str(int(o)) for o in manifest["per_head_offsets"]),
+        "tokens " + " ".join(str(int(t)) for t in tokens),
+    ]
+    for item in sorted(manifest["physical_files"], key=lambda f: f["index"]):
+        lines.append(f"file {int(item['index'])} {item['path']}")
+    for part in sorted(manifest["logical_parts"], key=lambda p: p["global_row_start"]):
+        lines.append("part {gs} {rows} {off} {file}".format(
+            gs=int(part["global_row_start"]), rows=int(part["rows"]),
+            off=int(part["file_offset"]), file=int(part["physical_file_index"])))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def run_check(manifest_path: Path, data_dir: Path | None, tokens: list[int] | None,
               emit_golden: Path | None, vocab_size: int | None, seed: int,
-              ngram_base: int | None, divisor: int | None) -> int:
+              ngram_base: int | None, divisor: int | None,
+              emit_spec_path: Path | None = None) -> int:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if vocab_size:
         manifest["unigram_vocab_size"] = vocab_size
@@ -267,19 +301,26 @@ def run_check(manifest_path: Path, data_dir: Path | None, tokens: list[int] | No
         print("  越界样本:", bad[:5])
         return 1
 
+    if emit_spec_path:
+        emit_spec(manifest, emit_spec_path, tokens, eos)
+        print(f"  规格文件写入 {emit_spec_path} (供 tools/ple_gather_test.cu 消费)")
+
     if data_dir is not None:
         print(f"\n== 真表 gather ({data_dir}) ==")
         reader = TableReader(manifest, data_dir)
         try:
             digest = hashlib.sha256()
+            fnv = 0xCBF29CE484222325
             gathered = []
             for row_index, row in enumerate(rows):
                 vecs = [reader.gather(r) for r in row]
                 gathered.append([vec.hex()[:32] for vec in vecs])
                 for vec in vecs:
                     digest.update(vec)
+                    fnv = fnv1a64(vec, fnv)
             print(f"  gather 行数={len(rows)}x{len(rows[0])} 字节={len(rows) * len(rows[0]) * reader.row_stride}")
             print(f"  载荷 sha256={digest.hexdigest()}")
+            print(f"  载荷 fnv1a64=0x{fnv:016x} (GPU 工具以此对拍)")
             # 抽样打印一行, 便于人工核对
             print(f"  样本 token={tokens[0]} rows={rows[0][:4]}...")
             if emit_golden:
@@ -291,6 +332,7 @@ def run_check(manifest_path: Path, data_dir: Path | None, tokens: list[int] | No
                     "rows": rows,
                     "row_stride_bytes": reader.row_stride,
                     "payload_sha256": digest.hexdigest(),
+                    "payload_fnv1a64": f"{fnv:016x}",
                     "sample_hex": gathered[0],
                 }
                 emit_golden.write_text(json.dumps(golden, indent=1), encoding="utf-8")
@@ -347,6 +389,7 @@ def main() -> int:
     ap.add_argument("--data-dir", help="物理分片所在目录 (manifest 同级)")
     ap.add_argument("--tokens", help="逗号分隔 token 序列 (默认确定性样本)")
     ap.add_argument("--emit-golden", help="写出 golden JSON (供 GPU 通道对拍)")
+    ap.add_argument("--emit-spec", help="写出扁平规格文件 (供 tools/ple_gather_test.cu 消费)")
     ap.add_argument("--vocab-size", type=int, help="unigram vocab (复算 multipliers 用)")
     ap.add_argument("--ngram-base", type=int,
                     help="ngram_vocab_size_base (manifest 缺失时传入, 默认 20000000)")
@@ -365,8 +408,9 @@ def main() -> int:
         tokens = [int(tok) for tok in args.tokens.replace(" ", "").split(",") if tok]
     data_dir = Path(args.data_dir) if args.data_dir else None
     golden = Path(args.emit_golden) if args.emit_golden else None
+    spec = Path(args.emit_spec) if args.emit_spec else None
     return run_check(Path(args.manifest), data_dir, tokens, golden, args.vocab_size,
-                     args.seed, args.ngram_base, args.divisor)
+                     args.seed, args.ngram_base, args.divisor, spec)
 
 
 if __name__ == "__main__":
