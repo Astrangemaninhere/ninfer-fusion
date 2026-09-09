@@ -465,8 +465,14 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
 std::size_t Variant::post_mixer_workspace_capacity_bytes(
     WeightsProfile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
-    // Muse MLP = 独立 linear + silu_mul (无 workspace).
-    return 0;
+    // Muse's dense MLP runs as separate linear + silu_mul calls (there is no fused linear_swiglu
+    // workspace path for this variant), so gate, up and act are live simultaneously plus the
+    // down-projection output, all BF16. The layer scope releases them only after the layer
+    // completes; returning zero made multi-chunk prefill overflow the arena with std::bad_alloc
+    // (_TODO.md 100).
+    const std::size_t tokens = static_cast<std::size_t>(last);
+    return 3ULL * 2ULL * TextConfig::intermediate * tokens +
+           2ULL * TextConfig::hidden * tokens;
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,

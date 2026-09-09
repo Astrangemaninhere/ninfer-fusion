@@ -18,6 +18,12 @@ std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
 }
 
+// Debug aid for workspace-sizing investigations (see _TODO.md 89).
+bool arena_trace_enabled() {
+    static const bool enabled = std::getenv("NINFER_ARENA_TRACE") != nullptr;
+    return enabled;
+}
+
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
     if (err != cudaSuccess) {
         std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, cudaGetErrorName(err),
@@ -252,12 +258,38 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;
     if (off_ > peak_) { peak_ = off_; }
+    if (arena_trace_enabled()) {
+        const auto module_offset = [](void* address) -> std::size_t {
+            Dl_info info{};
+            if (dladdr(address, &info) != 0 && info.dli_fbase != nullptr) {
+                return static_cast<std::size_t>(static_cast<const char*>(address) -
+                                                static_cast<const char*>(info.dli_fbase));
+            }
+            return 0;
+        };
+        const std::size_t caller0 = module_offset(__builtin_return_address(0));
+        std::fprintf(stderr, "[arena] off=%zu bytes=%zu end=%zu cap=%zu caller=0x%zx\n",
+                     aligned_offset, bytes, end, cap_, caller0);
+    }
     return DeviceSpan{ptr, bytes};
 }
 
 Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                           std::size_t align) {
     Tensor view(nullptr, dtype, shape);
+    if (arena_trace_enabled()) {
+        Dl_info info{};
+        void* caller = __builtin_return_address(0);
+        std::size_t offset = 0;
+        if (dladdr(caller, &info) != 0 && info.dli_fbase != nullptr) {
+            offset = static_cast<std::size_t>(static_cast<const char*>(caller) -
+                                              static_cast<const char*>(info.dli_fbase));
+        }
+        std::fprintf(stderr, "[arena-alloc] dtype=%d bytes=%zu caller=0x%zx shape=",
+                     static_cast<int>(dtype), view.bytes(), offset);
+        for (const std::int32_t extent : shape) { std::fprintf(stderr, "%d,", extent); }
+        std::fprintf(stderr, "\n");
+    }
     const DeviceSpan storage = alloc_bytes(view.bytes(), align);
     return Tensor(storage.data, dtype, shape);
 }
