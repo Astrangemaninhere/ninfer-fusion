@@ -200,6 +200,7 @@ add_library(ninfer_ops STATIC
   ops/linear/q5/q5_rowsplit_gemm_mma.cu
   ops/linear/q5/q5_rowsplit_gemm_simt.cu
   ops/linear/q5/q5_rowsplit_gemv.cu
+  ops/linear/qpn/qpn_host.cu
   ops/linear_add/bf16/bf16_linear_add_decode.cu
   ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
   ops/linear_add/bf16/bf16_linear_add_small_t.cu
