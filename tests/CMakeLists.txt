@@ -50,6 +50,9 @@ ninfer_add_op_test(ninfer_entropy_cold_requant_test
 ninfer_add_op_test(ninfer_cold_i8_test
   SOURCES ops/test_cold_i8.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_ple_table_e2e_test
+  SOURCES ops/ple_table_e2e_test.cu
+  LIBRARIES ninfer_ops ninfer_core)
 
 function(ninfer_add_fused_linear_test name source common)
   ninfer_add_op_test(${name}
