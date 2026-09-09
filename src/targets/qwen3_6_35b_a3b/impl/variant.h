@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "targets/qwen3_6_35b_a3b/impl/config.h"
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
@@ -35,7 +35,7 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr bool supports_per_layer_kv_defaults    = false;
-    [[nodiscard]] static std::array<DType, 16> default_layer_kv_dtypes(WeightsProfile profile);
+    [[nodiscard]] static std::array<DType, 64> default_layer_kv_dtypes(WeightsProfile profile);
     static constexpr bool supports_dflash2                     = DFlash2Config::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 

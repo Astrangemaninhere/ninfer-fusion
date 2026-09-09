@@ -1,4 +1,4 @@
-#include "targets/qwen3_6_27b/impl/variant.h"
+﻿#include "targets/qwen3_6_27b/impl/variant.h"
 
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
@@ -20,7 +20,7 @@
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 
-std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
+std::array<DType, 64> Variant::default_layer_kv_dtypes(WeightsProfile) {
     // Default: 10 layers of E8-lattice K (H64 rotation + E8 projection,
     // 4-bit packed) + 6 layers of NVFP4 (E2M1 K + ISO3 V). Measured on 13.3k zh
     // perplexity at ctx 4096: ppl 1.020 (best of all mixes; all-E8 1.112,
@@ -28,7 +28,7 @@ std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
     // decode ~111 tok/s on 5090). E8 supplies the K lattice gain; NVFP4
     // layers supply the ISO3 V which fits the value distribution better
     // than i4.
-    std::array<DType, 16> table{};
+    std::array<DType, 64> table{};
     table.fill(DType::NVFP4);
     for (const int layer : {0, 1, 3, 4, 6, 7, 8, 9, 13, 14}) {
         table[static_cast<std::size_t>(layer)] = DType::E8Kv;

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "core/arena.h"
 #include "core/layout.h"
@@ -58,7 +58,7 @@ struct PagedKVLayerView {
     DType v_dtype             = DType::BF16;
     std::int32_t v_quant_group = 0;
     std::uint32_t sliding_window_tokens = 0;
-    std::array<DType, 16> layer_dtypes{};
+    std::array<DType, 64> layer_dtypes{};
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */

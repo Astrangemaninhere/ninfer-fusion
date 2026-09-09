@@ -470,6 +470,11 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     // producer/consumer geometry inside launch_tc_partial_i8.
 #define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
+        if constexpr (Geometry::GroupSize == 16 && Geometry::QHeads == 32 && (TOKENS) > 3) {       \
+            /* Muse-class row-tile budget: RowTiles == TokenTile <= 3 in the tiled kernels.  */    \
+            /* Do not instantiate; fail loudly if a draft route ever reaches here.          */      \
+            throw std::invalid_argument("Muse small-T decode supports draft widths up to 3");      \
+        } else {                                                                                   \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.dtype == DType::I8) {                                                        \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked, false>(               \
@@ -527,6 +532,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         } else {                                                                                   \
             launch_profile.template operator()<true, false>();                                     \
         }                                                                                          \
+        } /* Muse TT>3 guard else close */                                                         \
     } while (0)
 
     switch (invocation.width) {

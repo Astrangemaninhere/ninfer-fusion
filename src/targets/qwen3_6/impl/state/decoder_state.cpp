@@ -76,9 +76,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
     KVPageGeometry geometry;
     geometry.planes.reserve(static_cast<std::size_t>(layers) * 8ULL);
-    std::array<DType, 16> stored{};
-    std::array<bool, 16> residual_flags{};
-    std::array<std::uint32_t, 16> plane_base{};
+    // Family-capacity slots: must match PagedKVCacheLayout's 64-wide tables.
+    std::array<DType, 64> stored{};
+    std::array<bool, 64> residual_flags{};
+    std::array<std::uint32_t, 64> plane_base{};
     std::uint32_t plane_cursor = 0;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const DType selected = layer_dtype(layer);

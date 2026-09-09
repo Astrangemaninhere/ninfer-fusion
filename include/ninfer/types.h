@@ -39,7 +39,9 @@ enum class KvCacheStorage : std::uint8_t {
 
 // Per-layer table width shared by targets that publish per-layer KV storage.
 // Entries are indexed by full-attention layer order, not physical model layer.
-inline constexpr std::size_t kKvLayerStorageSlots = 16;
+// Family capacity: the smallest member has 16 full-attention layers; larger
+// members index beyond that, so the table must cover the family maximum.
+inline constexpr std::size_t kKvLayerStorageSlots = 64;
 
 enum class EnginePurpose : std::uint8_t {
     Generation,

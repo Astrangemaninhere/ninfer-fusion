@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "targets/qwen3_6_27b/impl/config.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
@@ -16,7 +16,7 @@ using GraphExecutionProfile = qwen3_6::GraphExecutionProfile;
 // It owns no request state, execution phase, graph object, or schedule callback.
 struct Variant {
     static constexpr bool supports_per_layer_kv_defaults    = true;
-    [[nodiscard]] static std::array<DType, 16> default_layer_kv_dtypes(WeightsProfile profile);
+    [[nodiscard]] static std::array<DType, 64> default_layer_kv_dtypes(WeightsProfile profile);
     using WeightsProfile                 = detail::WeightsProfile;
     using TextConfig                     = detail::TextConfig;
     using VisionConfig                   = detail::VisionConfig;
