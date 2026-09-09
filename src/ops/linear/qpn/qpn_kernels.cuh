@@ -1432,4 +1432,8 @@ __global__ void skinny_fp8_qpn8_mt2(const uint8_t *__restrict__ bcodes,
 void gemm_qpn_simt(const void* x_half, const void* codes, const void* scales, float gscale,
                    void* y_half, int m, int k, int n, cudaStream_t stream);
 
+// M-dispatch entry: simt M<=3, skinny_nvfp4_qpn<1> for M 4..8, <2> for M 9..16.
+void gemm_qpn(const void* x_half, const void* codes, const void* scales, float gscale,
+              void* y_half, int m, int k, int n, cudaStream_t stream);
+
 } // namespace ninfer::ops::qpn
