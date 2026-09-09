@@ -30,6 +30,7 @@
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -43,6 +44,30 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+
+// NINFER_HEADDBG=1 dumps the first BF16 values of a decode-head tensor so a degenerate (all-zero)
+// hidden or logits is visible without a debugger (_TODO.md 102: Muse decode emits token 0).
+inline void debug_head_probe(cudaStream_t stream, const Tensor& tensor, const char* label) {
+    static const bool enabled = std::getenv("NINFER_HEADDBG") != nullptr;
+    if (!enabled || tensor.data == nullptr || tensor.dtype != DType::BF16) { return; }
+    const std::size_t count = std::min<std::size_t>(8, tensor.bytes() / sizeof(__nv_bfloat16));
+    if (count == 0) { return; }
+    __nv_bfloat16 host[8] = {};
+    if (cudaMemcpyAsync(host, tensor.data, count * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    std::fprintf(stderr, "[headdbg] %-14s", label);
+    for (std::size_t i = 0; i < count; ++i) {
+        std::fprintf(stderr, " %.6g", static_cast<double>(__bfloat162float(host[i])));
+    }
+    std::fprintf(stderr, "\n");
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -692,10 +717,14 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
 
         Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, batch});
         ops::embedding(ids, *embed_, x, stream);
+        debug_head_probe(stream, x, "post_embed");
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
+        debug_head_probe(stream, x, "post_layers_x");
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
+        debug_head_probe(stream, hidden, "final_hidden");
         ops::linear(hidden, *lm_head_, logits, stream);
+        debug_head_probe(stream, logits, "logits");
     }
     work_.reset();
 }
