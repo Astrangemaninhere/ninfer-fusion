@@ -91,7 +91,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(Bc == 32 || Bc == 64);
-    static_assert(RowTiles >= 1 && RowTiles <= 3);
+    // RowTiles == TokenTile for GroupSize-16 geometries (Muse 32q/2kv); the
+    // dispatch kWc table keeps every derived quantity in range up to 6.
+    static_assert(RowTiles >= 1 && RowTiles <= 6);
     static_assert(Wc % RowTiles == 0);
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == Groups * GroupKc);
