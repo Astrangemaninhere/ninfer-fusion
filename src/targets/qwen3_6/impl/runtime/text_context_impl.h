@@ -883,6 +883,17 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor v_flat    = v.view({kCfg.kv_size, T});
     Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
                                   s);
+    // NINFER_HEADDBG=1: stage probes for the layers around Muse's first divergence (_TODO.md 103).
+    const auto mix_probe = [&](const char* stage, const Tensor& tensor) {
+        if (!head_debug_enabled() || (fidx != 15 && fidx != 16)) { return; }
+        char label[32];
+        std::snprintf(label, sizeof(label), "L%02d_%s", fidx, stage);
+        debug_head_probe(s, tensor, label);
+    };
+    mix_probe("in_x", x);
+    mix_probe("q", q);
+    mix_probe("k", k);
+    mix_probe("v", v);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -899,6 +910,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     } else {
         ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
     }
+
+    mix_probe("qn", qn);
+    mix_probe("kn", kn);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
@@ -925,8 +939,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                                       *active_causal_attention_envelope_, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
+    mix_probe("attn_out", a);
 
     Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    mix_probe("out_x", x);
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
