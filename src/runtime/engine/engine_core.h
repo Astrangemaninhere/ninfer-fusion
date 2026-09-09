@@ -250,6 +250,14 @@ public:
         return published_stats_;
     }
 
+    // W16: why the engine stopped accepting work (empty while healthy).
+    [[nodiscard]] EngineFailureState failure_state() const {
+        std::lock_guard lock(queue_mutex_);
+        return failure_reason_.empty()
+                   ? EngineFailureState{}
+                   : EngineFailureState{true, failure_reason_, failed_at_};
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -1781,9 +1789,20 @@ private:
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
         std::deque<std::shared_ptr<Request>> pending;
+        std::string reason = "unknown exception";
+        try {
+            if (error) { std::rethrow_exception(error); }
+        } catch (const std::exception& exception) {
+            reason = exception.what();
+        } catch (...) {
+        }
         {
             std::lock_guard lock(queue_mutex_);
             failed_ = true;
+            if (failure_reason_.empty()) {
+                failure_reason_ = std::move(reason);
+                failed_at_      = std::chrono::system_clock::now();
+            }
             pending.swap(pending_);
         }
         scheduler_.reset();
@@ -1933,6 +1952,8 @@ private:
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;
+    std::string failure_reason_;                        // W16: first failure wins
+    std::chrono::system_clock::time_point failed_at_{};
     std::thread worker_;
 };
 

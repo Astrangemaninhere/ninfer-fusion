@@ -106,6 +106,10 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    // W16: engine health. After the worker hits an unexpected exception the
+    // engine permanently rejects work (serve answers 503); this reports why so
+    // the serve layer can surface it instead of a silent unavailable.
+    [[nodiscard]] EngineFailureState failure_state() const;
     void reset_memory_peaks() noexcept;
 
     // Re-runs the KV sequence plan with a new per-layer storage table (FreeToken

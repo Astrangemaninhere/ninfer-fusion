@@ -509,6 +509,24 @@ RuntimeStats Engine::runtime_stats() const {
         impl_->core);
 }
 
+EngineFailureState Engine::failure_state() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> EngineFailureState {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return EngineFailureState{};
+            } else if constexpr (requires { core->failure_state(); }) {
+                return core->failure_state();
+            } else {
+                // Causal scoring cores never serve requests, so they cannot be
+                // the poisoned engine the caller is asking about.
+                return EngineFailureState{};
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(

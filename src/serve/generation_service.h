@@ -105,6 +105,11 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    // W16: engine health for /health (failed => serve answers 503).
+    [[nodiscard]] ninfer::EngineFailureState failure_state() const {
+        return engine_->failure_state();
+    }
+
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

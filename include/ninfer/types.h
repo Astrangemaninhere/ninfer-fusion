@@ -43,6 +43,16 @@ enum class KvCacheStorage : std::uint8_t {
 // members index beyond that, so the table must cover the family maximum.
 inline constexpr std::size_t kKvLayerStorageSlots = 64;
 
+// Engine health snapshot (W16). After the worker loop hits an unexpected
+// exception the engine permanently rejects work with RequestErrorKind::
+// Unavailable (serve returns 503); `reason` and `since` make that state
+// diagnosable instead of a silent unavailable.
+struct EngineFailureState {
+    bool failed = false;
+    std::string reason;
+    std::chrono::system_clock::time_point since{};
+};
+
 enum class EnginePurpose : std::uint8_t {
     Generation,
     CausalScoring,

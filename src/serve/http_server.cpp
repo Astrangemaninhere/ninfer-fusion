@@ -361,7 +361,25 @@ void HttpServer::register_routes() {
             }
         });
 
-    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+        // W16: a poisoned engine is not healthy — report the failure reason so
+        // orchestration can drain the instance instead of retrying a dead one.
+        if (service_ != nullptr) {
+            const ninfer::EngineFailureState failure = service_->failure_state();
+            if (failure.failed) {
+                const auto since = std::chrono::duration_cast<std::chrono::seconds>(
+                                       failure.since.time_since_epoch())
+                                       .count();
+                nlohmann::json body{
+                    {"status", "failed"},
+                    {"engine",
+                     {{"state", "failed"}, {"reason", failure.reason}, {"since", since}}},
+                };
+                res.status = 503;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+        }
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
