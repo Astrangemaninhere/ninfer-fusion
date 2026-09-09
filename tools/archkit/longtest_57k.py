@@ -39,7 +39,9 @@ CITIES = ["苍梧", "临溪", "白泷", "云栖", "鹿鸣", "栖霞", "平潮", 
 def make_context(target_tokens: int, needle_count: int, rng: random.Random):
     """Build filler paragraphs with needles planted at even depth intervals.
 
-    Returns (context_text, needles) where needles = [(code, city, secret, question, answer)].
+    Returns (context_text, planted) where planted = [(code, city, secret, question, answer)]
+    holds exactly the needles that were embedded in the text — those are the ones the probe
+    must ask about. (Returning the leftover, unplanted needles made every run report 0/0.)
     Token estimate: Chinese ≈ 1 token/char for this engine family; keep ~5% slack
     by oversizing filler and truncating on the last paragraph boundary.
     """
@@ -51,6 +53,7 @@ def make_context(target_tokens: int, needle_count: int, rng: random.Random):
         needles.append((code, city, secret,
                         f"{city}站的月度密钥是什么？只回答密钥本身。",
                         secret))
+    planted: list[tuple[str, str, str, str, str]] = []
     paras: list[str] = []
     est = 0
     idx = 0
@@ -63,12 +66,14 @@ def make_context(target_tokens: int, needle_count: int, rng: random.Random):
                 f"设备读数在标准区间内浮动属于正常现象，无需额外记录。")
         est += len(body) + 2
         if est >= next_needle_at and needles:
-            code, city, secret, _q, _a = needles.pop(0)
+            item = needles.pop(0)
+            code, city, secret, _q, _a = item
             body += " " + NEEDLE_TEMPLATE.format(code=code, city=city, secret=secret)
+            planted.append(item)
             next_needle_at += needle_every
         paras.append(body)
         idx += 1
-    return "\n\n".join(paras), needles
+    return "\n\n".join(paras), planted
 
 
 def chat(port: int, model: str, messages: list[dict], max_tokens: int, timeout: int = 600) -> str:
@@ -79,7 +84,10 @@ def chat(port: int, model: str, messages: list[dict], max_tokens: int, timeout: 
         headers={"content-type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read())
-    return data["choices"][0]["message"]["content"] or ""
+    message = data["choices"][0]["message"]
+    # Thinking models spend the budget in reasoning_content; a short budget can leave
+    # `content` empty, so match against both channels.
+    return ((message.get("content") or "") + "\n" + (message.get("reasoning_content") or "")).strip()
 
 
 def reload_kv(port: int, spec: str) -> None:
@@ -99,13 +107,13 @@ def run_config(port: int, model: str, ctx_text: str, needles, label: str) -> boo
         {"role": "system", "content": "从档案中精确检索。只回答被问到的密钥本身，不要解释。"},
         {"role": "user", "content": ctx_text + "\n\n" +
          " ".join(q for _c, _s, q, _a in [(n[0], n[1], n[3], n[4]) for n in needles])},
-    ], max_tokens=120)
+    ], max_tokens=max(512, len(needles) * 64))
     dt = time.time() - t0
     ok_all = True
     for _code, _city, secret, _q, _a in needles:
         if secret not in answer:
             ok_all = False
-    hits = sum(1 for _c, _s, _q, a in needles if a in answer)
+    hits = sum(1 for _c, _s, _q, a in [(n[0], n[1], n[3], n[4]) for n in needles] if a in answer)
     print(f"[{label}] prefill+decode {dt:.1f}s, needle hits {hits}/{len(needles)} -> "
           f"{'PASS' if ok_all else 'FAIL'}", flush=True)
     if not ok_all:
