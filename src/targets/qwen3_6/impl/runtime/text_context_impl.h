@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -47,9 +48,13 @@ namespace {
 
 // NINFER_HEADDBG=1 dumps the first BF16 values of a decode-head tensor so a degenerate (all-zero)
 // hidden or logits is visible without a debugger (_TODO.md 102: Muse decode emits token 0).
-inline void debug_head_probe(cudaStream_t stream, const Tensor& tensor, const char* label) {
+inline bool head_debug_enabled() {
     static const bool enabled = std::getenv("NINFER_HEADDBG") != nullptr;
-    if (!enabled || tensor.data == nullptr || tensor.dtype != DType::BF16) { return; }
+    return enabled;
+}
+
+inline void debug_head_probe(cudaStream_t stream, const Tensor& tensor, const char* label) {
+    if (!head_debug_enabled() || tensor.data == nullptr || tensor.dtype != DType::BF16) { return; }
     const std::size_t count = std::min<std::size_t>(8, tensor.bytes() / sizeof(__nv_bfloat16));
     if (count == 0) { return; }
     __nv_bfloat16 host[8] = {};
@@ -63,10 +68,13 @@ inline void debug_head_probe(cudaStream_t stream, const Tensor& tensor, const ch
         return;
     }
     std::fprintf(stderr, "[headdbg] %-14s", label);
+    bool any_nan = false;
     for (std::size_t i = 0; i < count; ++i) {
-        std::fprintf(stderr, " %.6g", static_cast<double>(__bfloat162float(host[i])));
+        const float value = __bfloat162float(host[i]);
+        if (value != value) { any_nan = true; }
+        std::fprintf(stderr, " %.6g", static_cast<double>(value));
     }
-    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "%s\n", any_nan ? "  <NAN>" : "");
 }
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
@@ -1041,6 +1049,14 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    // NINFER_HEADDBG=1: per-stage probe on every layer so the first NaN inside the decode stack
+    // is visible (see _TODO.md 102/103).
+    const auto probe = [&](int layer, const char* stage) {
+        if (!head_debug_enabled()) { return; }
+        char label[32];
+        std::snprintf(label, sizeof(label), "L%02d_%s", layer, stage);
+        debug_head_probe(ctx_.stream, x, label);
+    };
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1055,6 +1071,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mixer_scope = work_.scope();
                 attn_mix(full, x, fidx, ph);
             }
+            probe(layer, "attn");
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
@@ -1063,6 +1080,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
+            probe(layer, "mlp");
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
@@ -1076,6 +1094,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mixer_scope = work_.scope();
                 gdn_mix(gdn, x, gidx, ph);
             }
+            probe(layer, "gdn");
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
@@ -1084,6 +1103,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
+            probe(layer, "mlp");
         }
     }
 }
