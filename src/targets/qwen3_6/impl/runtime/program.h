@@ -537,6 +537,17 @@ public:
                     DeviceContext& device);
     ~ProgramImplCore() noexcept;
 
+    // W6: shrink (never grow) the prefill unit so a decoding request is not blocked by a full-size
+    // chunk. Workspace and persistent buffers stay sized for prefill_chunk_capacity, so any value
+    // in [128, prefill_chunk_capacity] is safe. Aligned down to the 128-token prefill alignment.
+    void set_prefill_chunk(std::uint32_t chunk) noexcept {
+        constexpr std::uint32_t kAlignment = 128;
+        std::uint32_t clamped = chunk < kAlignment ? kAlignment : chunk;
+        if (clamped > prefill_chunk_capacity) { clamped = prefill_chunk_capacity; }
+        prefill_chunk = clamped - (clamped % kAlignment);
+        if (prefill_chunk < kAlignment) { prefill_chunk = kAlignment; }
+    }
+
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
@@ -644,7 +655,11 @@ public:
     const ContextCacheOptions context_cache;
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
-    const std::uint32_t prefill_chunk;
+    // Startup chunk (workspace and persistent buffers are sized for it); the mutable copy may be
+    // shrunk at runtime by the W6 bandwidth governor so a decoding request is not blocked by a
+    // full-size prefill unit. Shrinking is always safe, growing is not.
+    const std::uint32_t prefill_chunk_capacity;
+    std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;

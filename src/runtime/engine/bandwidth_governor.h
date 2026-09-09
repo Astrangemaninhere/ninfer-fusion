@@ -20,7 +20,9 @@
 // admits one prefill unit per two decode units. With no decode work the scheduler still runs prefill
 // (starvation avoidance lives in choose_execution, not here).
 //
-// Enabled only by NINFER_FT_BW_GOV=1; all state is worker-thread local.
+// Enabled only by NINFER_FT_BW_GOV=1; all state is worker-thread local. The signal is the worker's
+// own device-wait time, so on a fully asynchronous path where the worker never blocks on the device
+// the metric collapses to ~0 and the governor stays inert (safe degradation, no false throttling).
 
 #include <algorithm>
 #include <cstdint>
@@ -211,6 +213,18 @@ public:
     void charge_prefill() noexcept {
         if (!enabled_ || share_ >= 1.0) { return; }
         credit_ = credit_ > 1.0 ? credit_ - 1.0 : 0.0;
+    }
+
+    // W6: the prefill unit itself shrinks with the admitted share, so a decoding request waits for
+    // one small unit instead of a full chunk. Returns `base` unchanged while unthrottled; the
+    // caller's Program clamps to its startup chunk and the 128-token prefill alignment.
+    [[nodiscard]] std::uint32_t prefill_chunk_for(std::uint32_t base) const noexcept {
+        constexpr std::uint32_t kAlignment = 128;
+        if (!enabled_ || share_ >= 1.0 || base <= kAlignment) { return base; }
+        std::uint32_t scaled = static_cast<std::uint32_t>(static_cast<double>(base) * share_);
+        scaled -= scaled % kAlignment;
+        if (scaled < kAlignment) { scaled = kAlignment; }
+        return scaled < base ? scaled : base;
     }
 
 private:

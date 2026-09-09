@@ -2065,6 +2065,14 @@ private:
                     prefill_runnable = !slots_[*lane]->capture_pending;
                 }
                 bandwidth_governor_.observe(steady_now_ns(), bandwidth_counters());
+                if (bandwidth_governor_.enabled()) {
+                    // W6: shrink the prefill unit with the admitted share so a decoding request
+                    // waits for one small unit instead of a full chunk.
+                    if constexpr (requires { instance_.program->set_prefill_chunk(0u); }) {
+                        instance_.program->set_prefill_chunk(bandwidth_governor_.prefill_chunk_for(
+                            instance_.program->prefill_chunk_capacity));
+                    }
+                }
                 const bool prefill_admitted =
                     !prefill_runnable || bandwidth_governor_.prefill_allowed();
                 const ExecutionAction action = scheduler_.choose_execution(

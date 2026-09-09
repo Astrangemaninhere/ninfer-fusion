@@ -163,6 +163,45 @@ int test_throttle_and_recover() {
         if (governor.snapshot().share >= 1.0) { recover_window = i; }
     }
     failures += check(recover_window >= 0, "calm decode did not restore the full prefill share");
+
+    // The prefill unit shrinks with the share so a decoding request waits for a small unit.
+    failures += check(governor.prefill_chunk_for(3072) == 3072,
+                      "unthrottled share changed the prefill chunk");
+    return failures;
+}
+
+int test_prefill_chunk_scaling() {
+    int failures = 0;
+    BandwidthGovernor::Tuning tuning;
+    tuning.window_ns = 1'000'000ULL;
+    Feed feed(tuning, true);
+    BandwidthGovernor& governor = feed.governor();
+
+    BandwidthGovernor disabled(tuning, false);
+    failures += check(disabled.prefill_chunk_for(3072) == 3072,
+                      "disabled governor changed the prefill chunk");
+
+    // Unthrottled: the chunk is untouched.
+    failures += check(governor.prefill_chunk_for(3072) == 3072,
+                      "fresh governor changed the prefill chunk");
+
+    Window calm;
+    calm.us_per_token = 1.0;
+    for (int i = 0; i < 6; ++i) { feed.step(calm); }
+
+    Window contended;
+    contended.us_per_token = 2.0;
+    for (int i = 0; i < 12; ++i) { feed.step(contended); }
+    const double share = governor.snapshot().share;
+    const std::uint32_t chunk = governor.prefill_chunk_for(3072);
+    failures += check(chunk < 3072, "throttled governor did not shrink the prefill chunk");
+    failures += check(chunk % 128 == 0, "shrunk prefill chunk is not 128-aligned");
+    failures += check(chunk >= 128, "shrunk prefill chunk fell below the alignment");
+    failures += check(share < 1.0, "contention did not throttle before the chunk check");
+
+    // A chunk already at the alignment floor is left alone.
+    failures += check(governor.prefill_chunk_for(128) == 128,
+                      "chunk floor was scaled below the alignment");
     return failures;
 }
 
@@ -204,6 +243,7 @@ int main() {
     int failures = 0;
     failures += test_disabled();
     failures += test_throttle_and_recover();
+    failures += test_prefill_chunk_scaling();
     failures += test_choice_contract();
     if (failures == 0) { std::cout << "BANDWIDTH_GOVERNOR_TEST PASS\n"; }
     return failures == 0 ? 0 : 1;
