@@ -159,7 +159,8 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::speculative_accept_greedy_drafts(
         targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p),
+        /*draft_ids=*/Tensor{}, /*draft_probs=*/Tensor{}, workspace, nullptr);
     cuda_synchronize();
 
     int failures = verify_exact((label + " sampled").c_str(), read<std::int32_t>(d_sampled, k + 1),
@@ -346,7 +347,8 @@ int batched_sampling_workspace_stride_case() {
     WorkspaceArena workspace(workspace_bytes);
     ops::speculative_accept_greedy_drafts(
         targets, logits_tensor, draft_tensor, extents, lengths, anchors, licensed, counts, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr);
+        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p),
+        /*draft_ids=*/Tensor{}, /*draft_probs=*/Tensor{}, workspace, nullptr);
     cuda_synchronize();
 
     int failures = verify_exact("speculative sampling B=2 licensed",

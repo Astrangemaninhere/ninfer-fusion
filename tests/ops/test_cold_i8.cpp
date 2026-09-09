@@ -187,17 +187,18 @@ int main() {
     auto* valid_v = valid_k + kKvHeads;
     ops::cold_i8_slot_pack_raw(static_cast<const std::uint8_t*>(d_rq_codes.data()),
                                static_cast<const std::uint8_t*>(d_rq_scales.data()), kKvHeads, 1,
-                               static_cast<std::uint8_t*>(d_slots.data()), valid_k, nullptr);
+                               static_cast<std::uint8_t*>(d_slots.data()), valid_k,
+                               ops::kColdI8SlotBytes, nullptr);
     ops::cold_i8_slot_pack_raw(
         static_cast<const std::uint8_t*>(d_rq_codes.data()) + static_cast<std::size_t>(kKvHeads) * kNvCodeB,
         static_cast<const std::uint8_t*>(d_rq_scales.data()) + static_cast<std::size_t>(kKvHeads) * kNvScaleB,
         kKvHeads, 1,
         static_cast<std::uint8_t*>(d_slots.data()) + static_cast<std::size_t>(kKvHeads) * ops::kColdI8SlotBytes,
-        valid_v, nullptr);
+        valid_v, ops::kColdI8SlotBytes, nullptr);
     cuda_synchronize();
     ops::cold_i8_slot_restore_raw(static_cast<const std::uint8_t*>(d_slots.data()), kKvHeads, 1,
                                   static_cast<std::int8_t*>(d_out_codes.data()),
-                                  d_out_scales.data(), nullptr);
+                                  d_out_scales.data(), ops::kColdI8SlotBytes, nullptr);
     cuda_synchronize();
 
     std::vector<std::int8_t> got_codes(src_codes.size());

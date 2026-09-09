@@ -565,7 +565,7 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
     };
     if (cyclic) {
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
-                                    cyclic_view(cache_k, cache_v), nullptr);
+                                    cyclic_view(cache_k, cache_v), kWindow, nullptr);
     } else {
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
                                     paged_view(cache_k, cache_v, d_table), nullptr);
@@ -627,7 +627,7 @@ int cyclic_graph_replay_case() {
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                "begin kv append capture");
     ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, lane_tensor, {0, tokens},
-                                cache, stream);
+                                cache, kWindow, stream);
     cuda_check(cudaStreamEndCapture(stream, &graph), "end kv append capture");
     cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
                "instantiate kv append graph");
@@ -812,7 +812,7 @@ int batch_selector_case(bool cyclic) {
     constexpr ops::KVCacheAppendPrefixExecutionEnvelope envelope{0, tokens};
     if (cyclic) {
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
-                                    cyclic_view(cache_k, cache_v, batch), nullptr);
+                                    cyclic_view(cache_k, cache_v, batch), kWindow, nullptr);
     } else {
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
                                     paged_view(cache_k, cache_v, d_tables, batch), nullptr);
