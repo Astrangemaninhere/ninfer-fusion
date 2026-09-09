@@ -138,6 +138,11 @@ public:
     // Program and the process should exit. Serialized; safe to call while idle.
     void reload_kv_storage(std::string_view kv_layer_storage_spec);
 
+    // W16 P1: last-resort recovery of a poisoned engine. Same drain contract as reload_kv_storage;
+    // rebuilds the Program (all cached prefixes are lost) and respawns the worker. No-op while the
+    // engine is healthy. Throws if the CUDA context itself is unusable.
+    void recover();
+
 private:
     enum class CacheParticipation : std::uint8_t {
         Disabled,

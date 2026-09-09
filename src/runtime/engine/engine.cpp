@@ -570,4 +570,41 @@ void Engine::reload_kv_storage(
         impl_->core);
 }
 
+void Engine::recover() {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Generation) {
+        throw std::logic_error("recover requires a Generation Engine");
+    }
+    if (!failure_state().failed) { return; }
+    impl_->device.bind_to_current_thread();
+    // A failed unit may have left a sticky CUDA error. Clear it and probe the context before
+    // touching the Program: an unusable context means recovery must not pretend to succeed.
+    (void)cudaGetLastError();
+    void* probe                    = nullptr;
+    const cudaError_t probe_status = cudaMalloc(&probe, 4096);
+    if (probe_status != cudaSuccess) {
+        (void)cudaGetLastError();
+        throw std::runtime_error(std::string("Engine::recover: CUDA context unusable: ") +
+                                 cudaGetErrorString(probe_status));
+    }
+    (void)cudaFree(probe);
+    // The rebuild runs inside recover() after the failed worker has exited: the Program swap
+    // (KV pool, graph state, cached prefixes) must not race the worker that poisoned it.
+    std::visit(
+        [this](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
+                if constexpr (requires { core->recover([] {}); }) {
+                    core->recover([this, &core] {
+                        targets::replan_target_kv(impl_->active, impl_->options, impl_->device);
+                        if constexpr (requires { core->clear_context_catalog_after_replan(); }) {
+                            core->clear_context_catalog_after_replan();
+                        }
+                    });
+                }
+            }
+        },
+        impl_->core);
+}
+
 } // namespace ninfer

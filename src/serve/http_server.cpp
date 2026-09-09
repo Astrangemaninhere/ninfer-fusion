@@ -429,6 +429,9 @@ void HttpServer::register_routes() {
     server_.Post("/reload_kv", [this](const httplib::Request& req, httplib::Response& res) {
         handle_reload_kv(req, res);
     });
+    server_.Post("/recover", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_recover(req, res);
+    });
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
@@ -481,6 +484,29 @@ void HttpServer::handle_reload_kv(const httplib::Request& req, httplib::Response
         api_error.status  = 400;
         api_error.type    = "invalid_request_error";
         api_error.message = std::string("reload_kv failed: ") + error.what();
+        write_openai_error(res, api_error);
+    }
+}
+
+// POST /recover  (empty body). Last-resort recovery of a poisoned engine: drains in-flight
+// requests, rebuilds the Program and respawns the worker. No-op while the engine is healthy.
+void HttpServer::handle_recover(const httplib::Request&, httplib::Response& res) const {
+    if (service_ == nullptr) {
+        ApiError error;
+        error.status  = 503;
+        error.type    = "server_error";
+        error.message = "model is still loading";
+        write_openai_error(res, error);
+        return;
+    }
+    try {
+        service_->recover();
+        res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    } catch (const std::exception& error) {
+        ApiError api_error;
+        api_error.status  = 500;
+        api_error.type    = "server_error";
+        api_error.message = std::string("recover failed: ") + error.what();
         write_openai_error(res, api_error);
     }
 }

@@ -122,6 +122,12 @@ public:
         std::array<KvCacheStorage, kKvLayerStorageSlots> layer_storage,
         std::array<bool, kKvLayerStorageSlots> residual_layers = {});
 
+    // W16 P1: last-resort recovery from a poisoned engine (failure_state().failed). Rebuilds the
+    // Program exactly like reload_kv_storage (the old KV pool and every cached prefix are lost),
+    // then respawns the worker. Same contract: no request may be in flight or admitted until this
+    // returns — the serve layer drains before calling. Throws if the context itself is unusable.
+    void recover();
+
 private:
     class Impl;
     std::shared_ptr<Impl> impl_;

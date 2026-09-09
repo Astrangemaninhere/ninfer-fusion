@@ -279,6 +279,46 @@ public:
         } catch (...) {}
     }
 
+    // W16 P1: respawn the worker of a poisoned engine. rebuild_program runs after the failed
+    // worker has exited and before the new worker starts, so the caller can swap the Program
+    // (fresh KV pool and graph state) without racing it. Idempotent while healthy.
+    template <class RebuildProgram>
+    void recover(RebuildProgram&& rebuild_program) {
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_) { throw std::logic_error("recover on a shutting-down EngineCore"); }
+            if (!failed_) { return; }
+        }
+        // The failed worker returns right after fail_all_locked; join outside execution_mutex_ so
+        // its own lock release cannot deadlock against us.
+        if (worker_.joinable()) { worker_.join(); }
+        rebuild_program();
+        {
+            std::scoped_lock execution_lock(execution_mutex_);
+            std::lock_guard queue_lock(queue_mutex_);
+            if (stopping_) { throw std::logic_error("recover on a shutting-down EngineCore"); }
+            if (worker_.joinable()) { throw std::logic_error("recover: worker is still running"); }
+            failed_ = false;
+            failure_reason_.clear();
+            failed_at_ = {};
+            pending_.clear();
+            materializing_.reset();
+        }
+        std::promise<void> startup;
+        std::future<void> started = startup.get_future();
+        worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
+            try {
+                device_.bind_to_current_thread();
+                startup.set_value();
+            } catch (...) {
+                startup.set_exception(std::current_exception());
+                return;
+            }
+            worker_loop();
+        });
+        started.get();
+    }
+
 private:
     enum class HostWorkClass : std::uint8_t {
         Decode,

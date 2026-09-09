@@ -61,6 +61,7 @@ private:
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
     void handle_reload_kv(const httplib::Request& req, httplib::Response& res) const;
+    void handle_recover(const httplib::Request& req, httplib::Response& res) const;
 
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);

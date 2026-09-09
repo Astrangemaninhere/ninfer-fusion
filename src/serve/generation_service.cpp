@@ -513,4 +513,33 @@ void GenerationService::reload_kv_storage(std::string_view kv_layer_storage_spec
     reload_in_progress_.store(false, std::memory_order_release);
 }
 
+void GenerationService::recover() {
+    std::lock_guard reload_lock(reload_mutex_);
+    reload_in_progress_.store(true, std::memory_order_release);
+    try {
+        // The failed worker completed every admitted request, so active drains to zero; new
+        // requests are rejected while the flag is set.
+        const auto drain_deadline = Clock::now() + std::chrono::seconds(120);
+        for (;;) {
+            {
+                std::lock_guard lock(request_capacity_->mutex);
+                if (request_capacity_->active == 0) { break; }
+            }
+            if (Clock::now() > drain_deadline) {
+                throw_request_error(
+                    ninfer::RequestError(RequestErrorKind::Overloaded,
+                                         "timed out waiting for in-flight requests to "
+                                         "drain before engine recovery"));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        write_console_log(ConsoleLogLevel::Info, "drained; recovering engine");
+        engine_->recover();
+    } catch (...) {
+        reload_in_progress_.store(false, std::memory_order_release);
+        throw;
+    }
+    reload_in_progress_.store(false, std::memory_order_release);
+}
+
 } // namespace ninfer::serve
