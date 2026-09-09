@@ -237,11 +237,17 @@ public:
                (!have_decode || previous_unit_was_decode);
     }
 
+    // prefill_admitted is the bandwidth governor's verdict. Default true keeps the historical 1:1
+    // alternation; a false verdict holds prefill back while decode work exists, but never starves
+    // prefill: with no decode membership the prefill branch still runs.
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
+                                                   bool previous_unit_was_decode,
+                                                   bool prefill_admitted = true) const noexcept {
         if (prefill_runnable) {
-            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
-                                                            : ExecutionAction::Prefill;
+            if (have_decode && (!previous_unit_was_decode || !prefill_admitted)) {
+                return ExecutionAction::Decode;
+            }
+            return ExecutionAction::Prefill;
         }
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }

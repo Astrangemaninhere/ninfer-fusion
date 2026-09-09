@@ -6,6 +6,7 @@
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
+#include "runtime/engine/bandwidth_governor.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/resource_manager.h"
 #include "runtime/engine/scheduler.h"
@@ -18,6 +19,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <future>
@@ -258,6 +261,17 @@ public:
                    : EngineFailureState{true, failure_reason_, failed_at_};
     }
 
+    // KV replan (Engine::reload_kv_storage) swaps the Program, which invalidates
+    // every catalogued continuation handle — they are Program-owned. The serve
+    // layer drains before calling, so clearing the catalog here is safe and
+    // keeps the next planning pass from touching a stale owner (which would
+    // otherwise poison the engine through the worker's fail path).
+    void clear_context_catalog_after_replan() noexcept {
+        std::scoped_lock execution_lock(execution_mutex_);
+        resources_.clear_after_program_cleanup();
+        scheduler_.reset();
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -307,6 +321,49 @@ private:
         const auto count =
             std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count();
         return count > 0 ? static_cast<std::uint64_t>(count) : 0;
+    }
+
+    // W16: request-domain failures must not take the whole engine down. Classification follows
+    // docs/maintainer/engine-failure-recovery.md §3.1: RequestError is an intentional, request-scoped
+    // rejection; allocation failure is a recoverable engine stop; anything else is an invariant break
+    // (sticky, engine stop).
+    enum class FailureClass : std::uint8_t { Request, Resource, Invariant };
+
+    // How far the current execution unit got. A request-domain failure may only unwind the engine's
+    // own setup work; once device work or a commit is in flight the conservative engine-stop path
+    // takes over.
+    enum class UnitPhase : std::uint8_t { Setup, Commit };
+
+    [[nodiscard]] static FailureClass classify_failure(const std::exception_ptr& error) noexcept {
+        if (!error) { return FailureClass::Invariant; }
+        try {
+            std::rethrow_exception(error);
+        } catch (const RequestError&) {
+            return FailureClass::Request;
+        } catch (const std::bad_alloc&) {
+            return FailureClass::Resource;
+        } catch (...) {
+            return FailureClass::Invariant;
+        }
+    }
+
+    [[nodiscard]] static std::uint64_t steady_now_ns() noexcept {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+                .count());
+    }
+
+    // Worker-thread counters for the bandwidth governor. cumulative_stats_ is owned by the worker
+    // loop, so no lock is needed here.
+    [[nodiscard]] BandwidthGovernor::Counters bandwidth_counters() const noexcept {
+        const RuntimeHostWorkStats& host = cumulative_stats_.host_work;
+        return BandwidthGovernor::Counters{
+            .decode_device_ns  = host.decode_device_wait_ns,
+            .decode_tokens     = cumulative_stats_.committed_decode_tokens,
+            .decode_rounds     = cumulative_stats_.decode_rounds,
+            .prefill_device_ns = host.prefill_device_wait_ns,
+            .prefill_units     = host.prefill_units,
+        };
     }
 
     [[nodiscard]] ActiveExposureSet active_exposure_set() const {
@@ -960,6 +1017,7 @@ private:
                         bool decode_round,
                         const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+        unit_phase_ = UnitPhase::Commit;
         const std::size_t row_count = lane_indices.size();
         if (row_count == 0 || row_count != pending.row_count() || pending.row_stride() == 0 ||
             (!pending.row_counts().empty() && pending.row_counts().size() != row_count) ||
@@ -1242,6 +1300,7 @@ private:
                              typename Package::PrefillProgress&& progress,
                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+        unit_phase_ = UnitPhase::Commit;
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
@@ -1287,6 +1346,7 @@ private:
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }
+        maybe_inject_request_fault(request);
         setup.finish();
         ProgramCallScope program_call(*this);
         auto progress =
@@ -1691,6 +1751,7 @@ private:
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
+        unit_phase_ = UnitPhase::Commit;
         ProgramCallScope program_call(*this);
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
@@ -1703,6 +1764,7 @@ private:
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+        unit_phase_ = UnitPhase::Commit;
         if (membership.empty() || membership.row_stride == 0 ||
             membership.tokens.size() !=
                 static_cast<std::size_t>(membership.row_stride) * membership.size) {
@@ -1785,6 +1847,73 @@ private:
         publish_runtime_stats();
     }
 
+    // Test-only fault injection: NINFER_FAULT_INJECT=request_once throws a RequestError from the
+    // prefill setup phase (must fail only that request), invariant_once throws a logic_error (must
+    // stop the engine). NINFER_FAULT_INJECT_MIN_ID skips the startup warmup request(s). One shot.
+    void maybe_inject_request_fault(const std::shared_ptr<Request>& request) {
+        static const std::string mode = [] {
+            const char* value = std::getenv("NINFER_FAULT_INJECT");
+            return std::string(value == nullptr ? "" : value);
+        }();
+        if (mode.empty()) { return; }
+        static const std::uint64_t min_id = [] {
+            const char* value = std::getenv("NINFER_FAULT_INJECT_MIN_ID");
+            const long long parsed = value == nullptr ? 1 : std::atoll(value);
+            return parsed > 0 ? static_cast<std::uint64_t>(parsed) : 1ULL;
+        }();
+        if (request->id < min_id) { return; }
+        static std::atomic<int> fired{0};
+        if (fired.fetch_add(1, std::memory_order_acq_rel) != 0) { return; }
+        if (mode == "request_once") {
+            throw RequestError(RequestErrorKind::InvalidMedia,
+                               "injected request-domain fault (NINFER_FAULT_INJECT)");
+        }
+        if (mode == "invariant_once") {
+            throw std::logic_error("injected invariant fault (NINFER_FAULT_INJECT)");
+        }
+    }
+
+    // W16: fail only the attributed request, keep the engine serving. Requires a request-domain
+    // exception raised before this unit issued device work or committed anything, a single
+    // unambiguous owner, an intact lane/sequence binding, and no context transaction in flight.
+    // Returns false whenever any precondition is unclear so the caller falls back to fail_all_locked.
+    bool fail_request_lane(const std::exception_ptr& error) {
+        if (unit_phase_ != UnitPhase::Setup) { return false; }
+        const std::shared_ptr<Request> request = unit_owner_;
+        if (request == nullptr) { return false; }
+        if (classify_failure(error) != FailureClass::Request) { return false; }
+        if (instance_.program->has_context_transaction() || request->capture_pending) {
+            return false;
+        }
+        std::optional<std::uint32_t> lane;
+        for (std::uint32_t candidate = 0; candidate < max_concurrency_; ++candidate) {
+            if (slots_[candidate] == request) {
+                lane = candidate;
+                break;
+            }
+        }
+        if (!lane) { return false; }
+        if (!request->sequence || !request->lane || request->lane->value != *lane) {
+            return false;
+        }
+        auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
+        request->generation_timings = aborted.timings;
+        request->speculative_stats  = std::move(aborted.speculative);
+        if (scheduler_.prefill_lane() == *lane) { scheduler_.clear_prefill_lane(*lane); }
+        std::string reason = "request-domain failure";
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::exception& exception) {
+            reason = exception.what();
+        } catch (...) {}
+        std::fprintf(stderr, "[engine] request id=%llu failed in lane %u: %s\n",
+                     static_cast<unsigned long long>(request->id), *lane, reason.c_str());
+        complete_error(request, error);
+        remove_completed_slot(*lane);
+        unit_owner_.reset();
+        return true;
+    }
+
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
@@ -1848,6 +1977,8 @@ private:
 
             std::unique_lock execution_lock(execution_mutex_);
             try {
+                unit_phase_ = UnitPhase::Setup;
+                unit_owner_.reset();
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
@@ -1877,6 +2008,9 @@ private:
                 if (!control_membership.empty()) {
                     set_host_work_class(HostWorkClass::Control);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    unit_owner_ = control_membership.size == 1
+                                      ? slots_[control_membership.lanes[0]]
+                                      : nullptr;
                     run_control_batch(control_membership);
                     previous_unit_was_decode = true;
                     continue;
@@ -1890,11 +2024,19 @@ private:
                     }
                     prefill_runnable = !slots_[*lane]->capture_pending;
                 }
+                bandwidth_governor_.observe(steady_now_ns(), bandwidth_counters());
+                const bool prefill_admitted =
+                    !prefill_runnable || bandwidth_governor_.prefill_allowed();
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                    !membership.empty(), prefill_runnable, previous_unit_was_decode,
+                    prefill_admitted);
                 if (action == ExecutionAction::Prefill) {
+                    bandwidth_governor_.charge_prefill();
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    if (const auto lane = scheduler_.prefill_lane(); lane) {
+                        unit_owner_ = slots_[*lane];
+                    }
                     run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
                     continue;
@@ -1902,6 +2044,7 @@ private:
                 if (action == ExecutionAction::Decode) {
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    unit_owner_ = membership.size == 1 ? slots_[membership.lanes[0]] : nullptr;
                     run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
                     continue;
@@ -1910,7 +2053,19 @@ private:
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
-                HostPhaseMeasurement cleanup   = begin_host_phase();
+                bool recovered = false;
+                try {
+                    recovered = fail_request_lane(error);
+                } catch (...) {
+                    recovered = false;
+                }
+                if (recovered) {
+                    try {
+                        publish_runtime_stats();
+                    } catch (...) {}
+                    continue;
+                }
+                HostPhaseMeasurement cleanup = begin_host_phase();
                 fail_all_locked(error);
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 try {
@@ -1950,6 +2105,9 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    BandwidthGovernor bandwidth_governor_;
+    UnitPhase unit_phase_ = UnitPhase::Setup;          // W16: lane-failure eligibility
+    std::shared_ptr<Request> unit_owner_;              // W16: single-owner attribution
     bool stopping_ = false;
     bool failed_   = false;
     std::string failure_reason_;                        // W16: first failure wins
