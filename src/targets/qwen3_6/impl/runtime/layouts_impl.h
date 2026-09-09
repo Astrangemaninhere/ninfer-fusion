@@ -730,6 +730,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                   out.dflash_context, out.dflash_round, out.dflash2_context, out.dflash2_round,
                   out.causal_score});
     out.capacity = out.general_capacity;
+    if (std::getenv("NINFER_WS_DUMP") != nullptr) {
+        std::fprintf(stderr,
+                     "[ws] chunk=%u text_prefill=%zu ordinary=%zu mtp_prefill=%zu mtp_round=%zu "
+                     "general=%zu\n",
+                     chunk_u32, out.text_prefill, out.ordinary_round, out.mtp_prefill,
+                     out.mtp_round, out.general_capacity);
+    }
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));

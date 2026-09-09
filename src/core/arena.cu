@@ -232,7 +232,22 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
         throw std::overflow_error("arena allocation end offset overflows size_t");
     }
     const std::size_t end = aligned_offset + bytes;
-    if (end > cap_) { throw std::bad_alloc(); }
+    if (end > cap_) {
+        void* caller = __builtin_return_address(0);
+        Dl_info info{};
+        if (dladdr(caller, &info) != 0 && info.dli_sname != nullptr) {
+            std::fprintf(stderr,
+                         "arena overflow: request=%zu B offset=%zu end=%zu cap=%zu "
+                         "caller=%s+%p\n",
+                         bytes, aligned_offset, end, cap_, info.dli_sname,
+                         static_cast<char*>(caller) - static_cast<char*>(info.dli_saddr));
+        } else {
+            std::fprintf(stderr,
+                         "arena overflow: request=%zu B offset=%zu end=%zu cap=%zu caller=%p\n",
+                         bytes, aligned_offset, end, cap_, caller);
+        }
+        throw std::bad_alloc();
+    }
 
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;

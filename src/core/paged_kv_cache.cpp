@@ -267,7 +267,14 @@ bool DeviceKVPagePool::can_resize_reservation(const DeviceKVPageReservation& res
 
 void DeviceKVPagePool::resize_reservation(DeviceKVPageReservation& reservation,
                                           std::uint32_t new_reserved_pages) {
-    if (!can_resize_reservation(reservation, new_reserved_pages)) { throw std::bad_alloc(); }
+    if (!can_resize_reservation(reservation, new_reserved_pages)) {
+        std::fprintf(stderr,
+                     "kv pool resize failed: reservation=%u new=%u reserved=%u allocated=%u "
+                     "capacity=%u\n",
+                     reservation.pages_, new_reserved_pages, reserved_pages_, allocated_pages_,
+                     capacity_pages());
+        throw std::bad_alloc();
+    }
     reserved_pages_    = reserved_pages_ - reservation.pages_ + new_reserved_pages;
     reservation.pages_ = new_reserved_pages;
 }
@@ -658,7 +665,12 @@ reserve_device_kv_page_bundle(std::span<const DeviceKVPageReservationRequest> re
                 throw std::invalid_argument("Paged KV bundle names the same pool twice");
             }
         }
-        if (request.pages > request.pool->available_pages()) { throw std::bad_alloc(); }
+        if (request.pages > request.pool->available_pages()) {
+            std::fprintf(stderr, "kv bundle reservation failed: request=%u available=%u capacity=%u\n",
+                         request.pages, request.pool->available_pages(),
+                         request.pool->capacity_pages());
+            throw std::bad_alloc();
+        }
     }
 
     std::vector<DeviceKVPageReservation> reservations;
