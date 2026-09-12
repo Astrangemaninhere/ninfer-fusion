@@ -189,6 +189,10 @@ struct EngineOptions {
     // because no model knowledge exists there. Mutually exclusive with an explicit
     // kv_layer_storage (checked in serve_options.cpp).
     double kv_bit_budget_bits = 0.0;
+    // Separable form of the same budget ("0-7:8,8-63:4.5"): distinct ceilings per layer
+    // range, minimised per range (globally optimal because the objective is additive and
+    // the constraints are per-range). Empty means the single-ceiling form above.
+    std::string kv_bit_budget_ranges;
     bool kv_bit_budget_explicit = false;
     // Per-layer two-stage residual planes for the NVFP4 tier (second-stage
     // E2M1 K / ISO3 V over the first-stage error). Each enabled NVFP4 layer

@@ -315,4 +315,176 @@ struct KvBitBudgetSolution {
     return kv_bit_budget_solve(layers, budget_bits, e8_limit, cold_cap).spec;
 }
 
+// ---------------------------------------------------------------------------
+// Separable per-range bit ceilings ("分开约束"): the user may cap different layer
+// ranges independently, e.g. "0-7:8,8-63:4.5" (leading layers 8 bits, the rest 4.5).
+//
+// Optimality: the objective is the sum of per-layer penalties and the constraints are
+// per-range capacities, so the feasible set is the Cartesian product of the ranges'
+// feasible sets and minimising each range independently attains the global optimum.
+// Implementation is therefore the single-budget DP above, run once per range, with the
+// emitted layer indices shifted into absolute coordinates. The e8 leading-window limit
+// is applied on ABSOLUTE layer indices, and the cold pool is shared: ranges are solved
+// deepest-first (the pack order already sends cold to the deep block) and each range may
+// only spend what the pool has left, so the total cold layers can never exceed cold_cap.
+struct KvBitBudgetRange {
+    std::int32_t first = 0;   // inclusive, absolute layer index
+    std::int32_t last = 0;    // inclusive, absolute layer index
+    double bits = 0.0;        // ceiling for the average bits/element inside this range
+};
+
+// "N" (single ceiling for every layer) or "lo-hi:bits[,lo-hi:bits...]".
+// Ranges must tile [0, layers) in order; gaps/overlaps/out-of-order are rejected.
+[[nodiscard]] inline std::vector<KvBitBudgetRange>
+kv_bit_budget_parse_ranges(std::string_view text, std::int32_t layers) {
+    std::vector<KvBitBudgetRange> ranges;
+    const auto parse_number = [&](std::string_view piece, const char* what) {
+        try {
+            std::size_t used = 0;
+            const double value = std::stod(std::string(piece), &used);
+            if (used != piece.size()) { throw std::invalid_argument("trailing characters"); }
+            return value;
+        } catch (const std::exception&) {
+            throw std::invalid_argument(std::string("kv-bit-budget: invalid ") + what + ": " +
+                                        std::string(piece));
+        }
+    };
+    bool has_colon = text.find(':') != std::string_view::npos;
+    if (!has_colon) {
+        if (text.empty()) { throw std::invalid_argument("kv-bit-budget: empty specification"); }
+        ranges.push_back(KvBitBudgetRange{0, layers - 1, parse_number(text, "budget")});
+        return ranges;
+    }
+    std::size_t cursor = 0;
+    while (cursor <= text.size()) {
+        const std::size_t comma = text.find(',', cursor);
+        const std::string_view item =
+            text.substr(cursor, comma == std::string_view::npos ? text.size() - cursor
+                                                                : comma - cursor);
+        if (item.empty()) { throw std::invalid_argument("kv-bit-budget: empty range item"); }
+        const std::size_t colon = item.find(':');
+        if (colon == std::string_view::npos) {
+            throw std::invalid_argument("kv-bit-budget: range item needs 'lo-hi:bits': " +
+                                        std::string(item));
+        }
+        const std::string_view layers_part = item.substr(0, colon);
+        const std::string_view bits_part   = item.substr(colon + 1);
+        const std::size_t dash             = layers_part.find('-');
+        KvBitBudgetRange range;
+        if (dash == std::string_view::npos) {
+            const double only = parse_number(layers_part, "layer index");
+            range.first = range.last = static_cast<std::int32_t>(only);
+        } else {
+            range.first = static_cast<std::int32_t>(parse_number(layers_part.substr(0, dash),
+                                                                "layer index"));
+            range.last = static_cast<std::int32_t>(parse_number(layers_part.substr(dash + 1),
+                                                               "layer index"));
+        }
+        range.bits = parse_number(bits_part, "budget");
+        ranges.push_back(range);
+        if (comma == std::string_view::npos) { break; }
+        cursor = comma + 1;
+    }
+    std::int32_t expect = 0;
+    for (const KvBitBudgetRange& range : ranges) {
+        if (range.first != expect || range.last < range.first || range.last >= layers) {
+            throw std::invalid_argument(
+                "kv-bit-budget: ranges must tile layers 0.." + std::to_string(layers - 1) +
+                " in order (expected to start at " + std::to_string(expect) + ")");
+        }
+        if (!(range.bits > 0.0)) {
+            throw std::invalid_argument("kv-bit-budget: range budget must be positive");
+        }
+        expect = range.last + 1;
+    }
+    if (expect != layers) {
+        throw std::invalid_argument("kv-bit-budget: ranges must cover every layer (last covered " +
+                                    std::to_string(expect - 1) + " of " +
+                                    std::to_string(layers - 1) + ")");
+    }
+    return ranges;
+}
+
+// Shifts the layer indices of a single-range spec by `offset` (grammar: "lo-hi:tier,...").
+[[nodiscard]] inline std::string kv_bit_budget_shift_spec(std::string_view spec,
+                                                         std::int32_t offset) {
+    if (offset == 0) { return std::string(spec); }
+    std::string out;
+    std::size_t cursor = 0;
+    while (cursor < spec.size()) {
+        const std::size_t comma = spec.find(',', cursor);
+        const std::string_view item =
+            spec.substr(cursor, comma == std::string_view::npos ? spec.size() - cursor
+                                                               : comma - cursor);
+        const std::size_t colon = item.find(':');
+        const std::string_view layers_part = item.substr(0, colon);
+        const std::string_view tier_part   = item.substr(colon + 1);
+        const std::size_t dash             = layers_part.find('-');
+        const std::int32_t lo = static_cast<std::int32_t>(
+            std::stol(std::string(layers_part.substr(0, dash == std::string_view::npos
+                                                            ? layers_part.size()
+                                                            : dash)))) + offset;
+        std::string shifted = std::to_string(lo);
+        if (dash != std::string_view::npos) {
+            const std::int32_t hi = static_cast<std::int32_t>(
+                std::stol(std::string(layers_part.substr(dash + 1)))) + offset;
+            shifted += "-" + std::to_string(hi);
+        }
+        shifted += ":";
+        shifted += std::string(tier_part);
+        if (!out.empty()) { out += ","; }
+        out += shifted;
+        if (comma == std::string_view::npos) { break; }
+        cursor = comma + 1;
+    }
+    return out;
+}
+
+[[nodiscard]] inline std::string
+kv_bit_budget_spec_ranges(std::int32_t layers, const std::vector<KvBitBudgetRange>& ranges,
+                          std::int32_t e8_limit = kKvBitBudgetE8LayerLimit,
+                          std::int32_t cold_cap = 0) {
+    if (ranges.empty()) {
+        throw std::invalid_argument("kv-bit-budget: no ranges given");
+    }
+    std::int32_t expect = 0;
+    for (const KvBitBudgetRange& range : ranges) {
+        if (range.first != expect || range.last < range.first || range.last >= layers) {
+            throw std::invalid_argument("kv-bit-budget: ranges must tile the layer stack");
+        }
+        expect = range.last + 1;
+    }
+    if (expect != layers) {
+        throw std::invalid_argument("kv-bit-budget: ranges must cover every layer");
+    }
+    // Deepest range first so the shared cold pool is spent where the pack order puts cold.
+    std::vector<std::size_t> order(ranges.size());
+    for (std::size_t i = 0; i < ranges.size(); ++i) { order[i] = i; }
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return ranges[a].first > ranges[b].first;
+    });
+    std::vector<std::string> pieces(ranges.size());
+    std::int32_t cold_left = cold_cap;
+    for (const std::size_t index : order) {
+        const KvBitBudgetRange& range = ranges[index];
+        const std::int32_t count      = range.last - range.first + 1;
+        // e8 is a leading-layer window in ABSOLUTE coordinates.
+        const std::int32_t within = e8_limit - range.first;
+        const std::int32_t local_e8 = within <= 0 ? 0 : (within < count ? within : count);
+        const KvBitBudgetSolution solved =
+            kv_bit_budget_solve(count, range.bits, local_e8, cold_left);
+        for (const auto& [name, used] : solved.counts) {
+            if (name == "cold") { cold_left -= used; }
+        }
+        pieces[index] = kv_bit_budget_shift_spec(solved.spec, range.first);
+    }
+    std::string out;
+    for (std::size_t i = 0; i < pieces.size(); ++i) {
+        if (pieces[i].empty()) { continue; }
+        if (!out.empty()) { out += ","; }
+        out += pieces[i];
+    }
+    return out;
+}
+
 } // namespace ninfer::product

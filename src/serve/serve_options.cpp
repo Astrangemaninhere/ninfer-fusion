@@ -270,6 +270,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.kv_layer_storage_explicit = true;
         } else if (arg == "--kv-bit-budget") {
+            // Same two forms as the CLI: a scalar ceiling, or separable per-range ceilings
+            // ("0-7:8,8-63:4.5") parsed by the allocator itself.
+            const std::string budget_spec = require_value("--kv-bit-budget");
+            if (budget_spec.find(':') != std::string::npos ||
+                budget_spec.find(',') != std::string::npos) {
+                options.kv_bit_budget_ranges              = budget_spec;
+                options.kv_bit_budget_bits                = 0.0;
+                options.kv_bit_budget_explicit            = true;
+                continue;
+            }
+            options.kv_bit_budget_bits = parse_float_in(budget_spec.c_str(), "--kv-bit-budget",
+                                                        0.01f, 16.0f);
             // Fractional bits/element for the full-attention KV. Stored raw here: this
             // parse site has no model knowledge (the layer count is unknown); the
             // per-layer table is resolved from the DP in make_sequence_planner_impl

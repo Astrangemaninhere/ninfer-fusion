@@ -1013,9 +1013,20 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             static_cast<std::int32_t>(TextConfig::full_attention_layers());
         const std::uint32_t cold_pages = effective_cold_pages(
             options.cold_policy, options.cold_keep_tokens, options.max_cold_pages);
-        const std::string spec = product::kv_bit_budget_spec(
-            full_layers, options.kv_bit_budget_bits, product::kKvBitBudgetE8LayerLimit,
-            static_cast<std::int32_t>(cold_pages));
+        // Two forms of the same knob: a single ceiling for every full-attention layer, or
+        // separable per-range ceilings ("0-7:8,8-63:4.5") which the DP minimises per range
+        // (globally optimal: additive objective, per-range constraints).
+        const std::string spec =
+            options.kv_bit_budget_ranges.empty()
+                ? product::kv_bit_budget_spec(full_layers, options.kv_bit_budget_bits,
+                                              product::kKvBitBudgetE8LayerLimit,
+                                              static_cast<std::int32_t>(cold_pages))
+                : product::kv_bit_budget_spec_ranges(
+                      full_layers,
+                      product::kv_bit_budget_parse_ranges(options.kv_bit_budget_ranges,
+                                                          full_layers),
+                      product::kKvBitBudgetE8LayerLimit,
+                      static_cast<std::int32_t>(cold_pages));
         // Split the DP plan. "cold" is NOT a --kv-layer-storage tier (S12 note):
         // cold-planned layers keep a HOT window at NVFP4 (cold slots hold
         // requantized E2M1-family data, decoder_state.cpp cold-pool note), the
@@ -1049,10 +1060,12 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         }
         storage_explicit = true;
         std::fprintf(stderr,
-                     "[kv-bit-budget] full_attention_layers=%d bits=%.2f cold_pages=%u "
-                     "cold_placed=%s hot=%s (cold residency needs --cold-policy "
-                     "window|disk; pool sized by --max-cold-pages >= %u)\n",
+                     "[kv-bit-budget] full_attention_layers=%d bits=%.2f ranges=%s "
+                     "cold_pages=%u cold_placed=%s hot=%s (cold residency needs "
+                     "--cold-policy window|disk; pool sized by --max-cold-pages >= %u)\n",
                      static_cast<int>(full_layers), options.kv_bit_budget_bits,
+                     options.kv_bit_budget_ranges.empty() ? "-"
+                                                          : options.kv_bit_budget_ranges.c_str(),
                      static_cast<unsigned>(cold_pages),
                      cold_ranges.empty() ? "-" : cold_ranges.c_str(), hot_spec.c_str(),
                      static_cast<unsigned>(cold_pages));

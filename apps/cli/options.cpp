@@ -82,7 +82,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--spec auto|mtp|dflash|dflash2|none --draft-tokens N]\n           (--spec defaults to auto; none turns speculation off)\n"
+           "       [--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--kv-bit-budget SPEC] [--spec auto|mtp|dflash|dflash2|none --draft-tokens N]\n           (--kv-bit-budget takes a ceiling per KV element, or per layer range:\n            \"0-7:8,8-63:4.5\"; it never exceeds the declared ceilings)\n           (--spec defaults to auto; none turns speculation off)\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -141,7 +141,22 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
             options.kv_cache_explicit = true;
-                } else if (arg == "--kv-layer-storage") {
+                } else if (arg == "--kv-bit-budget") {
+            // "N" (one ceiling for every full-attention layer) or "lo-hi:bits,..."
+            // (separable per-range ceilings; the DP minimises each range independently).
+            const std::string budget_spec = value(arg);
+            if (budget_spec.find(':') != std::string::npos ||
+                budget_spec.find(',') != std::string::npos) {
+                options.kv_bit_budget_ranges   = budget_spec;
+                options.kv_bit_budget_bits     = 0.0;
+                options.kv_bit_budget_explicit = true;
+            } else {
+                options.kv_bit_budget_bits =
+                    parse_float(budget_spec.c_str(), "--kv-bit-budget", 0.01F, 16.0F);
+                options.kv_bit_budget_ranges.clear();
+                options.kv_bit_budget_explicit = true;
+            }
+        } else if (arg == "--kv-layer-storage") {
             options.kv_layer_storage_spec = value(arg);
             options.kv_layer_storage_explicit = true;
 } else if (arg == "--spec") {

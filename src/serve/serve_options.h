@@ -47,6 +47,8 @@ struct ServeOptions {
     bool kv_layer_storage_explicit        = false;
     double kv_bit_budget_bits             = 0.0; // --kv-bit-budget, resolved at planner time
     bool kv_bit_budget_explicit           = false;
+    // Separable per-range ceilings ("0-7:8,8-63:4.5"); empty means the scalar form above.
+    std::string kv_bit_budget_ranges;
     std::array<bool, 16> kv_residual_layers{};
     bool kv_residual_explicit             = false;
     // Same default as the CLI: unspecified --spec means auto, `--spec none` opts out.

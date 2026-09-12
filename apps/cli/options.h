@@ -32,6 +32,11 @@ struct Options {
     bool enable_vision  = false;
     bool use_cuda_graph = true;
     std::string kv_layer_storage_spec;
+    // KV bit budget: a single ceiling per element, or separable per-range ceilings
+    // ("0-7:8,8-63:4.5"); the DP never exceeds them and minimises the penalty inside them.
+    double kv_bit_budget_bits = 0.0;
+    std::string kv_bit_budget_ranges;
+    bool kv_bit_budget_explicit = false;
     bool kv_layer_storage_explicit = false;
     ColdPolicy cold_policy        = ColdPolicy::None;
     std::uint32_t cold_keep_tokens = 128;

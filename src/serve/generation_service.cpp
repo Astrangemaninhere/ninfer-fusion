@@ -249,6 +249,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_layer_storage_explicit = options_.kv_layer_storage_explicit;
     engine_options.kv_bit_budget_bits      = options_.kv_bit_budget_bits;
     engine_options.kv_bit_budget_explicit  = options_.kv_bit_budget_explicit;
+    engine_options.kv_bit_budget_ranges    = options_.kv_bit_budget_ranges;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.yarn_enabled             = options_.yarn_enabled;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;

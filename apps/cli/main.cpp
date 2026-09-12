@@ -304,6 +304,11 @@ int main(int argc, char** argv) {
             }
             engine_options.kv_layer_storage_explicit = true;
         }
+        if (cli.kv_bit_budget_explicit) {
+            engine_options.kv_bit_budget_bits     = cli.kv_bit_budget_bits;
+            engine_options.kv_bit_budget_ranges   = cli.kv_bit_budget_ranges;
+            engine_options.kv_bit_budget_explicit = true;
+        }
         engine_options.cold_policy           = cli.cold_policy;
         engine_options.cold_keep_tokens      = cli.cold_keep_tokens;
         engine_options.cold_host_bytes       = cli.cold_host_bytes;
