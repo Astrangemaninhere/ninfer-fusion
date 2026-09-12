@@ -123,7 +123,8 @@ EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
         // the load plan or the program, and a disabled run must end on the full head.
         resolved.speculative.proposal_head = qwen3_6::resolved_proposal_head(
             resolved.speculative.proposal_head, resolved.speculative.backend,
-            weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2);
+            weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2,
+            resolved.speculative.draft_tokens);
         return resolved;
     }
     // The artifact weights decide the backend, not the context length: a
@@ -148,7 +149,8 @@ EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
     // shortlist draft head, so the bf16-head profile keeps the full head.
     resolved.speculative.proposal_head = qwen3_6::resolved_proposal_head(
         resolved.speculative.proposal_head, resolved.speculative.backend,
-        weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2);
+        weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2,
+        resolved.speculative.draft_tokens);
     return resolved;
 }
 

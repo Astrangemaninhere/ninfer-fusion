@@ -51,14 +51,24 @@ struct StartupFeatures {
 // argmax accept" (speculative_round.cuh). --lm-head-draft still opts in explicitly.
 // A disabled run must land on Full: layouts_impl.h rejects a non-full head once
 // speculation is off (the target head does the sampling then).
+// MTP may take the shortlist head from this draft window up. Measured on
+// qwen3.8-27b/nvfp4-dflash2 (same prompt, greedy, 160 tokens, dl/_head_sweep.txt):
+// k=3 differs from the full head at 88/160 positions while k=5/7/9 are
+// bit-identical, and the shortlist head is 14-28% faster (k=9: 325.63 vs 253.86
+// tok/s). Below the threshold the full head is the fidelity-safe choice.
+inline constexpr std::uint32_t kMtpShortlistMinimumDrafts = 5;
+
 [[nodiscard]] inline ProposalHead resolved_proposal_head(ProposalHead head,
                                                         SpeculativeBackend backend,
-                                                        bool has_shortlist_head) noexcept {
+                                                        bool has_shortlist_head,
+                                                        std::uint32_t draft_tokens) noexcept {
     if (head != ProposalHead::Auto) { return head; }
-    if (backend != SpeculativeBackend::DFlash2 || !has_shortlist_head) {
-        return ProposalHead::Full;
+    if (!has_shortlist_head) { return ProposalHead::Full; }
+    if (backend == SpeculativeBackend::DFlash2) { return ProposalHead::Optimized; }
+    if (backend == SpeculativeBackend::Mtp && draft_tokens >= kMtpShortlistMinimumDrafts) {
+        return ProposalHead::Optimized;
     }
-    return ProposalHead::Optimized;
+    return ProposalHead::Full;
 }
 
 

@@ -44,12 +44,30 @@ Control experiments that make this attributable:
   either head, and the shortlist head is only +2.5% faster. For DFlash2 the
   shortlist head is a pure proposal mechanism, as documented.
 
+## The head only matters at small k
+
+Sweeping the head against the draft window on the same prompt (dl/_head_sweep.txt,
+160 tokens, greedy; shortlist = `--lm-head-draft`, full = `--no-lm-head-draft`):
+
+| k | shortlist tok/s | full tok/s | shortlist vs full token ids |
+|---|---|---|---|
+| 3 | 210.20 | 199.86 | 88/160 positions differ, 5 edit blocks |
+| 5 | 243.84 | 213.87 | **bit-identical (0/160)** |
+| 7 | 298.73 | 252.08 | **bit-identical (0/160)** |
+| 9 | 325.63 | 253.86 | **bit-identical (0/160)** |
+
+So the shortlist head only perturbs the emitted tokens in the small-window path;
+from k=5 up it is free speed (+14% at k=5, +28% at k=9). The k=3 divergence and the
+k>=5 identity are both reproducible run to run.
+
 ## Fix
 
-`qwen3_6::resolved_proposal_head` (startup_features.h) now resolves
-`ProposalHead::Auto` to the shortlist head **only for the DFlash2 backend**
-(where it is a pure proposal mechanism and output-identical); MTP resolves to the
-full head. `--lm-head-draft` still opts into the shortlist head explicitly.
+`qwen3_6::resolved_proposal_head` (startup_features.h) resolves
+`ProposalHead::Auto` as: shortlist head for DFlash2 (pure proposal mechanism,
+output-identical) and for MTP once the draft window reaches
+`kMtpShortlistMinimumDrafts = 5` (measured output-identical there); full head below
+that and for every disabled run. `--lm-head-draft` still opts into the shortlist
+head explicitly at any k.
 `Auto` also resolves to `Full` whenever speculation ends up disabled — without that,
 a plain run fails `layouts_impl.h` "disabled speculative decoding requires
 draft_tokens=0 and the full proposal head".
