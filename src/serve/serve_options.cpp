@@ -1,4 +1,5 @@
 #include "product/kv_options.h"
+#include "product/kv_tier_formats.h"
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
@@ -80,7 +81,10 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8] [--spec mtp|dflash|dflash2|auto --draft-tokens N] "
+           "[--kv-dtype bf16|int8|fp8] [--kv-tier-formats SPEC] [--nvfp4-mode fusion|pure] "
+           "[--kv-rotation on|off] [--kv-row-scale auto|off|FILE] "
+           "[--kv-v-codec iso3|e2m1] "
+           "[--spec mtp|dflash|dflash2|auto --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--no-auto-system-shared-prefix] [--cors] "
@@ -100,6 +104,11 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --kv-tier-formats hot=auto|bf16|int8,tail=...,cold=... names the KV tiers\n"
+           "       (hot = the resident format of every full-attention layer, bf16/int8 only;\n"
+           "       cold = the aged-out tier format, whose codec is derived from the layer\n"
+           "       dtype and only reachable as int8 today; tail is accepted only when it\n"
+           "       repeats hot). --nvfp4-mode pure forbids nvfp4/iso3/e8.\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -269,6 +278,55 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.kv_layer_storage[i] = table[i];
             }
             options.kv_layer_storage_explicit = true;
+        } else if (arg == "--kv-tier-formats") {
+            // KV tier vocabulary ("hot=bf16,tail=fp16,cold=iso3"; kvcfg/kv_formats.h).
+            // Raw text: vocabulary rules are checked after the loop (the mode may come
+            // later in argv) and the per-layer landing needs the model's layer count.
+            options.kv_tier_formats_spec     = require_value("--kv-tier-formats");
+            options.kv_tier_formats_explicit = true;
+        } else if (arg == "--nvfp4-mode") {
+            const std::string_view mode = require_value("--nvfp4-mode");
+            if (mode == "pure") {
+                options.kv_nvfp4_pure = true;
+            } else if (mode == "fusion") {
+                options.kv_nvfp4_pure = false;
+            } else {
+                throw std::invalid_argument("invalid nvfp4-mode: " + std::string(mode));
+            }
+            options.kv_tier_formats_explicit = true;
+        } else if (arg == "--kv-rotation") {
+            // SEPARATION: SO(4) rotation of K on cache write and Q before
+            // quantization. off takes the identity map on BOTH sides.
+            const std::string_view mode = require_value("--kv-rotation");
+            if (mode == "off") {
+                options.kv_rotation_off = true;
+            } else if (mode == "on" || mode == "auto" || mode == "default") {
+                options.kv_rotation_off = false;
+            } else {
+                throw std::invalid_argument("invalid kv-rotation: " + std::string(mode) +
+                                            " (expected on|off)");
+            }
+            options.kv_rotation_explicit = true;
+        } else if (arg == "--kv-row-scale") {
+            // SEPARATION: three-state row scale. The vocabulary is validated by
+            // kv_rowscale_mode_from_spec() at plan time (the same parser the
+            // environment hook uses), so the CLI cannot drift from NINFER_KV_ROWSCALE.
+            options.kv_row_scale_spec     = std::string(require_value("--kv-row-scale"));
+            options.kv_row_scale_explicit = true;
+        } else if (arg == "--kv-v-codec") {
+            // SEPARATION: V-plane codec on the NVFP4 tier. iso3 is the engine
+            // default; e2m1 is an ablation and is refused when a mechanism that
+            // hardcodes ISO3 V (residual plane, cold pool) is active.
+            const std::string_view mode = require_value("--kv-v-codec");
+            if (mode == "iso3") {
+                options.kv_v_codec = KvVCodec::Iso3;
+            } else if (mode == "e2m1") {
+                options.kv_v_codec = KvVCodec::E2M1;
+            } else {
+                throw std::invalid_argument("invalid kv-v-codec: " + std::string(mode) +
+                                            " (expected iso3|e2m1)");
+            }
+            options.kv_v_codec_explicit = true;
         } else if (arg == "--kv-bit-budget") {
             // Same two forms as the CLI: a scalar ceiling, or separable per-range ceilings
             // ("0-7:8,8-63:4.5") parsed by the allocator itself.
@@ -280,14 +338,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.kv_bit_budget_explicit            = true;
                 continue;
             }
+            // budget_spec is already the consumed value: do NOT call require_value again,
+            // it would advance past the next argv token (e.g. swallow --port).
             options.kv_bit_budget_bits = parse_float_in(budget_spec.c_str(), "--kv-bit-budget",
                                                         0.01f, 16.0f);
             // Fractional bits/element for the full-attention KV. Stored raw here: this
             // parse site has no model knowledge (the layer count is unknown); the
             // per-layer table is resolved from the DP in make_sequence_planner_impl
             // (layouts_impl.h), where TextConfig::full_attention_layers() is available.
-            options.kv_bit_budget_bits = parse_float_in(require_value("--kv-bit-budget"),
-                                                        "--kv-bit-budget", 0.01f, 16.0f);
             options.kv_bit_budget_explicit = true;
         } else if (arg == "--kv-residual-layers") {
             const std::string value = require_value("--kv-residual-layers");
@@ -459,6 +517,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument(
             "--kv-bit-budget and --kv-layer-storage are mutually exclusive: the budget "
             "is resolved into exactly the table --kv-layer-storage provides");
+    }
+    if (options.kv_tier_formats_explicit) {
+        // Vocabulary rules only (bad tier, bad format, tier ordering, pure vs iso/e8).
+        // The per-layer landing plus the tier/table consistency checks need the model's
+        // full-attention layer count and run in make_sequence_planner_impl.
+        (void)product::kv_tier_formats_parse(options.kv_tier_formats_spec,
+                                             options.kv_nvfp4_pure);
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

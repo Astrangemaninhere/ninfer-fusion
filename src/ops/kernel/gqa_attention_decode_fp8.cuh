@@ -13,7 +13,7 @@
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 #include "ops/kernel/gqa_isoquant_rot.cuh"
-#include "ops/kernel/gqa_attention_prefill_nvfp4.cuh" // gqa_prefill_nvfp4_rot
+#include "ops/kernel/gqa_attention_prefill_nvfp4.cuh" // gqa_isoquant_rot_block4 (via the rot header)
 
 #include <cstdint>
 
@@ -27,7 +27,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
     std::uint8_t* cache_k_scale, std::uint8_t* cache_v_scale,
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
+    std::int32_t split_units, float scale,
     float* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
@@ -128,17 +129,33 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
     }
 
     const int window = last_pos + 1;
-    const int active_split_count =
-        gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+    // Fixed split grid (split_units > 0): split s owns the keys
+    // [s*split_units, min((s+1)*split_units, window)). Its interior boundaries are
+    // launch constants, so the partial a split contributes for a key range -- and the
+    // fp32 addition order it used to build it -- no longer move when the launch covers
+    // a different number of tokens. The live window still clips every range (no split
+    // addresses a key past the last valid one) and split_units == 0 keeps the legacy
+    // window-driven partition.
+    int active_split_count = 0;
+    int split_start        = 0;
+    int split_limit        = 0;
+    if (split_units > 0) {
+        active_split_count = gqa_small_t_split_active(window, split_units, split_count);
+        split_start        = split * split_units;
+        split_limit        = split_start + split_units;
+    } else {
+        active_split_count =
+            gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start = split * units_per_split * (tile_split ? Bc : 1);
+        split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+    }
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    const int split_end = (split_limit < window) ? split_limit : window;
     if (split_start >= split_end) {
         write_neutral();
         return;
@@ -179,14 +196,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
                     gqa_kv_new_index<Geometry>(kv_head, group * 16, token) + lane * 4;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) { kx[j] = __bfloat162float(input.k[src + j]); }
-                const float y0 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 0);
-                const float y1 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 1);
-                const float y2 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 2);
-                const float y3 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 3);
-                kx[0]          = y0;
-                kx[1]          = y1;
-                kx[2]          = y2;
-                kx[3]          = y3;
+                gqa_isoquant_rot_block4(kx, block);
             }
             float kmax = fmaxf(fmaxf(fabsf(kx[0]), fabsf(kx[1])),
                                fmaxf(fabsf(kx[2]), fabsf(kx[3])));
@@ -234,17 +244,27 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
         __syncthreads();
     }
 
-    for (int idx = tid; idx < Br * D; idx += Threads) {
-        const int row = idx / D;
-        const int d   = idx - row * D;
+    for (int idx = tid; idx < Br * (D / 8); idx += Threads) {
+        const int row = idx / (D / 8);
+        const int d   = (idx - row * (D / 8)) * 8;
         int q_head    = 0;
         int token     = 0;
         gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-        __nv_bfloat16 value = __float2bfloat16(0.0f);
-        if (row < row_count && gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-            value = q[gqa_q_index<Geometry>(q_head, d, token)];
+        const bool valid = row < row_count && gqa_valid_q_head<Geometry>(kv_head, q_head);
+        float x[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            x[i] = valid ? __bfloat162float(q[gqa_q_index<Geometry>(q_head, d + i, token)]) : 0.0f;
         }
-        qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = value;
+        // K is rotated at append time; rotate Q by the same per-4-block IsoQuant
+        // matrix so QK^T is invariant. Same rotation as the ISO3 path
+        // (gqa_attention_decode_iso3.cuh) and the gate lives inside
+        // gqa_isoquant_rot_block4(), so "rotation off" stays identity on both sides.
+        gqa_prefill_nvfp4_rotate_8(x, d);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qkv_s[row * D + gqa_small_t_tc_swz(row, d + i)] = __float2bfloat16(x[i]);
+        }
     }
     __syncthreads();
 

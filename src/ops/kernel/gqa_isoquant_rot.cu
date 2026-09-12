@@ -1,4 +1,12 @@
 ﻿#include "ops/kernel/gqa_isoquant_rot.cuh"
+#include "ops/kernel/gqa_isoquant_rot_gate.h"
+
+#include <cuda_runtime.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 // Baked IsoQuant per-4-channel SO(4) rotations, [64][4][4] fp32, imported
 // from the nvfp4rtx offline calibration (isoquant_rot.npy). Kept in constant
@@ -71,3 +79,44 @@ __constant__ float kGqaIsoquantRotDev[64][4][4] = {
         {{0.4133192002773285f, 0.38275083899497986f, 0.8261796236038208f, -0.00980697013437748f}, {-0.584749698638916f, 0.5674367547035217f, 0.03652407228946686f, 0.5785752534866333f}, {-0.35834357142448425f, -0.7157992720603943f, 0.5145338177680969f, 0.3073699474334717f}, {0.5990199446678162f, -0.13837909698486328f, -0.22660110890865326f, 0.7554324865341187f}},
         {{0.6994558572769165f, -0.6821857690811157f, -0.21111047267913818f, -0.028574516996741295f}, {-0.38532692193984985f, -0.4039255678653717f, -0.08315643668174744f, 0.8255012631416321f}, {-0.6019008755683899f, -0.5340152382850647f, -0.19258402287960052f, -0.5616534352302551f}, {0.0003105102223344147f, 0.293759286403656f, -0.954687774181366f, 0.047714173793792725f}}
 };
+
+// Runtime gate (gqa_isoquant_rot.cuh). Word 0 baked to 1 so an engine that
+// never calls the switch below reads the table exactly as before; words 1..3
+// are reserved and stay 0 so the four words share one 16-byte constant line
+// (a single warp-uniform LDC fetches the enable bit).
+__constant__ int kGqaIsoquantRotGeom[4] = {1, 0, 0, 0};
+
+namespace ninfer::ops {
+
+bool kv_rotation_apply_spec(const std::string& spec) {
+    KvRotationMode mode = KvRotationMode::Auto;
+    std::string err;
+    if (!kv_rotation_mode_from_spec(spec, mode, err)) {
+        throw std::runtime_error("KVROT " + err);
+    }
+    // Auto is a RESTORE, not a no-op: the descriptor is process-global device
+    // state, so an engine built with "off" followed by an engine built with
+    // "on" in the same process must not inherit the disabled gate. The value
+    // written for Auto is exactly the baked initializer, so the on-path device
+    // behaviour is unchanged and no kernel can observe a difference from the
+    // pre-separation engine.
+    const int gate[4] = {mode == KvRotationMode::Off ? 0 : 1, 0, 0, 0};
+    const cudaError_t e = cudaMemcpyToSymbol(kGqaIsoquantRotGeom, gate, sizeof gate);
+    if (e != cudaSuccess) {
+        throw std::runtime_error(std::string("KVROT upload: ") + cudaGetErrorString(e));
+    }
+    if (mode == KvRotationMode::Off) {
+        std::fprintf(stderr, "[kvrot] gate off: SO(4) rotation disabled (K write and Q read "
+                             "both take the identity map)\n");
+        return true;
+    }
+    return false;
+}
+
+bool kv_rotation_apply_from_env() {
+    const char* spec = std::getenv("NINFER_KV_ROTATION");
+    if (spec == nullptr) { return false; }
+    return kv_rotation_apply_spec(std::string(spec));
+}
+
+} // namespace ninfer::ops

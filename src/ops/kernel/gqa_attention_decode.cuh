@@ -95,6 +95,32 @@ __device__ __forceinline__ int gqa_small_t_default_splits(int window) {
     return splits < Geometry::DecodeSplits ? splits : Geometry::DecodeSplits;
 }
 
+// Fixed split grid for the split-KV small-T decode. `split_units` is a launch
+// constant derived from GqaExecutionEnvelope::split_reference_keys alone, so split s
+// owns exactly the keys [s*split_units, (s+1)*split_units): every interior boundary
+// sits on the fixed key grid and only the trailing split is clipped by the live
+// window. A row's split partition -- and with it the fp32 reduction order that decides
+// ULP-level ties -- is therefore a function of the row's own key prefix, never of how
+// many tokens the enclosing launch carries (batch-1 decode vs k+1 wide verify).
+// The partial kernels and the reducer must be given the same split_units; a launch
+// that passes 0 keeps the legacy window-driven partition.
+__host__ __device__ __forceinline__ int gqa_small_t_split_active(int window, int split_units,
+                                                               int launch_capacity) {
+    if (window <= 0 || split_units <= 0 || launch_capacity <= 0) { return 0; }
+    const int needed = div_up(window, split_units);
+    return needed < launch_capacity ? needed : launch_capacity;
+}
+
+// Keys per split from the split reference: at most DecodeSplits splits cover the whole
+// reference, rounded up to a 32-key boundary so a boundary tile is staged as a whole.
+template <typename Geometry>
+__host__ __device__ __forceinline__ int gqa_small_t_split_units(int split_reference_keys) {
+    const int reference = split_reference_keys > 0 ? split_reference_keys : 1;
+    const int raw       = div_up(reference, static_cast<int>(Geometry::DecodeSplits));
+    const int units     = div_up(raw, 32) * 32;
+    return units > 0 ? units : 32;
+}
+
 template <typename Geometry, bool Int8>
 __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_capacity,
                                                          int tokens) {
@@ -149,7 +175,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, std::int32_t split_units, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -185,8 +211,14 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     }
 
     const int window = last_pos + 1;
+    // split_units > 0 selects the fixed split grid, which the partial kernels also used
+    // for this launch. Splits beyond the row's own last key hold the neutral partials the
+    // partial kernel wrote (m = -inf, l = 0), so walking them is exact: their l is
+    // skipped and the weight applied to their accumulator is 0.
     const int active_split_count =
-        gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
+        split_units > 0
+            ? gqa_small_t_split_active(window, split_units, split_count)
+            : gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 
     __shared__ float reduce[256];
 

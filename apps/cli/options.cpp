@@ -1,6 +1,7 @@
 #include "options.h"
 #include "product/speculative_options.h"
 #include "product/kv_options.h"
+#include "product/kv_tier_formats.h"
 
 #include <cerrno>
 #include <cmath>
@@ -83,14 +84,31 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--kv-bit-budget SPEC] [--spec auto|mtp|dflash|dflash2|none --draft-tokens N]\n           (--kv-bit-budget takes a ceiling per KV element, or per layer range:\n            \"0-7:8,8-63:4.5\"; it never exceeds the declared ceilings)\n           (--spec defaults to auto; none turns speculation off)\n"
+           "       [--kv-tier-formats hot=auto|bf16|int8,tail=...,cold=...] [--nvfp4-mode fusion|pure]\n"
+           "           (hot = the resident format of every full-attention layer; only bf16 and\n"
+           "            int8 have a resident codec. cold is the aged-out tier format; the cold\n"
+           "            slot codec is derived from the layer dtype and only int8 is reachable\n"
+           "            today. tail is accepted only when it repeats hot: the engine has no\n"
+           "            recent-window tier yet. --nvfp4-mode pure forbids nvfp4/iso3/e8.)\n"
+           "       [--kv-rotation on|off] [--kv-row-scale auto|off|FILE]\n"
+           "       [--kv-v-codec iso3|e2m1]\n"
+           "           (component switches for the NVFP4/FP8/ISO3 KV tiers.\n"
+           "            --kv-rotation off takes the identity SO(4) map on BOTH the K write\n"
+           "            and the Q read, so QK^T stays exact and only the quantization domain\n"
+           "            changes. --kv-row-scale off takes the identity row scale in the kernel\n"
+           "            (no identity file needed); auto keeps the baked table; FILE loads an\n"
+           "            NINFERKVRS1 sidecar (NINFER_KV_ROWSCALE is the env equivalent).\n"
+           "            --kv-v-codec e2m1 stores NVFP4-tier V as E2M1 instead of ISO3 and is\n"
+           "            refused when a V residual plane or the cold pool is active.)\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--cold-policy none|off|window|host] [--cold-keep-tokens N]\n"
-           "       [--cold-host-bytes N[g|m|k]]\n"
+           "       [--cold-policy none|off|window|host|disk] [--cold-keep-tokens N]\n"
+           "       [--max-cold-pages N] [--cold-host-bytes N[g|m|k]]\n"
+           "       [--cold-disk-path DIR] [--cold-disk-bytes N]\n"
            "       [--no-cuda-graph] [--graph-capture-ceiling N]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -141,7 +159,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
             options.kv_cache_explicit = true;
-                } else if (arg == "--kv-bit-budget") {
+        } else if (arg == "--kv-bit-budget") {
             // "N" (one ceiling for every full-attention layer) or "lo-hi:bits,..."
             // (separable per-range ceilings; the DP minimises each range independently).
             const std::string budget_spec = value(arg);
@@ -156,10 +174,64 @@ Options parse_options(int argc, char** argv) {
                 options.kv_bit_budget_ranges.clear();
                 options.kv_bit_budget_explicit = true;
             }
+        } else if (arg == "--kv-quality-weight") {
+            // 0 = fastest KV path, 1 = most accurate; the DP minimises
+            // w*quality + (1-w)*speed per tier inside the bit ceiling.
+            options.kv_quality_weight =
+                parse_float(value(arg), "--kv-quality-weight", 0.0F, 1.0F);
+        } else if (arg == "--kv-tier-scores") {
+            options.kv_tier_scores = value(arg);
         } else if (arg == "--kv-layer-storage") {
             options.kv_layer_storage_spec = value(arg);
             options.kv_layer_storage_explicit = true;
-} else if (arg == "--spec") {
+        } else if (arg == "--kv-tier-formats") {
+            // KV tier vocabulary ("hot=bf16,tail=fp16,cold=iso3"; kvcfg/kv_formats.h).
+            // Parsed raw: the vocabulary's own rules are checked after the loop (the
+            // nvfp4 mode may come later in argv) and the per-layer landing needs the
+            // model's layer count, so it happens in the planner.
+            options.kv_tier_formats_spec     = value(arg);
+            options.kv_tier_formats_explicit = true;
+        } else if (arg == "--nvfp4-mode") {
+            const std::string_view mode = value(arg);
+            if (mode == "pure") {
+                options.kv_nvfp4_pure = true;
+            } else if (mode == "fusion") {
+                options.kv_nvfp4_pure = false;
+            } else {
+                throw std::invalid_argument("invalid nvfp4-mode: " + std::string(mode));
+            }
+            options.kv_tier_formats_explicit = true;
+        } else if (arg == "--kv-rotation") {
+            // SEPARATION: SO(4) rotation of K on cache write and Q before
+            // quantization; off takes the identity map on BOTH sides.
+            const std::string_view mode = value(arg);
+            if (mode == "off") {
+                options.kv_rotation_off = true;
+            } else if (mode == "on" || mode == "auto" || mode == "default") {
+                options.kv_rotation_off = false;
+            } else {
+                throw std::invalid_argument("invalid kv-rotation: " + std::string(mode) +
+                                            " (expected on|off)");
+            }
+            options.kv_rotation_explicit = true;
+        } else if (arg == "--kv-row-scale") {
+            // SEPARATION: three-state row scale (auto|off|<path>); validated at
+            // plan time by the same parser NINFER_KV_ROWSCALE uses.
+            options.kv_row_scale_spec     = std::string(value(arg));
+            options.kv_row_scale_explicit = true;
+        } else if (arg == "--kv-v-codec") {
+            // SEPARATION: V-plane codec on the NVFP4 tier (iso3 default).
+            const std::string_view mode = value(arg);
+            if (mode == "iso3") {
+                options.kv_v_codec = KvVCodec::Iso3;
+            } else if (mode == "e2m1") {
+                options.kv_v_codec = KvVCodec::E2M1;
+            } else {
+                throw std::invalid_argument("invalid kv-v-codec: " + std::string(mode) +
+                                            " (expected iso3|e2m1)");
+            }
+            options.kv_v_codec_explicit = true;
+        } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
@@ -182,12 +254,26 @@ Options parse_options(int argc, char** argv) {
             if (v == "none" || v == "off") { options.cold_policy = ColdPolicy::None; }
             else if (v == "window") { options.cold_policy = ColdPolicy::Window; }
             else if (v == "host") { options.cold_policy = ColdPolicy::Host; }
+            else if (v == "disk") { options.cold_policy = ColdPolicy::Disk; }
             else { throw std::invalid_argument("invalid cold-policy: " + v); }
-            options.cold_keep_tokens = 128;
+            // Default the window only when the caller did not size it: this assignment
+            // used to clobber --cold-keep-tokens regardless of order (and of the value).
+            if (!options.cold_keep_tokens_explicit) { options.cold_keep_tokens = 128; }
         } else if (arg == "--cold-keep-tokens") {
-            options.cold_keep_tokens = parse_u32(value(arg), "cold-keep-tokens");
+            options.cold_keep_tokens          = parse_u32(value(arg), "cold-keep-tokens");
+            options.cold_keep_tokens_explicit = true;
         } else if (arg == "--cold-host-bytes") {
-            options.cold_host_bytes = parse_u32(value(arg), "cold-host-bytes");
+            options.cold_host_bytes = parse_u64(value(arg), "cold-host-bytes");
+        } else if (arg == "--max-cold-pages") {
+            // 0 is meaningful here: it keeps the policy-derived pool size.
+            options.max_cold_pages = parse_u32(value(arg), "max-cold-pages", true);
+        } else if (arg == "--cold-disk-path") {
+            options.cold_disk_path = value(arg);
+        } else if (arg == "--cold-disk-bytes") {
+            options.cold_disk_bytes = parse_u64(value(arg), "cold-disk-bytes");
+            if (options.cold_disk_bytes == 0) {
+                throw std::invalid_argument("--cold-disk-bytes must be positive");
+            }
         } else if (arg == "--graph-capture-ceiling") {
             options.graph_capture_ceiling = parse_u32(value(arg), "graph-capture-ceiling");
         } else if (arg == "--no-lm-head-draft") {
@@ -263,6 +349,13 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
     }
     if (options.greedy) { options.sampling.temperature = 0.0F; }
+    if (options.kv_tier_formats_explicit) {
+        // Vocabulary rules only (bad tier, bad format, tier ordering, pure vs iso/e8).
+        // The per-layer landing and the tier/table consistency checks need the model's
+        // full-attention layer count and run in make_sequence_planner_impl.
+        (void)product::kv_tier_formats_parse(options.kv_tier_formats_spec,
+                                             options.kv_nvfp4_pure);
+    }
     return options;
 }
 

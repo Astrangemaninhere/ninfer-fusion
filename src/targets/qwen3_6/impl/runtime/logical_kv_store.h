@@ -800,6 +800,52 @@ public:
         return valid(handle) && pages_[handle.index_].cold_compressed;
     }
 
+    // Cold Host tier: the same device-page release as transfer_to_cold -- the
+    // physical page goes back to the pool and the descriptor (address membership
+    // + block-table slot) stays -- but the contents live in a pinned Host extent
+    // that the caller has already attached, so the page is NOT marked
+    // cold_compressed. That distinction is load-bearing: a cold_compressed page is
+    // promised a raw-slot restore (prepare_kv_restores skips it because "Cold-pool
+    // pages restore in place from their raw slots"), and a Host-tier page has no
+    // such slot. It is restored by the ordinary Host -> Device materialization
+    // path instead, which is exactly why the Host replica must be current here.
+    void transfer_to_cold_host(LogicalKVPageHandle handle, DeviceKVPageReservation& reservation) {
+        Page& page = require(handle);
+        if (page.source_pins != 0 || page.destination_pinned || !page.device_replica ||
+            page.cold_compressed || page.writer_references != 0 || page.references == 0 ||
+            !page.host_replica || page.host_replica->content_epoch != page.content_epoch ||
+            page.host_replica->committed_columns != page.committed_columns) {
+            throw std::logic_error("logical KV page is not cold-Host-transferable");
+        }
+        physical_->dematerialize_one(reservation, std::move(*page.device_replica));
+        page.device_replica.reset();
+    }
+
+    // Cold Host eligibility, BEFORE the Host copy exists: committed history
+    // (writer_references == 0), free of pins/fork ties, still holding its device
+    // replica, not already owned by a slot tier, and not already host-resident.
+    // This is the predicate the eviction consumer gates on; the read-free
+    // (per-layer window) half of the decision belongs to the tier, which knows the
+    // frontier and the layer windows.
+    [[nodiscard]] bool can_cold_host_prepare(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
+               !page.destination_pinned && page.device_replica.has_value() &&
+               !page.cold_compressed && !page.host_replica;
+    }
+
+    // Cold Host eligibility, AFTER the Host copy is published: the surviving copy
+    // must be current (same content epoch and coverage) or the device replica may
+    // not be released.
+    [[nodiscard]] bool can_cold_host_transfer(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
+               !page.destination_pinned && page.device_replica.has_value() &&
+               !page.cold_compressed && host_replica_current(handle);
+    }
+
     // Cold-pool restore: allocate a fresh physical page for a cold descriptor
     // and hand it back so the caller can repopulate it from the cold slot.
     // The descriptor keeps its membership position and reference counts. Any
@@ -1761,6 +1807,31 @@ public:
             throw std::out_of_range("KV cold restore is outside the address space");
         }
         return pages_->restore_from_cold(membership(address, logical_page), address.reservation);
+    }
+
+    // Cold Host tier counterparts (see LogicalKVPageStore::can_cold_host_prepare).
+    // There is no host-tier restore wrapper on purpose: a host-tier cold page is an
+    // ordinary Host-resident page, so it comes back through the materialization
+    // path (reserve_device_replica + publish_device_replica) already used by every
+    // other Host-only replica.
+    [[nodiscard]] bool can_cold_host_prepare(KVAddressSpaceHandle handle,
+                                             std::uint32_t logical_page) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Address& address = addresses_[handle.index_];
+        if (logical_page >= address.page_count) { return false; }
+        return pages_->can_cold_host_prepare(membership(address, logical_page));
+    }
+
+    void transfer_to_cold_host(KVAddressSpaceHandle handle, std::uint32_t logical_page) {
+        Address& address = require_active(handle);
+        if (logical_page >= address.page_count) {
+            throw std::out_of_range("KV cold Host transfer is outside the address space");
+        }
+        const LogicalKVPageHandle logical = membership(address, logical_page);
+        if (!pages_->can_cold_host_transfer(logical)) {
+            throw std::logic_error("logical KV page is not cold-Host-transferable");
+        }
+        pages_->transfer_to_cold_host(logical, address.reservation);
     }
 
     [[nodiscard]] std::uint64_t content_epoch(KVAddressSpaceHandle handle,

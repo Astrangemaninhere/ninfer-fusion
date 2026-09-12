@@ -7,18 +7,52 @@
 
 namespace ninfer::targets::qwen3_6::detail {
 
-// Adaptive MTP draft-window control: the survival/cost criterion (replaces the entropy
-// heuristic, which measured net negative - entropy is not the accept probability, it
-// carries no survival product, and its nats threshold has no relation to the cost ratio).
+// STATUS: opt-in, and it stays opt-in. It was verified and lost - do not enable
+// NINFER_MTP_WINDOW_CUT as a default, and do not reach for the `auto` front end to turn it
+// on (the actuator, not the confidence, has to change first).
 //
-// Per-round objective with the measured cost model (artifact nvfp4-dflash2, shortlist
-// draft head, batch 1): round(k) = a + b*k with a = 14.7 ms and b = 0.9 ms per draft
-// column, and tokens(k) = 1 + sum_{i<=k} S_i where S_i = prod_{j<=i} p_j and the "+1" is
-// the correction/bonus token the verifier always emits (speculative_round.cuh). Column k
-// column, and tokens(k) = 1 + sum_{i<=k} S_i where S_i = prod_{j<=i} p_j and the "+1" is
-// the correction/bonus token the verifier always emits (speculative_round.cuh).
-// Throughput is Phi(k) = N(k) / C(k) with C(k) = a + b*k, so the discrete test for
-// adding column k is Phi(k) > Phi(k-1)  <=>  S_k*C(k) > N(k-1)*b, i.e.
+// A/B (artifact nvfp4-dflash2, shortlist draft head, batch 1, greedy, fixed prompt; raw logs
+// dl/_criterion_ab.txt and dl/_criterion_ab2.txt). tok/s / acceptance length:
+//   code 160 tok: k=3 199.86/3.79 | k=9 322.67/7.23 | k=15 275.07/7.57 | criterion 236.84/6.36
+//   hex  128 tok: k=3 168.69/3.23 | k=9 190.00/4.23 | k=15 159.30/4.38 | criterion 138.76/3.74
+//   rep  128 tok: k=3 209.06/3.97 | k=9 437.08/9.77 | k=15 510.09/14.11 | criterion 512.00/14.11
+// -27% against the best fixed k on code, -27% on hex, a tie on strong repetition.
+//
+// WHY: the criterion moves the number of LIVE columns, but the round cost is set by the
+// CAPTURED width. Over 54 controlled runs (short context, batch 1, k = 1..15):
+// ms/round = 16.71 + 0.737 * W_conf, i.e. b_width = 0.737 ms per column of the requested
+// window. Holding W_conf fixed and varying only the live columns gives b_mask = 0.103 ms per
+// live column (four independent paired runs: 0.106/0.094/0.107/0.105 - at W_conf=15 the code
+// prompt costs 27.02 ms/round drafting 8.24 columns and 27.70 ms/round drafting 14.62, so
+// 6.4 columns buy 0.68 ms = 2.4% of the round while giving back 1.21 tokens/round = 16% of
+// the acceptance length). The threshold below prices the column it removes at b_width
+// instead of b_mask, i.e. 7.2x too high, so its break-even survival is ~7x too high and it
+// cuts columns that pay for themselves.
+//
+// The header's own (a, b) = (14.7 ms, 0.9 ms) IS approximately the width model (measured
+// 16.71 / 0.737), so the formula is right about the axis it names; the wiring applies it to
+// the other axis. A ratio retune alone does NOT rescue it: with r = b_mask/a the threshold
+// never binds inside a legal window (simulated against the measured code-domain hazard:
+// drafted/round = 15.00 for r <= 0.0065), so the criterion silently degenerates to "draft
+// the configured k" - which is the k=15 point that loses to k=9 on code and on hex. The
+// winning action is to change the CAPTURED width (re-capture per width from a ladder) and
+// re-decide it at a coarse cadence with this same threshold evaluated on the width model.
+// Until that ladder exists the honest configuration is a fixed --draft-tokens picked by
+// content class.
+//
+// SECOND, SMALLER DISCREPANCY (open): on the code prompt the realized window sits about one
+// column below what the threshold selects from the run's own accept record - 206 drafted
+// columns over 25 rounds where round 1 carries the staged 15, so rounds 2..25 average 7.96,
+// against the 9 that S_9 = 0.35 > threshold 0.23 implies. Candidates, none of them checked:
+// the per-round budget clamp extent = min(window, remaining-1) in the final rounds, and the
+// read-across from a 25-round EMA transient. Instrument the chosen window per round before
+// trusting any of these numbers.
+//
+// Cost model: round(k) = a + b*k with a = 14.7 ms and b = 0.9 ms per draft column, and
+// tokens(k) = 1 + sum_{i<=k} S_i where S_i = prod_{j<=i} p_j and the "+1" is the
+// correction/bonus token the verifier always emits (speculative_round.cuh). Throughput is
+// Phi(k) = N(k) / C(k) with C(k) = a + b*k, so the discrete test for adding column k is
+// Phi(k) > Phi(k-1)  <=>  S_k*C(k) > N(k-1)*b, i.e.
 //
 //     S_k > b * (1 + sum_{i<k} S_i) / (a + b*k).
 //
@@ -34,12 +68,16 @@ namespace ninfer::targets::qwen3_6::detail {
 // is an unbiased estimator and costs no device work, no extra kernel and no sync.
 //
 // Caveat (measured): inside a *captured* graph the width is baked, so the marginal cost of
-// a row-masked column is b_eff <= b. The ratio is therefore configurable (env
-// NINFER_MTP_WINDOW_RATIO) and the criterion is applied where b is genuinely avoidable once
-// the graph-width ladder lands.
+// a row-masked column is b_eff <= b - measured b_eff/b = 0.14. The ratio is configurable
+// (env NINFER_MTP_WINDOW_RATIO) and the criterion only becomes applicable where b is
+// genuinely avoidable, i.e. once the graph-width ladder lands.
 inline constexpr float kMtpWindowReachDecay  = 0.9F;    // EMA per round
 inline constexpr float kMtpWindowPriorAccept = 1.8F;    // Beta prior, mean 0.9 (optimistic cold start)
 inline constexpr float kMtpWindowPriorReach  = 0.2F;
+// b/a as calibrated on the *width* sweep (0.9/14.7). Feeding it to the threshold above
+// prices a live column at the cost of a captured column, 7.2x high; see STATUS. The value is
+// frozen at the original calibration so the recorded A/B stays reproducible - pass
+// NINFER_MTP_WINDOW_RATIO=0.0062 to sit at the never-cut end of the range.
 inline constexpr float kMtpWindowCostRatio   = 0.9F / 14.7F;  // b/a measured
 inline constexpr std::uint32_t kMtpWindowMinimum = 1;
 

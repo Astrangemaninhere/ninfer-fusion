@@ -59,5 +59,36 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    // --kv-tier-formats: absent means the engine keeps every existing path (the flag is
+    // the only thing that turns the tier resolution on), and the vocabulary's own rules
+    // are checked at parse time.
+    const ninfer::cli::Options no_tiers =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"});
+    failures += check(!no_tiers.kv_tier_formats_explicit && no_tiers.kv_tier_formats_spec.empty() &&
+                          !no_tiers.kv_nvfp4_pure,
+                      "the tier vocabulary is off unless asked for");
+    const ninfer::cli::Options tiers = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                              "--kv-tier-formats", "hot=int8,cold=int8",
+                                              "--nvfp4-mode", "pure"});
+    failures += check(tiers.kv_tier_formats_explicit &&
+                          tiers.kv_tier_formats_spec == "hot=int8,cold=int8" && tiers.kv_nvfp4_pure,
+                      "--kv-tier-formats did not preserve its spec, or --nvfp4-mode its value");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--nvfp4-mode",
+                             "fusion"})
+                          .kv_nvfp4_pure == false,
+                      "--nvfp4-mode fusion did not resolve to the fusion default");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--kv-tier-formats", "hot=int4"});
+                      }),
+                      "the CLI accepted hot=int4 (below int8)");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--nvfp4-mode", "mixed"});
+                      }),
+                      "the CLI accepted an unknown nvfp4 mode");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").find("--kv-tier-formats") !=
+                          std::string::npos,
+                      "CLI help omits --kv-tier-formats");
     return failures == 0 ? 0 : 1;
 }

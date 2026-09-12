@@ -72,17 +72,10 @@ __device__ __forceinline__ void gqa_nvfp4_load_b_frag_64(unsigned (&frag)[2],
     ldmatrix_x2(frag[0], frag[1], smem_addr(smem + row * 64 + col));
 }
 
-__device__ __forceinline__ float gqa_nvfp4_rotated(float x0, float x1, float x2, float x3,
-                                                   int block, int row) {
-    return gqa_isoquant_rot_value(block, row, 0) * x0 +
-           gqa_isoquant_rot_value(block, row, 1) * x1 +
-           gqa_isoquant_rot_value(block, row, 2) * x2 +
-           gqa_isoquant_rot_value(block, row, 3) * x3;
-}
-
-// Lane l < 4 loads the four values of its 4-channel block, applies the baked
-// SO(4) rotation, and returns the rotated block in x[]. The caller's src
-// pointer ALREADY points at the 16-dimension group start.
+// Lane l < 4 loads the four values of its 4-channel block and applies the
+// baked SO(4) rotation to it; the runtime on/off gate lives inside
+// gqa_isoquant_rot_block4() (gqa_isoquant_rot.cuh) and nowhere else. The
+// caller's src pointer ALREADY points at the 16-dimension group start.
 __device__ __forceinline__ void gqa_nvfp4_load_rotate_4(float (&x)[4], const __nv_bfloat16* src,
                                                        int group, int lane) {
     if (lane < 4) {
@@ -90,14 +83,7 @@ __device__ __forceinline__ void gqa_nvfp4_load_rotate_4(float (&x)[4], const __n
         const int base  = lane * 4;
 #pragma unroll
         for (int j = 0; j < 4; ++j) { x[j] = __bfloat162float(src[base + j]); }
-        const float y0 = gqa_nvfp4_rotated(x[0], x[1], x[2], x[3], block, 0);
-        const float y1 = gqa_nvfp4_rotated(x[0], x[1], x[2], x[3], block, 1);
-        const float y2 = gqa_nvfp4_rotated(x[0], x[1], x[2], x[3], block, 2);
-        const float y3 = gqa_nvfp4_rotated(x[0], x[1], x[2], x[3], block, 3);
-        x[0] = y0;
-        x[1] = y1;
-        x[2] = y2;
-        x[3] = y3;
+        gqa_isoquant_rot_block4(x, block);
     } else {
         x[0] = x[1] = x[2] = x[3] = 0.0f;
     }
@@ -134,8 +120,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         int slot_bytes, int sliding_window,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
-        std::int32_t column_begin, std::int32_t logical_capacity, int layer, float scale,
-        float* partial_acc, float* partial_m, float* partial_l,
+        std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t split_units,
+        int layer, float scale, float* partial_acc, float* partial_m, float* partial_l,
         std::int32_t batch_size, bool masked, bool writes_cache) {
     constexpr int Wc      = WarpsPerCta;
     constexpr int RowCount = TokenTile * Geometry::GroupSize;
@@ -273,18 +259,34 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int token_begin   = (sliding_window > 0) ? window_full - sliding_window : 0;
     const int window_begin =
         (sliding_window > 0) ? ((max(0, token_begin) + Bc - 1) / Bc) * Bc : 0;
-    const int window       = window_full - window_begin;
-    const int active_split_count =
-        gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
+    const int window = window_full - window_begin;
+    // Fixed split grid (split_units > 0): split s owns the keys
+    // [s*split_units, min((s+1)*split_units, window)). Its interior boundaries are
+    // launch constants, so the partial a split contributes for a key range -- and the
+    // fp32 addition order it used to build it -- no longer move when the launch covers
+    // a different number of tokens. The live window still clips every range (no split
+    // addresses a key past the last valid one) and split_units == 0 keeps the legacy
+    // window-driven partition.
+    int active_split_count = 0;
+    int split_start        = 0;
+    int split_limit        = 0;
+    if (split_units > 0) {
+        active_split_count = gqa_small_t_split_active(window, split_units, split_count);
+        split_start        = split * split_units;
+        split_limit        = split_start + split_units;
+    } else {
+        active_split_count =
+            gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start = split * units_per_split * (tile_split ? Bc : 1);
+        split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+    }
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    const int split_end = (split_limit < window) ? split_limit : window;
     if (split_start >= split_end) {
         NINFER_NVFP4_WRITE_NEUTRAL();
         return;
@@ -318,9 +320,15 @@ _Pragma("unroll 1")
             // apply the Sinkhorn-constrained row scale before E4M3/E2M1 packing.
             float kx[4];
             gqa_nvfp4_load_rotate_4(kx, input_k + src0, grp, lane);
+            // Inside the lane<4 window on purpose: lanes >= 4 hold x = 0 from the rotate
+            // helper and their group max is reduced within their own 4-lane group and never
+            // consumed, so scaling them is dead work that widens the constant-memory address
+            // span from 16 to 128 words (4 cache lines) per warp. Matches the prefill site.
+            if (lane < 4) {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                kx[j] *= gqa_kv_row_scale(layer, kv_head, grp * 16 + lane * 4 + j);
+                for (int j = 0; j < 4; ++j) {
+                    kx[j] *= gqa_kv_row_scale(layer, kv_head, grp * 16 + lane * 4 + j);
+                }
             }
             float kmax = fmaxf(fmaxf(fabsf(kx[0]), fabsf(kx[1])),
                                fmaxf(fabsf(kx[2]), fabsf(kx[3])));
@@ -472,9 +480,14 @@ _Pragma("unroll 1")
         const int src = gqa_q_index<Geometry>(q_head, grp * 16, token);
         float qx[4];
         gqa_nvfp4_load_rotate_4(qx, q + src, grp, lane);
+        // Same window as the K side: only lanes 0..3 carry the rotated block, and the
+        // reciprocal is a full IEEE division, so keeping it off the dead lanes removes
+        // 28 of 32 divisions per warp per group with no numeric change.
+        if (lane < 4) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            qx[j] *= gqa_kv_row_scale_inv(layer, kv_head, grp * 16 + lane * 4 + j);
+            for (int j = 0; j < 4; ++j) {
+                qx[j] *= gqa_kv_row_scale_inv(layer, kv_head, grp * 16 + lane * 4 + j);
+            }
         }
         float qmax = fmaxf(fmaxf(fabsf(qx[0]), fabsf(qx[1])), fmaxf(fabsf(qx[2]), fabsf(qx[3])));
         qmax       = gqa_nvfp4_group_max4(qmax, FullMask);
@@ -509,11 +522,20 @@ _Pragma("unroll 1")
         const int stage_tile_k0       = (TILE_K0);                                           \
         const int stage_global_k0    = window_begin + stage_tile_k0;                         \
         const int stage_physical_page = (PHYSICAL_PAGE);                                     \
+        const int stage_slot_base = stage_physical_page <= -2 ? -stage_physical_page - 2 : 0; \
+        /* Pool layout is [slot_bytes, kv_heads, 2, pages]: the flat head-slot  */            \
+        /* index is slot * 2*KVHeads + head, as in the i8 decode, the i8 prefill */           \
+        /* and the nvfp4 prefill. Both slot regions and BOTH validity planes    */            \
+        /* arrive plane-relative (launcher: V = K + nb[1] / + nb[2]), so K and V  */          \
+        /* take the same flat id here -- the single-base readers (small_t_*) are  */          \
+        /* the ones that add KVHeads for the plane offset.                      */            \
+        const int stage_slot_id = stage_slot_base * (2 * Geometry::KVHeads) + kv_head;        \
         const bool stage_cold         = stage_physical_page <= -2 &&                         \
                                  cold_k_slots != nullptr && cold_v_slots != nullptr &&       \
-                                 slot_bytes >= 1024 + 320;                              \
-        const int stage_slot_base = stage_cold ? -stage_physical_page - 2 : 0;               \
-        const int stage_slot_id   = stage_slot_base + kv_head;                               \
+                                 cold_k_valid != nullptr && cold_v_valid != nullptr &&        \
+                                 slot_bytes >= 1024 + 320 &&                                  \
+                                 cold_k_valid[stage_slot_id] != 0 &&                          \
+                                 cold_v_valid[stage_slot_id] != 0;                            \
         const int stage_half      = (stage_global_k0 & kPagedKVPageMask) >> 5;               \
         const std::uint8_t* stage_k_slot =                                                    \
             stage_cold ? cold_k_slots + static_cast<std::int64_t>(stage_slot_id) *            \
@@ -673,7 +695,16 @@ _Pragma("unroll 1")                                                             
                                    af[0], af[1], af[2], af[3], bf[0], bf[1], sfa, sfb);
                 }
             }
-            // Second QK pass accumulates the E2M1 residual K plane.
+            // Second QK pass accumulates the E2M1 residual K plane. The plane is only
+            // allocated for layers that opted into the residual (kv_residual_layers), and
+            // the staging zero-fills it otherwise - so when it is absent this pass
+            // multiplies zeros and is pure cost (it consumed the whole fp4-vs-s8 QK
+            // advantage: one mxf4 instruction carries 2x the MACs of mma_s8, so the extra
+            // pass left nvfp4 issuing exactly as many QK MMAs per key block as int8).
+            // Guarding it on the pointer is uniform across the launch and changes nothing
+            // numerically: the skipped MMAs only ever added 0.
+            const bool has_k_residual = cache_k_residual != nullptr;
+            if (has_k_residual) {
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
                 unsigned af[4];
@@ -689,6 +720,7 @@ _Pragma("unroll 1")                                                             
                     mma_nvfp4_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
                                    af[0], af[1], af[2], af[3], bf[0], bf[1], sfa, sfb);
                 }
+            }
             }
 
             const int row0 = producer_row_base + gid;
@@ -800,18 +832,29 @@ _Pragma("unroll 1")                                                             
         if constexpr (Iso3V) {
             // Hybrid PV: K keeps native mxf4nvf4 QK, V is decoded from ISO3
             // nibbles into a full-D swizzled BF16 tile and P x V runs on BF16 mma.
-            for (int idx = tid; idx < Bc * D; idx += Threads) {
-                const int pos = idx / D;
-                const int d   = idx - pos * D;
-                const std::uint8_t byte = v_pk[pos * 128 + (d >> 1)];
-                const std::uint8_t code = (d & 1) ? (byte >> 4) : (byte & 0x0F);
-                const float vscale = gqa_kv_nvfp4_e4m3_to_f32(v_sf[pos * 16 + (d >> 4)]);
-                float value = gqa_iso3_decode(code) * vscale;
-                const std::uint8_t rbyte = v_rpk[pos * 128 + (d >> 1)];
-                const std::uint8_t rcode = (d & 1) ? (rbyte >> 4) : (rbyte & 0x0F);
-                const float vrscale = gqa_kv_nvfp4_e4m3_to_f32(v_rsf[pos * 16 + (d >> 4)]);
-                value += gqa_iso3_decode(rcode) * vrscale;
-                v_bf16[pos * D + gqa_small_t_tc_swz(pos, d)] = __float2bfloat16(value);
+            // One thread per 16-element group (Bc*D/16 == the thread count here), so the
+            // E4M3 group scale is decoded once instead of once per element, and the residual
+            // plane is only touched when it exists. Same element count per thread as before.
+            const bool has_v_residual = cache_v_residual != nullptr;
+            for (int g = tid; g < Bc * (D / 16); g += Threads) {
+                const int pos = g / (D / 16);
+                const int grp = g - pos * (D / 16);
+                const float vscale  = gqa_kv_nvfp4_e4m3_to_f32(v_sf[pos * 16 + grp]);
+                const float vrscale =
+                    has_v_residual ? gqa_kv_nvfp4_e4m3_to_f32(v_rsf[pos * 16 + grp]) : 0.0F;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const int d = grp * 16 + j;
+                    const std::uint8_t byte = v_pk[pos * 128 + (d >> 1)];
+                    const std::uint8_t code = (d & 1) ? (byte >> 4) : (byte & 0x0F);
+                    float value = gqa_iso3_decode(code) * vscale;
+                    if (has_v_residual) {
+                        const std::uint8_t rbyte = v_rpk[pos * 128 + (d >> 1)];
+                        const std::uint8_t rcode = (d & 1) ? (rbyte >> 4) : (rbyte & 0x0F);
+                        value += gqa_iso3_decode(rcode) * vrscale;
+                    }
+                    v_bf16[pos * D + gqa_small_t_tc_swz(pos, d)] = __float2bfloat16(value);
+                }
             }
             __syncthreads();
 

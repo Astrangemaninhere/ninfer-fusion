@@ -97,4 +97,11 @@ __constant__ unsigned short kGqaKvRowScalePool[kKvRowScalePoolWords] = {
 // addressing (and the exact payload) of the old [16][4][256] extent. The
 // loader rewrites pool and descriptor together; the descriptor is written
 // last so it is the single point at which the new geometry becomes visible.
-__constant__ int kGqaKvRowScaleGeom[4] = {16, 4, 256, 16384};
+// The three geometry words come from kKvRowScaleBakedGeom (single source, so
+// the loader's "back to auto" restore cannot drift from this initializer) and
+// the word count is the pool capacity they fill.
+static_assert(kKvRowScaleBakedGeom[0] * kKvRowScaleBakedGeom[1] * kKvRowScaleBakedGeom[2] ==
+                  kKvRowScalePoolWords,
+              "baked row-scale geometry does not fill the pool exactly");
+__constant__ int kGqaKvRowScaleGeom[4] = {kKvRowScaleBakedGeom[0], kKvRowScaleBakedGeom[1],
+                                          kKvRowScaleBakedGeom[2], kKvRowScalePoolWords};

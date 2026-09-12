@@ -46,8 +46,15 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                                       GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                       Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                       cudaStream_t stream) {
-    const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
+    const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
+    // Split reference: a constant of the produced execution graph (the sequence key
+    // capacity). Batch-1 decode and the MTP/DFlash verify of the same request carry the
+    // same value, so a verify column reduces its keys in the same order as the decode
+    // row it replaces. It also replaces the live window in the I8 tile schedule, which
+    // is the second way a launch width used to reach the exact result.
+    const auto split_reference       = gqa_small_t_split_reference(envelope);
+    const auto implementation_window = split_reference;
+    const auto split_units           = gqa_small_t_split_units<Geometry>(split_reference);
     const auto splits =
         gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
 
@@ -98,15 +105,15 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 } \
             } else if (cache.dtype == DType::FP8_E4M3FN) {                                        \
                 launch_tc_partial_fp8<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
-                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, split_units,             \
                     partial_acc, partial_m, partial_l, stream);                                    \
             } else if (cache.dtype == DType::ISO3) {                                               \
                 launch_tc_partial_iso3<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(          \
-                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, split_units,             \
                     partial_acc, partial_m, partial_l, stream);                                    \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
-                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, split_units,             \
                     partial_acc, partial_m, partial_l, stream);                                    \
             }                                                                                      \
         };                                                                                         \
@@ -164,7 +171,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
                 invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+                invocation.batch_size, splits, split_units,
+                static_cast<__nv_bfloat16*>(out.data));
     };
     const bool masked         = invocation.valid_columns != nullptr;
     const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {

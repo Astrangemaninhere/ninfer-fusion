@@ -3,9 +3,13 @@
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
 
+#include <ninfer/types.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
+#include <string>
 
 namespace ninfer::targets::qwen3_6 {
 
@@ -34,6 +38,17 @@ struct DecoderStateSpec {
     // SWA layers' attention window in tokens, indexed like layer_kv_dtypes.
     // 0 = no window (full attention) -- the value every consumer guards on.
     std::array<std::uint32_t, 64> layer_sliding_windows{};
+    // SEPARATION: codec of the V plane on the NVFP4 tier. Iso3 keeps the engine
+    // default (V stored as ISO3 sign-magnitude INT3); E2M1 is the ablation.
+    // Both share one plane geometry, so this only changes what the producers
+    // encode and the consumers decode.
+    KvVCodec kv_v_codec                     = KvVCodec::Iso3;
+    // SEPARATION: the two STATE-BASED component switches. Both are
+    // committed to device state at the same single point as kv_v_codec
+    // (plan_decoder_state). The upstream *_explicit resolution happens in
+    // layouts_impl.h, so the spec carries the final decision, not the flag.
+    bool kv_rotation_off                    = false;
+    std::string kv_row_scale_spec;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -51,12 +66,21 @@ struct PagedKVCacheLayout {
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
-    // Cold slots per layer: [slot_bytes, kv_heads, 2, max_cold_pages]
+    // Cold slots per layer: [record_stride, kv_heads, 2, max_cold_pages]
     // plus an I32 validity plane of [kv_heads, 2, max_cold_pages].
     // Per-layer cold slots; sized like kKvLayerStorageSlots (a family member may
     // exceed the 16 full-attention layers of the smallest variant).
     std::array<TensorRegion, 64> cold_slots{};
     std::array<TensorRegion, 64> cold_slot_valid{};
+    // Cold-slot record stride PER LAYER, in bytes; one record is one
+    // (page, kv_head, K|V) plane set. Each layer's record is exactly as wide as
+    // the codec its resolved dtype feeds -- 9232 B for the int8 raw slot, 9536 B
+    // for the nvfp4 rANS slot -- so a mixed stack is not charged the widest codec
+    // on every layer. Indexed like layer_dtypes; all-zero when the pool is off
+    // (decoder_state.cpp derives it from the attention geometry).
+    std::array<std::int32_t, 64> layer_slot_bytes{};
+    // Widest record in the pool (the codec default). Diagnostics and upper
+    // bound only: every record access must use the per-layer stride above.
     std::int32_t slot_bytes = 0;
     std::uint32_t max_cold_pages = 0;
     // Resolved per-layer storage (one entry per full-attention layer).
@@ -70,6 +94,10 @@ struct PagedKVCacheLayout {
     // per-layer plane counts; mixed BF16/quantized tables have unequal
     // strides).
     std::array<std::uint32_t, 64> layer_plane_base{};
+    // SEPARATION: V codec of the NVFP4 tier (see DecoderStateSpec::kv_v_codec).
+    // Carried on the layout so PagedKVCache can publish it as v_dtype without
+    // re-deriving it from a global option.
+    KvVCodec kv_v_codec = KvVCodec::Iso3;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -103,12 +131,30 @@ public:
     PagedKVCache(PagedKVCache&&)                 = delete;
     PagedKVCache& operator=(PagedKVCache&&)      = delete;
 
-        // Cold-slot pool: fixed raw slots per (layer, kv_head, plane).
+        // Cold-slot pool: fixed records per (layer, kv_head, plane). The pool
+        // reserves one record per layer and sizes each layer's record by the
+        // codec that layer's dtype feeds; slot_bytes()/cold_slot_bytes() report
+        // the widest record (diagnostics only).
     [[nodiscard]] std::int32_t cold_slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::int32_t slot_bytes() const noexcept { return slot_bytes_; }
+    // Cold-slot record stride of one layer (0 when the cold pool is disabled).
+    // This -- not slot_bytes() -- is the stride every cold record access uses.
+    [[nodiscard]] std::int32_t layer_slot_bytes(std::uint32_t layer) const noexcept {
+        return layer < layers_ && layer_slot_bytes_[layer] != 0 ? layer_slot_bytes_[layer]
+                                                                : slot_bytes_;
+    }
     [[nodiscard]] std::uint32_t max_cold_pages() const noexcept { return max_cold_pages_; }
     std::int32_t allocate_cold_slot() noexcept;
     void release_cold_slot(std::int32_t slot) noexcept;
+
+    // Per-layer sliding windows (0 = full attention, i.e. the layer reads every
+    // committed token), sized to the layer count. The Cold Host tier's read-free
+    // predicate needs it: a page a full-attention layer may still read can never
+    // leave the device, so the tier reports itself inert instead of reserving
+    // host memory it cannot use.
+    [[nodiscard]] std::span<const std::uint32_t> layer_sliding_windows() const noexcept {
+        return std::span<const std::uint32_t>(layer_sliding_windows_.data(), layers_);
+    }
 
 [[nodiscard]] std::uint32_t max_context() const noexcept { return max_context_; }
 
@@ -149,9 +195,12 @@ private:
     std::array<bool, 64> layer_residual_{};
     std::array<std::uint32_t, 64> layer_sliding_windows_{};
     std::array<std::uint32_t, 64> layer_plane_base_{};
+    // SEPARATION: V codec of the NVFP4 tier (PagedKVCacheLayout::kv_v_codec).
+    KvVCodec kv_v_codec_ = KvVCodec::Iso3;
     std::array<Tensor, 64> cold_slots_;
     std::array<Tensor, 64> cold_slot_valid_;
     std::int32_t slot_bytes_ = 0;
+    std::array<std::int32_t, 64> layer_slot_bytes_{};
     std::uint32_t max_cold_pages_ = 0;
     std::vector<std::uint8_t> cold_slot_used_;
 };

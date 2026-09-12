@@ -30,6 +30,13 @@
 // (gqa_isoquant_row_scale_loader.h); loader.cu static_asserts them equal.
 inline constexpr int kKvRowScalePoolWords = 16384;
 
+// The geometry the payload below was calibrated for: qwen3.8-27b's 16
+// full-attention layers x 4 KV heads x 256 channels. Single-sourced here so
+// the device initializer of kGqaKvRowScaleGeom and the loader's "back to auto"
+// restore (kv_rowscale_sidecar_apply_spec) can never drift; a static_assert in
+// gqa_isoquant_row_scale.cu binds the product to kKvRowScalePoolWords.
+inline constexpr int kKvRowScaleBakedGeom[3] = {16, 4, 256};
+
 // BF16 row scales, row-major [layer][kv_head][d] with the RUNTIME strides in
 // kGqaKvRowScaleGeom[0..2]. The baked payload covers 27b; the loader overwrites
 // it (with the descriptor) when NINFER_KV_ROWSCALE names a sidecar.
@@ -46,16 +53,21 @@ extern __constant__ unsigned short kGqaKvRowScalePool[kKvRowScalePoolWords];
 // The four words share one 16-byte constant line, so a single warp-uniform LDC
 // can fetch them; the accessor reads [0..2].
 // A never-written (all-zero) descriptor makes every range check below fail, so
-// the pool is never read and the accessor answers identity.
+// the pool is never read and the accessor answers identity. That is exactly the
+// row-scale OFF state (--kv-row-scale off / NINFER_KV_ROWSCALE=off): the
+// identity map is expressed by the guard the on-path already pays for, so the
+// switch adds no kernel instruction and needs no all-ones sidecar file.
 extern __constant__ int kGqaKvRowScaleGeom[4];
 
 namespace ninfer::ops {
 
 __device__ __forceinline__ float gqa_kv_row_scale(int layer, int kv_head, int d) {
-    // Runtime geometry: the index is a compile-time constant, so these are
-    // warp-uniform (broadcast LDC) and loop-invariant (ptxas hoists them above
-    // the quantize loops). They add no divergent load, no division, and no
-    // per-element work -- see the S3 report's "zero-diff shape" section.
+    // Runtime geometry: the GEOMETRY words are warp-uniform (broadcast LDC, hoisted).
+    // The per-channel index is NOT: it is grp*16 + lane*4 + j, so a warp's four loads span
+    // 16 channels -- up to 4 constant cache lines when the caller runs all 32 lanes. Call
+    // sites must therefore keep this multiply inside the lane<4 window of the rotate helper
+    // (both the decode and the prefill K/Q sites do); the prefill site used to be the only
+    // one that did, and the extra span was pure tax, not numerics.
     const int layers = ::kGqaKvRowScaleGeom[0];
     const int kvh    = ::kGqaKvRowScaleGeom[1];
     const int hdim   = ::kGqaKvRowScaleGeom[2];

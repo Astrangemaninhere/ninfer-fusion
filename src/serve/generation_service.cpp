@@ -247,9 +247,27 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_cache_explicit        = options_.kv_cache_explicit;
     engine_options.kv_layer_storage         = options_.kv_layer_storage;
     engine_options.kv_layer_storage_explicit = options_.kv_layer_storage_explicit;
+    // --kv-residual-layers: per-layer NVFP4 second-stage residual planes. The
+    // planner gates on kv_residual_explicit and only then reads the table
+    // (layouts_impl.h make_sequence_planner_impl), so BOTH must cross this
+    // boundary -- without this copy the flag parses, is accepted, and silently
+    // plans single-plane KV for every layer.
+    engine_options.kv_residual_layers       = options_.kv_residual_layers;
+    engine_options.kv_residual_explicit     = options_.kv_residual_explicit;
     engine_options.kv_bit_budget_bits      = options_.kv_bit_budget_bits;
     engine_options.kv_bit_budget_explicit  = options_.kv_bit_budget_explicit;
     engine_options.kv_bit_budget_ranges    = options_.kv_bit_budget_ranges;
+    engine_options.kv_tier_formats_spec     = options_.kv_tier_formats_spec;
+    engine_options.kv_tier_formats_explicit = options_.kv_tier_formats_explicit;
+    engine_options.kv_nvfp4_pure            = options_.kv_nvfp4_pure;
+    // SEPARATION: the three KV component switches; plan_decoder_state() is the
+    // commit point for their device-side gates.
+    engine_options.kv_rotation_off          = options_.kv_rotation_off;
+    engine_options.kv_rotation_explicit     = options_.kv_rotation_explicit;
+    engine_options.kv_row_scale_spec        = options_.kv_row_scale_spec;
+    engine_options.kv_row_scale_explicit    = options_.kv_row_scale_explicit;
+    engine_options.kv_v_codec               = options_.kv_v_codec;
+    engine_options.kv_v_codec_explicit      = options_.kv_v_codec_explicit;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.yarn_enabled             = options_.yarn_enabled;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
@@ -517,7 +535,11 @@ void GenerationService::reload_kv_storage(std::string_view kv_layer_storage_spec
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         write_console_log(ConsoleLogLevel::Info, "drained; re-running KV sequence plan");
-        engine_->reload_kv_storage(table, {});
+        // The replan contract carries the layer-storage table AND the residual table
+        // (include/ninfer/engine.h); passing {} here would silently clear
+        // --kv-residual-layers on the first relayout. Reuse the startup table so a
+        // relayout only changes what the spec actually named.
+        engine_->reload_kv_storage(table, options_.kv_residual_layers);
     } catch (...) {
         reload_in_progress_.store(false, std::memory_order_release);
         throw;

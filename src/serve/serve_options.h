@@ -49,10 +49,31 @@ struct ServeOptions {
     bool kv_bit_budget_explicit           = false;
     // Separable per-range ceilings ("0-7:8,8-63:4.5"); empty means the scalar form above.
     std::string kv_bit_budget_ranges;
-    std::array<bool, 16> kv_residual_layers{};
+    // --kv-tier-formats SPEC + --nvfp4-mode (kvcfg/kv_formats.h vocabulary). Raw text:
+    // the per-layer landing needs the model's layer count, so it happens in the planner
+    // (product/kv_tier_formats.h documents which tiers the engine can express).
+    std::string kv_tier_formats_spec;
+    bool kv_tier_formats_explicit         = false;
+    bool kv_nvfp4_pure                    = false;
+    // SEPARATION: the three KV component switches (same wire as the engine
+    // options). --kv-rotation on|off, --kv-row-scale auto|off|<path>,
+    // --kv-v-codec iso3|e2m1. All three default to the pre-separation
+    // behaviour and are committed to the device in plan_decoder_state().
+    bool kv_rotation_off                  = false;
+    bool kv_rotation_explicit             = false;
+    std::string kv_row_scale_spec;
+    bool kv_row_scale_explicit            = false;
+    KvVCodec kv_v_codec                   = KvVCodec::Iso3;
+    bool kv_v_codec_explicit              = false;
+    // Indexed like EngineOptions::kv_residual_layers / layouts.h's 64-slot
+    // per-layer tables; a 16-slot array here would reject --kv-residual-layers
+    // 16 as out of range while the planner accepts 64.
+    std::array<bool, kKvLayerStorageSlots> kv_residual_layers{};
     bool kv_residual_explicit             = false;
-    // Same default as the CLI: unspecified --spec means auto, `--spec none` opts out.
-    SpeculativeOptions speculative{SpeculativeBackend::Auto};
+    // Serve keeps speculation OFF unless asked for (tests/test_serve_options.cpp asserts it):
+    // a server operator opts in with --spec auto|mtp|dflash|dflash2. The CLI, by contrast,
+    // defaults --spec to auto because an interactive run always wants the draft backend.
+    SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

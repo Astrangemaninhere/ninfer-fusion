@@ -304,14 +304,49 @@ int main(int argc, char** argv) {
             }
             engine_options.kv_layer_storage_explicit = true;
         }
+        if (cli.kv_tier_formats_explicit) {
+            // Raw passthrough: the vocabulary is validated at parse time and landed on the
+            // per-layer dtype table in the planner (product/kv_tier_formats.h explains why).
+            engine_options.kv_tier_formats_spec     = cli.kv_tier_formats_spec;
+            engine_options.kv_tier_formats_explicit = true;
+            engine_options.kv_nvfp4_pure            = cli.kv_nvfp4_pure;
+        }
+        // SEPARATION: the three KV component switches. Explicit flags only: an
+        // unset flag leaves the engine options at their pre-separation defaults
+        // (rotation on, row scale auto, V codec iso3), and none of the three
+        // uploads or allocates anything unless it names a non-default state.
+        if (cli.kv_rotation_explicit) {
+            engine_options.kv_rotation_off      = cli.kv_rotation_off;
+            engine_options.kv_rotation_explicit = true;
+        }
+        if (cli.kv_row_scale_explicit) {
+            engine_options.kv_row_scale_spec     = cli.kv_row_scale_spec;
+            engine_options.kv_row_scale_explicit = true;
+        }
+        if (cli.kv_v_codec_explicit) {
+            engine_options.kv_v_codec          = cli.kv_v_codec;
+            engine_options.kv_v_codec_explicit = true;
+        }
         if (cli.kv_bit_budget_explicit) {
             engine_options.kv_bit_budget_bits     = cli.kv_bit_budget_bits;
             engine_options.kv_bit_budget_ranges   = cli.kv_bit_budget_ranges;
             engine_options.kv_bit_budget_explicit = true;
         }
+        // Two-score KV selection: the budget DP reads both of these
+        // (layouts_impl.h make_sequence_planner_impl). options.cpp parses them into
+        // cli::Options but nothing copied them across, so the flags were accepted
+        // and then ignored. The cli defaults (weight -1, empty table) are exactly
+        // the engine defaults, so an unset flag stays a no-op.
+        engine_options.kv_quality_weight     = cli.kv_quality_weight;
+        engine_options.kv_tier_scores        = cli.kv_tier_scores;
         engine_options.cold_policy           = cli.cold_policy;
         engine_options.cold_keep_tokens      = cli.cold_keep_tokens;
         engine_options.cold_host_bytes       = cli.cold_host_bytes;
+        // Cold-pool shape and the disk spill target used to be reachable only
+        // through ninfer-serve, so the CLI could not size the offload pool at all.
+        engine_options.max_cold_pages        = cli.max_cold_pages;
+        engine_options.cold_disk_bytes       = cli.cold_disk_bytes;
+        engine_options.cold_disk_path        = cli.cold_disk_path;
         engine_options.graph_capture_ceiling = cli.graph_capture_ceiling;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.

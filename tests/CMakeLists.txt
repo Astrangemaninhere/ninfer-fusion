@@ -94,6 +94,17 @@ target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
 ninfer_add_test(ninfer_cli_options_test
   SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
+# --kv-tier-formats landing (product/kv_tier_formats.h) and the vocabulary's own
+# CPU twin that had no build target at all: both are header-only host tests.
+ninfer_add_test(ninfer_kv_tier_formats_test
+  SOURCES test_kv_tier_formats.cpp)
+ninfer_add_test(ninfer_kvcfg_formats_test
+  SOURCES ${PROJECT_SOURCE_DIR}/src/kvcfg/kv_formats_test.cpp)
+# Cold-tier byte budgets (product/kv_cold_tier_budget.h): the admission ladder
+# over --cold-host-bytes / --cold-disk-bytes is pure integer arithmetic, so it
+# is a header-only host test like the two above.
+ninfer_add_test(ninfer_kv_cold_tier_budget_test
+  SOURCES test_kv_cold_tier_budget.cpp)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)

@@ -14,10 +14,14 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include "product/kv_bit_budget.h"
+#include "product/kv_cold_tier_budget.h"
 #include "product/kv_options.h"
+#include "product/kv_tier_formats.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -77,8 +81,11 @@ TargetKVCacheProfile target_kv_cache_profile(KvCacheStorage storage) {
         return {DType::FP8_E4M3FN, qwen3_6::kKvFp8QuantGroup};
     case KvCacheStorage::Nvfp4Group16:
         return {DType::NVFP4, qwen3_6::kNvfp4KvQuantGroup};
+    // ISO3 is a tier of its own: identical planes to NVFP4 but a distinct
+    // 3-bit sign-magnitude codec, so the resolved dtype must stay ISO3 and the
+    // K/V decode kernel is the ISO3 one (gqa_attention_decode_iso3.cuh).
     case KvCacheStorage::Iso3Group16:
-        return {DType::NVFP4, qwen3_6::kNvfp4KvQuantGroup};
+        return {DType::ISO3, qwen3_6::kNvfp4KvQuantGroup};
     case KvCacheStorage::E8Group64:
         return {DType::E8Kv, qwen3_6::kKvInt8QuantGroup};
     }
@@ -116,22 +123,27 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 
 // S30: single source of truth for the effective cold-pool size (S25 precedence).
 // ColdPolicy::None always forces 0 (no cold path; slots would be dead device
-// memory). ColdPolicy::Host keeps 0 until a runtime host-eviction consumer
-// exists (program_impl.h gates requant buffers on Window/Disk, spill files on
-// Disk). Window/Disk take the explicit --max-cold-pages cap when non-zero,
-// else the keep-tokens derivation. Used by BOTH the layout reservation and the
-// --kv-bit-budget DP so the DP's cold capacity always equals the reserved pool.
+// memory). ColdPolicy::Host keeps 0 as well, and for a better reason than "the
+// consumer is missing": the Host tier's medium is pinned host memory, its pages
+// are READ-FREE (no kernel ever reads them again), so it needs no device cold
+// slot at all -- see cold_host_tier.h. Window/Disk take the explicit
+// --max-cold-pages cap when non-zero, else the keep-tokens derivation. Used by
+// BOTH the layout reservation and the --kv-bit-budget DP so the DP's cold
+// capacity always equals the reserved pool.
 [[nodiscard]] inline std::uint32_t effective_cold_pages(ColdPolicy policy,
                                                         std::uint32_t keep_tokens,
                                                         std::uint32_t explicit_pages) {
-    // Host has no eviction consumer, so it can never supply cold pages. Asking for a
-    // non-zero cap together with it is a contradiction that used to be swallowed into a
-    // silently empty cold pool; make the contradiction loud instead.
+    // The device cold-slot pool is the *slot* tiers' resource. Under the Host
+    // policy a non-zero --max-cold-pages would reserve device slots the Host tier
+    // never uses (it may not: its pages are the ones nothing reads, so there is no
+    // slot to read them from), and --cold-host-bytes is the knob that bounds that
+    // tier. Asking for both is a contradiction; make it loud instead of quietly
+    // reserving a pool that stays empty.
     if (policy == ColdPolicy::Host && explicit_pages != 0) {
         throw std::invalid_argument(
-            "cold policy 'host' has no eviction consumer yet and resolves to 0 cold pages, "
-            "so --max-cold-pages cannot be honoured; drop the cap or use --cold-policy "
-            "window|disk");
+            "cold policy 'host' uses pinned host memory, not the device cold-slot pool, "
+            "so --max-cold-pages cannot be honoured; bound the tier with --cold-host-bytes "
+            "or use --cold-policy window|disk");
     }
     switch (policy) {
     case ColdPolicy::Window:
@@ -190,6 +202,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .layer_kv_dtypes           = plan.layer_kv_dtypes,
                      .layer_residual            = plan.kv_residual_layers,
                      .layer_sliding_windows    = layer_windows,
+                     // SEPARATION: the three KV component switches reach the
+                     // decoder plan through here; plan_decoder_state() is the
+                     // single place that commits them to the device (rotation
+                     // gate, row-scale gate, V codec + its hard-fail checks).
+                     .kv_v_codec                = plan.kv_v_codec,
+                     .kv_rotation_off           = plan.kv_rotation_off,
+                     .kv_row_scale_spec         = plan.kv_row_scale_spec,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency + 1),
                      .text_physical_page_groups = physical_pages,
@@ -197,7 +216,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      // --max-cold-pages via effective_cold_pages (same S25
                      // precedence, now shared with the --kv-bit-budget DP so the
                      // DP's cold capacity always equals the pool reserved here:
-                     // None->0 always; Host->0 until host eviction exists;
+                     // None->0 always; Host->0 because the Host tier lives in
+                     // pinned host memory and holds read-free pages only (no
+                     // device slot is involved, --cold-host-bytes is its cap);
                      // Window/Disk: explicit cap else keep-tokens derivation).
                      .max_cold_pages            = effective_cold_pages(
                          plan.cold_policy, plan.cold_keep_tokens, plan.max_cold_pages),
@@ -930,6 +951,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->cold_host_bytes  = inputs.cold_host_bytes;
     impl->cold_disk_path   = inputs.cold_disk_path;
     impl->cold_disk_bytes  = inputs.cold_disk_bytes;
+    // The two cold byte budgets are config, not runtime state: a tier the
+    // operator explicitly selected whose cap can never admit one page is
+    // rejected here, before anything is laid out (the same loud-contradiction
+    // rule effective_cold_pages applies to --max-cold-pages + host). The
+    // capacities in pages are derived later, where the strides are known.
+    product::validate_cold_tier_budget(product::cold_tier_budget_from(
+        impl->cold_policy, impl->cold_host_bytes, impl->cold_disk_bytes));
     impl->causal_scoring      = inputs.causal_scoring;
     impl->graph_capture_ceiling = inputs.graph_capture_ceiling;
     impl->device              = inputs.device;
@@ -938,6 +966,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->layer_kv_dtypes     = inputs.layer_kv_dtypes;
     impl->kv_residual_layers  = inputs.kv_residual_layers;
+    impl->kv_v_codec          = inputs.kv_v_codec;
+    impl->kv_rotation_off     = inputs.kv_rotation_off;
+    impl->kv_row_scale_spec   = inputs.kv_row_scale_spec;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -1008,6 +1039,35 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     // the N1 path (S12/S14 goldens).
     std::array<KvCacheStorage, 64> budget_storage_table = options.kv_layer_storage;
     bool storage_explicit = options.kv_layer_storage_explicit;
+
+    // --kv-tier-formats / --nvfp4-mode: the KV tier vocabulary (hot/tail/cold +
+    // nvfp4 mode). Resolved HERE, not at the parse site, for the same reason as
+    // --kv-bit-budget below: `hot` is the resident format of every full-attention
+    // layer, so the landing needs this target's layer count, and the mode/cold
+    // gates must judge the table this plan will really build. Stage 1 (here)
+    // applies `hot` to the same storage table the other knobs produce, so the
+    // engine keeps exactly one resolution path into the per-layer dtypes; stage 2
+    // (after layer_overrides) judges mode/cold on the effective per-layer dtype.
+    // Whatever the engine cannot express -- the `tail` tier, the unreachable cold
+    // codecs -- is refused with the missing mechanism named, never approximated.
+    std::optional<product::KvTierPlan> tier_plan;
+    if (options.kv_tier_formats_explicit) {
+        tier_plan = product::kv_tier_formats_plan(options.kv_tier_formats_spec,
+                                                  options.kv_nvfp4_pure, budget_storage_table);
+        if (tier_plan->override_hot &&
+            (storage_explicit || options.kv_bit_budget_explicit || options.kv_cache_explicit)) {
+            throw std::invalid_argument(
+                "--kv-tier-formats with an explicit hot format cannot be combined with "
+                "--kv-layer-storage / --kv-bit-budget / --kv-dtype: hot already names the "
+                "resident format of every full-attention layer, so the two describe the same "
+                "table");
+        }
+        if (tier_plan->override_hot) {
+            budget_storage_table = tier_plan->table;
+            storage_explicit     = true;
+        }
+    }
+
     if (options.kv_bit_budget_explicit && !storage_explicit) {
         const std::int32_t full_layers =
             static_cast<std::int32_t>(TextConfig::full_attention_layers());
@@ -1016,17 +1076,69 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         // Two forms of the same knob: a single ceiling for every full-attention layer, or
         // separable per-range ceilings ("0-7:8,8-63:4.5") which the DP minimises per range
         // (globally optimal: additive objective, per-range constraints).
-        const std::string spec =
-            options.kv_bit_budget_ranges.empty()
-                ? product::kv_bit_budget_spec(full_layers, options.kv_bit_budget_bits,
-                                              product::kKvBitBudgetE8LayerLimit,
-                                              static_cast<std::int32_t>(cold_pages))
-                : product::kv_bit_budget_spec_ranges(
-                      full_layers,
-                      product::kv_bit_budget_parse_ranges(options.kv_bit_budget_ranges,
-                                                          full_layers),
-                      product::kKvBitBudgetE8LayerLimit,
-                      static_cast<std::int32_t>(cold_pages));
+        // Two-score path: when a quality weight is given, the per-tier penalty becomes the
+        // weighted sum of the measured quality and speed columns, and the same DP resolves it.
+        // The two knobs are orthogonal - one describes the constraint structure, the other the
+        // ladder that breaks ties - so all four combinations must exist. The ranges branch
+        // comes first for a concrete reason: the range form leaves options.kv_bit_budget_bits
+        // at 0, so a scored run that ignored the ranges would resolve every layer against a
+        // zero-bit ceiling instead of the ceiling the operator actually gave.
+        const bool scored_active = options.kv_quality_weight >= 0.0;
+        const bool ranges_given = !options.kv_bit_budget_ranges.empty();
+        const std::int32_t e8_limit = product::kKvBitBudgetE8LayerLimit;
+        const std::int32_t cold_cap = static_cast<std::int32_t>(cold_pages);
+        product::KvTierScoreTable scores = product::kv_bit_budget_default_scores();
+        product::KvBitBudgetSolution scored;
+        if (scored_active) {
+            if (!options.kv_tier_scores.empty()) {
+                scores = options.kv_tier_scores.find('\n') != std::string::npos
+                             ? product::kv_bit_budget_parse_scores(options.kv_tier_scores)
+                             : product::kv_bit_budget_parse_scores([&] {
+                                   std::ifstream in(options.kv_tier_scores);
+                                   if (!in) {
+                                       throw std::invalid_argument(
+                                           "kv-tier-scores: cannot open " +
+                                           options.kv_tier_scores);
+                                   }
+                                   return std::string(std::istreambuf_iterator<char>(in),
+                                                      std::istreambuf_iterator<char>());
+                               }());
+            }
+            if (!ranges_given) {
+                scored = product::kv_bit_budget_solve_scored(
+                    full_layers, options.kv_bit_budget_bits, scores, options.kv_quality_weight,
+                    e8_limit, cold_cap);
+                std::fprintf(stderr,
+                             "[kv-score] quality_weight=%.2f achieved_bits=%.2f penalty=%.2f "
+                             "spec=%s (speed column is the measured per-tier time cost, quality "
+                             "column the measured precision loss)\n",
+                             options.kv_quality_weight, scored.achieved_bits, scored.penalty,
+                             scored.spec.c_str());
+            }
+        }
+        std::string spec;
+        if (ranges_given) {
+            const auto ranges =
+                product::kv_bit_budget_parse_ranges(options.kv_bit_budget_ranges, full_layers);
+            spec = scored_active
+                       ? product::kv_bit_budget_scored_ranges(
+                             full_layers, ranges, scores, options.kv_quality_weight, e8_limit,
+                             cold_cap)
+                       : product::kv_bit_budget_spec_ranges(full_layers, ranges, e8_limit,
+                                                            cold_cap);
+            if (scored_active) {
+                std::fprintf(stderr,
+                             "[kv-score] quality_weight=%.2f ranges=%s spec=%s (the weighted "
+                             "speed/quality ladder ran inside each range's own ceiling)\n",
+                             options.kv_quality_weight, options.kv_bit_budget_ranges.c_str(),
+                             spec.c_str());
+            }
+        } else {
+            spec = scored_active
+                       ? scored.spec
+                       : product::kv_bit_budget_spec(full_layers, options.kv_bit_budget_bits,
+                                                     e8_limit, cold_cap);
+        }
         // Split the DP plan. "cold" is NOT a --kv-layer-storage tier (S12 note):
         // cold-planned layers keep a HOT window at NVFP4 (cold slots hold
         // requantized E2M1-family data, decoder_state.cpp cold-pool note), the
@@ -1071,6 +1183,13 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                      static_cast<unsigned>(cold_pages));
     }
 
+    // Both fp8 spellings name the SAME target tier: KvCacheStorage carries an old
+    // Fp8E4M3Row256 (the standalone ops/kv_cache row-scaled codec's name, kept for
+    // --kv-dtype / request-log naming) and Fp8Group16 (what product::parse_kv_storage
+    // emits for the per-layer spec), and target_kv_cache_profile() maps both to
+    // (DType::FP8_E4M3FN, kKvFp8QuantGroup). Only Fp8Group16 used to be handled here, so
+    // a table written with the other spelling resolved to DType::BF16 - a silent downgrade
+    // that drops the fp8 request instead of building it.
     std::array<DType, 64> layer_overrides{};
     const bool has_override = storage_explicit;
     if (has_override) {        for (std::size_t i = 0; i < layer_overrides.size(); ++i) {
@@ -1082,10 +1201,11 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                                             : (v == KvCacheStorage::Nvfp4Group16
                                                    ? DType::NVFP4
                                                    : (v == KvCacheStorage::Iso3Group16
-                                                          ? DType::NVFP4
+                                                          ? DType::ISO3
                                                           : (v == KvCacheStorage::E8Group64
                                                                  ? DType::E8Kv
-                                                                 : (v == KvCacheStorage::Fp8Group16
+                                                                 : ((v == KvCacheStorage::Fp8Group16 ||
+                                                                     v == KvCacheStorage::Fp8E4M3Row256)
                                                                         ? DType::FP8_E4M3FN
                                                                         : DType::BF16)))));
         }
@@ -1097,6 +1217,30 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     } else if constexpr (Variant::supports_per_layer_kv_defaults) {
         layer_overrides = Variant::default_layer_kv_dtypes(
             weights_profile);
+    }
+    if (tier_plan.has_value()) {
+        // Stage 2: mode and cold, judged on the EFFECTIVE dtype of every layer. A
+        // BF16 override slot inherits the global dtype, exactly as
+        // PagedKVCache::plan_cache resolves it (decoder_state.cpp layer_dtype()), so
+        // resolving it here is what makes the check describe the built plan and not
+        // just the option text. The per-layer class carries the two facts the gates
+        // need: whether the layer sits on a fusion tier (mode=pure) and which
+        // cold-slot codec it can feed (cold=), mirroring the two branches of
+        // enqueue_cold_compressions (program_impl.h) and the all-INT8 gate above them.
+        const std::int32_t tier_layers =
+            static_cast<std::int32_t>(TextConfig::full_attention_layers());
+        std::array<product::KvLayerClass, kKvLayerStorageSlots> tier_classes{};
+        for (std::size_t i = 0; i < tier_classes.size(); ++i) {
+            const DType selected =
+                layer_overrides[i] == DType::BF16 ? kv_profile.dtype : layer_overrides[i];
+            tier_classes[i] = product::kv_layer_class_of(selected);
+        }
+        const bool tier_cold_pool =
+            effective_cold_pages(options.cold_policy, options.cold_keep_tokens,
+                                 options.max_cold_pages) > 0;
+        const std::string tier_report = product::kv_tier_formats_check(
+            *tier_plan, tier_classes, tier_layers, tier_cold_pool);
+        std::fprintf(stderr, "%s\n", tier_report.c_str());
     }
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
@@ -1117,6 +1261,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_residual_layers  = options.kv_residual_explicit
                                    ? options.kv_residual_layers
                                    : std::array<bool, 64>{},
+        .kv_v_codec          = options.kv_v_codec,
+        .kv_rotation_off     = options.kv_rotation_explicit && options.kv_rotation_off,
+        .kv_row_scale_spec   = options.kv_row_scale_explicit ? options.kv_row_scale_spec
+                                                             : std::string{},
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,

@@ -34,32 +34,14 @@ namespace {
 
 using namespace ninfer::ops::detail;
 
-__device__ __forceinline__ float gqa_prefill_nvfp4_rot(float x0, float x1, float x2, float x3,
-                                                       int block, int row) {
-    return gqa_isoquant_rot_value(block, row, 0) * x0 +
-           gqa_isoquant_rot_value(block, row, 1) * x1 +
-           gqa_isoquant_rot_value(block, row, 2) * x2 +
-           gqa_isoquant_rot_value(block, row, 3) * x3;
-}
-
-// Rotate eight contiguous dims (two 4-blocks) in registers.
+// Rotate eight contiguous dims (two 4-blocks) in registers. The runtime gate
+// lives inside gqa_isoquant_rot_block4() and nowhere else, so this wrapper
+// needs no gate of its own: with the rotation off both halves early-return and
+// x is left exactly as loaded.
 __device__ __forceinline__ void gqa_prefill_nvfp4_rotate_8(float (&x)[8], int d) {
     const int block0 = d >> 2;
-    float y0[4];
-#pragma unroll
-    for (int row = 0; row < 4; ++row) {
-        y0[row] = gqa_prefill_nvfp4_rot(x[0], x[1], x[2], x[3], block0, row);
-    }
-#pragma unroll
-    for (int row = 0; row < 4; ++row) { x[row] = y0[row]; }
-    const int block1 = block0 + 1;
-    float y1[4];
-#pragma unroll
-    for (int row = 0; row < 4; ++row) {
-        y1[row] = gqa_prefill_nvfp4_rot(x[4], x[5], x[6], x[7], block1, row);
-    }
-#pragma unroll
-    for (int row = 0; row < 4; ++row) { x[4 + row] = y1[row]; }
+    gqa_isoquant_rot_block4(&x[0], block0);
+    gqa_isoquant_rot_block4(&x[4], block0 + 1);
 }
 
 __device__ __forceinline__ void gqa_prefill_bar_sync(int id, int count) {
@@ -129,14 +111,7 @@ __device__ __forceinline__ void gqa_prefill_mxf4_rotate_4(float (&x)[4],
         const int base  = lane * 4;
 #pragma unroll
         for (int j = 0; j < 4; ++j) { x[j] = __bfloat162float(src[base + j]); }
-        const float y0 = gqa_prefill_nvfp4_rot(x[0], x[1], x[2], x[3], block, 0);
-        const float y1 = gqa_prefill_nvfp4_rot(x[0], x[1], x[2], x[3], block, 1);
-        const float y2 = gqa_prefill_nvfp4_rot(x[0], x[1], x[2], x[3], block, 2);
-        const float y3 = gqa_prefill_nvfp4_rot(x[0], x[1], x[2], x[3], block, 3);
-        x[0] = y0;
-        x[1] = y1;
-        x[2] = y2;
-        x[3] = y3;
+        gqa_isoquant_rot_block4(x, block);
     } else {
         x[0] = x[1] = x[2] = x[3] = 0.0f;
     }
@@ -518,14 +493,7 @@ __launch_bounds__(256) __global__
             gqa_kv_nvfp4_src_index<Geometry>(kv_head, group * 16, token) + lane * 4;
 #pragma unroll
         for (int j = 0; j < 4; ++j) { kx[j] = __bfloat162float(k[src + j]); }
-        const float y0 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 0);
-        const float y1 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 1);
-        const float y2 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 2);
-        const float y3 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 3);
-        kx[0] = y0;
-        kx[1] = y1;
-        kx[2] = y2;
-        kx[3] = y3;
+        gqa_isoquant_rot_block4(kx, block);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             kx[j] *= gqa_kv_row_scale(layer, kv_head, group * 16 + lane * 4 + j);
@@ -655,14 +623,7 @@ __launch_bounds__(256) __global__
             gqa_kv_nvfp4_src_index<Geometry>(kv_head, group * 16, token) + lane * 4;
 #pragma unroll
         for (int j = 0; j < 4; ++j) { kx[j] = __bfloat162float(k[src + j]); }
-        const float y0 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 0);
-        const float y1 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 1);
-        const float y2 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 2);
-        const float y3 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 3);
-        kx[0] = y0;
-        kx[1] = y1;
-        kx[2] = y2;
-        kx[3] = y3;
+        gqa_isoquant_rot_block4(kx, block);
     }
     float kmax = fmaxf(fmaxf(fabsf(kx[0]), fabsf(kx[1])), fmaxf(fabsf(kx[2]), fabsf(kx[3])));
 #pragma unroll
@@ -753,14 +714,7 @@ __launch_bounds__(256) __global__
             gqa_kv_nvfp4_src_index<Geometry>(kv_head, group * 16, token) + lane * 4;
 #pragma unroll
         for (int j = 0; j < 4; ++j) { kx[j] = __bfloat162float(k[src + j]); }
-        const float y0 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 0);
-        const float y1 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 1);
-        const float y2 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 2);
-        const float y3 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 3);
-        kx[0] = y0;
-        kx[1] = y1;
-        kx[2] = y2;
-        kx[3] = y3;
+        gqa_isoquant_rot_block4(kx, block);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             kx[j] *= gqa_kv_row_scale(layer, kv_head, group * 16 + lane * 4 + j);
@@ -928,14 +882,7 @@ __launch_bounds__(256) __global__
             gqa_kv_nvfp4_src_index<Geometry>(kv_head, group * 16, token) + lane * 4;
 #pragma unroll
         for (int j = 0; j < 4; ++j) { kx[j] = __bfloat162float(k[src + j]); }
-        const float y0 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 0);
-        const float y1 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 1);
-        const float y2 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 2);
-        const float y3 = gqa_prefill_nvfp4_rot(kx[0], kx[1], kx[2], kx[3], block, 3);
-        kx[0] = y0;
-        kx[1] = y1;
-        kx[2] = y2;
-        kx[3] = y3;
+        gqa_isoquant_rot_block4(kx, block);
     }
     float kmax = fmaxf(fmaxf(fabsf(kx[0]), fabsf(kx[1])), fmaxf(fabsf(kx[2]), fabsf(kx[3])));
 #pragma unroll
@@ -1216,11 +1163,14 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                                          cold_v_slots != nullptr && cold_k_valid != nullptr &&
                                          cold_v_valid != nullptr && cold_slot_bytes >= 1024 + 320;
             const int slot_base    = cold_available ? -table_entry - 2 : 0;
-            // Region-relative flat slot index: slot * 2*KVHeads + head; the V
-            // plane's valid entries sit one KVHeads block later.
+            // Region-relative flat slot index: slot * 2*KVHeads + head. Both valid
+            // planes arrive PRE-OFFSET by the launcher (V = K + cold_slot_valid.nb[1],
+            // which is the plane stride of the {kv_heads, 2, cold_pages} tensor), so K
+            // and V take the SAME flat id here -- the single-base readers
+            // (small_t_*) are the ones that add KVHeads themselves.
             const int cold_slot_id = slot_base * (2 * Geometry::KVHeads) + kv_head;
             const bool cold        = cold_available && cold_k_valid[cold_slot_id] != 0 &&
-                              cold_v_valid[cold_slot_id + Geometry::KVHeads] != 0;
+                              cold_v_valid[cold_slot_id] != 0;
             const int physical_page = cold ? 0 : table_entry;
             const std::uint8_t* k_slot =
                 cold ? cold_k_slots + static_cast<std::int64_t>(cold_slot_id) * cold_slot_bytes
@@ -1384,7 +1334,12 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                                af[0], af[1], af[2], af[3], bf[0], bf[1], sfa, sfb);
             }
         }
-        // Second pass accumulates the E2M1 residual K plane.
+        // Second pass accumulates the E2M1 residual K plane. Guarded on the plane pointer
+        // for the same reason as the small-T kernel: without a residual the staging
+        // zero-fills k_rpk/k_rsf, so this pass only multiplies zeros - and it costs a full
+        // second set of QK MMAs, which is exactly the fp4-vs-s8 advantage. The 27B's
+        // width>=7 verify runs THIS kernel, so both had to be guarded.
+        if (cache_k_residual != nullptr) {
 #pragma unroll
         for (int k = 0; k < Mxf4QKKs; ++k) {
             unsigned af[4];
@@ -1399,6 +1354,7 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                 mma_nvfp4_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
                                af[0], af[1], af[2], af[3], bf[0], bf[1], sfa, sfb);
             }
+        }
         }
     };
 

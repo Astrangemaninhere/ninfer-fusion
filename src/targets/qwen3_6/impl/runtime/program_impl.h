@@ -591,10 +591,16 @@ schedule::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
     schedule::MtpCausalAttentionEnvelopes out;
-    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
+    // The split reference is pinned to the sequence capacity, not to the per-round
+    // frontier + k: the verify columns must reduce exactly like the batch-1 decode of
+    // the same row, so their split grid may not depend on the draft window or on how
+    // far the sequence has advanced.
+    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL),
+                         capacity};
     out.batch         = out.target_verify;
     for (std::uint32_t step = 0; step + 1 < k; ++step) {
-        out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
+        out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL),
+                        capacity};
     }
     return out;
 }
@@ -862,14 +868,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
-    if (cold_policy == ColdPolicy::Host) {
-        // Declared on the CLI but not wired to a host-eviction consumer: the cold pool
-        // stays at 0 pages (see effective_cold_pages), so the flag buys nothing. Say so
-        // once at construction rather than letting the layout quietly disagree.
-        std::fprintf(stderr,
-                     "[cold] --cold-policy host is not implemented: cold pool stays at 0 "
-                     "pages; use --cold-policy window|disk\n");
-    }
+    // ColdPolicy::Host does have an eviction consumer now (cold_host_tier.h): a
+    // pinned Host pool, sized by --cold-host-bytes alone, whose pages are released
+    // device pages that no attention kernel can read any more. The pool is built
+    // below, once the Host page stride (hence its whole-page capacity) is known.
     if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk) {
         const std::int32_t requant_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
         if (requant_heads > 0) {
@@ -882,8 +884,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     if (cold_policy == ColdPolicy::Disk) {
         // Per-layer spill files: each slot is a fixed stride of compressed
-        // bytes, so the file offset is slot * stride. Opened once; the engine
-        // truncates on start (cold pages are re-spilled as they age).
+        // bytes, so the file offset is file_slot * stride. Opened once; the
+        // engine truncates on start (cold pages are re-spilled as they age).
         const std::uint32_t layers = decoder->text_kv.layers();
         const std::string dir =
             cold_disk_path.empty() ? std::string("/tmp") : cold_disk_path;
@@ -900,6 +902,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             cold_disk_slot_bytes   = std::max(cold_disk_slot_bytes,
                                               static_cast<std::size_t>(view.cold_slots.nb[3]));
         }
+        // Size the file-slot space from --cold-disk-bytes (stored in
+        // cold_disk_file_slots, which nothing else reads). One slot per
+        // largest-layer stride keeps the worst case inside the budget.
+        if (cold_disk_slot_bytes != 0) {
+            std::uint64_t slots =
+                cold_disk_bytes / static_cast<std::uint64_t>(cold_disk_slot_bytes);
+            if (slots == 0) { slots = 1; }  // a zero budget still admits one page
+            // The bitmap is host memory, so bound it (2^26 slots = 64 MiB of
+            // bitmap, i.e. >= 2 TiB of spill at the largest observed stride,
+            // which is already far past any real budget).
+            constexpr std::uint64_t kMaxFileSlots = 1ULL << 26;
+            cold_disk_file_slots = slots < kMaxFileSlots ? slots : kMaxFileSlots;
+            cold_disk_file_used.assign(static_cast<std::size_t>(cold_disk_file_slots), 0);
+        }
         if (cold_disk_slot_bytes != 0) {
             CUDA_CHECK(cudaHostAlloc(&cold_disk_staging[0], cold_disk_slot_bytes,
                                      cudaHostAllocDefault));
@@ -909,6 +925,75 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     text_host_kv_page_stride =
         plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
+    if (cold_policy == ColdPolicy::Host) {
+        // The tier owns its own pinned arena: --cold-host-bytes is enforced against
+        // THIS pool and nothing else (one cap, one pool -- see program.h). The pool
+        // is only materialized when the model can actually use it: on a stack with a
+        // full-attention layer no page is ever read-free, so pinning memory would buy
+        // nothing, and the tier says so instead of allocating.
+        const std::span<const std::uint32_t> layer_windows =
+            decoder->text_kv.layer_sliding_windows();
+        product::ColdTierBudget cold_budget =
+            product::cold_tier_budget_from(cold_policy, cold_host_bytes, cold_disk_bytes);
+        // Tier 1 is counted in whole LOGICAL PAGES too: plan_host_kv_page_layout
+        // packs every text layer's resident planes for one page end to end, so the
+        // stride is "one page across all layers" and never a per-layer or per-head
+        // slice -- the same granularity rule tier 2 states below, and the reason a
+        // page can carry exactly one residency bit.
+        cold_budget.host_page_bytes = text_host_kv_page_stride;
+        // Tier 2 is counted in H1's unit: ONE whole cold slot across EVERY text
+        // layer. A block-table sentinel encodes a single slot base and the attention
+        // kernels index that same slot number in every layer's cold_slots at once, so
+        // a demotion in any smaller unit (per layer, per head, per plane) would leave
+        // a live sentinel pointing at bytes that already left the device -- and the
+        // kernels have no fault path. The per-page cost is therefore the SUM of the
+        // per-layer whole-slot strides. `cold_slots.nb[3]` is exactly that stride
+        // (one record per layer: K+V planes, all heads), i.e. the same quantity the
+        // spill mirror writes records with, the per-layer accessor D2 published as
+        // PagedKVCache::layer_slot_bytes(layer), and the bytes C2's
+        // kv_cold_codec_spec_of(class).pool_stride_bytes names. It is read from the
+        // live layer view rather than from PagedKVCache::slot_bytes() (the pool's
+        // WIDEST record, a diagnostic and an upper bound only), so a per-layer codec
+        // (D2) changes the sum without an edit here.
+        //
+        // Under ColdPolicy::Host the sum is 0 by construction: effective_cold_pages
+        // reserves no cold slots, so no layer owns a cold record and there is nothing
+        // to spill. The ladder is then host -> stay hot, which is what makes it fall
+        // through instead of inventing an overflow. The term is still computed the
+        // H1 way so the disk rung is correct the moment a policy enables both tiers.
+        std::uint64_t spill_page_bytes = 0;
+        for (std::uint32_t layer = 0; layer < decoder->text_kv.layers(); ++layer) {
+            const Tensor layer_cold_slots = decoder->text_kv.batch_layer_view(layer).cold_slots;
+            if (layer_cold_slots.data == nullptr) { continue; }
+            spill_page_bytes += static_cast<std::uint64_t>(layer_cold_slots.nb[3]);
+        }
+        cold_budget.disk_page_bytes = spill_page_bytes;
+        cold_budget.device_cold_pages = decoder->text_kv.max_cold_pages();
+        if (!cold_host_layers_are_windowed(layer_windows)) {
+            cold_host_tier_inert_reported = true;
+            std::fprintf(stderr,
+                         "[cold] --cold-policy host admits nothing on this model: no layer has a "
+                         "sliding window, so every committed page stays readable by some layer "
+                         "and can never leave the device; no Host pool is reserved (use "
+                         "--cold-policy window|disk for a read-back cold pool)\n");
+        } else {
+            const HostKVPageLayout text_host_layout =
+                plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry());
+            cold_host_tier = std::make_unique<ColdHostTier>(
+                cold_budget, std::span<const HostKVPageLayout>(&text_host_layout, 1));
+            if (!cold_host_tier->enabled()) {
+                std::fprintf(stderr,
+                             "[cold] --cold-policy host is inert: %llu B does not hold one %zu B "
+                             "page\n",
+                             static_cast<unsigned long long>(cold_budget.host_bytes),
+                             text_host_kv_page_stride);
+            } else {
+                std::fprintf(stderr, "[cold] %s (keep_tokens=%u)\n",
+                             cold_host_tier->description().c_str(),
+                             cold_keep_tokens);
+            }
+        }
+    }
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
@@ -1107,6 +1192,7 @@ ProgramImplCore::~ProgramImplCore() noexcept {
         if (f != nullptr) { std::fclose(f); }
     }
     cold_disk_files.clear();
+    cold_disk_file_used.clear();
     for (void* p : cold_disk_staging) {
         if (p != nullptr) {
             (void)cudaFreeHost(p);
@@ -2926,7 +3012,7 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         sequence.dflash_context_frontier = retained->backend_frontier;
     }
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    sweep_host_kv_pools();
     refresh_state_views(sequence);
 }
 
@@ -4718,7 +4804,7 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         source.dflash_context_frontier = details.reuse_base;
     }
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    sweep_host_kv_pools();
     refresh_state_views(source);
 
     const detail::PhysicalResources after   = resident_resources(source);
@@ -4956,7 +5042,14 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                     }
                     const DeviceKVPageHandle restored =
                         pages.restore_from_cold(logical, reservation);
-                    restore_cold_page(*source_state, page, entry->slot, restored);
+                    if (!restore_cold_page(*source_state, page, entry->slot, entry->file_slot,
+                                           restored)) {
+                        // Nothing was written into `restored`: put the descriptor back
+                        // on the cold path so the sentinel still addresses this page's
+                        // bytes, then report the missing staging slot.
+                        pages.transfer_to_cold(logical, reservation);
+                        throw std::logic_error("cold checkpoint page could not be staged");
+                    }
                     continue;
                 }
                 if (!pages.host_resident(logical) || !host_kv_extents) {
@@ -6484,6 +6577,12 @@ void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
     sequence.mtp_draft_count         = 0;
+    // The criterion's depth-conditional accept counts are per request, not per lane: a
+    // lane reused for the next request must not start from the previous request's survival
+    // record. Both fields are written only under NINFER_MTP_WINDOW_CUT (mtp_window_cut.h),
+    // so this is inert for every fixed-k run.
+    sequence.mtp_window              = {};
+    sequence.mtp_drafted_extent      = 0;
     sequence.tail_hidden_valid       = false;
     sequence.endpoint_valid          = false;
     sequence.rewrite_checkpoint      = {};
@@ -9111,7 +9210,7 @@ ProgramImplCore::release_shared_prefix_state(std::uint32_t index,
     shared    = SharedPrefixState{};
     slot.role = SharedPrefixSlotRole::Free;
     if (++slot.generation == 0) { ++slot.generation; }
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    sweep_host_kv_pools();
     return removed;
 }
 
@@ -9469,7 +9568,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 backend_kv_addresses->destructive_truncate_inactive(
                     *sequence.kv->backend, *transaction.backend_activation_frontier);
             }
-            if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+            sweep_host_kv_pools();
         }
         if ((text_prefix_fork || backend_prefix_fork) && !transaction.prefix_forks_ready) {
             throw std::logic_error("materialization prefix forks are incomplete");
@@ -9983,12 +10082,30 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                     // record and cap the next window at the depth whose expected token value
                     // still pays for the column. Knobs: NINFER_MTP_WINDOW_CUT=0 disables,
                     // NINFER_MTP_WINDOW_RATIO overrides b/a for calibration.
-                    // Opt-in until the criterion has its own A/B: every existing fixed-k
-                    // experiment must keep meaning "fixed k". The `auto` front end turns
-                    // this on once verified.
+                    //
+                    // Opt-in, and it stays opt-in - it is not "unverified", it was verified and
+                    // it lost. dl/_criterion_ab.txt: -27% against the best fixed k on the code
+                    // prompt (236.84 vs 322.67 tok/s) and on the high-entropy prompt (138.76 vs
+                    // 190.00), a tie on strong repetition. The criterion removes LIVE columns
+                    // while the round cost follows the CAPTURED width (b_mask = 0.103 ms/col vs
+                    // b_width = 0.737 ms/col), so every column it drops costs far more acceptance
+                    // length than it saves time. Consequences for this call site: keep the
+                    // default off so every existing fixed-k experiment keeps meaning "fixed k",
+                    // and do not turn it on from the `auto` front end either - auto resolves to
+                    // DFlash2 for the dflash2 artifact, and otherwise to MTP with k=3, where a
+                    // shrink-only cap can only ever cost tokens.
                     static const bool kWindowCutEnabled = [] {
-                        const char* env = std::getenv("NINFER_MTP_WINDOW_CUT");
-                        return env != nullptr && std::atoi(env) != 0;
+                        const char* env     = std::getenv("NINFER_MTP_WINDOW_CUT");
+                        const bool enabled  = env != nullptr && std::atoi(env) != 0;
+                        if (enabled) {
+                            static_cast<void>(std::fprintf(
+                                stderr,
+                                "[mtp-window-cut] enabled: measured net-negative (-27%% on the "
+                                "code and high-entropy prompts against the best fixed k); the "
+                                "cost follows the captured width, not the live column count - "
+                                "read the STATUS note in mtp_window_cut.h first\n"));
+                        }
+                        return enabled;
                     }();
                     static const float kWindowCostRatio = [] {
                         const char* env = std::getenv("NINFER_MTP_WINDOW_RATIO");
@@ -10409,13 +10526,15 @@ void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
     }
     if (text_kv_addresses) { (void)text_kv_addresses->release(sequence.kv->text); }
     sequence.kv.reset();
-    if (decoder != nullptr) {
-        for (const auto& cold : sequence.cold_pages) {
-            decoder->text_kv.release_cold_slot(cold.slot);
-        }
+    for (const auto& cold : sequence.cold_pages) {
+        if (decoder != nullptr) { decoder->text_kv.release_cold_slot(cold.slot); }
+        // The file slots are process-global, so they must be returned even when
+        // there is no decoder to hand the device slot back to. Nothing used to
+        // free them: the space was implicit and unbounded.
+        release_cold_disk_file_slot(cold.file_slot);
     }
     sequence.cold_pages.clear();
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    sweep_host_kv_pools();
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& sequence) const {
@@ -10461,6 +10580,27 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 }
 
 
+// File-slot allocator for ColdPolicy::Disk. File slots are independent of the
+// device cold slots: the device pool is a shared working set that is recycled by
+// restores, while a file slot pins one on-disk region for as long as a page's
+// only replica lives there. Reusing a released *device* slot index as a file
+// offset (what the code used to do) therefore aliased pages on disk.
+std::int32_t ProgramImplCore::allocate_cold_disk_file_slot() noexcept {
+    for (std::size_t slot = 0; slot < cold_disk_file_used.size(); ++slot) {
+        if (cold_disk_file_used[slot] == 0) {
+            cold_disk_file_used[slot] = 1;
+            return static_cast<std::int32_t>(slot);
+        }
+    }
+    return -1;
+}
+
+void ProgramImplCore::release_cold_disk_file_slot(std::int32_t file_slot) noexcept {
+    if (file_slot >= 0 && static_cast<std::size_t>(file_slot) < cold_disk_file_used.size()) {
+        cold_disk_file_used[static_cast<std::size_t>(file_slot)] = 0;
+    }
+}
+
 // Cold-pool maintenance: pack the retired prefix of a sequence's text KV into
 // raw entropy slots and detach those pages (sentinel entries in the block
 // table; physical pages return to the pool). Runs when the window policy is
@@ -10487,10 +10627,53 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
 
     const std::int32_t kv_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
     const std::uint32_t layers  = decoder->text_kv.layers();
-    // Cold slots carry requantized E2M1 planes (int8 -> E2M1 g64). The page
-    // stays hot unless every layer can pack, so mixed-dtype stacks skip.
+    // Cold slots carry requantized E2M1 planes, ONE CODEC PER LAYER DTYPE: the
+    // int8 tier packs raw nibbles (int8 -> E2M1 g64) and the nvfp4 tier
+    // rANS-encodes the native E2M1 (K) / ISO3 (V) nibbles over g64 scales. Both
+    // write the SAME fixed slot, whose stride is resolved per layer by that
+    // layer's codec width (decoder_state.cpp cold_slot_stride_for), and readers
+    // exist for exactly these two tiers (decode/prefill: the raw i8 slot for
+    // DType::I8, the rANS slot for DType::NVFP4), so I8 and NVFP4 are the
+    // cold-capable set. ISO3 is a tier of its own: an iso3 layer's K plane holds
+    // iso3 codes and neither its decode nor its prefill kernel has a cold branch.
+    // The page stays hot unless EVERY layer can pack: transfer_to_cold returns the
+    // physical page to the shared pool, and the execution table has no layer axis,
+    // so one sentinel per (sequence, page) retires the page for all layers at
+    // once. That is also why a residual-bearing layer is NOT cold-capable --
+    // restore_cold_page repopulates codes and scales only, never the residual
+    // planes the nvfp4 decode reads.
+    const auto cold_codec_of = [](DType dtype) -> const char* {
+        switch (dtype) {
+        case DType::I8: return "the int8 raw slot";
+        case DType::NVFP4: return "the nvfp4 rANS slot";
+        case DType::ISO3: return "an iso3 plane (no cold codec)";
+        case DType::E8Kv: return "an e8 lattice plane (no cold codec)";
+        case DType::FP8_E4M3FN: return "an fp8 plane (no cold codec)";
+        default: return "a 16-bit plane (no cold codec)";
+        }
+    };
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        if (decoder->text_kv.batch_layer_view(layer).dtype != DType::I8) { return; }
+        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+        const bool packed       = view.dtype == DType::I8 || view.dtype == DType::NVFP4;
+        const bool cold_capable = packed && view.k_residual_pages.data == nullptr;
+        if (cold_capable) { continue; }
+        // Silent no-op until now: with any layer that has no cold codec the cold pool
+        // still reserves its slots but compresses nothing, so --cold-policy looks
+        // enabled and does nothing. Say so once, loudly.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "[cold] policy is set but layer %u is %s (dtype code %u, "
+                         "residual plane %u): cold compression is skipped and the "
+                         "reserved pool stays idle\n",
+                         layer,
+                         packed ? "a plane with a residual the cold restore cannot rebuild"
+                                : cold_codec_of(view.dtype),
+                         static_cast<unsigned>(view.dtype),
+                         view.k_residual_pages.data == nullptr ? 0U : 1U);
+        }
+        return;
     }
     std::vector<std::int32_t> k_flags(static_cast<std::size_t>(kv_heads));
     std::vector<std::int32_t> v_flags(static_cast<std::size_t>(kv_heads));
@@ -10506,10 +10689,11 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
             const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
             const Tensor cold_slots          = view.cold_slots;
             if (cold_slots.data == nullptr) { continue; }
-            if (view.dtype != DType::I8) {
-                success = false;  // cold slots only carry int8 planes
-                break;
-            }
+            // No dtype gate here: the per-layer codec dispatch below is the real
+            // admission test (I8 packs the raw nibble slot, NVFP4 the rANS slot,
+            // anything else fails the page and keeps it hot). This used to read
+            // `dtype != DType::I8 -> fail`, which is what kept the NVFP4 arm below
+            // unreachable even after the stack gate above let such a stack through.
             const DeviceKVPageHandle ph = store.physical_page(text, page);
             const std::int32_t physical = ph.index();
             auto* k_codes = static_cast<const std::uint8_t*>(view.k_pages.data) +
@@ -10527,22 +10711,10 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                             static_cast<std::int64_t>(slot) * view.cold_slot_valid.nb[2];
             auto* v_valid = reinterpret_cast<std::int32_t*>(
                 reinterpret_cast<std::uint8_t*>(k_valid) + view.cold_slot_valid.nb[1]);
-            ops::entropy_cold_requant_raw(
-                k_codes, k_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
-                static_cast<std::uint8_t*>(cold_requant_codes),
-                static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
-            ops::cold_i8_slot_pack_raw(
-                static_cast<const std::uint8_t*>(cold_requant_codes),
-                static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
-                k_valid, view.slot_bytes, device.stream);
-            ops::entropy_cold_requant_raw(
-                v_codes, v_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
-                static_cast<std::uint8_t*>(cold_requant_codes),
-                static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
-            ops::cold_i8_slot_pack_raw(
-                static_cast<const std::uint8_t*>(cold_requant_codes),
-                static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
-                v_valid, view.slot_bytes, device.stream);
+            // The INT8 requant+pack pair lives ONLY in the I8 branch below: it used to be
+            // emitted once unconditionally here and then repeated verbatim inside the
+            // branch, so every eviction ran the same two kernels twice (and every other
+            // dtype ran the INT8 pair for nothing).
             if (view.dtype == DType::I8) {
                 // INT8 tier: requant to E2M1 g64 and store the raw nibble slot.
                 ops::entropy_cold_requant_raw(
@@ -10566,6 +10738,10 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                 // requantize scales to g64 for a skew that rANS compresses,
                 // and encode into the entropy slot. On incompressible pages
                 // the slot flags stay 0 and the hot plane keeps serving.
+                // NOTE: the slot carries one plane per K/V side, so a layer with
+                // residual planes (--kv-residual) loses its stage-2 contribution
+                // on cold pages; the rANS slot has no residual field. That is why
+                // the stack gate above refuses a residual-bearing layer outright.
                 ops::entropy_cold_requant_raw(
                     k_codes, k_scales, ops::EntropyColdRequantMode::Nvfp4G16, kv_heads, 1,
                     static_cast<std::uint8_t*>(cold_requant_codes),
@@ -10583,7 +10759,7 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                     static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
                     view.slot_bytes, v_valid, nullptr, kv_heads, device.stream);
             } else {
-                success = false;  // bf16/fp8 layers have no cold slot codec
+                success = false;  // bf16/fp8/iso3/e8: no cold slot codec, page stays hot
                 break;
             }
         }
@@ -10593,9 +10769,38 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
         }
         device.synchronize();
 
-        if (cold_policy == ColdPolicy::Disk && cold_disk_staging != nullptr) {
-            // Mirror every layer's slot bytes into its spill file. The slot
-            // is a fixed-stride unit; file offset = slot * stride.
+        // The page's file slot is taken before the mirror and kept for its whole
+        // cold lifetime, so its on-disk offset never moves. (`cold_disk_staging
+        // != nullptr` used to guard this block: an array never decays to a null
+        // pointer, so the test was a constant true; the buffer check that matters
+        // is element 0.)
+        std::int32_t file_slot = -1;
+        if (cold_policy == ColdPolicy::Disk) {
+            if (cold_disk_staging[0] == nullptr) {
+                // Disk policy with no staging buffer: the spill files could not be
+                // prepared, so keep the page resident instead of claiming a spill.
+                decoder->text_kv.release_cold_slot(slot);
+                break;
+            }
+            file_slot = allocate_cold_disk_file_slot();
+            if (file_slot < 0) {
+                // --cold-disk-bytes is the SSD side of the offload budget. Running
+                // out of file slots keeps the excess resident (loudly, once)
+                // instead of aliasing another page's file region.
+                static bool warned_spill_budget = false;
+                if (!warned_spill_budget) {
+                    warned_spill_budget = true;
+                    std::fprintf(stderr,
+                                 "[cold] spill budget exhausted (%llu file slots x %zu B): "
+                                 "further pages stay resident; raise --cold-disk-bytes\n",
+                                 static_cast<unsigned long long>(cold_disk_file_slots),
+                                 cold_disk_slot_bytes);
+                }
+                decoder->text_kv.release_cold_slot(slot);
+                break;
+            }
+            // Mirror every layer's slot bytes into its spill file. The slot is a
+            // fixed-stride unit and this page owns `file_slot`.
             bool mirrored = true;
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
                 FILE* f = layer < cold_disk_files.size() ? cold_disk_files[layer] : nullptr;
@@ -10609,7 +10814,7 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                 CUDA_CHECK(cudaMemcpyAsync(cold_disk_staging[0], k_slot, bytes,
                                            cudaMemcpyDeviceToHost, device.stream));
                 CUDA_CHECK(cudaStreamSynchronize(device.stream));
-                const std::int64_t offset = static_cast<std::int64_t>(slot) *
+                const std::int64_t offset = static_cast<std::int64_t>(file_slot) *
                                             static_cast<std::int64_t>(bytes);
                 if (std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0 ||
                     std::fwrite(cold_disk_staging[0], 1, bytes, f) != bytes) {
@@ -10618,42 +10823,59 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                 }
             }
             if (!mirrored) {
+                release_cold_disk_file_slot(file_slot);
                 decoder->text_kv.release_cold_slot(slot);
                 continue;
             }
             std::fflush(nullptr);
         }
 
-        // A slot only counts once every head's pack kernel committed its valid
+        // A slot only counts once EVERY layer's pack kernel committed its valid
         // flag; otherwise the page would decode as garbage through the slot.
+        // The rANS codec clears a layer's flag when one of its streams overflows
+        // the fixed stream budget ('callers fall back to the uncompressed plane',
+        // entropy_nvfp4_slot_kernels.cuh), and the decode kernels trust the
+        // published sentinel instead of re-reading the flags, so the whole stack
+        // has to be checked. The raw int8 codec has a fixed 9232 B layout and no
+        // overflow path at all, which is why reading layer 0 alone used to be an
+        // empty condition -- and why it stops being one the moment a layer can
+        // resolve to the rANS codec.
         // Valid tensor is [kv_heads, 2, pages] col-major: head innermost,
         // page outermost, so slot pages sit at slot * 2*kv_heads.
-        const Tensor cold_valid = decoder->text_kv.cold_slot_valid(0);
-        auto* k_valid = static_cast<std::int32_t*>(cold_valid.data) +
-                        static_cast<std::int64_t>(slot) * cold_valid.nb[2];
-        auto* v_valid = reinterpret_cast<std::int32_t*>(
-            reinterpret_cast<std::uint8_t*>(k_valid) + cold_valid.nb[1]);
-        CUDA_CHECK(cudaMemcpy(k_flags.data(), k_valid,
-                              k_flags.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(v_flags.data(), v_valid,
-                              v_flags.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
-        const bool valid =
-            std::all_of(k_flags.begin(), k_flags.end(),
-                        [](std::int32_t value) { return value != 0; }) &&
-            std::all_of(v_flags.begin(), v_flags.end(),
-                        [](std::int32_t value) { return value != 0; });
+        bool valid = true;
+        for (std::uint32_t layer = 0; layer < layers && valid; ++layer) {
+            const Tensor cold_valid = decoder->text_kv.cold_slot_valid(layer);
+            if (cold_valid.data == nullptr) { continue; }
+            auto* k_valid = static_cast<std::int32_t*>(cold_valid.data) +
+                            static_cast<std::int64_t>(slot) * cold_valid.nb[2];
+            auto* v_valid = reinterpret_cast<std::int32_t*>(
+                reinterpret_cast<std::uint8_t*>(k_valid) + cold_valid.nb[1]);
+            CUDA_CHECK(cudaMemcpy(k_flags.data(), k_valid,
+                                  k_flags.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(v_flags.data(), v_valid,
+                                  v_flags.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+            valid = std::all_of(k_flags.begin(), k_flags.end(),
+                                [](std::int32_t value) { return value != 0; }) &&
+                    std::all_of(v_flags.begin(), v_flags.end(),
+                                [](std::int32_t value) { return value != 0; });
+        }
         if (!valid) {
+            release_cold_disk_file_slot(file_slot);
             decoder->text_kv.release_cold_slot(slot);
             continue;
         }
 
-        // Publish the sentinel and return the physical page to the pool.
+        // Publish the sentinel and return the physical page to the pool. The
+        // sentinel is the only handle decode has on a page with no physical page
+        // behind it, so the device slot it names must stay valid for as long as
+        // the entry is in the table -- see the note on restore_cold_page.
         const std::int32_t entry = paged_kv_cold_entry(slot);
         decoder->text_kv.execution_tables().publish_indices(
             store.execution_row(text).handle(), page, std::span<const std::int32_t>(&entry, 1),
             device.stream);
         store.transfer_to_cold(text, page);
-        sequence.cold_pages.emplace_back(page, slot);
+        sequence.cold_pages.push_back(SequenceState::ColdPageEntry{
+            .page = page, .slot = slot, .file_slot = file_slot});
         sequence.cold_frontier = page + 1;
         ++compressed;
     }
@@ -10664,22 +10886,171 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
     }
 }
 
-// Restore one cold page's data from its raw slot into the physical page and
-// release the slot. Shared by the rewrite warm path and the checkpoint
-// restore path (which must repopulate cold pages without a host replica).
-void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t page,
-                                        std::int32_t slot, const DeviceKVPageHandle& physical,
-                                        bool disk_prefetched) {
+// Cold Host tier maintenance (ColdPolicy::Host): retire the READ-FREE prefix of a
+// sequence's text KV into the tier's pinned Host pool and hand the device pages
+// back to the pool. Read-free is what makes this safe without touching a single
+// kernel or block-table entry: a page no layer can read has no reader, so its
+// physical page may be reused immediately, and nothing has to be restored inline.
+// The page comes back only through the materialization path (rewrite, fork,
+// resume, checkpoint restore), which already restores any Host-resident page.
+void ProgramImplCore::enqueue_cold_host_evictions(SequenceState& sequence) {
+    if (cold_policy != ColdPolicy::Host || cold_host_tier == nullptr || !sequence.kv ||
+        decoder == nullptr || !sequence.kv->text.valid()) {
+        return;
+    }
+    if (!cold_host_tier->enabled()) { return; }
+    const std::span<const std::uint32_t> layer_windows =
+        decoder->text_kv.layer_sliding_windows();
+    if (!cold_host_layers_are_windowed(layer_windows)) {
+        // The device cold-slot tiers are for pages that stay READABLE; this tier is
+        // for pages that are not. One full-attention layer re-reads every committed
+        // token, so no page ever qualifies: say it once instead of scanning forever.
+        if (!cold_host_tier_inert_reported) {
+            cold_host_tier_inert_reported = true;
+            std::fprintf(stderr,
+                         "[cold] --cold-policy host admits nothing: no layer has a sliding "
+                         "window, so no page is ever read-free\n");
+        }
+        return;
+    }
+    KVAddressSpaceStore& store       = *text_kv_addresses;
+    const KVAddressSpaceHandle text  = sequence.kv->text;
+    const std::uint32_t mapped       = store.mapped_pages(text);
+    if (mapped == 0) { return; }
+    // The same "keep the newest cold_keep_tokens hot" promise the slot tiers honour;
+    // 0 would let the tier offer the page that is still being written.
+    const std::uint32_t frontier = sequence.text_kv_valid;
+    const std::uint32_t keep     = cold_keep_tokens != 0 ? cold_keep_tokens : 1U;
+    HostKVExtentStore* extents   = cold_host_tier->extents();
+
+    std::uint32_t evicted = 0;
+    for (std::uint32_t page = sequence.host_cold_frontier; page < mapped; ++page) {
+        // Both gates are monotone in the page index, so the first page that fails
+        // one of them ends the scan (pages are retired in order).
+        const std::uint64_t page_end =
+            (static_cast<std::uint64_t>(page) + 1U) * kColdHostPageTokens;
+        if (page_end + keep > frontier) { break; }
+        if (!cold_host_page_is_read_free(page, kColdHostPageTokens, frontier, layer_windows)) {
+            break;
+        }
+        if (store.cold_compressed(text, page)) { continue; }  // a device-slot tier owns it
+        if (!store.can_cold_host_prepare(text, page)) { continue; }
+        const product::ColdTierDecision decision = cold_host_tier->admit();
+        if (decision.tier != product::ColdTier::Host) {
+            // Tier 1 is full. Tier 2 (SSD) would catch this page, but no policy
+            // enables both tiers today and the spill tier's file space is still the
+            // device cold-slot pool (see REPORT / the patch's prerequisite note), so
+            // the page simply stays where it is: counted and reported, never thrown.
+            cold_host_tier->note_refused();
+            break;
+        }
+        std::array<LogicalKVPageHandle, 1> membership{store.logical_page(text, page)};
+        std::optional<HostKVExtentReservation> reservation =
+            extents->prepare(*text_kv_pages, membership);
+        if (!reservation) { break; }  // no Host descriptor left; the reservation rolls back
+        std::array<DeviceKVPageHandle, 1> source{};
+        extents->device_sources(*reservation, source);
+        text_kv_pages->physical_pool().copy_to_host(
+            source, extents->writable_view(*reservation), device.transfer_stream);
+        device.synchronize();
+        cold_host_tier->note_admission(product::ColdTier::Host);
+        (void)extents->publish(std::move(*reservation));
+        store.transfer_to_cold_host(text, page);
+        sequence.host_cold_frontier = page + 1;
+        ++evicted;
+    }
+    if (evicted != 0) { report_cold_host_tier("evicted"); }
+}
+
+// Host-tier replicas outlive the address space that referenced them, so the two
+// pinned Host KV pools are swept together wherever references may have dropped.
+// They keep separate budgets (--cold-host-bytes is not host_kv_capacity_bytes: one
+// cap, one pool) but they share the release trigger, and sweeping only one of them
+// would pin memory until some unrelated later sweep.
+void ProgramImplCore::sweep_host_kv_pools() noexcept {
+    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    sweep_cold_host_tier();
+}
+
+void ProgramImplCore::sweep_cold_host_tier() noexcept {
+    if (cold_host_tier == nullptr || !cold_host_tier->enabled()) { return; }
+    const std::size_t released = cold_host_tier->extents()->release_unreferenced();
+    if (released == 0) { return; }
+    const std::uint64_t stride = cold_host_tier->budget().host_page_bytes;
+    const std::uint32_t pages =
+        stride == 0 ? 0U : static_cast<std::uint32_t>(released / stride);
+    cold_host_tier->note_page_released(pages);
+    try {
+        report_cold_host_tier("released");
+    } catch (...) {}  // this runs on teardown paths that must not throw
+}
+
+void ProgramImplCore::report_cold_host_tier(const char* tag) {
+    if (cold_host_tier == nullptr || !cold_host_tier->enabled()) { return; }
+    std::fprintf(stderr, "[cold] %s %s used=%u/%u pages\n", tag,
+                 cold_host_tier->counters_line().c_str(), cold_host_tier->used_pages(),
+                 cold_host_tier->capacity_pages());
+}
+
+// Restore one cold page's data into the physical page and return the cold
+// resources the page no longer needs. Shared by the rewrite warm path and the
+// checkpoint restore path (which must repopulate cold pages without a host
+// replica).
+//
+// Why the working-set slot is released here rather than next to the spill: every
+// cold page has a sentinel in its block table, and the attention kernels
+// dereference that sentinel as a slot index with no validity gate at all
+// (gqa_attention_decode_nvfp4.cuh:523-535: `stage_cold = stage_physical_page <=
+// -2 && ...`, then the slot pointer is formed from `-entry - 2` with no
+// cold_k_valid test; gqa_attention_decode_impl.cuh:344-392 / small_t.cu:119,165
+// take the same path) while the prefill kernel gates on the validity plane read
+// at an unbounded slot id (gqa_attention_prefill_nvfp4.cuh:1216-1223, and falls
+// back to `physical_page = table_entry`, i.e. a negative page index, when the
+// gate fails). Every qwen3_6 layer is full
+// attention (Variant::is_swa_attention() == false, sliding_window == 0), so
+// window_begin == 0 and all pages below the frontier are attended on every step.
+// A live sentinel must therefore always name a slot holding THIS page's bytes,
+// and a page may only lose its slot when the bytes are guaranteed to live
+// somewhere else AND the sentinel is about to be replaced by a physical page
+// index. That is exactly this function (and sequence release). Releasing the slot
+// next to the spill would leave a live sentinel pointing at a slot that is free
+// to be recycled -- the aliasing bug this round fixes the precondition for.
+//
+// Order matters: the staging slot is taken before anything is released, so a
+// failure leaves the page exactly as it was; the page's own working-set slot is
+// then released, because the spill file -- not the slot -- is now this page's
+// replica; the file slot is released last, once the bytes are in `physical`.
+bool ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t page,
+                                        std::int32_t device_slot, std::int32_t file_slot,
+                                        const DeviceKVPageHandle& physical) {
     const int kv_heads          = decoder->text_kv.batch_layer_view(0).num_kv_heads;
     const std::uint32_t layers  = decoder->text_kv.layers();
     const std::int32_t ph_index = physical.index();
-    // Disk tier: `slot` is a file slot, not a device slot. Bind a temporary
-    // device staging slot, read the file back into it, and decode from it;
-    // the staging slot is released after the decode kernels.
-    std::int32_t staging_slot = slot;
-    if (cold_policy == ColdPolicy::Disk && cold_disk_staging[0] != nullptr) {
-        staging_slot = decoder->text_kv.allocate_cold_slot();
-        if (staging_slot < 0) { return; }  // no staging slot: leave the page cold
+    // Disk tier: `file_slot` names the spill file region; `device_slot`, when the
+    // page still holds one, is only a working-set copy of the same bytes. Bind a
+    // staging slot, read the file back into it and decode from it; the page is hot
+    // afterwards, so neither the working-set copy nor the file region is needed.
+    std::int32_t staging_slot = device_slot;
+    if (file_slot >= 0) {
+        if (cold_disk_staging[0] == nullptr) { return false; }
+        if (device_slot >= 0) {
+            // The spill file is this page's replica, so the working-set copy it
+            // still holds is redundant. Give it up BEFORE taking the staging slot:
+            // that keeps the allocation below unconditional (release_cold_slot
+            // just freed one, and allocate_cold_slot rescans the whole pool).
+            decoder->text_kv.release_cold_slot(device_slot);
+            staging_slot  = decoder->text_kv.allocate_cold_slot();
+            if (staging_slot < 0) {
+                throw std::logic_error("cold warm-up could not take a staging slot");
+            }
+        } else {
+            // No working-set copy to trade in: nothing has been released yet, so
+            // failing here leaves the page exactly as it was and the caller can
+            // keep it cold (and keep its file region).
+            staging_slot = decoder->text_kv.allocate_cold_slot();
+            if (staging_slot < 0) { return false; }
+        }
+        bool read_ok = true;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             FILE* f = layer < cold_disk_files.size() ? cold_disk_files[layer] : nullptr;
             if (f == nullptr) { continue; }
@@ -10688,10 +11059,14 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
             if (cold_slots.data == nullptr) { continue; }
             const std::size_t bytes = static_cast<std::size_t>(cold_slots.nb[3]);
             const std::int64_t offset =
-                static_cast<std::int64_t>(slot) * static_cast<std::int64_t>(bytes);
+                static_cast<std::int64_t>(file_slot) * static_cast<std::int64_t>(bytes);
             if (std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0 ||
                 std::fread(cold_disk_staging[0], 1, bytes, f) != bytes) {
-                continue;
+                // A short read used to `continue` and decode the slot's previous
+                // contents into the physical page. A corrupt spill file is not
+                // repairable here, so say so instead of publishing garbage.
+                read_ok = false;
+                break;
             }
             auto* k_slot = static_cast<std::uint8_t*>(cold_slots.data) +
                            static_cast<std::int64_t>(staging_slot) * cold_slots.nb[3];
@@ -10699,8 +11074,12 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
                                        cudaMemcpyHostToDevice, device.stream));
         }
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        if (!read_ok) {
+            throw std::runtime_error("cold spill file read failed for logical page " +
+                                     std::to_string(page));
+        }
     }
-    slot = staging_slot;
+    const std::int32_t slot = staging_slot;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
         const Tensor cold_slots          = view.cold_slots;
@@ -10729,9 +11108,18 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
                 k_slot_base + slot * cold_slots.nb[3], view.slot_bytes,
                 static_cast<int>(cold_slots.nb[3]), kv_heads, 1, page_ids,
                 static_cast<int>(view.k_scale_pages.nb[3]), k_scales_nv, device.stream);
+            // Same geometry as the K scatter above: the V region is a second
+            // kv_heads x stride block inside the same slot, so the head stride is
+            // THIS LAYER's record stride (PagedKVBatchLayerView::slot_bytes, i.e.
+            // the per-layer codec width -- never PagedKVCache::slot_bytes(), which
+            // is only the widest record in the pool) and the page stride is the
+            // slot stride nb[3]. This call used to pass nb[3] as the head stride,
+            // which walked head*2*kv_heads records away and read the wrong head's
+            // scale tail; page_count is 1, so the page-stride argument is inert
+            // either way.
             ops::entropy_nvfp4_slot_scales_scatter_raw(
-                v_slot_base + slot * cold_slots.nb[3], static_cast<int>(cold_slots.nb[3]),
-                static_cast<int>(cold_slots.nb[3]) * kv_heads, kv_heads, 1, page_ids,
+                v_slot_base + slot * cold_slots.nb[3], view.slot_bytes,
+                static_cast<int>(cold_slots.nb[3]), kv_heads, 1, page_ids,
                 static_cast<int>(view.v_scale_pages.nb[3]), v_scales_nv, device.stream);
         } else if (view.dtype == DType::I8) {
             auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
@@ -10752,30 +11140,37 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
                                           v_codes_i8, v_scales_h, view.slot_bytes, device.stream);
         }
     }
+    // Exactly one device slot is live on every path into here, and it is the
+    // staging slot; releasing it is what returns a spilled page's device memory.
+    // The old `if (Disk && staging_slot != slot) release(staging_slot)` was
+    // unreachable: `slot = staging_slot` above made the two names equal, so the
+    // release never ran and the *page's own* slot (which the file copy made
+    // redundant) was leaked instead.
     decoder->text_kv.release_cold_slot(slot);
-    if (cold_policy == ColdPolicy::Disk && staging_slot != slot) {
-        decoder->text_kv.release_cold_slot(staging_slot);
-    }
+    release_cold_disk_file_slot(file_slot);
     auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
                               [page](const SequenceState::ColdPageEntry& e) {
                                   return e.page == page;
                               });
     if (entry != sequence.cold_pages.end()) { sequence.cold_pages.erase(entry); }
     sequence.cold_frontier = 0;  // pages are hot again; rescan from the front
+    return true;
 }
 
 // Warm-restore the cold prefix of a sequence (rewrite/resume paths only): the
 // steady-state decode path reads cold pages directly from their slots, but a
 // rewrite needs real physical pages so append/fork can mutate them again.
 void ProgramImplCore::prefetch_cold_pages(SequenceState& sequence, std::uint32_t pages,
-                                          std::span<const std::int32_t> slots) {
+                                          std::span<const std::int32_t> file_slots) {
     if (cold_policy != ColdPolicy::Disk || cold_disk_staging[0] == nullptr) { return; }
     // Pre-read the file regions into pinned staging to warm the OS page
     // cache; the actual H2D happens in restore once a device staging slot is
     // allocated, so the read latency is hidden behind the previous decode.
+    // `file_slots` are file slots, not device slots: the two index spaces are
+    // independent, and only the file slot locates a page on disk.
     const std::uint32_t layers = decoder->text_kv.layers();
     for (std::uint32_t i = 0; i < pages; ++i) {
-        const std::int32_t slot = slots[i];
+        const std::int32_t slot = file_slots[i];
         if (slot < 0) { continue; }
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             FILE* f = layer < cold_disk_files.size() ? cold_disk_files[layer] : nullptr;
@@ -10819,7 +11214,7 @@ void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t en
                                           return e.page == page;
                                       });
             if (entry == sequence.cold_pages.end()) { continue; }
-            prefetch_slots.push_back(entry->slot);
+            prefetch_slots.push_back(entry->file_slot);
         }
         prefetch_cold_pages(sequence, static_cast<std::uint32_t>(prefetch_slots.size()),
                             prefetch_slots);
@@ -10835,9 +11230,17 @@ void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t en
         if (entry == sequence.cold_pages.end()) { continue; }
         const DeviceKVPageHandle physical = store.restore_from_cold(text, page);
         const std::int32_t ph_index      = physical.index();
-        restore_cold_page(sequence, page, entry->slot, physical);
-        restore_cold_page(sequence, page, entry->slot, physical,
-                          cold_policy == ColdPolicy::Disk);
+        // One restore call. This used to run twice with the same arguments (the
+        // only difference being the unused `disk_prefetched` flag, which is gone):
+        // in Disk mode that re-read the whole spill file, and in Window mode it
+        // restored from the page's slot *after* the first call had released it --
+        // a read out of a slot that was free to be recycled, plus a double release.
+        if (!restore_cold_page(sequence, page, entry->slot, entry->file_slot, physical)) {
+            // No staging slot: put the page back on the cold path, so the sentinel
+            // keeps naming bytes that are still this page's.
+            store.transfer_to_cold(text, page);
+            continue;
+        }
         decoder->text_kv.execution_tables().publish_indices(
             store.execution_row(text).handle(), page,
             std::span<const std::int32_t>(&ph_index, 1), device.stream);
@@ -11092,7 +11495,8 @@ void ProgramImplCore::prepare_graphs() {
                 profile.topology_class =
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
                 const ops::GqaExecutionEnvelope envelope{planned.min + 1,
-                                                                     planned.max + 1};
+                                                                     planned.max + 1,
+                                                                     capacity};
                 schedule::capture_ordinary_decode_batch(ordinary_state,
                                                         static_cast<std::int32_t>(batch_size),
                                                         envelope, profile.definition);
@@ -11152,7 +11556,8 @@ void ProgramImplCore::prepare_graphs() {
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
+                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL)),
+            capacity};
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         schedule::dflash_decode_batch(dflash_state, 1, draft_window,
@@ -11177,7 +11582,8 @@ void ProgramImplCore::prepare_graphs() {
                 const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
+                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL)),
+                    capacity};
 
                 schedule::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
@@ -11199,7 +11605,8 @@ void ProgramImplCore::prepare_graphs() {
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
+                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL)),
+            capacity};
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         schedule::dflash2_decode_batch(dflash2_state, 1, draft_window,
@@ -11229,7 +11636,8 @@ void ProgramImplCore::prepare_graphs() {
                 const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
+                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL)),
+                    capacity};
 
                 schedule::capture_dflash2_decode_batch(
                     dflash2_state, static_cast<std::int32_t>(batch_size), draft_window,
@@ -11356,7 +11764,7 @@ void ProgramImplCore::extend_ordinary_graphs(std::uint32_t batch_size,
         profile.min_execution_frontier = planned.min;
         profile.max_execution_frontier = planned.max;
         profile.topology_class         = planned.topology_class * max_concurrency + (batch_size - 1U);
-        const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+        const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1, capacity};
         schedule::capture_ordinary_decode_batch(ordinary_state,
                                                 static_cast<std::int32_t>(batch_size), envelope,
                                                 profile.definition);
@@ -11830,7 +12238,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
-        ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+        ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1,
+                                           capacity};
         if (use_cuda_graph) {
             // On-demand capture: with a startup ceiling, growth past the
             // captured segments extends the family once per crossing here.
@@ -12174,7 +12583,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
-        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens, capacity};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
@@ -12185,7 +12594,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     draft_window + 1ULL)),
+                capacity};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -12321,6 +12731,16 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
                 enqueue_cold_compressions(sequence);
             }
         }
+    } else if (cold_policy == ColdPolicy::Host) {
+        // Same boundary, different medium: retire the read-free prefix into the
+        // pinned Host pool and give the device pages back (cold_host_tier.h). The
+        // window/disk path above is not touched, so the two are independent.
+        for (const std::uint32_t lane : lanes) {
+            SequenceState& sequence = active_sequence(lane);
+            if (sequence.kv) {
+                enqueue_cold_host_evictions(sequence);
+            }
+        }
     }
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing);
@@ -12399,7 +12819,7 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlash2Envelopes envelopes = dflash2_envelopes(0, maximum_frontier, draft_window);
-        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens, capacity};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash2_graphs, static_cast<std::uint32_t>(lanes.size()),
@@ -12410,7 +12830,8 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     draft_window + 1ULL)),
+                capacity};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -12653,6 +13074,9 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         break;
     case DType::NVFP4:
         out.kv_cache = KvCacheStorage::Nvfp4Group16;
+        break;
+    case DType::ISO3:
+        out.kv_cache = KvCacheStorage::Iso3Group16;
         break;
     case DType::E8Kv:
         out.kv_cache = KvCacheStorage::E8Group64;

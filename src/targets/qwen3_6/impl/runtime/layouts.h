@@ -97,6 +97,13 @@ struct SequencePlanningInputs {
     std::array<DType, 64> layer_kv_dtypes{};
     // Per-layer two-stage residual planes for the NVFP4 tier.
     std::array<bool, 64> kv_residual_layers{};
+    // SEPARATION: V codec of the NVFP4 tier (iso3 default, e2m1 ablation).
+    KvVCodec kv_v_codec = KvVCodec::Iso3;
+    // SEPARATION: SO(4) rotation of K on write / Q on read; true = identity.
+    bool kv_rotation_off = false;
+    // SEPARATION: row-scale three-state spec (auto|off|<path>). Empty leaves
+    // the decision to NINFER_KV_ROWSCALE, i.e. the pre-separation behaviour.
+    std::string kv_row_scale_spec;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -133,6 +140,13 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::array<DType, 64> layer_kv_dtypes{};
     // Per-layer two-stage residual planes for the NVFP4 tier.
     std::array<bool, 64> kv_residual_layers{};
+    // SEPARATION: V codec of the NVFP4 tier (iso3 default, e2m1 ablation).
+    KvVCodec kv_v_codec = KvVCodec::Iso3;
+    // SEPARATION: SO(4) rotation of K on write / Q on read; true = identity.
+    bool kv_rotation_off = false;
+    // SEPARATION: row-scale three-state spec (auto|off|<path>). Empty leaves
+    // the decision to NINFER_KV_ROWSCALE, i.e. the pre-separation behaviour.
+    std::string kv_row_scale_spec;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

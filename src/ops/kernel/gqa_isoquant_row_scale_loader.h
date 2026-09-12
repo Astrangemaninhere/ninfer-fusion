@@ -151,6 +151,69 @@ bool kv_rowscale_sidecar_apply_from_env(std::uint32_t model_layers,
                                         std::uint32_t model_head_dim,
                                         std::uint64_t model_hash);
 
+// ---- SEPARATION: the row scale becomes a three-state component ----
+//
+// The switch used to be "sidecar file or baked table", i.e. there was no way
+// to turn the row scale OFF without generating an all-ones sidecar file. Off
+// is now a first-class state and it is expressed KERNEL-SIDE, in the accessor
+// that already exists:
+//
+//   Auto  "auto" / "" / unset -> restore the baked calibration geometry
+//                                (kKvRowScaleBakedGeom) into the descriptor. A
+//                                restore, not a no-op: the descriptor is
+//                                process-global, so an engine that ran with
+//                                "off" must not leak the zeroed geometry into a
+//                                later engine in the same process. The value
+//                                written is the baked initializer, so the
+//                                on-path device behaviour is unchanged.
+//   Off   "off" | "none" | "identity" -> upload an all-zero geometry
+//        descriptor. kGqaKvRowScaleGeom[0..2] are the accessor's range checks,
+//        so layers=0 makes EVERY (layer, kv_head, d) out of geometry and
+//        gqa_kv_row_scale() answers 1.0 -- the identity path that already
+//        exists and is already exercised by a model wider than the pool
+//        (gqa_isoquant_row_scale.cuh comment + _TODO.md 104). K*s = K and
+//        Q/s = Q exactly, and NO new kernel instruction is added: "off" reuses
+//        the guard the on-path already pays for.
+//   Path  anything else -> the existing NINFERKVRS1 sidecar.
+//
+// A literal path named "off"/"auto" is shadowed by the keyword; a path with a
+// separator ("./off") is unambiguous. That is the only spelling hazard, and it
+// is the same trade the tier vocabulary already makes.
+enum class KvRowScaleMode {
+    Auto,
+    Off,
+    Path,
+};
+
+[[nodiscard]] inline bool kv_rowscale_mode_from_spec(const std::string& spec,
+                                                     KvRowScaleMode& mode,
+                                                     std::string& path,
+                                                     std::string& err) {
+    path.clear();
+    if (spec.empty() || spec == "auto" || spec == "on" || spec == "default") {
+        mode = KvRowScaleMode::Auto;
+        return true;
+    }
+    if (spec == "off" || spec == "none" || spec == "identity") {
+        mode = KvRowScaleMode::Off;
+        return true;
+    }
+    mode = KvRowScaleMode::Path;
+    path = spec;
+    (void)err;
+    return true;
+}
+
+// Explicit-spec entry point (--kv-row-scale). Returns true when the row scale
+// is OFF, false when it is ON (baked Auto or a loaded sidecar). Every state
+// writes the descriptor: the switch is state-based, not event-based, so the
+// last engine planned in a process wins and no mode leaks into the next one.
+bool kv_rowscale_sidecar_apply_spec(const std::string& spec,
+                                    std::uint32_t model_layers,
+                                    std::uint32_t model_kv_heads,
+                                    std::uint32_t model_head_dim,
+                                    std::uint64_t model_hash);
+
 // Identity gate against the LOADED model. Non-identity tables must match the
 // model geometry EXACTLY (a 16-layer table under a 52-layer model is the
 // foreign-table hazard and is refused). Identity tables may under-cover.

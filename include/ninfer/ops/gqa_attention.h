@@ -15,6 +15,14 @@ inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1'010'000;
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
+    // Split-geometry reference for the split-KV small-T decode path: the key count the
+    // split partition is derived from. It has to be a constant of the produced graph
+    // (the sequence key capacity), because the batch-1 decode of a row and the wide MTP
+    // verify of the same row must partition that row's keys identically -- a partition
+    // that follows the live window reassociates the fp32 split reduction and flips
+    // ULP-level ties between arms (k=3 vs k=9, plain vs speculative). 0 keeps the legacy
+    // window-driven partition.
+    std::uint32_t split_reference_keys = 0;
 };
 
 /**

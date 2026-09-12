@@ -43,6 +43,33 @@ enum class KvCacheStorage : std::uint8_t {
 // members index beyond that, so the table must cover the family maximum.
 inline constexpr std::size_t kKvLayerStorageSlots = 64;
 
+// SEPARATION: codec of the V plane of the NVFP4 KV tier. K is always E2M1
+// there; V has always been ISO3 sign-magnitude INT3 (decoder_state.cpp
+// kv_layer_v_dtype + the ISO3 V decode in gqa_attention_decode_nvfp4.cuh).
+// Both codecs share the SAME plane geometry -- two codes per byte with one
+// E4M3FN group scale per 16 channels -- so the choice is a pure decoder
+// switch: no extra plane, no extra allocation, and no new kernel
+// instantiation (the V=E2M1 shapes are already compiled for the prefill and
+// partial-decode paths).
+//
+// E2M1 is offered as an ablation knob only. It is REFUSED when a mechanism
+// that hardcodes ISO3 V is active, because those paths do not read v_dtype:
+//   * a V residual plane on any NVFP4 layer
+//     (gqa_attention_prefill_fill_nvfp4k_iso3v_kernel writes ISO3, and both
+//      the prefill and decode producers decode the residual only on the
+//      VVDType == ISO3 / Iso3V branch);
+//   * the entropy cold pool for NVFP4 layers
+//     (program_impl.h requantizes V with EntropyColdRequantMode::Iso3VG16
+//      unconditionally).
+enum class KvVCodec : std::uint8_t {
+    // Default: NVFP4 layers store V as ISO3 (byte-for-byte the pre-separation
+    // engine). Plain Nvfp4Group16 layers already store V as E2M1 and are
+    // unaffected by this knob.
+    Iso3 = 0,
+    // Ablation: NVFP4 layers store V as E2M1 (no rotation, /6 max).
+    E2M1 = 1,
+};
+
 // Desensitized note about the most recent request-domain (lane-level) failure
 // (docs/maintainer/engine-failure-recovery.md 3.2/3.5). Carries no exception
 // text, so unauthenticated consumers (/health is auth-exempt) may surface it.
@@ -193,6 +220,12 @@ struct EngineOptions {
     // range, minimised per range (globally optimal because the objective is additive and
     // the constraints are per-range). Empty means the single-ceiling form above.
     std::string kv_bit_budget_ranges;
+    // Two-score selection (speed vs quality). kv_quality_weight < 0 keeps the shipped
+    // single-penalty ladder; >= 0 selects the weighted ladder, where the per-tier penalty is
+    // w*quality + (1-w)*speed from the measured score table (see kv_bit_budget.h).
+    double kv_quality_weight = -1.0;
+    // Inline score table ("<tier> <quality_x100> <speed_x100>" lines) or a file path.
+    std::string kv_tier_scores;
     bool kv_bit_budget_explicit = false;
     // Per-layer two-stage residual planes for the NVFP4 tier (second-stage
     // E2M1 K / ISO3 V over the first-stage error). Each enabled NVFP4 layer
@@ -200,6 +233,33 @@ struct EngineOptions {
     // storages ignore the table. Empty (default) keeps single-plane KV.
     std::array<bool, kKvLayerStorageSlots> kv_residual_layers{};
     bool kv_residual_explicit = false;
+    // --kv-tier-formats SPEC: the KV tier vocabulary (hot/tail/cold + nvfp4 mode,
+    // src/kvcfg/kv_formats.h). Stored raw because the landing is per-layer and the
+    // layer count is target knowledge: make_sequence_planner_impl resolves it into
+    // the same per-layer dtype table the knobs above feed (product/kv_tier_formats.h
+    // documents which tiers the engine can and cannot express). Unset keeps every
+    // existing path byte-identical.
+    std::string kv_tier_formats_spec;
+    bool kv_tier_formats_explicit = false;
+    // --nvfp4-mode pure: stay off the fusion tiers (nvfp4/iso3/e8) for attribution.
+    bool kv_nvfp4_pure = false;
+    // --kv-v-codec iso3|e2m1: codec of the V plane on the NVFP4 tier (see the
+    // KvVCodec comment above). Iso3 is the engine default and the only mode a
+    // residual-plane or cold-pool NVFP4 layer accepts; e2m1 is an ablation.
+    KvVCodec kv_v_codec      = KvVCodec::Iso3;
+    bool kv_v_codec_explicit = false;
+    // --kv-rotation on|off: SO(4) IsoQuant rotation of K (on cache write) and Q
+    // (before quantization) on the NVFP4/FP8/ISO3 tiers. off is an ablation
+    // that takes the identity map on BOTH sides, so QK^T stays exact and only
+    // the quantization domain changes.
+    bool kv_rotation_off = false;
+    bool kv_rotation_explicit = false;
+    // --kv-row-scale auto|off|<path>: Sinkhorn row scale applied on K write and
+    // inverted on Q read. auto keeps the baked calibration table, off takes the
+    // identity map (in the kernel, via the geometry descriptor's own guard),
+    // <path> loads a NINFERKVRS1 sidecar.
+    std::string kv_row_scale_spec;
+    bool kv_row_scale_explicit = false;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -219,10 +279,15 @@ struct EngineOptions {
     std::uint32_t cold_keep_tokens    = 128;
     // Explicit cold-pool cap in pages (--max-cold-pages). 0 = derive from the
     // policy (Window/Disk: cold_keep_tokens/kPagedKVPageSize + 16; others 0).
-    // ColdPolicy::None always wins over an explicit cap; Host keeps 0 until its
-    // runtime eviction path exists (see layouts_impl.h derivation + comments).
+    // ColdPolicy::None always wins over an explicit cap; Host keeps 0 because the
+    // Host tier's medium is pinned host memory and its pages are read-free, so no
+    // device cold slot is involved at all (see layouts_impl.h derivation + the
+    // cold_host_tier.h consumer).
     std::uint32_t max_cold_pages       = 0;
-    // Pinned host-memory budget for ColdPolicy::Host offload. Default 4 GiB.
+    // Pinned host-memory budget for the ColdPolicy::Host tier (tier 1 of the cold
+    // ladder: host first, then --cold-disk-bytes). Default 4 GiB. This is the cap
+    // the tier's admission enforces, in whole pages (host_bytes / page_stride);
+    // it is a separate pool from context_cache.host_kv_capacity_bytes.
     std::uint64_t cold_host_bytes     = 4ULL << 30;
     // ColdPolicy::Disk: directory for per-layer cold spill files (created on
     // demand) and the total spill budget. Empty path uses the system temp dir.

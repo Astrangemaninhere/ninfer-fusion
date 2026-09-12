@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,7 +27,47 @@ ServeOptions parse(std::vector<std::string> arguments) {
 } // namespace
 
 int main() {
+    // --kv-bit-budget must consume exactly one token: a following --port has to survive.
+    {
+        const auto opts = parse({"ninfer-serve", "m.ninfer", "--kv-bit-budget", "4.5",
+                                 "--port", "8000"});
+        if (!(opts.kv_bit_budget_explicit && opts.kv_bit_budget_bits == 4.5) ||
+            opts.port != 8000) {
+            std::cerr << "--kv-bit-budget consumed the following token\n";
+            return 1;
+        }
+        const auto ranges = parse({"ninfer-serve", "m.ninfer", "--kv-bit-budget",
+                                   "0-7:8,8-15:4.5", "--port", "8000"});
+        if (ranges.kv_bit_budget_ranges != "0-7:8,8-15:4.5" || ranges.port != 8000) {
+            std::cerr << "range form of --kv-bit-budget consumed the following token\n";
+            return 1;
+        }
+    }
+
     int failures = 0;
+
+    // The tier vocabulary is off unless asked for: this is the option-level half of the
+    // zero-regression argument (the other half is that make_sequence_planner_impl only
+    // runs its resolution under this flag).
+    {
+        const auto off = parse({"ninfer-serve", "model.ninfer"});
+        failures += check(!off.kv_tier_formats_explicit && off.kv_tier_formats_spec.empty() &&
+                              !off.kv_nvfp4_pure,
+                          "the KV tier vocabulary is enabled by default");
+        const auto tiers = parse({"ninfer-serve", "model.ninfer", "--kv-tier-formats",
+                                  "hot=int8,cold=int8", "--nvfp4-mode", "pure", "--port", "8000"});
+        failures += check(tiers.kv_tier_formats_explicit &&
+                              tiers.kv_tier_formats_spec == "hot=int8,cold=int8" &&
+                              tiers.kv_nvfp4_pure && tiers.port == 8000,
+                          "--kv-tier-formats did not preserve its spec or consumed --port");
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--kv-tier-formats", "cold=iso3",
+                         "--nvfp4-mode", "pure"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "the vocabulary's pure-vs-iso/e8 rule was not enforced at "
+                                    "parse time");
+    }
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
@@ -324,6 +365,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
               "serve help omits --request-log-jsonl");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--kv-tier-formats") != std::string::npos,
+              "serve help omits --kv-tier-formats");
     bool secret_present    = false;
     bool redaction_present = false;
     for (const std::string& argument : logged.startup_argv) {

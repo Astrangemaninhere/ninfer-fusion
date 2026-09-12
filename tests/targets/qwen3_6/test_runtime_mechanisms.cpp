@@ -93,20 +93,29 @@ void test_decoder_layout() {
            "INT8 Text/MTP KV payload accounting");
 
     q36::DecoderStateSpec fp8_spec = decoder_spec(ninfer::DType::FP8_E4M3FN, true);
-    fp8_spec.attention_head_dim    = q36::kKvFp8QuantGroup;
+    // Two groups of head_dim: keeping the leading extent > 1 is what makes the assertion
+    // below discriminating -- at head_dim == kKvFp8QuantGroup the extent is 1 either way,
+    // so a row-scaled (one scale per token row) plane and a group-16 plane look alike.
+    fp8_spec.attention_head_dim    = 2 * q36::kKvFp8QuantGroup;
     fp8_spec.kv_quant_group        = q36::kKvFp8QuantGroup;
     ninfer::LayoutBuilder fp8_builder;
     const q36::DecoderStateLayout fp8 = q36::plan_decoder_state(fp8_builder, fp8_spec);
     (void)fp8_builder.finish(256);
+    // The fp8 tier is a packed-16 dtype like nvfp4/iso3: FP8-E4M3FN codes plus E4M3FN group
+    // scales (ops/wrapper/gqa_attention.cpp:80-82/:121-133, read by
+    // gqa_attention_decode_fp8.cuh:159). An FP16 scale plane here is the bug that made every
+    // fp8 run fail at that guard with "invalid NVFP4 KV cache scale dtype".
     expect(fp8.text_kv.pages.planes.size() == 8 &&
                fp8.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
-               fp8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
-               fp8.text_kv.pages.planes[2].geometry.leading_extent == 1,
-           "FP8 Text KV has row-scaled code and scale planes per layer");
+               fp8.text_kv.pages.planes[0].geometry.leading_extent == 2 * q36::kKvFp8QuantGroup &&
+               fp8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               fp8.text_kv.pages.planes[2].geometry.leading_extent == 2,
+           "FP8 Text KV has E4M3FN code and group-16 E4M3FN scale planes per layer");
     expect(fp8.mtp_kv && fp8.mtp_kv->pages.planes.size() == 4 &&
                fp8.mtp_kv->pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
-               fp8.mtp_kv->pages.planes[2].geometry.leading_extent == 1,
-           "FP8 MTP KV has row-scaled code and scale planes");
+               fp8.mtp_kv->pages.planes[2].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               fp8.mtp_kv->pages.planes[2].geometry.leading_extent == 2,
+           "FP8 MTP KV has E4M3FN code and group-16 E4M3FN scale planes");
     expect(fp8.kv_payload_bytes() == fp8.text_kv.payload_bytes() + fp8.mtp_kv->payload_bytes(),
            "FP8 Text/MTP KV payload accounting");
 }

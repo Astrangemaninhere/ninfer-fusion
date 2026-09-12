@@ -84,6 +84,14 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
     return (splits < Geometry::DecodeSplits) ? splits : Geometry::DecodeSplits;
 }
 
+// The split reference of one launch: the pinned graph constant, or -- for callers that
+// do not pin one yet -- the envelope itself (legacy behaviour).
+inline std::int32_t gqa_small_t_split_reference(GqaExecutionEnvelope envelope) {
+    return static_cast<std::int32_t>(envelope.split_reference_keys != 0
+                                         ? envelope.split_reference_keys
+                                         : envelope.max_visible_keys);
+}
+
 template <typename Geometry>
 std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
     // A 64-key default split just above a 32-key boundary makes the partial
@@ -136,6 +144,14 @@ std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int
     // Evaluating every segment end plus both interval ends gives the exact interval maximum.
     constexpr std::uint32_t ends[] = {128, 160, 512, 4096, 5000, 8198, 16390};
     for (const std::uint32_t end : ends) { include(end); }
+    // Fixed split grid: div_up(max_visible_keys, split_units) splits already cover the
+    // entire envelope and the device-side active count is exactly that, so the launched
+    // grid is never smaller than div_up(window, split_units) for any window inside it.
+    const std::int32_t split_units =
+        gqa_small_t_split_units<Geometry>(gqa_small_t_split_reference(envelope));
+    const std::int32_t fixed_splits =
+        div_up(static_cast<std::int32_t>(envelope.max_visible_keys), split_units);
+    capacity = capacity > fixed_splits ? capacity : fixed_splits;
     return capacity;
 }
 
@@ -143,7 +159,8 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
           typename CacheInput>
 void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
-                            std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
+                            std::int32_t logical_capacity, std::int32_t splits,
+                            std::int32_t split_units, Tensor& partial_acc,
                             Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     constexpr int kBlock = 32 * WarpsPerCta;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
@@ -163,7 +180,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             ? nullptr
             : static_cast<const std::int32_t*>(invocation.table_rows->data),
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
-        logical_capacity, scale, static_cast<float*>(partial_acc.data),
+        logical_capacity, split_units, scale, static_cast<float*>(partial_acc.data),
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -172,7 +189,8 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
           typename CacheInput>
 void launch_tc_partial_fp8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                            PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
-                           std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
+                           std::int32_t logical_capacity, std::int32_t splits,
+                           std::int32_t split_units, Tensor& partial_acc,
                            Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     constexpr int kBlock = 32 * WarpsPerCta;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
@@ -196,7 +214,7 @@ void launch_tc_partial_fp8(const Tensor& q, CacheInput input, const Tensor& pos,
             ? nullptr
             : static_cast<const std::int32_t*>(invocation.table_rows->data),
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
-        logical_capacity, scale, static_cast<float*>(partial_acc.data),
+        logical_capacity, split_units, scale, static_cast<float*>(partial_acc.data),
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -205,7 +223,8 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
           typename CacheInput, bool Nvfp4K = false>
 void launch_tc_partial_iso3(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
-                            std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
+                            std::int32_t logical_capacity, std::int32_t splits,
+                            std::int32_t split_units, Tensor& partial_acc,
                             Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     constexpr int kBlock = 32 * WarpsPerCta;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
@@ -230,7 +249,7 @@ void launch_tc_partial_iso3(const Tensor& q, CacheInput input, const Tensor& pos
             ? nullptr
             : static_cast<const std::int32_t*>(invocation.table_rows->data),
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
-        logical_capacity, static_cast<int>(cache.sliding_window_tokens), scale,
+        logical_capacity, split_units, static_cast<int>(cache.sliding_window_tokens), scale,
         static_cast<float*>(partial_acc.data),
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
@@ -243,6 +262,9 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                           std::int32_t logical_capacity, std::int32_t implementation_window,
                           std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
                           Tensor& partial_l, cudaStream_t stream) {
+    // implementation_window carries the launch's split reference (not the live window):
+    // it selects the tile schedule and the fixed split grid the kernel must share.
+    const int split_units = gqa_small_t_split_units<Geometry>(implementation_window);
     Tensor& cache_k       = cache.k_pages;
     Tensor& cache_v       = cache.v_pages;
     Tensor& cache_k_scale = cache.k_scale_pages;
@@ -286,7 +308,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, scale, static_cast<float*>(partial_acc.data),
+                logical_capacity, split_units, scale, static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
     // Revision 2b: INT8-tier cold slots (raw nibble codec). The kernel takes
@@ -360,6 +382,7 @@ void launch_tc_partial_nvfp4(const Tensor& q, const __nv_bfloat16* input_k,
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
     const bool masked     = invocation.valid_columns != nullptr;
+    const int split_units = gqa_small_t_split_units<Geometry>(implementation_window);
     const std::uint8_t* cold_k = static_cast<const std::uint8_t*>(cache.cold_slots.data);
     const std::uint8_t* cold_v =
         cold_k == nullptr ? nullptr : cold_k + cache.cold_slots.nb[2];
@@ -418,7 +441,8 @@ void launch_tc_partial_nvfp4(const Tensor& q, const __nv_bfloat16* input_k,
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, cache.layer_index, scale, static_cast<float*>(partial_acc.data),
+                logical_capacity, split_units, cache.layer_index, scale,
+                static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                 invocation.batch_size, masked, writes_cache);
     };

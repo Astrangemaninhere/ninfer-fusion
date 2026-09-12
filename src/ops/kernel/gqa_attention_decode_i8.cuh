@@ -77,8 +77,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::uint8_t* cold_k_slots, const std::uint8_t* cold_v_slots, int slot_bytes,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
-        std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-        float* partial_acc, float* partial_m, float* partial_l) {
+        std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t split_units,
+        float scale, float* partial_acc, float* partial_m, float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -200,17 +200,33 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
 
     const int window = last_pos + 1;
-    const int active_split_count =
-        gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
+    // Fixed split grid (split_units > 0): split s owns the keys
+    // [s*split_units, min((s+1)*split_units, window)). Its interior boundaries are
+    // launch constants, so the partial a split contributes for a key range -- and the
+    // fp32 addition order it used to build it -- no longer move when the launch covers
+    // a different number of tokens. The live window still clips every range (no split
+    // addresses a key past the last valid one) and split_units == 0 keeps the legacy
+    // window-driven partition.
+    int active_split_count = 0;
+    int split_start        = 0;
+    int split_limit        = 0;
+    if (split_units > 0) {
+        active_split_count = gqa_small_t_split_active(window, split_units, split_count);
+        split_start        = split * split_units;
+        split_limit        = split_start + split_units;
+    } else {
+        active_split_count =
+            gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start = split * units_per_split * (tile_split ? Bc : 1);
+        split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+    }
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    const int split_end = (split_limit < window) ? split_limit : window;
     if (split_start >= split_end) {
         write_neutral();
         return;

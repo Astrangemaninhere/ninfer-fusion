@@ -21,7 +21,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
+    std::int32_t split_units, float scale,
     float* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
@@ -122,17 +123,33 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     }
 
     const int window = last_pos + 1;
-    const int active_split_count =
-        gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+    // Fixed split grid (split_units > 0): split s owns the keys
+    // [s*split_units, min((s+1)*split_units, window)). Its interior boundaries are
+    // launch constants, so the partial a split contributes for a key range -- and the
+    // fp32 addition order it used to build it -- no longer move when the launch covers
+    // a different number of tokens. The live window still clips every range (no split
+    // addresses a key past the last valid one) and split_units == 0 keeps the legacy
+    // window-driven partition.
+    int active_split_count = 0;
+    int split_start        = 0;
+    int split_limit        = 0;
+    if (split_units > 0) {
+        active_split_count = gqa_small_t_split_active(window, split_units, split_count);
+        split_start        = split * split_units;
+        split_limit        = split_start + split_units;
+    } else {
+        active_split_count =
+            gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
+                                               : div_up(window, active_split_count);
+        split_start = split * units_per_split * (tile_split ? Bc : 1);
+        split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+    }
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    const int split_end = (split_limit < window) ? split_limit : window;
     if (split_start >= split_end) {
         write_neutral();
         return;

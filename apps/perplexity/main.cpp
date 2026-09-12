@@ -47,6 +47,11 @@ struct Options {
     ninfer::KvCacheStorage kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
     std::array<ninfer::KvCacheStorage, ninfer::kKvLayerStorageSlots> kv_layer_storage{};
     bool kv_layer_storage_explicit = false;
+    // --kv-dtype is an explicit global tier: without this bit, layouts_impl.h
+    // always takes either the pinned per-layer table or the target's registered
+    // default table, so --kv-dtype is a dead label here (measured: a bf16 run and
+    // an fp8 run came out bit-identical). Same field as include/ninfer/types.h.
+    bool kv_cache_explicit = false;
     bool quick                = false;
 };
 
@@ -101,6 +106,7 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
+            out.kv_cache_explicit         = true;
             if (dtype == "bf16") {
                 out.kv = ninfer::KvCacheStorage::BFloat16;
             } else if (dtype == "int8") {
@@ -210,6 +216,7 @@ int run(const Options& options) {
     engine_options.device                 = options.device;
     engine_options.max_context            = options.context;
     engine_options.kv_cache               = options.kv;
+    engine_options.kv_cache_explicit      = options.kv_cache_explicit;
     engine_options.kv_layer_storage      = options.kv_layer_storage;
     engine_options.kv_layer_storage_explicit = options.kv_layer_storage_explicit;
     engine_options.load_progress.callback = [&](std::string_view phase, std::uint64_t done,

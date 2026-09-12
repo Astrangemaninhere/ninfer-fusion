@@ -25,6 +25,10 @@ void launch_tc_partial_i8_e8(const Tensor& q, CacheInput input, const Tensor& po
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
     constexpr bool E8 = true;
+    // The split reference arrives in the implementation_window slot (see
+    // gqa_attention_small_t_launch_for): it drives both the tile schedule and the fixed
+    // split grid the E8 kernel must share with the reducer.
+    const int split_units = gqa_small_t_split_units<Geometry>(implementation_window);
     // E8 tiers have no cold-slot codec; the cold branch stays disabled.
     const std::uint8_t* cold_k_i8 = nullptr;
     const std::uint8_t* cold_v_i8 = nullptr;
@@ -57,7 +61,7 @@ void launch_tc_partial_i8_e8(const Tensor& q, CacheInput input, const Tensor& po
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, scale, static_cast<float*>(partial_acc.data),
+                logical_capacity, split_units, scale, static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
     if constexpr (Geometry::GroupSize == 4) {

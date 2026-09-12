@@ -13,6 +13,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "targets/qwen3_6/impl/runtime/cold_host_tier.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
@@ -468,17 +469,38 @@ struct SequenceState {
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
 
-    // Cold-pool bookkeeping: text pages currently detached into raw cold
-    // slots (logical page -> slot). Released with the sequence or when the
-    // rewrite path warms the prefix back into physical pages.
+    // Cold-pool bookkeeping: text pages currently detached into raw cold slots.
+    // Released with the sequence or when the rewrite path warms the prefix back
+    // into physical pages.
+    //
+    // The device slot and the spill-file slot are two independent resources with
+    // independent lifetimes, so they are tracked apart:
+    //   slot      - the device working-set slot that holds this page's compressed
+    //               bytes, or -1 when the page holds none. Window policy holds one
+    //               for as long as the page is cold, because the block table's
+    //               sentinel is the only handle decode has on a cold page.
+    //   file_slot - the spill-file slot (ColdPolicy::Disk only, else -1). Its
+    //               on-disk offset is file_slot * <layer slot stride>, a location
+    //               that is stable for the page's whole cold lifetime. It used to
+    //               be the *device* slot index, so recycling a device slot
+    //               silently rewrote another page's file region.
     struct ColdPageEntry {
         std::uint32_t page;
         std::int32_t slot;
+        std::int32_t file_slot = -1;
     };
     std::vector<ColdPageEntry> cold_pages;
     // First logical page not yet offered to the cold pool; compression scans
     // forward from here so each round only visits the newly retired pages.
     std::uint32_t cold_frontier = 0;
+
+    // Cold Host tier (--cold-policy host): pages whose device replica was
+    // released into the pinned Host pool. They carry no device slot -- the page
+    // is restored by the ordinary Host -> Device materialization path -- so only
+    // the frontier is needed here; the Host replica on the logical page is the
+    // record of the eviction itself (and of its restore: the descriptor loses it
+    // when a device replica comes back).
+    std::uint32_t host_cold_frontier = 0;
 };
 
 struct SharedPrefixState {
@@ -688,6 +710,13 @@ public:
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
     std::unique_ptr<HostKVExtentStore> host_kv_extents;
+    // Cold Host tier (--cold-policy host): the eviction consumer's own pinned
+    // pool. Deliberately a SEPARATE arena from host_kv_arena, so
+    // --cold-host-bytes is enforced independently of the context-cache Host KV
+    // budget (same reasoning as weight_host_offload_bytes in ninfer/types.h:
+    // different lifetimes and failure modes, one budget per pool).
+    std::unique_ptr<ColdHostTier> cold_host_tier;
+    bool cold_host_tier_inert_reported = false;
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
@@ -751,17 +780,34 @@ public:
     std::vector<FILE*> cold_disk_files;
     void* cold_disk_staging[2]    = {nullptr, nullptr};
     std::size_t cold_disk_slot_bytes = 0;
-    // File-slot counter for ColdPolicy::Disk: each spilled page gets a
-    // monotonically increasing file offset (slot * stride); the device
-    // staging pool is reused across spills, so file slots are not device
-    // slots.
+    // File-slot space for ColdPolicy::Disk: every spilled page owns one stable
+    // file slot for its whole cold lifetime, and the on-disk offset is
+    // file_slot * <that layer's slot stride>. File slots are a resource of their
+    // own, sized from --cold-disk-bytes (which used to be parsed and then
+    // ignored entirely); the device cold slots are a separate, shared working
+    // set, so returning one can never move a page's bytes on disk.
     std::uint64_t cold_disk_file_slots = 0;
+    std::vector<std::uint8_t> cold_disk_file_used;
+    [[nodiscard]] std::int32_t allocate_cold_disk_file_slot() noexcept;
+    void release_cold_disk_file_slot(std::int32_t file_slot) noexcept;
     void prefetch_cold_pages(SequenceState& sequence, std::uint32_t pages,
-                             std::span<const std::int32_t> slots);
+                             std::span<const std::int32_t> file_slots);
     void enqueue_cold_compressions(SequenceState& sequence);
     void warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page);
-    void restore_cold_page(SequenceState& sequence, std::uint32_t page, std::int32_t slot,
-                           const DeviceKVPageHandle& physical, bool disk_prefetched = false);
+    // Restores one cold page into `physical` and releases the cold resources the
+    // page no longer needs once it is hot again. Returns false only when no
+    // staging slot could be found, in which case nothing was written into
+    // `physical` and the caller must put the page back on the cold path (see the
+    // long note at the definition).
+    [[nodiscard]] bool restore_cold_page(SequenceState& sequence, std::uint32_t page,
+                                         std::int32_t device_slot, std::int32_t file_slot,
+                                         const DeviceKVPageHandle& physical);
+    // Cold Host tier (--cold-policy host): retire read-free pages into the pinned
+    // Host pool, and keep that pool's accounting honest when references go away.
+    void enqueue_cold_host_evictions(SequenceState& sequence);
+    void sweep_host_kv_pools() noexcept;
+    void sweep_cold_host_tier() noexcept;
+    void report_cold_host_tier(const char* tag);
 
     // On-demand graph capture state (see DecodeGraphFamily comment).
     std::uint32_t graph_capture_ceiling = 16;

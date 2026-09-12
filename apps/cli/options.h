@@ -37,10 +37,36 @@ struct Options {
     double kv_bit_budget_bits = 0.0;
     std::string kv_bit_budget_ranges;
     bool kv_bit_budget_explicit = false;
+    // Two-score KV selection: 0 = fastest, 1 = most accurate; negative leaves the shipped
+    // single-penalty ladder in place. --kv-tier-scores overrides the score table.
+    double kv_quality_weight = -1.0;
+    std::string kv_tier_scores;
     bool kv_layer_storage_explicit = false;
+    // --kv-tier-formats SPEC + --nvfp4-mode: the KV tier vocabulary (kvcfg/kv_formats.h).
+    // Stored raw and resolved in the planner, where the layer count is known; the parse
+    // site only checks the vocabulary's own rules (product::kv_tier_formats_parse).
+    std::string kv_tier_formats_spec;
+    bool kv_tier_formats_explicit = false;
+    bool kv_nvfp4_pure            = false;
+    // SEPARATION: the three KV component switches (include/ninfer/types.h).
+    bool kv_rotation_off          = false;
+    bool kv_rotation_explicit     = false;
+    std::string kv_row_scale_spec;
+    bool kv_row_scale_explicit    = false;
+    KvVCodec kv_v_codec           = KvVCodec::Iso3;
+    bool kv_v_codec_explicit      = false;
     ColdPolicy cold_policy        = ColdPolicy::None;
-    std::uint32_t cold_keep_tokens = 128;
+    std::uint32_t cold_keep_tokens          = 128;
+    bool cold_keep_tokens_explicit          = false;
     std::uint64_t cold_host_bytes  = 4ULL << 30;
+    // --max-cold-pages: explicit cold-pool cap in pages (0 = derive from the
+    // policy). Without it the CLI could only ever use the derived pool
+    // (cold_keep_tokens/kPagedKVPageSize + 16), i.e. 18 pages, which is the whole
+    // point of "cap the offload" being unreachable from this front end.
+    std::uint32_t max_cold_pages   = 0;
+    // ColdPolicy::Disk spill budget and directory (serve-only flags before).
+    std::uint64_t cold_disk_bytes  = 32ULL << 30;
+    std::string cold_disk_path;
     bool yarn_enabled     = false;
     std::uint32_t graph_capture_ceiling = 16;
 
