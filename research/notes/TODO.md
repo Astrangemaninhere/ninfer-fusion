@@ -5870,3 +5870,176 @@ fuzz 4000/0、**引擎零调用**，`lookup_fuse::suffix_best` 已有 CPU 参考
 但 `score_seconds` **67.75 s（ctx 131072，3855 tok/s）vs 270.65 s（ctx 262144，965 tok/s）⇒ 同一份工作量慢 4 倍**。
 ⇒ 说明**评分成本随 `max_context`（池大小）增长，而不只随活跃 token 数**——这与 M3 在 *decode* 上的结论（"池大小不构成代价"）不同，
 因为这里是 **prefill 主导**。需单独立项：prefill/attention 的成本是否随池容量而非活跃窗口增长（若是，2M 及以上的可行性要重估）。
+
+### 28. 按轮次外挂召回：架构与量化实测（用户新方向，agent 交付）
+口径：CPU numpy + 仓库自带 tokenizer；索引 4.00 MiB（1M token @4 B/token，必付）。
+
+**① 字节/时间账（k=3 轮召回）**：
+| 载荷 | 体积 | 读入时间 |
+|---|---|---|
+| 索引（必付） | 4.00 MiB | 1.4 ms @3 GB/s / 0.6 ms @7 GB/s |
+| **打包 KV（熵编码 15,022 B/token）** | 11.52 MiB（3×268 tok）→ **1.7 ms @7 / 4.0 ms @3**；44.01 MiB（3×1024）→ 6.6 / 15.4 ms | |
+| 文本外挂 | 845 B ~ 3.15 KiB | 微秒级（SSD 不在关键路径） |
+| 对照：逐 token 流式读全部 1M KV | 18.00 GiB | **2.76 s @7 GB/s** |
+⇒ **"SSD 不是瓶颈"对打包 KV 成立且很硬：2.76 s → 6.6 ms（418×）**，且每请求只付一次。
+**但"文本+重算"那条路是把带宽换成算力，换贵了**：804 token 重算 = **554 ms**（1450 tok/s），同一召回走打包 KV 只要 2.3 ms（≈240×）；
+而且重算**有损**（16 个 full-attention 层 `KV(p)=f(T[0..p])`，单轮重算 ≠ 原 KV）。
+⇒ **结论：每轮存"打包 KV"而不是"文本"。**
+
+**② 召回质量 Recall@k**（真实 Q&A 池 3142 条 + 1M 语料切片；暴力比对 22 配置已过）：
+- 逐字粘贴在**消息末尾**：`suffix_lookup` 现有语义 **R@1 = 0.73–1.00**（min_len≥16 时 ≥0.90），R@8 ≥ 0.99
+- 逐字粘贴在**消息中间**（后面还有追问）：**R@1 = 0.00–0.03，100% 查询零匹配**；同数据改"任意位置 n-gram" → **0.83–1.00**
+- 用户**换词**：n-gram 全线 0.00–0.03（**零匹配率 100%**）；**BM25 R@1 = 0.80–1.00**（1024-token 长文档、查询词覆盖 10% 时 0.96–1.00，5% 时 0.67–0.78，2% 时只剩 0.33）
+⇒ **现有语义（尾部锚定 + 最长匹配排序）在三种查询形态里两种直接失效** ⇒ 检索索引必须升格：
+**"轮级 + 任意位置 n-gram 倒排 + idf/BM25 打分"**，起点就是 `src/spec/lookup_fuse.h:25`（已写好、引擎零调用）。
+
+**③ 1M 下的显存**（热窗 N 常驻 + 其余外挂；权重 18.98 GiB、预算 10.4 GiB）：
+| 热窗 N | 常驻 KV |
+|---|---|
+| 32k | **613.69 MiB（1/30）** |
+| 128k | 2.29 GiB |
+| 512k | 9.04 GiB |
+外部侧车：文本 lzma **1.02 MiB** / token id 3.88 MiB / 若要外挂真 KV 则 14.21 GiB。
+**附带发现比 SSD 账更重要：常驻 KV 直接钉死 decode 上限** —— 全 1M 常驻 = **80 tok/s**，N=32k = **2,550 tok/s（32×）**
+⇒ 把久远轮次移出常驻 KV 不只是省显存，还是**吞吐的乘数**。
+
+**④ 两个关键架构结论（都放宽了约束）**：
+- **轮次召回把 `cold_host_page_is_read_free` 这条把 1M 卡死的前置条件移除了**：
+  未召回的轮**永不被 attend**，"驱逐"= "不在召回集"，read-free 由构造满足。
+- **打包 KV 不能用现有的 9,536 B 固定冷槽 stride**（比常住 9,216 B 还大，`kv_tier_formats.h:57-60` 自有记载）
+  ⇒ 必须**变长块 + 4 B/块偏移表**（实测代价 ≈ 0）。
+
+**⑤ 最该先做的一件事**：把 `suffix_lookup` 升一格（轮级 + 任意位置 n-gram 倒排 + idf/BM25），
+先只做**纯仪表 `--turn-recall-stats off|log`**（默认 off、零行为改变），在现成的 `SequenceState::ledger`（`program.h:449`）
+上按 `TurnClosure` 轮边界（`chat_template.cpp:618,657`）统计命中率。
+
+### 29. GitHub：远端是**另一条无关历史**，已按"非破坏"方式投递
+**用户给的仓库**：`https://github.com/Astrangemaninhere/ninfer-fusion`（**公开**，`private=false`，已有内容）。
+- **远端 main = 76 提交 / 1433 文件**（`0eaac04`），本地 main = 11 提交 / 2605 文件，**`merge-base` 失败 ⇒ 无共同祖先**。
+  远端那条线含 `feat(ple): W2 real-table gather verification PASS`、`test(ple): W2-2 ... on real 95GiB sidecar`、
+  `diag(engine): Muse NaN ... layer 16 (TODO 104)`、`docs(kv): post-fix quality ladder ...`、
+  `fix(kv): an explicit --kv-dtype now reaches the KV page geometry`、`feat(archkit): KV bit-budget allocator` 等 ——
+  **同一项目的另一份快照**，且**远端有而本地没有** `tools/archkit/{flashnext_bindings,flashnext_convert,kv_bit_budget,kv_auto_allocate}.py`、
+  `tests/test_suffix_lookup.py`、`docs/maintainer/kv-strategy-matrix.md`、`ROADMAP.md`/`RESEARCH-{FLASHNEXT,EXTERNAL,FREETOKEN}.md`/`VRAM.md` 等
+  （正是 TODO 一直当作在 `ninfer-fusion-repo`（过期镜像）里的那批）。反之本地有整个 `src/product` KV 层与 `research/notes` 全部协作报告。
+- **投递方式（非破坏）**：`git push origin main:refs/heads/work/kv-switches-cold-import`
+  ⇒ 远端新分支 `f5c4def`，**`origin/main` 未被触碰**；PR 链接
+  `https://github.com/Astrangemaninhere/ninfer-fusion/pull/new/work/kv-switches-cold-import`。
+  随后把远端**仅在远端存在**的 64 个文件 `git checkout origin/main -- …` 取进本地（**纯新增、零覆盖**，已验证只有 A 与一个 D），
+  提交 `f5c4def`（+10,356 行），并清掉仓库里一个 0 字节垃圾文件 `$f`（shell 展开事故，`d38bb91` 带入）。
+- **为什么不能直接推 main**：两段无关历史 + 远端 76 个提交，强推会**摧毁那条线**。整合方向属用户决策。
+- **网络路径（记下来，省下次摸索）**：WSL 的 `git http.proxy=http://127.0.0.1:10808` **在 NAT 模式下够不到**（代理只监听 Windows 环回，
+  网关 172.30.128.1 的 10808/7890/10809 全不可连）⇒ 改为**从 Windows 侧用 portable git**
+  （`C:\Users\User\AppData\Local\OpenClaw\deps\portable-git\mingw64\bin\git.exe`）对 `\\wsl.localhost\Ubuntu\home\user\ninfer-fusion`
+  操作 + `-c safe.directory=* -c http.proxy=http://127.0.0.1:10808` ⇒ 通；认证可用（Windows 侧有 GCM，
+  虽然会打印一条 `credential-manager-core is not a git command` 的无害告警）。
+  **持久修法是 WSL 的 mirrored 网络模式**（`.wslconfig` 里 `networkingMode=mirrored`），但那要 `wsl --shutdown`（会打断构建/agent），
+  所以**没在跑长任务时再改**。
+
+### 30. 新导入靶子：`nerkyor/Qwen3.8-27B-EfficientThink-…-SimPO-MTP-NVFP4`（多量化合集包）
+**用户指路**（2026-09-13）："这个模型也值得导入进来看看，挂后台下载就是"，随后指定 **"下那个 24GB 的，这个效果最好"**。
+
+**仓库结构（查过 API）**：**160 文件 / 167.19 GB**，是**同一微调的 6 种量化合集**，每个子目录一种：
+| 变体目录 | 主权重 | 体积 |
+|---|---|---|
+| **`W4A4+W8A8/`** | `model-nvfp4-mixed.safetensors` | **24.006 GB（用户指定）** |
+| `W4A4/` | `model-nvfp4-fast.safetensors` | 18.822 GB（已下 200 MB 后停，留盘可续） |
+| `AWQ-W4A16/` | `…SimPO-AWQ-W4A16.safetensors` | 18.979 GB |
+| `INT8-W8A8-QAT/` | `model-0000{1..8}-of-00008` | ~31.9 GB |
+| `W4A16/` / `W8A16/` | `text-0N` | ~15.9 / ~31.6 GB |
+每个变体目录自带 `config.json` / `hf_quant_config.json` / `model.safetensors.index.json` / `manifest.json` / `SHA256SUMS` /
+tokenizer 五件套 / `chat_template.jinja` / **`DFlash2-FP8/{config,manifest,SHA256SUMS}`**（与引擎 `--spec dflash2` 对应）；
+根目录**没有** config.json（各变体各自一份）。`gated=false / private=false`（无需授权）。
+
+**架构（`W4A4+W8A8/config.json` 实测）**：`Qwen3_5ForConditionalGeneration` / `model_type: qwen3_5` / `language_model_only:false`（多模态包装）；
+`text_config`：**hidden 5120、head_dim 256、intermediate 17408、`attn_output_gate:true`、`full_attention_interval:4`**、
+`layer_types` = 每 4 层一个 `full_attention`（其余 `linear_attention`＝GDN）⇒ **16 个 full-attention 层**
+⇒ **与本引擎已注册的 `qwen3_8_27b` 家族（5120/256/16 full-attn + GDN + output gate）同构** ⇒ 预期是**近乎现成的导入**，
+正是"谁来都行"的合格靶子。
+
+**量化（`W4A4+W8A8/hf_quant_config.json` 实测）**：`producer: modelopt 0.43.0`、**`quant_algo: MIXED_PRECISION`**、
+`kv_cache_quant_algo: null`、`quantized_layers` 逐层给 `quant_algo`（前若干层是 **FP8**，其余应为 NVFP4）
+⇒ **真·混合精度 ModelOpt 检查点**，正好压测导入流水线的量化分类与 F 码路径（`P1` 读取器 + `import_model.py` 的 quant 判定）。
+
+**下载与网络（两个可复用的发现）**：
+1. **`_hf_chunk.py` 里 `PROXY` 硬编码 `http://127.0.0.1:10808`，而 WSL NAT 够不到 Windows 环回** ⇒ 在 WSL 跑它必失败。
+   但 **hf-mirror.com 在 WSL 是直连通的**（curl 探测通）⇒ 我用了**去代理的副本** `/home/user/scratch/hfchunk_noproxy.py`
+   （把 `build_opener(ProxyHandler(...))` 换成 `build_opener()`；**未改用户的脚本**）。
+2. **实测速率 ~2.5–7 MB/s**（不是历史记录里的 22–100 MB/s）⇒ 24 GB 约需 1–2.5 小时。落点
+   `/mnt/c/Users/User/Documents/ziqinzhang/models/Qwen3.8-27B-ET-Uncensored-NVFP4/{W4A4,W4A4+W8A8}/`
+   （**下到 C: 侧**：WSL `/` 只剩 53 GB，而 C: 有 566 GB）。
+**下一步**：下完后跑 `tools/convert/import_model.py --plan-only` 做前置普查（对象数/缺失键/量化分类），
+再按 F 码决定是直接导入还是先补 target 侧支持。
+
+### 31. 新靶子的**配套** DFlash2 草稿头 + vision-MTP 头（这次才能真正量接受率）
+在 160 文件全清单里找到（先前只看了非 safetensors 项，漏了这三个大文件）：
+| 文件 | 体积 | 说明 |
+|---|---|---|
+| `W4A4+W8A8/model-nvfp4-mixed.safetensors` | 24.006 GB | 主权重（下载中） |
+| **`W4A4+W8A8/DFlash2-FP8/model.safetensors`** | **2407.028 MB** | **配套草稿头（FP8）** ← 下接受率就靠它 |
+| `W4A4+W8A8/vision-mtp-bf16.safetensors` | 1770.898 MB | vision + MTP 头（bf16） |
+（六个变体目录各有一套同款配套；`W4A4/` 那支的草稿头同尺寸。）
+
+**草稿头 config 实测（`DFlash2DraftModel`）**：`num_hidden_layers: 5`、`head_dim: 128`、`hidden_size: 5120`、
+`intermediate_size: 17408`、`num_attention_heads: 32`、`num_key_value_heads: 8`、`layer_types` 5×`sliding_attention`、
+`sliding_window: 2048`、`max_window_layers: 5`；`dflash_config = { block_size: 8, conv_group_size: 16, conv_kernel_size: 2,
+mask_token_id: 248070, selector_rank: 256, selector_top_k: 16, target_layer_ids: [5,19,33,47,61] }`、
+`num_target_layers: 64` ⇒ **`target_layer_ids` 指向的就是这个 64 层模型自己的层** ⇒ **真配套**（此前那个 ckpt 的接受率上限只有 ≈25–31%，
+`_HANDOFF` 记"引擎 p0 26–35% ≥ 该 ckpt 离线上限" ⇒ 草稿是瓶颈）。`dtype: bfloat16` 但目录名 FP8 ⇒ 权重按 FP8 存。
+**接受率测量计划（三个文件到齐后）**：
+1. `tools/convert/import_model.py --plan-only` 对新源做普查（主权重是 ModelOpt `MIXED_PRECISION`：逐层 FP8/NVFP4）；
+   架构是 `qwen3_5` 家族 5120/256/16 full-attn + GDN + output_gate ⇒ **与已注册 `qwen3_8_27b` 同构**，预期近乎现成导入。
+2. 导入主权重（artifact 落 C: 侧，WSL 只剩 ~53 GB）+ 把**配套草稿头**接进 dflash2 路径（对照现有
+   `qwen3_8_27b_nvfp4_dflash2.ninfer` 的草稿结构与 `draft_dflash2_ref/config.json`）。
+3. 量接受率：固定 prompt + `--greedy` + `--spec dflash2 --draft-tokens K`（K=1/3/5/7），读引擎的接受率行与
+   `NINFER_ACCEPTLOG` 的逐轮明细；与旧（不配套）的 24.1%→53.3% 以及 ckpt 离线上限 ≈25–31% 对比。
+
+### 32. 免权重普查法（可复用仪器）：只靠 HTTP range 取 safetensors 头
+**原理**：safetensors = `u64 LE 头长` + JSON 头（`{name:{dtype,shape,data_offsets}}`）+ 数据区
+⇒ **两次 range GET（前 8 字节、再读头长）就能拿到该分片全部张量名/dtype/形状，权重一个字节都不用下**。
+脚本 `py/header_census.py`（走 hf-mirror 直连；注意**索引里的分片名是相对变体目录的**，直连会 404，须加前缀）。
+新靶子实测：**2139 张量 / 2 分片**，dtype `F32 800 / BF16 799 / F8_E4M3 400 / U8 140`，
+末段字段 `weight 937 / input_scale 400 / weight_scale 400 / bias 166 / weight_scale_2 140 / A_log 48 / dt_bias 48`。
+⇒ 这条以后对任何新源都能先用几分钟把"里面到底有什么"量清楚。
+
+### 33. 前门自举修复：`import_model.py` 按路径调用必崩
+`REPO_ROOT = Path(__file__).resolve().parents[2]` 早就算了，但**从未插进 `sys.path`**，
+而它用 `importlib.import_module("tools.convert...")` ⇒ `python3 tools/convert/import_model.py <源>`（最自然的用法）
+必然 `ModuleNotFoundError: No module named 'tools'`。已修：算完 ROOT 即 `sys.path.insert(0, ROOT)`（+ `import sys`）。
+md5 `a3e09637…` → `85d3977f…`。
+
+### 34. **新增：布局决策层 `tools/convert/common/layout_plan.py`（导入缺的那一半）**
+**为什么需要**：注册 target 的转换器都是"封闭的字节钉死契约"，各自硬编码一个检查点的对象计划——正确，但回答不了
+"这个新源应该变成什么"。前门只报告"缺哪个转换器"，**决策层负责从源件自身结构决定布局**。
+**它只看两件事**：① 一个量化组内 **dtype/shape 的关系**；② 源件**自己声明的量化算法**（ModelOpt `hf_quant_config.json`
+的逐层 `quant_algo`，只作交叉核对、不作唯一依据）。**全模块没有任何模型名/层名/键白名单**（除量化器自己定义的
+`.weight/.weight_scale/.weight_scale_2` 后缀约定）⇒ **新家族是数据问题不是代码改动**。
+**约束直接引自 `tools/artifact/layouts.py`**（不在本模块里造）：`blockscale-k16-m128x4-v1` 要 `n%128==0 && k%64==0`、
+码 `n*k/2` + 刻度 `n*k/16` + 尾部 fp32 divisor；`row-scale-v1` 码 `n*k` + **每行一个 BF16 刻度**（`n*2` 字节）、**无整除约束**；
+`contiguous-le-v1` 原样搬 BF16/FP32/I32。
+**关键设计**：按 **code 张量自身 dtype 优先分派**（直接可表示 ⇒ 原样搬），**标量刻度是逐行刻度的退化情形 ⇒ 广播**，
+并把 `F32 标量→BF16 刻度` 的收窄**记为 deviation**（不藏）；无法表达的**明确拒收并点名缺的机制**。
+**在新靶子真实普查上验证（2139 张量）**：
+```
+contiguous-le-v1          585 groups
+row-scale-v1              260 groups   ← 源件声明 FP8 260
+blockscale-k16-m128x4-v1  140 groups   ← 源件声明 NVFP4 140
+refusals: none           结构与声明一致 400 / 不一致 0
+```
+**过程中修掉一个真 bug**：初版按"有没有 scale 伴随"分派 ⇒ 585 个普通组（`lm_head`/`embed_tokens`/`layernorm`…）
+被误报 `F-UNRECOGNISED-GROUP`（537 个）。改成 **dtype 优先分派**后归零。代码 md5 `49e4838e…` → `d531e0a8…`。
+
+### 35. 新靶子在前门的正式裁定（跑通全过程）
+- **⑤ 前端资源**：源件自带 tokenizer **语义一致**（证据：6 个特殊 token id 全部对得上；
+  最大 id 248076 < vocab_size 248320；与第二份本地副本 token→id 逐项相同）；`tokenizer_config.json` 与
+  `chat_template.jinja` **未证实**（无法证明与钉死版本等价）⇒ 需 `--allow-frontend-drift`（偏离记入报告）；
+  另两项 sha256 **钉死一致**。⇒ 四态证据模型按设计工作。
+- **⑥ 路由**：`qwen3_8_27b` / `qwen3_6_27b` 的 **config 契约都逐字段匹配**（同形状不同权重族，需 `--target` 指明，默认取 qwen3_8_27b）；
+  `qwen3_6_35b_a3b` 因 MoE 不匹配拒。**nvfp4 入口**：`qwen3_8_27b` 那条**要求 compressed-tensors**（实测 got `modelopt`）⇒ 拒；
+  **`qwen3_6_27b` 那条通过**（但其输出 basename 固定为 `qwen3_6_27b_nvfp4.ninfer` 且 `--model` 必须是未量化官方源）。
+  ⇒ **结论：走 ModelOpt 适配器这条路**，不是拿现成 closed converter 硬套。
+- **⑦ 推测解码**：源件有 15 个 `mtp/*` 键 ⇒ MTP 可用；短名单头可离线生成，与 MTP 权重无关。
+- **⑧ 结论**：`work-item`，缺件已点名：**ModelOpt NVFP4 单源适配器**，位置
+  `tools/convert/dequant/modelopt.py` + **`tools/convert/qwen3_8_27b/convert_modelopt.py`**（后者尚不存在）。
+  ⚠️ 注意其表述里"注册布局要求 145 个对象为 FP8、112 个为 NVFP4"是**原 artifact 的历史构成**；
+  **导入应复现"这个源自己的声明"**（FP8 260 + NVFP4 140），而不是去凑历史比例。

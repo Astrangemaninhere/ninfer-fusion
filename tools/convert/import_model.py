@@ -29,6 +29,7 @@ import argparse
 import importlib
 import json
 import subprocess
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,15 @@ from typing import Any, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Run-by-path support.  The front door is normally invoked as
+# `python3 tools/convert/import_model.py <source>`, and the registered
+# targets/frontend policy are imported as `tools.convert...`; without the
+# repository root on sys.path that import fails no matter how good the rest
+# of the routing is.  Resolving ROOT from __file__ keeps the tool relocatable
+# instead of depending on the caller's working directory or PYTHONPATH.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 #: Targets whose contract this module can evaluate.  Listed explicitly rather
 #: than discovered, so a stray directory under tools/convert never becomes
