@@ -80,13 +80,20 @@ EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
         resolved.speculative.backend = SpeculativeBackend::Mtp;
         if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 3; }
     }
+    // No shortlist draft head on this target, and a disabled run must land on the full
+    // head (layouts_impl.h requires it), so Auto resolves to Full here.
+    resolved.speculative.proposal_head = qwen3_6::resolved_proposal_head(
+        resolved.speculative.proposal_head, resolved.speculative.backend, false);
     return resolved;
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    // Self-resolve so a direct package-API caller cannot freeze an unresolved Auto head
+    // into the startup features (the registry resolves too; there both sides compare equal).
+    const EngineOptions resolved = Package::resolved_auto_speculative(options, weights_profile);
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(options))));
+        weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(resolved))));
 }
 
 std::unique_ptr<Package::LoadedModel>

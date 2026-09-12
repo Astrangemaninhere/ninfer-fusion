@@ -118,17 +118,14 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
                                                     WeightsProfile weights_profile) {
     EngineOptions resolved = options;
-    // ProposalHead::Auto is resolved here, before the backend early-return: `resolved`
-    // feeds the planner, the load plan and the program. Resolving later trips the
-    // frozen-startup-features mismatch (registry.cpp documents the same trap).
-    // Profile based: a DFlash2 artifact carries the shortlist draft head.
-    if (resolved.speculative.proposal_head == ProposalHead::Auto) {
-        resolved.speculative.proposal_head =
-            weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2
-                ? ProposalHead::Optimized
-                : ProposalHead::Full;
+    if (options.speculative.backend != SpeculativeBackend::Auto) {
+        // An explicit backend still needs Auto resolved: it must never reach the planner,
+        // the load plan or the program, and a disabled run must end on the full head.
+        resolved.speculative.proposal_head = qwen3_6::resolved_proposal_head(
+            resolved.speculative.proposal_head, resolved.speculative.backend,
+            weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2);
+        return resolved;
     }
-    if (options.speculative.backend != SpeculativeBackend::Auto) { return resolved; }
     // The artifact weights decide the backend, not the context length: a
     // DFlash2 artifact has no MTP draft head (the two are mutually
     // exclusive), so auto must pick DFlash2 even at long contexts - a memory
@@ -146,6 +143,12 @@ EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
         resolved.speculative.backend = SpeculativeBackend::Mtp;
         if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 3; }
     }
+    // Resolved after the backend: an auto run that ends disabled must land on the full
+    // head (layouts_impl.h requires it). Only the DFlash2 profile is wired to the
+    // shortlist draft head, so the bf16-head profile keeps the full head.
+    resolved.speculative.proposal_head = qwen3_6::resolved_proposal_head(
+        resolved.speculative.proposal_head, resolved.speculative.backend,
+        weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2);
     return resolved;
 }
 

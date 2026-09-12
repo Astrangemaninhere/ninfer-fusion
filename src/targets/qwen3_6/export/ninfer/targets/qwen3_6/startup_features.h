@@ -38,4 +38,28 @@ struct StartupFeatures {
     };
 }
 
+// ProposalHead::Auto is resolved by the target packages (resolved_auto_speculative)
+// before the planner, the load plan and the program see the options, so startup
+// features and every downstream ProposalHead switch see a concrete head.
+//
+// Auto picks the shortlist draft head only for DFlash2, where it is a pure proposal
+// mechanism: measured byte-identical greedy output to the full head (df2 k=7: 1/160
+// positions, the same single verify-batch near-tie flip both ways) for +2.5% speed.
+// MTP must keep the full head: with the shortlist head the drafts leak into the
+// emitted tokens (k=3: 89/160 positions differ from plain greedy, 6 edit blocks),
+// which contradicts the documented greedy contract "bit-identical to the original
+// argmax accept" (speculative_round.cuh). --lm-head-draft still opts in explicitly.
+// A disabled run must land on Full: layouts_impl.h rejects a non-full head once
+// speculation is off (the target head does the sampling then).
+[[nodiscard]] inline ProposalHead resolved_proposal_head(ProposalHead head,
+                                                        SpeculativeBackend backend,
+                                                        bool has_shortlist_head) noexcept {
+    if (head != ProposalHead::Auto) { return head; }
+    if (backend != SpeculativeBackend::DFlash2 || !has_shortlist_head) {
+        return ProposalHead::Full;
+    }
+    return ProposalHead::Optimized;
+}
+
+
 } // namespace ninfer::targets::qwen3_6

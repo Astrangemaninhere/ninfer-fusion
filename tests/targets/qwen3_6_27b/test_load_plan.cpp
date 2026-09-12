@@ -181,6 +181,9 @@ int verify_profile_mismatch_rejection() {
     options.prefill_chunk                    = 128;
     options.use_cuda_graph                   = false;
     options.context_cache.device_state_slots = options.max_concurrency;
+    // Direct target-API callers resolve auto themselves (the registry does the same before
+    // planning): an unresolved Auto head is rejected by the disabled-spec check.
+    options = Package::resolved_auto_speculative(options, WeightsProfile::Qwen36GroupwiseInt);
     auto planner =
         Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt);
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;

@@ -87,6 +87,10 @@ EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
         // with a clear weights/feature mismatch, Auto resolves to None.
         resolved.speculative.backend = SpeculativeBackend::None;
     }
+    // No shortlist draft head on this target, and a disabled run must land on the full
+    // head (layouts_impl.h requires it), so Auto resolves to Full here.
+    resolved.speculative.proposal_head = qwen3_6::resolved_proposal_head(
+        resolved.speculative.proposal_head, resolved.speculative.backend, false);
     return resolved;
 }
 
