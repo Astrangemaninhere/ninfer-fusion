@@ -30,6 +30,11 @@ namespace ninfer::ops {
  *   and max_context is positive. The Op writes every output slot, including safe invalid-tail
  *   values. Inputs remain unchanged. No workspace or other state is used.
  */
+// Adaptive draft-window cap (auto mode): the window grows while the live window is fully
+// accepted and collapses just past the last accepted draft otherwise.
+void mtp_adaptive_extents(const Tensor& accepted, const Tensor& current_extents, Tensor& cuts,
+                          std::int32_t k_max, cudaStream_t stream);
+
 void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors,
                             const Tensor& accepted, const Tensor& updated_frontiers,
                             const Tensor& remaining_budgets, const Tensor& licensed_counts,

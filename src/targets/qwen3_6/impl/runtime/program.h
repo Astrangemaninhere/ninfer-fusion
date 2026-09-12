@@ -21,6 +21,7 @@
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+#include "targets/qwen3_6/impl/runtime/mtp_window_cut.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -453,6 +454,11 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // Adaptive draft-window control (survival/cost criterion, see mtp_window_cut.h):
+    // the per-sequence depth-conditional accept statistics and the extent the round in
+    // flight actually carried (needed to fold the finished round correctly).
+    qwen3_6::detail::MtpWindowState mtp_window{};
+    std::uint32_t mtp_drafted_extent = 0;
     bool tail_hidden_valid        = false;
     bool state_source_retained    = false;
     bool endpoint_valid           = false;

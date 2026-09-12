@@ -9,6 +9,9 @@ namespace ninfer::ops::detail {
 void mtp_svip_entropy_extents_launch(const Tensor& logits, const Tensor& accepted,
                                        Tensor& cuts, float threshold, cudaStream_t stream);
 
+void mtp_adaptive_extents_launch(const Tensor& accepted, const Tensor& current_extents,
+                                 Tensor& cuts, std::int32_t k_max, cudaStream_t stream);
+
 void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
                                    const Tensor& remaining_budgets, const Tensor& licensed_counts,

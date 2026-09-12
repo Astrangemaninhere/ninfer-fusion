@@ -135,7 +135,12 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             const int t_star = row_targets[a];
 
             for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+            // Commit the verifier's own argmax rather than the draft array. The accept loop
+            // above already forced row_targets[i] == row_drafts[i] for i < a, so this is
+            // bit-identical today, but it makes the committed stream a pure function of the
+            // verifier's argmax and a: the draft head can then only change how many tokens a
+            // round commits, never which tokens, at any window size.
+            for (int i = 0; i < a; ++i) { row_tokens[i] = row_targets[i]; }
             row_tokens[a] = t_star;
 
             const int produced   = a + 1;
@@ -419,7 +424,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
             const int t_star = row_targets[a];
             for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+            // See the single-block greedy path: the accept loop guarantees equality, so
+            // committing the verifier's argmax keeps the output draft-head independent.
+            for (int i = 0; i < a; ++i) { row_tokens[i] = row_targets[i]; }
             row_tokens[a]        = t_star;
             const int produced   = a + 1;
             licensed_counts[row] = produced;

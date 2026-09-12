@@ -53,6 +53,27 @@ __global__ void mtp_prepare_next_round_kernel(
 }
 
 
+// Adaptive draft window (auto mode): grow the window by one when the entire live window
+// was accepted, collapse to just past the last accepted draft on any rejection. Stateless
+// on purpose: it reads only this round's accepted count and the extent that was actually
+// drafted, so no persistent per-request state is needed. Cost model: round(k) = a + b*k
+// with b/a ~ 0.06, so draft column i pays off only while the per-column hit rate stays
+// above that ratio, and the round in flight is the cheapest available estimate of it.
+__global__ void mtp_adaptive_extents_kernel(const std::int32_t* accepted,
+                                            const std::int32_t* current_extents,
+                                            std::int32_t* cuts, std::int32_t k_max,
+                                            std::int32_t batch) {
+    const int row = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                    static_cast<int>(threadIdx.x);
+    if (row >= batch) { return; }
+    const int a = accepted[row] < 0 ? 0 : accepted[row];
+    const int e = current_extents[row] < 0 ? 0 : current_extents[row];
+    int next = (e > 0 && a >= e) ? e + 1 : a + 1;
+    if (next > k_max) { next = k_max; }
+    if (next < 1) { next = 1; }
+    cuts[row] = next;
+}
+
 // SVIP: entropy-based draft length cap. One block per row scans the verify
 // columns col = accepted+1 .. k (the positions that predict next round's
 // drafts) and caps the draft count before the first column whose softmax

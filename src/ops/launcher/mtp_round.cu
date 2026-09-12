@@ -23,6 +23,18 @@ void mtp_svip_entropy_extents_launch(const Tensor& logits, const Tensor& accepte
     CUDA_CHECK(cudaGetLastError());
 }
 
+void mtp_adaptive_extents_launch(const Tensor& accepted, const Tensor& current_extents,
+                                 Tensor& cuts, std::int32_t k_max, cudaStream_t stream) {
+    const int batch = accepted.ne[0];
+    constexpr int kBlock = 128;
+    const dim3 grid(static_cast<unsigned int>((batch + kBlock - 1) / kBlock));
+    mtp_adaptive_extents_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(accepted.data),
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(cuts.data), k_max, batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
                                    const Tensor& remaining_budgets, const Tensor& licensed_counts,

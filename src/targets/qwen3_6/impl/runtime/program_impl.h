@@ -9978,7 +9978,32 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                     sequence.mtp_draft_count = 0;
                 } else {
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
-                    sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
+                    std::uint32_t window      = static_cast<std::uint32_t>(next < 0 ? 0 : next);
+                    // Survival/cost criterion (see mtp_window_cut.h): fold this round's accept
+                    // record and cap the next window at the depth whose expected token value
+                    // still pays for the column. Knobs: NINFER_MTP_WINDOW_CUT=0 disables,
+                    // NINFER_MTP_WINDOW_RATIO overrides b/a for calibration.
+                    // Opt-in until the criterion has its own A/B: every existing fixed-k
+                    // experiment must keep meaning "fixed k". The `auto` front end turns
+                    // this on once verified.
+                    static const bool kWindowCutEnabled = [] {
+                        const char* env = std::getenv("NINFER_MTP_WINDOW_CUT");
+                        return env != nullptr && std::atoi(env) != 0;
+                    }();
+                    static const float kWindowCostRatio = [] {
+                        const char* env = std::getenv("NINFER_MTP_WINDOW_RATIO");
+                        return env != nullptr ? static_cast<float>(std::atof(env))
+                                              : qwen3_6::detail::kMtpWindowCostRatio;
+                    }();
+                    if (kWindowCutEnabled) {
+                        const std::int32_t accepted = mtp_host_egress->accepted_drafts[row];
+                        const std::uint32_t cut     = qwen3_6::detail::update_mtp_window_cut(
+                            sequence.mtp_window,
+                            static_cast<std::uint32_t>(accepted < 0 ? 0 : accepted),
+                            sequence.mtp_drafted_extent, draft_window, kWindowCostRatio);
+                        if (cut < window) { window = cut; }
+                    }
+                    sequence.mtp_draft_count = window;
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
@@ -11974,6 +11999,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t extent =
                 std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
+            // Remember the extent this round actually carries: the post-round window
+            // criterion needs it to fold the accept record without a second host read.
+            sequence.mtp_drafted_extent           = extent;
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =

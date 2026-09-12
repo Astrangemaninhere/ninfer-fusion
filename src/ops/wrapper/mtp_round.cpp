@@ -60,6 +60,20 @@ void mtp_svip_entropy_extents(const Tensor& logits, const Tensor& accepted, Tens
     detail::mtp_svip_entropy_extents_launch(logits, accepted, cuts, threshold, stream);
 }
 
+void mtp_adaptive_extents(const Tensor& accepted, const Tensor& current_extents, Tensor& cuts,
+                          std::int32_t k_max, cudaStream_t stream) {
+    constexpr const char* op = "mtp_adaptive_extents";
+    const int batch = accepted.ne[0];
+    if (batch < 1) { throw std::invalid_argument(std::string(op) + ": empty batch"); }
+    require_vector(accepted, DType::I32, batch, op, "accepted");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_vector(cuts, DType::I32, batch, op, "cuts");
+    if (k_max < 1 || k_max > 16) {
+        throw std::invalid_argument(std::string(op) + ": k_max must be in [1,16]");
+    }
+    detail::mtp_adaptive_extents_launch(accepted, current_extents, cuts, k_max, stream);
+}
+
 void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors,
                             const Tensor& accepted, const Tensor& updated_frontiers,
                             const Tensor& remaining_budgets, const Tensor& licensed_counts,

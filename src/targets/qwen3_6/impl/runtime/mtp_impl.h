@@ -161,9 +161,22 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 const char* env = std::getenv("NINFER_SVIP_THRESHOLD");
                 return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0F;
             }();
+            // Adaptive draft window (auto mode): NINFER_ADAPTIVE_WINDOW=<k_max> enables it.
+            // Stateless window control from the round's own accept record; see
+            // ops::mtp_adaptive_extents. Takes precedence over the entropy cap.
+            static const std::int32_t kAdaptiveWindowMax = [] {
+                const char* env = std::getenv("NINFER_ADAPTIVE_WINDOW");
+                return env != nullptr ? static_cast<std::int32_t>(std::atoi(env)) : 0;
+            }();
             const Tensor* svip_cuts_arg = nullptr;
             Tensor svip_cuts_storage;
-            if (kSvipThreshold > 0.0F) {
+            if (kAdaptiveWindowMax > 0) {
+                auto scope = state.execution.work.scope();
+                svip_cuts_storage = state.execution.work.alloc(DType::I32, {batch_size});
+                ops::mtp_adaptive_extents(accepted, current_extents, svip_cuts_storage,
+                                          kAdaptiveWindowMax, state.execution.device.stream);
+                svip_cuts_arg = &svip_cuts_storage;
+            } else if (kSvipThreshold > 0.0F) {
                 auto scope = state.execution.work.scope();
                 svip_cuts_storage = state.execution.work.alloc(DType::I32, {batch_size});
                 ops::mtp_svip_entropy_extents(target_logits, accepted, svip_cuts_storage,
