@@ -1,0 +1,16 @@
+#pragma once
+
+// ninfer::ops::detail — private launch prototype for gelu_mul. Included by the wrapper
+// (host) and defined by the launcher (.cu). Not part of the public api.
+// See docs/maintainer/op-development.md §2.
+
+#include "core/tensor.h"
+
+#include <cuda_runtime.h>
+
+namespace ninfer::ops::detail {
+
+// Host entry; assumes inputs already validated by the wrapper.
+void gelu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream);
+
+} // namespace ninfer::ops::detail

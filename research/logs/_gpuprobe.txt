@@ -1,0 +1,22 @@
+=== display adapters (check for an iGPU) ===
+  Zako Display Adapter | Status=OK | Res=x
+  GameViewer Virtual Display Adapter | Status=OK | Res=x
+  NVIDIA GeForce RTX 5090 D | Status=OK | Res=1024x768
+  Intel(R) Graphics | Status=OK | Res=1920x1080
+
+=== dwm CPU rate (5s sample) ===
+  dwm CPU sec: 8143.4 -> 8143.5 ; delta5s=0.08 => 1.6% of one core
+
+=== top CPU processes ===
+  dwm                  CPU=8144s Mem=266MB
+  System               CPU=7574s Mem=3MB
+  Memory Compression   CPU=5827s Mem=740MB
+  ZCode                CPU=5239s Mem=415MB
+  Taskmgr              CPU=3144s Mem=121MB
+  HOF AI Suite         CPU=2823s Mem=10MB
+
+=== HAGS ===
+  HwSchMode=1 (2=HAGS on, 1=off)
+
+=== current display modes (refresh rate matters for dwm) ===
+  \\.\DISPLAY5 Bounds=1920x1080 Primary=True

@@ -1,0 +1,17 @@
+=== 候选路径是否有 .git ===
+  /home/user/ninfer-fusion : 非 git 仓库
+  /home/user/ninfer-fusion-repo : 非 git 仓库
+  /mnt/c/Users/User/Documents/ziqinzhang : 非 git 仓库
+
+=== 体积 ===
+  ninfer-fusion 总: 63G
+    build/:        63G
+    源码(src+include+apps+tools+docs): 70M
+    src: 11M
+    include: 388K
+    apps: 128K
+    tools: 36M
+    docs: 588K
+    tools/freq_corpus: 35M
+    tools/calib: 64K
+    tests: 2.5M

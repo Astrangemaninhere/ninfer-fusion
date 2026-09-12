@@ -1,0 +1,60 @@
+#!/bin/bash
+# 短名单头 vs 全词表头：图模式、逐臂校验完整性（必须有完整 summary 才计入）
+set -u
+J=/mnt/c/Users/User/Documents/ziqinzhang/dl
+export PATH=/home/user/.local/bin:$PATH
+M=/home/user/models/qwen3_8_27b_nvfp4_dflash2.ninfer
+P='请用中文写一段两百字左右的短文，介绍西湖一年四季的景色变化，要求语句连贯、不要列条目。'
+LOG=$J/headcost2.log
+: > "$LOG"
+exec > >(tee -a "$LOG") 2>&1
+cd /home/user/ninfer-fusion/build || exit 3
+pkill -9 -x ninfer 2>/dev/null; sleep 3
+echo "=== 草稿头成本对照 v2（图模式，逐臂完整性校验）起 $(date '+%H:%M:%S') ==="
+printf "  %-12s %-4s %-7s %-9s %-9s %-8s %s\n" 臂 k AL tok/s ms轮 轮秒 完整
+one() {
+  local lbl="$1" k="$2"; shift 2
+  timeout 900 ./apps/ninfer "$M" --prompt "$P" --max-new 96 --max-context 4096 \
+    --no-thinking --greedy --spec mtp --draft-tokens "$k" "$@" > "$J/h2_$lbl.log" 2>&1
+  local al sp rd ok
+  al=$(grep -m1 'mtp acceptance length' "$J/h2_$lbl.log" | grep -oE '[0-9.]+')
+  sp=$(grep -m1 'decode speed' "$J/h2_$lbl.log" | grep -oE '[0-9.]+')
+  rd=$(grep -m1 'mtp rounds' "$J/h2_$lbl.log" | grep -oE '[0-9]+')
+  ok=$([ -n "${al:-}" ] && [ -n "${sp:-}" ] && [ -n "${rd:-}" ] && echo Y || echo N)
+  local ms rps
+  ms=$(awk -v s="${sp:-0}" -v a="${al:-0}" 'BEGIN{if(s>0)printf "%.2f",1000.0*a/s; else print "-"}')
+  rps=$(awk -v s="${sp:-0}" -v a="${al:-0}" 'BEGIN{if(a>0)printf "%.1f",s/a; else print "-"}')
+  printf "  %-12s %-4s %-7s %-9s %-9s %-8s %s\n" "$lbl" "$k" "${al:-?}" "${sp:-?}" "$ms" "$rps" "$ok"
+}
+for k in 1 3 5; do
+  one "short_k$k" "$k" --lm-head-draft
+  one "full_k$k"  "$k"
+done
+echo
+echo "=== 拟合（仅用完整臂）==="
+python3 - <<'PY'
+import pathlib, re
+J = pathlib.Path("/mnt/c/Users/User/Documents/ziqinzhang/dl")
+def fit(prefix):
+    pts = []
+    for k in (1, 3, 5):
+        p = J / f"h2_{prefix}_k{k}.log"
+        if not p.exists(): continue
+        t = p.read_text(errors="replace")
+        al = re.search(r"mtp acceptance length\s+([0-9.]+)", t)
+        sp = re.search(r"decode speed\s+([0-9.]+)", t)
+        rd = re.search(r"mtp rounds\s+([0-9]+)", t)
+        if al and sp and rd and float(sp.group(1)) > 0:
+            pts.append((k, 1000.0*float(al.group(1))/float(sp.group(1))))
+    if len(pts) < 2: return None
+    n = len(pts); sx = sum(p[0] for p in pts); sy = sum(p[1] for p in pts)
+    sxx = sum(p[0]**2 for p in pts); sxy = sum(p[0]*p[1] for p in pts)
+    b = (n*sxy - sx*sy)/(n*sxx - sx*sx); a = (sy - b*sx)/n
+    return a, b, pts
+for prefix, name in (("short", "短名单头 --lm-head-draft"), ("full", "全词表头（默认）")):
+    r = fit(prefix)
+    print(f"  {name}: " + (f"a={r[0]:.2f} ms, b={r[1]:.2f} ms/列   点={[(k,round(v,2)) for k,v in r[2]]}" if r else "数据不足"))
+print("  参考：真实读带宽 1813 GB/s ⇒ 权重下界 11.70 ms/轮；全词表头 FP8 1.27GB≈0.70ms，短头 Q4 0.34GB≈0.19ms")
+PY
+echo "=== 完成 $(date '+%H:%M:%S') ==="
+echo HEADCOST2_DONE

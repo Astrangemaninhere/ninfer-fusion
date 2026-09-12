@@ -1,0 +1,27 @@
+#pragma once
+
+#include "core/tensor.h"
+#include "ninfer/ops/sampling.h"
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+
+namespace ninfer::ops::detail {
+
+inline constexpr int kDflash2SelectorRank = 256;
+inline constexpr int kDflash2SelectorTopK = 16;
+// The selector codebooks are indexed by GLOBAL token ids, so their row count is the
+// global vocabulary even when the candidates come from the shortlist head.
+inline constexpr int kDflash2GlobalVocab  = 248320;
+
+void dflash2_selector_launch(const Tensor& unary_logits, const Tensor& projected_hidden,
+                             const Weight& predecessor_codebook,
+                             const Weight& successor_codebook, const Tensor& anchors,
+                             Tensor& candidates, Tensor& unary, Tensor& scores, Tensor& drafts,
+                             const SamplingConfig* configs, Tensor& candidate_ids,
+                             Tensor& candidate_probs, std::int32_t steps, std::int32_t top_k,
+                             std::int32_t domain, const Tensor& head_token_ids,
+                             cudaStream_t stream);
+
+} // namespace ninfer::ops::detail

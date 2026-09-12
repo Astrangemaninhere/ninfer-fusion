@@ -1,0 +1,71 @@
+{
+ "model_id": "ornith-1.5-9b-q4-k-m",
+ "family": "qwen38",
+ "hf": {
+  "source": "gguf",
+  "file": "C:\\Users\\User\\Documents\\ziqinzhang\\models\\ornith-1.5-9b\\Ornith-1.5-9B-Q4_K_M.gguf"
+ },
+ "geometry": {
+  "hidden": 4096,
+  "layers": 33,
+  "query_heads": 16,
+  "kv_heads": 4,
+  "head_dim": 256,
+  "vocab": 248320,
+  "max_ctx": 262144,
+  "intermediate": 12288,
+  "rms_eps": 9.999999974752427e-07
+ },
+ "layer_types": [
+  "linear_attention",
+  "linear_attention",
+  "linear_attention",
+  "full_attention",
+  "linear_attention",
+  "linear_attention",
+  "linear_attention",
+  "full_attention",
+  "linear_attention",
+  "linear_attention",
+  "linear_attention",
+  "full_attention",
+  "linear_attention",
+  "linear_attention",
+  "linear_attention",
+  "full_attention",
+  "linear_attention",
+  "linear_attention",
+  "linear_attention",
+  "full_attention",
+  "linear_attention",
+  "linear_attention",
+  "linear_attention",
+  "full_attention",
+  "linear_attention",
+  "linear_attention",
+  "linear_attention",
+  "full_attention",
+  "linear_attention",
+  "linear_attention",
+  "linear_attention",
+  "full_attention",
+  "full_attention"
+ ],
+ "knobs": {
+  "rope_theta": 10000000.0,
+  "tie_word_embeddings": false
+ },
+ "rope": {
+  "rope_theta": 10000000.0,
+  "rope_type": "default"
+ },
+ "multimodal": false,
+ "notes": [
+  "spec 由 GGUF 元数据生成 (gguf_spec.py); 权重转换需 qwen35 GGUF recipe"
+ ],
+ "quant_formats": {
+  "Q6_K": 35,
+  "F32": 184,
+  "Q4_K": 223
+ }
+}

@@ -1,0 +1,80 @@
+#include "ninfer/ops/dflash2_selector.h"
+
+#include "ops/launcher/dflash2_selector.h"
+
+#include <cstdint>
+#include <stdexcept>
+
+namespace ninfer::ops {
+
+void dflash2_selector(const Tensor& unary_logits, const Tensor& projected_hidden,
+                      const Weight& predecessor_codebook, const Weight& successor_codebook,
+                      const Tensor& anchors, Tensor& candidates, Tensor& unary, Tensor& scores,
+                      Tensor& drafts, const SamplingConfig* configs, Tensor& candidate_ids,
+                      Tensor& candidate_probs, std::int32_t steps, std::int32_t top_k,
+                      std::int32_t domain, const Tensor& head_token_ids,
+                      cudaStream_t stream) {
+    const auto invalid = [](const char* message) { throw std::invalid_argument(message); };
+    if (unary_logits.dtype != DType::BF16 || projected_hidden.dtype != DType::BF16 ||
+        anchors.dtype != DType::I32 || candidates.dtype != DType::I32 ||
+        unary.dtype != DType::FP32 || scores.dtype != DType::FP32 || drafts.dtype != DType::I32) {
+        invalid("dflash2_selector: logits/projected must be BF16, ids I32, scores F32");
+    }
+    const auto contiguous = [](const Tensor& tensor) {
+        return tensor.is_contiguous() && tensor.data != nullptr;
+    };
+    if (!contiguous(unary_logits) || !contiguous(projected_hidden) || !contiguous(anchors) ||
+        !contiguous(candidates) || !contiguous(unary) || !contiguous(scores) ||
+        !contiguous(drafts)) {
+        invalid("dflash2_selector: tensors must be contiguous and non-null");
+    }
+    const std::int32_t vocab  = unary_logits.ne[0];
+    const std::int32_t tokens = unary_logits.ne[1];
+    const std::int32_t rank   = projected_hidden.ne[0];
+    const std::int32_t batch  = anchors.ne[0];
+    if (rank != detail::kDflash2SelectorRank || steps < 1 || steps > 15 ||
+        top_k != detail::kDflash2SelectorTopK || batch < 1 || batch > 8 ||
+        tokens != steps * batch || domain < 1 || domain > vocab ||
+        projected_hidden.ne[1] != tokens) {
+        invalid(
+            "dflash2_selector: registered domain is V=131072|248320, R=256, S=1..15, "
+            "B=1..8, K=16, domain in [1,V]");
+    }
+    if (head_token_ids.data != nullptr &&
+        (head_token_ids.dtype != DType::I32 || !contiguous(head_token_ids) ||
+         head_token_ids.ne[0] != vocab)) {
+        invalid("dflash2_selector: head_token_ids must be a contiguous I32 [V] map");
+    }
+    if (candidates.ne[0] != batch || candidates.ne[1] != steps || candidates.ne[2] != top_k ||
+        unary.ne[0] != batch || unary.ne[1] != steps || unary.ne[2] != top_k ||
+        scores.ne[0] != batch || scores.ne[1] != steps || scores.ne[2] != top_k ||
+        scores.ne[3] != top_k || drafts.ne[0] != tokens) {
+        invalid("dflash2_selector: scratch or draft shapes are inconsistent");
+    }
+    if (candidate_ids.data != nullptr) {
+        if (candidate_ids.dtype != DType::I32 || candidate_probs.data == nullptr ||
+            candidate_probs.dtype != DType::FP32 || !contiguous(candidate_ids) ||
+            !contiguous(candidate_probs) || candidate_ids.ne[0] != top_k ||
+            candidate_ids.ne[1] != steps || candidate_ids.ne[2] != batch ||
+            candidate_probs.ne[0] != top_k || candidate_probs.ne[1] != steps ||
+            candidate_probs.ne[2] != batch) {
+            invalid("dflash2_selector: candidate distribution buffers must be [K,S,B]");
+        }
+    }
+    if (predecessor_codebook.qtype != QType::BF16_CTRL ||
+        successor_codebook.qtype != QType::BF16_CTRL ||
+        predecessor_codebook.n != detail::kDflash2GlobalVocab ||
+        predecessor_codebook.k != rank ||
+        successor_codebook.n != detail::kDflash2GlobalVocab ||
+        successor_codebook.k != rank || predecessor_codebook.qdata == nullptr ||
+        successor_codebook.qdata == nullptr) {
+        invalid("dflash2_selector: codebooks must be BF16 [V,256]");
+    }
+
+    detail::dflash2_selector_launch(unary_logits, projected_hidden, predecessor_codebook,
+                                    successor_codebook, anchors, candidates, unary, scores, drafts,
+                                    configs, candidate_ids, candidate_probs, steps, top_k, domain,
+                                    head_token_ids, stream);
+}
+
+} // namespace ninfer::ops

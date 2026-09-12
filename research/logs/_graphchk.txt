@@ -1,0 +1,14 @@
+=== 判定当前二进制是否走图  起 14:39:08 ===
+源码里的默认 ceiling：
+  /home/user/ninfer-fusion/apps/cli/options.h:37:    std::uint32_t graph_capture_ceiling = 16;
+  /home/user/ninfer-fusion/src/targets/qwen3_6/impl/runtime/layouts.h:103:    std::uint32_t graph_capture_ceiling = 16;
+  /home/user/ninfer-fusion/src/targets/qwen3_6/impl/runtime/layouts.h:147:    std::uint32_t graph_capture_ceiling = 16;
+  /home/user/ninfer-fusion/src/targets/qwen3_6/impl/runtime/program.h:761:    std::uint32_t graph_capture_ceiling = 16;
+  配置                 tok/s     说明
+/home/user/gchk.sh: line 19:   558 Killed                     timeout 600 ./apps/ninfer "$M" --prompt "$P" --max-new 64 --max-context 4096 --no-thinking --greedy --spec mtp --draft-tokens "$k" --lm-head-draft --graph-capture-ceiling "$cc" > "$J/gc_${cc}_$k.log" 2>&1
+  ceiling=16 k=1         ?         AL=?
+  ceiling=16 k=3         125.27    AL=2.17
+  ceiling=0 k=1          ?         AL=?
+  ceiling=0 k=3          ?         AL=?
+宿主: load: 1.85, 1.20, 0.71
+=== 完成 14:41:30 ===
