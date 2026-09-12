@@ -82,7 +82,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--spec mtp|dflash|dflash2|auto --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--spec auto|mtp|dflash|dflash2|none --draft-tokens N]\n           (--spec defaults to auto; none turns speculation off)\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"

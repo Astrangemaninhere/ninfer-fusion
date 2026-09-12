@@ -49,7 +49,8 @@ struct ServeOptions {
     bool kv_bit_budget_explicit           = false;
     std::array<bool, 16> kv_residual_layers{};
     bool kv_residual_explicit             = false;
-    SpeculativeOptions speculative;
+    // Same default as the CLI: unspecified --spec means auto, `--spec none` opts out.
+    SpeculativeOptions speculative{SpeculativeBackend::Auto};
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

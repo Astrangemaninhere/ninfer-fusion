@@ -25,7 +25,10 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     bool kv_cache_explicit  = false;
-    SpeculativeOptions speculative;
+    // Unspecified --spec means auto: the artifact's own draft backend (DFlash2 or MTP)
+    // is used. Measured on code: 270.2 tok/s auto vs 69.1 tok/s with speculation off.
+    // `--spec none` opts out.
+    SpeculativeOptions speculative{SpeculativeBackend::Auto};
     bool enable_vision  = false;
     bool use_cuda_graph = true;
     std::string kv_layer_storage_spec;

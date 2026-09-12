@@ -9,6 +9,9 @@
 namespace ninfer::product {
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
+    // "none"/"off" is the explicit opt-out: both front ends default --spec to auto, so
+    // there has to be a spelling for turning speculation back off.
+    if (value == "none" || value == "off") { return SpeculativeBackend::None; }
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
