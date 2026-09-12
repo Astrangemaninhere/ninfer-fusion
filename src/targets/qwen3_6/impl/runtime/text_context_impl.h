@@ -956,33 +956,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "MTP proposal batch logits");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     proposal_argmax(hidden, logits, draft_tokens);
-    // 树的先决测量：MTP 每步的草稿 logits 与选定 token。proposal_logits 每步被覆盖，
-    // 只留最后一步 ⇒ 离线无法重建逐深度分布与 hit@b。门控 NINFER_MTPLOG，需 --no-cuda-graph。
-    if (std::getenv("NINFER_MTPLOG") != nullptr) {
-        static int mtplog_calls = 0;
-        if (mtplog_calls < 96) {
-            ++mtplog_calls;
-            auto dump_t = [&](const char* tag, const Tensor& view) {
-                if (view.data == nullptr || view.numel() == 0) { return; }
-                std::vector<std::byte> host(view.bytes());
-                CUDA_CHECK(cudaMemcpyAsync(host.data(), view.data, host.size(),
-                                           cudaMemcpyDeviceToHost, ctx_.stream));
-                CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
-                char path[256];
-                std::snprintf(path, sizeof(path),
-                              "/mnt/c/Users/User/Documents/ziqinzhang/dl/mtplg_%s_%d.bin",
-                              tag, mtplog_calls);
-                if (std::FILE* fh = std::fopen(path, "wb")) {
-                    std::fwrite(host.data(), 1, host.size(), fh);
-                    std::fclose(fh);
-                }
-            };
-            dump_t("logits", logits);
-            dump_t("tokens", draft_tokens);
-            std::fprintf(stderr, "[mtplog] n=%d vocab=%d batch=%d logits_bytes=%zu\n",
-                         mtplog_calls, kCfg.vocab, batch, logits.bytes());
-        }
-    }
+
 }
 
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {

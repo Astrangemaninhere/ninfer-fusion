@@ -175,6 +175,8 @@ Options parse_options(int argc, char** argv) {
             options.cold_host_bytes = parse_u32(value(arg), "cold-host-bytes");
         } else if (arg == "--graph-capture-ceiling") {
             options.graph_capture_ceiling = parse_u32(value(arg), "graph-capture-ceiling");
+        } else if (arg == "--no-lm-head-draft") {
+            options.speculative.proposal_head = ProposalHead::Full;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--yarn") {

@@ -153,7 +153,10 @@ struct DFlash2Config {
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
-inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
+// Raised 5 -> 15 to match kMtpDecodeMaximumDrafts (15), so the MTP draft window
+// bound is 15 (width 16; the AR-envelope array in schedule.h follows this size).
+// Measured on code: k=9/AL 7.31 gives 327.6 tok/s.
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 15;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 7;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 

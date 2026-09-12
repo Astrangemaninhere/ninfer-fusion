@@ -12,7 +12,9 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
+// Raised 5 -> 15 so the MTP decode frame matches DFlash (width 6 -> 16, the decode
+// frame domain bound). Measured on code: k=9 reaches 327.6 tok/s (AL 7.31).
+inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 15;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;

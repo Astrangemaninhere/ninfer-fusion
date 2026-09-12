@@ -35,14 +35,19 @@ namespace ninfer::product {
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     switch (options.backend) {
     case SpeculativeBackend::None:
-        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
+        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full &&
+                options.proposal_head != ProposalHead::Auto) {
             throw std::invalid_argument(
                 "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2");
         }
         return;
     case SpeculativeBackend::Mtp:
-        if (options.draft_tokens == 0 || options.draft_tokens > 5) {
-            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
+        // Upper bound raised 5 -> 15 (the dflash domain bound; the verify width cap of
+        // 16 admits k <= 15). Measured: on code k=3/5/9 give 196.6/225.7/327.6 tok/s
+        // (AL 3.48/4.32/7.31) while on Chinese k=5 is worse than k=3, so the optimal k
+        // is content dependent and is meant to be picked by the adaptive cut.
+        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
+            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,15]");
         }
         return;
     case SpeculativeBackend::DFlash:
@@ -61,7 +66,8 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         // are mapped to global ids through text/draft_head_token_ids.
         return;
     case SpeculativeBackend::Auto:
-        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
+        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full &&
+                options.proposal_head != ProposalHead::Auto) {
             throw std::invalid_argument(
                 "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2");
         }

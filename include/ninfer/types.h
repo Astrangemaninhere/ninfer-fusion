@@ -112,6 +112,12 @@ struct KvCapacityPolicy {
 enum class ProposalHead : std::uint8_t {
     Full,
     Optimized,
+    // Auto: resolved by profile in resolved_auto_speculative (a DFlash2 artifact
+    // carries text/draft_head, so it maps to Optimized; other profiles stay Full).
+    // It must be resolved there: that function's result feeds the planner, the load
+    // plan and the program, otherwise the frozen-startup-features check rejects the
+    // loaded weights (see the note in registry.cpp).
+    Auto,
 };
 
 enum class SpeculativeBackend : std::uint8_t {
@@ -125,7 +131,7 @@ enum class SpeculativeBackend : std::uint8_t {
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
-    ProposalHead proposal_head = ProposalHead::Full;
+    ProposalHead proposal_head = ProposalHead::Auto;
 };
 
 struct LoadProgress {

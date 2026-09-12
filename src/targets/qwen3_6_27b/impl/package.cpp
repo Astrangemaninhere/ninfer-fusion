@@ -118,6 +118,16 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
                                                     WeightsProfile weights_profile) {
     EngineOptions resolved = options;
+    // ProposalHead::Auto is resolved here, before the backend early-return: `resolved`
+    // feeds the planner, the load plan and the program. Resolving later trips the
+    // frozen-startup-features mismatch (registry.cpp documents the same trap).
+    // Profile based: a DFlash2 artifact carries the shortlist draft head.
+    if (resolved.speculative.proposal_head == ProposalHead::Auto) {
+        resolved.speculative.proposal_head =
+            weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2
+                ? ProposalHead::Optimized
+                : ProposalHead::Full;
+    }
     if (options.speculative.backend != SpeculativeBackend::Auto) { return resolved; }
     // The artifact weights decide the backend, not the context length: a
     // DFlash2 artifact has no MTP draft head (the two are mutually

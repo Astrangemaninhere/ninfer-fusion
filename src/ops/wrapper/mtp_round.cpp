@@ -70,8 +70,14 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
-    if (T < 2 || T > 6) {
-        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,6]");
+    // T domain widened 6 -> 16. The kernel is a plain grid-stride loop with no
+    // per-T template specialization and the launcher sizes its grid from T, so the
+    // old [2,6] bound only asserted the previously validated domain (see the
+    // launcher header). Frame, AR-envelope array and width checks are all sized for
+    // 16 now. Widen T is validated by measurement: k=9 (T=10) keeps a healthy
+    // per-position profile and AL grows monotonically.
+    if (T < 2 || T > 16) {
+        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,16]");
     }
     if (batch < 1) { throw std::invalid_argument("mtp_prepare_next_round: B must be positive"); }
     if (max_context <= 0) {
