@@ -244,12 +244,15 @@ public:
         : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
         device.yarn_enabled = options.yarn_enabled;
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        std::thread module_warmup([&device = device] { warm_kernel_module(device); });
+        // jthread, not thread: the load path can throw (bad options, a reservation that
+        // cannot be met, a rejected KV budget), and a joinable std::thread destroyed during
+        // unwinding calls std::terminate - which swallowed those errors as a bare
+        // "terminate called without an active exception" abort. jthread joins on scope exit.
+        std::jthread module_warmup([&device = device] { warm_kernel_module(device); });
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
-        module_warmup.join();
         core              = std::visit(
             [&](auto& target_ptr) -> Core {
                 using Instance =
