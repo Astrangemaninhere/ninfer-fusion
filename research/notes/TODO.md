@@ -5197,3 +5197,676 @@ online-softmax 的 `m/l` 是 FP32 ✓。结合 A 路事实（**T≤6 走 SmallT/
 8. **dump/二进制分析先断言元素数与结构**（四次栽在布局/编码假设上）。
 9. **带宽口径**：5090D 理论 2176 GB/s（17001MHz×2×512bit/8），**可持续实测 1813 GB/s**；
    引擎有效 1.54 TB/s ⇒ 71% 峰值 / **85% 可持续** ⇒ 内存效率只剩 15~18%。
+
+## 2026-09-12 夜 · KV 组件化 / 冷路径 / 仪表陷阱（本轮结论归档）
+
+### 1. 本轮落地（14 组）
+- 首轮 10 份：P1（ModelOpt 读取器）、F1×3（fp8 入口映射 + 测试期望 + 成本表注释）、C2-core（冷 codec 表 + ISO3 修正）、
+  F3（判据注释 + `sequence.mtp_window` 复位）、R1（磁盘槽释放 + 2 个活 bug + CLI 三旗标）、H2-01（`kv_cold_tier_budget.h`）、
+  D2（逐层冷槽 stride）、S2（22 文件：旋转唯一 gate / row scale 三态 / V codec iso3|e2m1）。
+- 第三批 7 组：D1（DP 冷档成本模型，`kKvBitBudgetColdBitsX100 == 466` 有 static_assert）、
+  QROT（fp8 decode Q 读端补旋转）、Q3（三处开关接线）、PPL（perplexity `--kv-dtype` 死标签）、
+  HR（冷主机驱逐重基，21/21 hunk 零 fuzz）、F2（split 几何固定）、GM（G1⊕G2 冷路径解锁并集）。
+
+### 2. 实测：row-scale / kvarn 的价值（C1，`ninfer-perplexity`，噪声底 = 0）
+| 组 | baked | identity | Δ mean_nll |
+|---|---|---|---|
+| all-NVFP4 长 64k | 1.40990842 | 1.40831856 | **−0.00159（4/4 stream 同向）** |
+| all-NVFP4 短 2k | 1.50889187 | 1.50900833 | +0.00012（方向 2:2 混杂） |
+| 稠密长文本 130k（ctx 65536/stride 8192） | 1.99035283 | 1.98828477 | **−0.00207（9 窗中 8 窗同向）** |
+| 负对照 all-E8Kv | 2.15060161 | 2.15060161 | **0.00000（逐位相同）** |
+结论：**"长文本才有价值"不成立**（64k 下 identity 反而更优），"牺牲短文本"也不成立（2k 差异小 13 倍且方向混杂）。
+量级：row-scale 效应（0.1–0.3% ppl）比 KV 层选择（默认表 4.870 vs all-NVFP4 4.096 = 0.775 nats）小 180–490 倍 ⇒ 二阶旋钮。
+静态证实：全树仅 `gqa_isoquant_row_scale{,_loader}` + nvfp4 decode/prefill 四处读 `gqa_kv_row_scale`（负对照成立）。
+
+### 3. 独立复核：旋转表是"真旋转"
+S1：64 块实测 max|RRᵀ−I| = 1.9e-07、det ∈ [1±2e-07] ⇒ `--kv-rotation off`（R=I）对 `QK^T` **精确无损**，
+只是把量化误差分配退回未标定状态 ⇒ 它必须表现为不同 token id。gate 烘焙 `kGqaIsoquantRotGeom[4] = {1,0,0,0}`（默认开）。
+
+### 4. 新发现真 bug（两路独立裁定，已落 QROT）
+**fp8 decode 单边旋转**：`gqa_attention_decode_fp8.cuh:183` 写 K 时施加 R，但 `:240-250` 把 Q 原样送进 `qkv_s`，
+`:335-347` 的 `mma_bf16` 直接拿它对已旋转的 K ⇒ 实际算 `qᵀRk` 而不是 `(Rq)ᵀ(Rk)`。
+- iso3 路径 `gqa_attention_decode_iso3.cuh:93-95` 的注释逐字写着正确不变量（"K is rotated at append time; rotate Q by the same…"）。
+- 量级（Q2 宿主数值）：两边都转误差 mean 1.0e-7；只转 K 的误差 mean 1.97、95.7% 样本相对误差 > 0.1 ⇒ O(1) 全错。
+- 归因：`decode_fp8.cuh:1-8` 自述 body 抄自 bf16 kernel，而 bf16 kernel 全文无旋转、Q 暂存与 fp8 一字不差 ⇒ 只在写端补了旋转。
+- 影响面：默认层表不含 fp8，只在操作者显式选 `--kv-dtype fp8` / `all:fp8` 时触发；**且 `--kv-rotation off` 会让它退化为无害**，
+  所以任何"rotation off 更好"的 fp8 A/B 结论都是这个 bug 的假象，不可用。
+
+### 5. 新发现接线缺口（Q3：13 个开关，3 个无效，已落）
+- **`--kv-residual-layers`（serve 侧完全无效）**：`serve_options.cpp:350-368` 解析完整，但 `generation_service.cpp:237-281`
+  从不拷进 `EngineOptions`；另有第二个丢弃点 `:531` `reload_kv_storage(table, {})` 传空残差表，首次 relayout 会清空。
+  潜在 bug：`serve_options.h:71` 声明 `std::array<bool,16>`，契约是 64（`types.h:44`）⇒ `--kv-residual-layers 20` 被误拒。
+  **影响既往验收**：`research/scripts/_kv_matrix_57k.sh:42-56` 起的是 `ninfer-serve` 并传该旗标，
+  故 TODO.md:1131 的"残差双层 PASS"很可能是在残差未生效时得到的 ⇒ **该 PASS 需回查**（已列为待重测）。
+- **`--kv-quality-weight` / `--kv-tier-scores`（CLI 侧无效）**：解析了（`options.cpp:177-183`）与字段、运行期读者
+  （`layouts_impl.h:1079/1086`）都现成，但 `apps/cli/main.cpp` 无拷贝 ⇒ **两分数判据在 CLI 上从未可达**。
+- 非缺陷观察：`kv_v_codec_explicit` 是死标志（4 写 0 读），`--kv-v-codec` 生效只因 `layouts_impl.h:1257` 无条件拷值。
+
+### 6. 冷路径的性质与收益（G1/G2/GM）
+- 门是"**未完成门**"不是正确性门，且**有两个拦截点**：栈门（早退）+ 页级 `dtype != I8 -> success=false`；只解前者 nvfp4 一页也压不了。
+- 槽位几何本就双 codec：`slot_bytes = 9536` 同时容纳 rANS 上限与 int8 raw 布局（9232）。混合 int8+nvfp4 可支持；
+  **含 e8/iso3/fp8/bf16 的栈不行**（无冷 codec）⇒ 出厂默认 10×E8+6×NVFP4 档**解锁后仍一页压不了**（1M 的最大剩余障碍）。
+- 收益算术：@4.0 冷槽 9536 > 常住 9216 ⇒ 每 head-page **亏 320 B**；@2.6 stride = 320+32×167+1024 = **6688 B** ⇒
+  净 **+2528 B/head-page（+27.4%）**；1M/16 层/kv_heads 4/head_dim 256 ⇒ 18.00 → **13.06 GiB（省 4.94 GiB）**；盈亏平衡 **b ≲ 3.84**。
+- **翻 D2 常量到 2.6 会让 `decoder_state.cpp:367` 的 `static_assert(cold_slot_stride_for(...) == ops::kEntropyNvfp4SlotBytes)` 编译失败**
+  （6688 ≠ 9536）⇒ 必须同步改断言与文档，不能只改常量。
+
+### 7. 未决 / 待裁决
+- **`cold_v_valid` 索引约定不自洽（新发现，先测后改）**：张量声明 `DType::I32, {kv_heads, 2, cold_pages}`
+  （`decoder_state.cpp:466`）⇒ 按 row-major 平面偏置应是 `nb[2]`（slot 数据指针正是用 `cold_slots.nb[2]` 取 V 平面），
+  但**发布侧（`program_impl.h:10609-10611`）与三个 launcher（`decode_impl.cuh:16` / `decode_partial.cuh:38` / `prefill.cu:61`）
+  都用 `nb[1]`** 推 V valid；生产侧写 `slot_valid[page*valid_page_stride + head]`（`entropy_nvfp4_slot_kernels.cuh:123/170/183`），
+  prefill 消费侧又算 `slot_base*(2*KVHeads) + head` 并给 V 加 `+KVHeads`。四者不可能同时正确。
+  唯一真跑过的冷消费路径（int8 decode，`gqa_attention_decode_i8.cuh:406`）**根本不读 valid**，只用 block table 哨兵 `physical_page <= -2`。
+  ⇒ 本轮 GM 按"并集"落了解锁，但该 valid 门是**断言而非修复路径**；索引约定需在第一次 nvfp4 冷端到端测试时定案。
+- 1M 路线：驱逐被"被 attend 的页必须常驻"挡住（三条独立证明）⇒ 需 read-free 窗口语义 + 权重卸载；冷数据目前仍全在显存（disk 只做镜像，host 未实现）。
+- F2 修的并行度代价：131072+4096 窗口下 split 数变化（3 vs 64）需实测 decode 速度后再决定是否做 tile 级 mod-S 交错。
+- 残余：e8 中段窗口 11~15（F5 实测中）、nvfp4 慢的可信归因（M3）、split 几何的 CUDA graph 路径、独立 3-bit iso3 未接线。
+
+### 8. 仪表陷阱（三条，均已修/已记）
+1. `ninfer-perplexity` 的 `--kv-dtype` 是**死标签**（不设 `kv_cache_explicit`，全局档不生效）⇒ 已在 PPL 补丁修；
+   修之前该工具只能用 `--kv-layer-storage` 指定层。
+2. 摘要行 `kv cache dtype` 打印的是**全局 flag**而非生效的逐层表（nvfp4 跑会显示 `bf16`）⇒
+   判据一律用 **`kv cache payload`**（payload = bits_per_element × 0.5 + fixed，fixed=0.50 GiB = MTP 层；`--spec none` ⇒ 0）。
+   `report.json` 的 `execution.kv_dtype` 同样不可信。
+3. `--kv-layer-storage all:bf16` **不是** bf16 基线：`BFloat16` 同时是"未设置"哨兵（`src/product/kv_options.h:25-30` 明文），
+   要强制 BF16 必须走 `--kv-dtype bf16`（该路径 `_TODO.md 97/98/117` 已修）。另：`parse_kv_storage("fp8") = Fp8Group16`，
+   而 `--kv-dtype fp8 = Fp8E4M3Row256`，两种拼写现在都映射到 `DType::FP8_E4M3FN`（F1 修的就是前者静默落 BF16）。
+
+### 9. 流程教训（本轮实证两次的事故）
+- **"外来删除 hunk"**：补丁若基于**移动中**的工作树生成，会静默回退别人的改动，而且 `patch --dry-run` **仍然 rc=0**，
+  不会自曝。D1 与 HR 两条独立路径都实际踩到并各自用"逐 hunk 认领 + 锚定基准"发现。
+  ⇒ 规矩：补丁必须锚定基准生成；落地后必须跑**标记存活检查**（本轮全量点名见 `_build_acc.txt` 第 2 节）。
+- **不要在脚本运行时覆盖该脚本**：bash 会按文件偏移续读，覆盖后可能重复执行后半段命令。
+  本次后果：残`_build_first.sh` 的 bash 实例在旧构建被杀后**又拉起一次 `cmake --build -j16`**（连续两次）。
+  处置：把两份副本（`/mnt/c/.../ziqinzhang/_build_first.sh` 与 `.../sh/_build_first.sh`）都中和成 `exit 0` 占位。
+- 误报澄清：批 4 落地后标记曾显示 `D2=0 / F3=1`，看似回退，实为**我 marker 路径写错**
+  （`kColdSlotRansBitsPerCode` 定义在 `decoder_state.cpp:281`，export 头只声明区域；F3 的实际编辑在 `program_impl.h`），
+  已用「全树定位 + `git diff --stat`（39 文件）+ 修正后的 manifest 对比」确认无回退。
+
+### 10. 补记（同轮续查两条，都是"纠正先前假设"）
+
+**(a) 翻 D2 常量不是改一个数字：整数类型挡路，且第二处 static_assert 也会断。**
+`cold_slot_stride_bytes(codec, head_dim, page_tokens, std::int32_t bits_per_code)` 全程整数运算
+（`stream_budget = (stream_symbols * bits_per_code + 7) / 8`），所以把 `kColdSlotRansBitsPerCode` 写成 `2.6`
+会**截断成 2**；先前报告的 "6688 B / −27.4%" 是按实数算的，与当前类型不符。可用取值：
+| bits/code（整数）| 数据区 | stride | vs 常住 nvfp4 head-page 9216 B |
+|---|---|---|---|
+| 4（现状） | 8192 B | 9536 B | **+3.47%** |
+| 3 | 6144 B | 7488 B | **−18.75%** |
+| 2.6（需定点化） | 5324 B | 6668 B | −27.65% |
+要拿到 6688 必须把该参数改成定点（例如 `bits_x10`）或浮点，属小重构。另外**不止一处断言**：
+`decoder_state.cpp:374` 与 `src/product/kv_tier_formats.h:215`（`static_assert(kKvColdPoolStrideBytes == 9536, …)`）
+都会编译失败，`kv_bit_budget.h:50/132` 的两处"mirror"注释也要同步。
+安全性质（读码确认）：预算收紧**不会出错**——rANS 流溢出预算就清 valid 标志、该页保持热；
+只是会让更多页压不动（池子变"惰性"）。`floor_bytes = header + 4*32 + scale_plane = 1472` 不构成约束。
+
+**(b) `cold_v_valid` 不是"约定不一致"，是一处真缺陷（且至今无人读）。**
+- 文档（`include/ninfer/ops/entropy_nvfp4_slot.h`）写 `slot_valid is I32 [kv_heads, pages]`（**2 维**）；
+- 实际声明（`decoder_state.cpp:466`）是 `DType::I32, {kv_heads, 2, cold_pages}`（**3 维**）；
+- 3 维下平面步长是 `nb[2]`（slot 数据指针正是用 `cold_slots.nb[2]` 取 V 平面，自洽），
+  但发布侧（`program_impl.h:10609-10611`）与三个 launcher（`decode_impl.cuh:16` / `decode_partial.cuh:38` / `prefill.cu:61`）
+  全用 `nb[1]` ⇒ 按声明形状那是**头步长**（= 2×平面步长），即 V valid 指针实际指向 head=1/plane=0。
+- 消费侧的扁平式 `slot*2*KVHeads + head`（prefill）与生产侧的 `slot*cold_pages + head`
+  只有在 `cold_pages == 2*KVHeads` 时才偶然相等 ⇒ 两套索引不可能同时正确。
+- 唯一真跑过的冷消费路径（int8 decode，`gqa_attention_decode_i8.cuh:406`）**根本不读 valid**，只用哨兵 `physical_page <= -2`。
+**处置（本轮决定）**：nvfp4 冷的"是否冷"判定改回**只用 block table 哨兵**（与已跑通的 int8 路径一致），
+不把正确性押在这套未验证、且已被证明自相矛盾的标志数组上；标志数组的约定留作独立缺陷单
+（修法需要把 `cold_pages` 与 `KVHeads` 显式传进内核，而不是靠猜步长）。
+GM 并集补丁里那道 valid 门因此是"断言而非修复路径"，落地后需替换为哨兵判定。
+
+### 11. **更正**（第 10(b) 条的结论是错的，以本条为准）
+第 10(b) 条我判"`cold_v_valid` 指针用 `nb[1]` 是错的、平面偏置应是 `nb[2]`、标志数组自相矛盾"——**这个判断错了**，
+错因是我按 PyTorch 约定（`nb[0]` = 元素大小、`nb[i]` = 第 i-1 维的步长）去读步长。本引擎的约定不同：
+`src/core/tensor.cpp:51-57 set_contiguous_strides` 使 **`nb[i]` = 第 i 维的步长**（dim0 最内），于是
+- valid `{kv_heads, 2, cold_pages}`：`nb = [4, 4·kh, 8·kh, 8·kh·P]` ⇒ **平面（第 1 维，size 2）的步长就是 `nb[1]`**；
+- slots `{stride, kv_heads, 2, cold_pages}`：`nb = [1, S, S·kh, 2·S·kh]`（kh=2, S=9536 → `[1,9536,19072,38144]`）
+  ⇒ 那里平面是**第 2 维**，步长 `nb[2]`。
+两者是同一个意思（都是"跨一个平面的字节数"），只是 rank 不同。所以三个 launcher 的 `k_valid + nb[1]` **是对的**，
+而按声明形状推 `nb[2]` 才是错的。
+
+**正确结论（gm2 直读生产写入位置 + 消费 base 指针得出，证据充分）：**
+- 生产侧：`k_valid = data + slot·nb[2]`（元素 `s·2kh`）、`v_valid = k_valid + nb[1]`（元素 `s·2kh+kh`）；
+  encode 实参 `kv_heads, 1, …, nullptr, kv_heads` ⇒ `page_count=1`、`page≡0`、`valid_page_stride` **惰性**；
+  实体写入是 `k_valid[head]` / `v_valid[head]`（`entropy_nvfp4_slot_kernels.cuh:123/170/183`）。
+  ⇒ 布局：K(s,h) = `s·2kh+h`，V(s,h) = `s·2kh+kh+h`。
+- 消费侧两种自洽约定：(A) **预偏移 base**（V 由 launcher 加 `nb[1]`）⇒ 索引 = `s·2kh+h`，**不加减 KVHeads**；
+  (B) **单 base + 显式偏移**（`small_t_bf16.cuh` / `small_t_i8.cuh`，base 是 `cold_slot_valid.data`）⇒ 这里 `+KVHeads` 才对。
+- 因此：nvfp4 decode 用 `[stage_slot_id]` **正确**（GM 并集改对了）；G2 的 `+KVHeads` 读的是槽 s+1 的 K 标志，
+- **prefill `gqa_attention_prefill_nvfp4.cuh:1170` 是既有真 bug**：它数据侧用 (A)（`:1173-1176` + launcher `gqa_attention_prefill.cu:121-123` 加 `nb[2]`），
+  valid 侧却用 (B)（launcher `:126-131` 加 `nb[1]`）⇒ 自相矛盾，应为 `cold_v_valid[cold_slot_id]`。
+  G2 当初把这条 prefill 写法当"正确参照"去支撑 `+KVHeads`，属**同错互证**。
+- **写错的后果不是"仅禁用冷压缩"**：假阴性（真 1 读 0）⇒ `stage_cold=false` 但 `stage_physical_page` 仍是 `-2-slot`
+  ⇒ 热分支按负页号寻址（`gqa_attention_decode_nvfp4.cuh` 的 else 分支；prefill `:1171 physical_page = cold ? 0 : table_entry`）
+  ⇒ 越界读常驻平面 = **静默错答案**；假阳性（真 0 读 1）⇒ 去解编码器显式判无效的槽（溢出时只写 magic/flags=0）
+  ⇒ 垃圾 K/V = **静默错答案**。所以标志数组是**承重的**，不能改成"只看哨兵"（我先前那个提议会引入假阳性风险）。
+- 附带：`valid_page_stride` 惰性、以及"调用方把 `2·kh` 折进 base、而内核页内步长按 `kh`"这个分工**只在 `page_count==1` 时安全**
+  ⇒ 应在两处 encode 调用点加注释/断言。
+
+**待办（下一轮与 D2 一起做）**：① 修 prefill `:1170` 为 `[cold_slot_id]`（**两路独立复核一致**：gm1+gm2 都判它是既有真 bug，
+且 gm1 证实该行在 `git HEAD` 里就存在）；② 两处 encode 调用点加 `page_count==1` 的说明；
+③ D2 定点化重构（`bits_per_code` 整数截断问题 + 两处 static_assert + 环境变量可调以便实测 2.6 vs 3.0）；
+④ **产品侧可达性/文案未同步（GM 合并时丢弃了 G1 的产品补丁，属性缺口）**：`src/product/kv_tier_formats.h` 里
+`kv_cold_pool_reachable`（`:346-356`）仍要求全层 Int8、`cold=` 规格仍以"all-INT8 gate"为由拒绝（`:508-519`）、
+报告行仍打印 `not all-int8`（`:574`），`tests/test_kv_tier_formats.cpp:197/296-303` 也还是旧行为 ⇒
+解锁后产品层会**低报可达性、并用已不成立的理由拒绝 `cold=`**，必须同步。
+
+**两条独立复核的收敛性（值得记）**：gm1 与 gm2 在四个问题上给出完全相同的结论，包括
+"`[slot_id]` 对、`+KVHeads` 错"、"两个拦截点都解掉"、"旋转开关零回退"，以及
+"我上一轮对 `nb` 约定的描述是反的"。两条独立路径都直接读了 `src/core/tensor.cpp:51-58` 才定案——
+这正是"双路取证"要的效果：**我自己的单路推断错了，两路一致把它纠正过来**。
+
+### 12. NVFP4 慢的归因实测（M3，串行单实例 + 每跑持锁；结论可信）
+**仪器**：`--max-new 256`，`decode = F + T·gen` 拟合，基线 nvfp4 61.10 / int8 64.03 tok/s。
+- **满栈差只有 2.93 tok/s（4.58%）**，不是参考表里的 2.14×。
+- **单层 delta（16 层 × 双向，全部命中）**：`d1`（nvfp4 基座 + 单层→int8）中位数 **−0.01** tok/s（换 int8 **零收益**）；
+  `d2`（int8 基座 + 单层→nvfp4）中位数 **+0.52** tok/s（换 nvfp4 **稳定损失**）。
+  **线性外推两方向互相矛盾**（16×d1 ≈ −0.2 符号都反、16×d2 ≈ +8.2 高估 2.8×）⇒ 单层代价**不可加、呈凹/饱和**，只有全层同档才兑现。
+- **归因分摊**：QK 第二遍 = **0%**（K 侧用 iso3↔nvfp4 双向探针压到 ≈0.1 tok/s 证明几乎免费）；
+  **V 软解 ≈95–97%、K 码本 ≈3–5%**。若按参考表那 45.98 tok/s（2.14×）口径摊派，则 QK 第二遍 ≈93–96%——
+  但 V 软解实测被限制在解码时间 ~5% 以内，**不可能解释 2.14×**，所以 2.14× 不是本二进制能达到的口径。
+- **`F ≈ 16 ms/次解码、T ≈ 13.9–14.2 ms`**：`--max-context` 8192→131072 让 KV payload 144 MiB→2.25 GiB（15.6×）
+  而每 token 时间不变 ⇒ **池大小不构成代价**；随上下文增长的部分仅 ~2.1 ms/tok。
+  这解释了为什么 `--max-new 8` 那轮各档看起来同速（那轮测的是 16 ms 固定开销）⇒ **以后测档位速度必须给足 `--max-new`**。
+- **参考表不可复现且偏差已被解释**：其 +0.50 GiB 就是 MTP 层（该层 bf16）；实测 `M_bf16_none` 8.00 → `M_bf16_auto` 8.50 坐实。
+  归一化后参考的 nvfp4 慢 ≈2.06×、e8 快 ≈1.8×，与"旧二进制 + 未门控第二遍"一致 ⇒
+  **参考表一律标注来源、不当基准**；要重测请用 `F + T·gen` 口径而不是裸 tok/s。
+
+**两条必须跟进的新事实**：
+1. **MTP 驻留时排序反转**：nvfp4 **148.94** > int8 **136.70** tok/s（接受率 78% vs 60%）⇒
+   开推测（默认！）时 nvfp4 反而更快。这与我先前"nvfp4 更慢"的叙述相反，验收里要单独出一臂。
+2. **偶发崩溃**：`--kv-dtype nvfp4 --spec none` 出现一次 SIGABRT，`gqa_attention_prefill.cu:339 cudaMemcpy D2H` 失败；
+   同参数此前成功 ⇒ 非确定性，需在新二进制上复现排查（F2/GM 都改过 prefill 相关代码）。
+
+**附带印证 Q3**：残余 pass 在 CLI 上根本够不到——`error: unknown argument: --kv-residual-layers`，
+usage 无此 flag，二进制 `strings` 出现 0 次；源码只在 `apps/serve` 解析且**只能设 true 不能关**；
+残余平面还需 `dtype==NVFP4` 才分配 ⇒ 不分配、不发生，代价恒为 0。
+
+### 13. 导入普查的独立复算（q4，从零数，未借我的任何中间量）
+**先更正前提**：任务里给的源件路径 `/home/user/models/q38_abl_huihui_nvfp4` **在本机没有权重载荷**——
+它声明 2 个分片，而 `model.safetensors` 只以六个 `.incomplete` 块躺在 `.cache/huggingface/download/` 里。
+完整的 ModelOpt-NVFP4 源件是 `/home/user/models/q3nvfp4`（17,915,815,528 B / 2 分片）。q4 两个都数了，
+字节级结论都来自 q3nvfp4；huihui 目录只有那个 BF16 MTP 分片是真的（15 个 key present / 0.849 GB）。
+
+| 项 | 值 |
+|---|---|
+| 源对象（q3nvfp4） | **2387 keys**，401 个量化 Linear，17.916 GB，**27,356,728,560** 逻辑参数（≈27.4 B） |
+| 目标要求（注册 `qwen3_8_27b`） | **1124 对象 = 6 resources + 1118 tensors**；oracle 与这份清单**完全吻合**（0 处名字/格式/布局/形状不符） |
+| 可逐字节搬运（已验） | **1118 里 550**（209 单跑 + 48 拼接 + 222 vision BF16 + 71 NVFP4；NVFP4 载荷经注册 `encode_nvfp4` 重建 **100.000000%** 相同）⇒ 加上 huihui 的 MTP **12**（经 `mtp.py` 12/12 逐字节）共 **562** |
+| 值精确但非逐字节 | 144（96 个 `A_log`/`dt_bias` BF16→FP32 加宽 + 48 个 `conv1d` reshape+转置） |
+| 必须重算 | **412** = 41 NVFP4 `mlp/down` + 145 FP8 + 1 embedding + 111 vision Q4/Q5/Q6/W8 + 112 input-scale divisor + 2 draft head |
+| 缺 key | q3nvfp4 **12**（恰好是 `mtp/*` 全集）；huihui 193 |
+| 源里多余 | q3nvfp4 **0/2387**（每个 key 都被消费） |
+分区自检：550 + 144 + 412 + 12 = 1118 ✔
+
+**三类不可复现（都带数字）**：
+1. **41 个 NVFP4 `mlp/down`（层 15–55）**：codes 11.34% 不同、group scale 6.51%、divisor 41/41 逐位相同；载荷重建仅 89.20%。
+   数值：max|δ| = 0.0247、rel RMS 6.2435%、**max|δ| = 0.4286 个 NVFP4 group step**；
+   float64 SVD σ1/‖δ‖_F = **0.3008** vs 同密度零假设 **0.0520**（复现了文档里的 0.307/0.051）。
+   **既不是 `s·W`**（最优 s* = 0.998、残留 6.13%）**也不是 `W + a·1`**（a* = −2e−7、残留 max 0.0144），
+   逐元素比值散布 12.9% ⇒ **是两次独立量化落在略微不同的网格上**，不是参数化的权重改变。
+   ⚠️ 这**推翻**了我先前的说法"差一个秩 1/全局 scale 修正"。
+2. **145 个 FP8（+embedding）**：重编码源值只有 23.23% code / 8.21% row-scale 一致（9.85% rel RMS）。
+   注册档本身自洽（scales/codes/payload 100.000000%，且**每一行最大 code 字都是 `0x7E`**——印证了我从 oracle 反推出的不变量），
+   但这一类**无法**从该源逐字节复现。
+3. **112 个 FP32 divisor，干净的反例**：`1/input_scale` 只对 **1/112** 站点与 oracle 逐位相等，比值域 **0.355–3.761**。
+   ⚠️ 注意：P1 当初验证的 112/112 用的是 **`weight_scale_2`** 那条规则（"引擎做除法 ⇒ `divisor = fp32(1/weight_scale_2)`"），
+   与 q4 这里测的 `input_scale` **不是同一个字段** ⇒ 两说并不矛盾，但**必须由我亲自定点核对一遍**（见待办）。
+
+**交叉验证**：`tools/convert/import_model.py --plan-only` 逐位复现 q4 的数字（2387/2687、字段直方图、MTP 0/15、vision 333、
+同样的 17,915,815,528 B），并独立以 `F2 missing shard model.safetensors` 拒绝 huihui 目录；
+q3nvfp4 被路由为 work-item，且**只**因两个 MTP config key 被拒。⇒ 前门的数字有了独立第三方确认。
+
+**文档偏差（均为实测）**："27.0% of elements" vs 实测 6.03% nibbles / 11.34% bytes；divisor 比值域 0.68–1.47 vs 0.355–3.761；
+§5 表合计 1004（漏了 112 个 divisor 与 2 个 draft head，补上正好 1118）；"1104 source keys present" vs 1106。
+
+**待办**：定点核对 divisor 到底是 `1/weight_scale_2`（P1 规则，112/112）还是别的——
+这条直接决定导入流水线的除数规则是否正确，两方说法必须由主代理用同一份 oracle 一次判死。
+
+### 14. divisor 之争的判定（主代理亲自跑，5 轮探针，结论：**不可从本源复现**）
+**先澄清两件事不是同一个量**：NVFP4 权重对象**内部拖尾**的 FP32 `weight_divisor`（P1 验过 =
+`fp32(1/weight_scale_2)`，112/112 逐位）与 oracle 里**独立的** 112 个 `*/input_scale_divisor` 对象
+（FP32、shape []、`contiguous-le-v1`）是**两回事**。q4 测的是后者，P1 当初**把这 112 个对象列在 skipped 里**
+（它的验收表：`未匹配 skipped 119 = 7 个 mtp/* + 112 个 */input_scale_divisor`）⇒ 这 112 个此前**从未被任何人验证过**。
+
+**结构与候选空间**（实测）：
+- 源件 q3nvfp4 只有 **7 个标量字段名**：`input_scale`(401) / `weight_scale`(401) / `weight_scale_2`(401) /
+  `weight`(922) / `bias`(166) / `A_log`(48) / `dt_bias`(48) —— **没有 `output_scale`**。
+  ⇒ 激活侧唯一的标量就是 `input_scale`。
+- oracle 的 112 个 divisor **清一色是 MLP**：`gate_up_projection` 56 + `down_projection` 56 ——
+  正好等于 112 个 NVFP4 权重对象（注意力是 FP8，另有一套 row-scale 机制）；即**每个 NVFP4 对象配一个 divisor**。
+- 源件 MLP 是**分开的** `gate_proj`/`up_proj`/`down_proj`（无 `gate_up_proj`），且
+  `gate_proj.input_scale == up_proj.input_scale`、`gate_proj.weight_scale_2 == up_proj.weight_scale_2` **56/56**。
+
+**判定（候选置换空间 36 个/divisor）**：6 模块 × 2 字段 × ±1 层 = 36 个候选里，
+`|div − v|` 与 `|div − 1/v|` 的精确命中总数只有 **7 次偶然命中**（且各来自不同候选）⇒
+**不存在任何置换式精确映射**：div 既不等于这些源标量的直接值，也不等于它们的倒数。
+- 对 `gate_up_projection` vs `gate_proj.input_scale`：log-log **r = −0.98872、slope = −0.9983**
+  ⇒ 与 `1/input_scale` 是**同一个物理量族**，但乘性因子逐层摆动很大（`div/in` 跨 2274–658721，约 290×）。
+- 对 `down_projection` vs `down_proj.input_scale`：r = −0.84238、slope = −0.6916（更弱）。
+- 逐层看更清楚：L0 div/(1/in) = 0.963，L1 就变成 1.475 ⇒ 不是常数偏移，也不是常数倍数。
+
+**结论**：这 112 个 divisor **无法从本源的任何字段复现**（q4 的判断成立，且现在把 36 候选置换空间也排除掉了）；
+我先前"divisor = 1/weight_scale_2"的说法**只适用于权重对象内部的拖尾 divisor，不适用于这 112 个独立对象**。
+连同另两类不可复现（41 个 NVFP4 `mlp/down` 的 codes/scale、145 个 FP8），**三类都是"接近但不相等"**
+（divisor 与 1/input_scale 强相关却因子不定；down 的 σ1/‖δ‖_F = 0.30 vs 零假设 0.05；FP8 只有 23% code 一致）
+⇒ 最自洽的解释是：**该 oracle 的转换输入（那份标定/量化运行）与本机这份源件转储不是同一次**。
+
+**对导入流水线的意义（正面）**：要求从来不是"逐字节复现这个 oracle"，而是"任意非 ninfer 文件 → 自动生成
+可跑的 ninfer"。因此这三类不可复现**不阻塞**流水线；它们只说明：拿这份 q3nvfp4 生成的是**等价**产物而非同一产物。
+要逐字节对齐该 oracle，需要它当初那次转换的原始输入（标定产物），本源件里没有。
+
+### 15. e8 中段窗口 11~15 实测（f5，perplexity 判据 ctx 65536 / quick 261167 token）
+**结论：11~15 里没有"放 e8 仍然安全"的层。每多放一层都单调变差，且平滑无悬崖。**
+| 在出厂表(10×E8)之上加一层 | Δ% ppl |
+|---|---|
+| 层 **11** | **+6.17%** |
+| 层 15 | +10.26% |
+| 层 **12** | **+11.52%** |
+| 11~15 整块(13×E8) | +44.59% |
+单调前段窗口：11×E8(`0-10`) +11.00% / 12×E8 +19.73% / 13×E8 +33.00% / 16×E8 **+76.38%**。
+**⇒ 不支持把 E8 上限从 10 提高**；反方向才有收益：8×E8 **−6.02%**、0×e8(all:nvfp4) **−15.91%**。
+- **等层数换位**：e8 从 13 挪到 12 ⇒ **+3.58%** ⇒ 中段承受力 **11 > 13 > 15 ≈ 12**。
+- **位置也重要**：出厂分散表（4.870234）优于连续前段 `0-9:e8`（+1.95%）与换位 `{…,12,14}`（+3.58%）
+  ⇒ **DP 会排出的"前段连续"形状比出厂表差约 2%**。
+- **上下文不翻转排序**：ctx 4096/16384/65536 三档 all:nvfp4 一律最好（出厂表 e8 代价 +15.6%/+17.4%/+18.9%）。
+
+⚠️ **与 `variant.cpp:22-38` 的注释冲突（重要）**：该注释称 ctx 4096 上 10×E8(1.020) 优于 all-NVFP4(1.706)，
+f5 **无法复现**，且绝对量级也不同（注释 ~1.02 vs f5 ~4.1–8.6，疑似度量口径不同）。
+而 **C1 与 f5 两路独立吻合**：all:nvfp4 = 4.095580（C1 4.096）、出厂表 = 4.870234（C1 4.870）⇒
+**两份独立实测都说"全 NVFP4 比出厂的 10×E8 表更好"，与该注释的排序相反**。
+⇒ 需要用它**当初的原始脚本/语料**（13.3k 中文、ctx 4096）复跑判定；在判定前，
+`variant.cpp` 那张表与"DP 用的 tier 质量表"都属**待重测**（与 M3 的"参考表不可复现"是同一个坑）。
+
+**数据可靠性**：噪声底 0，4 组独立检查逐位一致（B0 起终点重跑、ctx4k 臂的"孤儿子进程产出 vs 干净重跑"，
+以及与另一 agent 的 3 条锚点 `all:nvfp4` 4.095580 / `all:e8` 8.590025 / 出厂表 4.870234 全部位相同）；20 臂全 rc=0。
+
+**顺带确认/提醒**：
+- 两个仪表陷阱独立复核成立（`--kv-dtype` 死标签、`all:bf16` 等于没设），都有逐位相同的实测证据。
+- **`ninfer-perplexity` 拒绝"已存在且非空"的 `--output` 目录**（rc=1）⇒ 任何 perplexity 跑法每臂都要用新目录。
+- **`i8` 不是合法拼写**（必须 `int8`）。
+- 二进制仍是 20:30:58 快照；重编后按 `sh/f5_ppl_recheck.sh` 复核（先比 md5，变了就重跑基线比对 `4.870234464376197`）。
+
+### 16. 产品侧一致性补丁（已备好，**未落**）：`product_cold_reachability.patch`
+冷路径解锁后产品层没跟上（低报可达性 + 用已不成立的理由拒绝 `cold=`）。补丁 19 hunk / 2 文件
+（`src/product/kv_tier_formats.h` + `tests/test_kv_tier_formats.cpp`），对当前真树 `patch -p1 --dry-run` **rc=0**、
+零 offset/fuzz、dry-run 后树逐字节不变、无 `.orig/.rej` 残留。
+- 语义改动：`kv_cold_pool_reachable` 改为"全层 ∈ {Int8, Nvfp4Fusion}"（与 `program_impl.h` 的真实准入一致）；
+  `kv_cold_codec_spec(Nvfp4Fusion).reachable` 改 `true`（注释写明：当前 4.0 bits/code 下 `reduces==false`，
+  9536 > 9216，所以 `cold=` 仍被**显存收益**那条理由正确拒绝）；陈旧文案/注释不再引用"all-INT8 gate 使 nvfp4 分支不可达"。
+- **顺手抓出并修掉一个连带缺陷**：`cold=int8` 的 offender 循环原本取"第一个不是 Int8 的层"——
+  `reachable` 放行 nvfp4 后，`[nvfp4, bf16]` 这种栈会**点名能压动的 nvfp4 层**当罪魁。
+  已改为用新谓词 `kv_layer_class_cold_capable()`（`Int8 || Nvfp4Fusion`）选取，并被 `kv_cold_pool_reachable` 复用。
+- 测试改了 9 处（`:188/:197/:254/:272-288/:300/:309-319/:344-372/:375-385`），
+  **承重性双向验证**：旧测试+新头 → 7 条 FAIL；新测试+旧头 → 12 条 FAIL；
+  新测试对改后头以 `-std=c++20 -Wall -Wextra` 编译 0 错 0 警告、运行 `all checks passed`。
+- 明确未动：`pool_stride_bytes` 与全部 `kKvCold*Bytes` 常量（留给 D2）；`kv_cold_codec_default` 的代码；
+  `layouts_impl.h:1229` 那句仍写 "the all-INT8 gate" 的陈旧注释（不在两文件范围内，避免冲突）⇒ 后续顺手改。
+- **已知边界（已写进注释与报告）**：① 全 nvfp4 栈上写 `cold=int8` 会被接受——因 `cold=` 在设备侧**不是选择器**
+  （codec 由逐层 dtype 派生），且报告行始终打印 RESOLVED spec 的字节真值，不会误报收益；要硬拦属**新语义**，单独立项。
+  ② `KvLayerClass` 不携带"是否有残差平面"，故对"带残差 nvfp4 栈"仍报可达（池 reserve、层压不动，
+  由 `program_impl.h:10658` 的逐层检查兜住）——注释里标为 `BOUNDARY`。
+
+### 17. 出厂 KV 表的争议判定（找到原始脚本与语料，两边都对，分歧在**语料**）
+**找到了源头（不是"找不到"）**：脚本 `/home/user/fusion_ppl.sh`（四臂正是注释里那四个数），
+语料 `/home/user/perplexity-corpus.txt`（`scored_tokens=13318` 即"13.3k"，sha256 `54b85a53…` 与历史 report.json 逐位一致），
+生成器 `gen_corpus.py` = **把同一段 232 字中文逐字 append 120 次** ⇒ 全文 120 行、**唯一行只有 1 行**。
+历史四臂 report.json 全部在位（默认 1.0202220884607947 / all-E8 1.1119582079644514 /
+all-NVFP4 1.705519481556782 / all-I8 1.5217006341755472），同一张表也印在 Windows 侧 README 里。
+
+**复现（9 臂，单一二进制 md5 `d2827de5…`，rc 全 0）**：
+| 臂 | 原口径（zh 复读语料 ctx4096） | 历史 | 对照口径（perplexity-1m quick，261167 token） |
+|---|---|---|---|
+| 出厂默认表 | **1.0266312582** | 1.020222 | 5.0335 |
+| all:e8 | 1.1204700908 | 1.111958 | 7.7531（**最差**） |
+| all:nvfp4 | 1.4783051775 | 1.705519 | **4.3537（最好）** |
+| all:int8 | 1.9785998885 | 1.521701 | — |
+（默认表与 `--kv-dtype int8` 在该工具上**逐位相同**，`total_nll` 都是 350.03458349495634。）
+
+**判定**：
+- **注释的排序可以复现**（默认 1.0266 < all-E8 1.1205 < all-NVFP4 1.4783），与历史同向；
+  两关键臂差 0.6% / 13%，属 09-02→09-12 的引擎漂移。
+- **归因是语料**：同一二进制、同一 ctx/stride、同一口径下，排序在"复读语料"与"真文本"之间**翻转**
+  ⇒ **不是 ctx**（f5 已证三档 ctx 都不翻转）、**不是 ppl 口径**。
+- **口径不是问题**：注释数字 = `exp(mean_nll)` = 工具的 `overall/perplexity`，逐位吻合
+  （1.0202=exp(0.020020)、1.7055=exp(0.533870)…）。绝对量级差（1.02 vs 4.87）纯来自语料：
+  复读语料把 nll 压到 0.02 nats（win1/2/4 的 ppl 只有 1.001，**指标塌到地板**），真文本是 1.6–2.0 nats。
+- **机制**：该语料实际只测"KV 能否逐字复现前文"——E8 重表把复读窗口 nll 压到 0.001–0.002，NVFP4 抬到 0.07–0.46。
+  ⇒ `variant.cpp:22-38` 那个 1.020 **是合成复读语料的产物，不可外推到真实文本**。
+
+**建议（待你裁决）**：不要以"ppl 更好"为由保留 10×E8 出厂表；改按"长上下文检索 + 真文本 ppl"双判据选表
+（短期可收表到 `{0,1,3,4,6,7}`），并把该注释标注为"合成复读语料、不可外推"。同时修 e8 高层的退化。
+
+**副产物两条（都是独立发现，建议各自立项）**：
+1. **`--kv-dtype` 在本构建上对池几何完全无效**（`int8`/`bf16`/不传三者 `total_nll` 逐位相同）——
+   这与"死标签"提示一致，但**否证了 TODO §98 声称的"`--kv-dtype bf16` 现给真 bf16 基线"**
+   ⇒ 本构建**无法**用 `ninfer-perplexity` 取得无损 bf16 对照（`all:bf16` 是哨兵）。
+   （注：CLI 侧的 `--kv-dtype` 是**设了** `kv_cache_explicit` 的，只有 perplexity 这个生产者漏了——已由 PPL 补丁修，故这条在**重编后**应复核是否仍成立。）
+2. **`all:int8` 相对历史恶化 30%**（1.5217 → 1.9786，已差于 NVFP4）⇒ 一个与本争议无关的**引擎回退**，
+   建议单独立项排查（注意：本次用的是 20:30 快照二进制，**不含**本晚落地的 14 组补丁）。
+
+### 18. ngram 当"另一种 KV"：**实测判定为死路**（用户设想的这一形态）
+仪器：哈希 n-gram 倒排索引 + 向量化精确 LCP（1M 建索引 0.107 s）；**用 O(N·Q·L) 暴力枚举在 32 个配置上逐位对拍，
+最长匹配长度与最近源距离 mismatch=0（VALIDATION PASSED）**；`max_cand` 16→1024 只动 2 个百分点。
+
+**一句话**：按 KV 页（64 token）粒度，"精确匹配查表"在 1M 混合上下文里的覆盖率是 **0.000%**（精确 0 页，不是"很小"），
+**最乐观的无限索引上界也只有 3.76%**；安全口径下一页都压不下来。英文散文与随机数据上**完全不划算**。
+
+| 场景 | cov≥4 | cov≥8 | cov≥64 | **KV 页覆盖** | 源距离中位数 |
+|---|---:|---:|---:|---:|---:|
+| 1M 混合流，前缀索引（N=4k…524k，含 1 MiB 预算点） | 0.5–1.6% | ~0 | 0 | **0.000%** | 15–39 万 |
+| 1M 混合流，整段因果上界（无限索引+自引用，**不安全**） | 38.96% | 21.00% | 1.99% | **3.762%** | 821 |
+| 代码域 260k，前缀索引 130k | 30.76% | 12.42% | 0.48% | **0.887%** | 99,174 |
+| 代码域 260k，因果上界 | 50.61% | 28.11% | 2.14% | **4.235%** | 910 |
+| 中文维基 260k，前缀索引 | 21.63% | 11.71% | 1.21% | **2.687%** | 103,083 |
+| 英文散文（wikitext/PG-19，两口径） | 1.2–6.3% | 0.06–0.31% | **0.00%** | **0.000%** | 2k–112k |
+| 真随机字节（→真 tokenizer） | 1.31% | 0.00% | 0 | **0.000%** | — |
+| 对照：16× 重复代码块 / 同文两遍 | 99.7% | 99.3% | 93.9% | **100%** | — |
+
+**三个把结论钉死的发现**：
+1. **索引字节不是约束**：4 B/token（后缀数组）～12 B/token（哈希表），全历史 4–12 MiB = nvfp4 KV 的 **0.022–0.065%**；
+   1 MiB 预算 = 26.2 万索引 token（25% 历史）。**瓶颈 100% 在覆盖率**。
+2. **结构性障碍**：full-attention 层 `KV(p) = f(T[0..p])`，同序列内两位置的**前缀长度必然不同**
+   ⇒ **序列内重复永远不可能精确共享 KV**，给多长 guard 都不行。唯一精确路径是**跨序列整前缀复用**——
+   而引擎**已经实现了**（`ResidentPrefixIdentity` + `reuse_base`）。实测该语料跨流最大 LCP 只有 **2 token**，
+   1M 流内 `max LCP(T[j:], T[0:]) = 2`。
+3. **重复性是局部的**：因果上界里按匹配长度加权的源距离中位数 **821 token**，仅 15.4% 来自 65k 以外
+   ⇒ **"对遥远过去建索引"这个方向本身是错的**，一个最近 1k–64k 的滑动索引就拿到 84.6%。
+
+**KV 换算口径（双证）**：`kPagedKVPageSize=64`（`src/core/paged_kv_cache.h:17`）× 16 个 full-attn 层 × kv_heads 4 ×
+head_dim 256 ⇒ nvfp4 **18,432 B/token**（`src/product/kv_tier_formats.h:45-52`；TODO §98 实测 1152 MiB@65,536ctx 吻合）
+⇒ **1M = 18.00 GiB**。⚠️ **我先前说的"~22 GiB"仓库复现不出（是 1.222×）**，以 **18.00 GiB** 为准；
+`sh/run_1m.sh` 顶部注释里那个 4.85e-6 系数偏大，需改成 3.815e-6 GiB/(token·bit·el)（注释级，不影响测量）。
+
+**⇒ 结论与转向**：
+- **ngram 作为 KV 替身：放弃**（安全口径 0.000%，无限索引上界 3.76%，且唯一精确路径已由前缀缓存实现）。
+- **ngram 作为草稿/算力加速器：仍值得**，但只在**结构化/代码类文本**上（代码 cov≥4 达 30.76% 可提出 4-token 草稿）；
+  这正是 `suffix_lookup` 原本的用途，而它今天**引擎零调用**（唯一调用点是未注册进构建的测试）。
+- 1M 的正确杠杆回到：**降位宽（3-bit/2-bit）+ 熵编码 + 按上下文年龄分层**，以及 **read-free + 权重卸载**。
+- 附带印证：仓库自带的 nvfp4 冷档**本身净亏**（slot 9,536 B > 常住 9,216 B/head-page）——ngram 不是绕开它的路。
+
+### 19. KV 验收电池第一轮（26 臂，全 rc=0）+ 仪器修正三处
+**结论：引擎的 KV 逐层记账是精确正确的**；判据从 11 条 FAIL 收敛到只剩冷臂那 2 条（原因见下，已修）。
+
+**铁证（三条逐层记账恒等式，预测 vs 实测到 4 位小数全等）**：
+| 恒等式 | 预测 | 实测 |
+|---|---|---|
+| `p_layer_nvfp4 == 16 层 nvfp4 + MTP(bf16)` | 0.1721 GiB | 0.1721 GiB |
+| `p_nvfp4 == 16 层 nvfp4 + MTP(nvfp4)` | 0.1495 GiB | 0.1495 GiB |
+| `p_default == 16 层默认表 + MTP(bf16)` | 0.1672 GiB | 0.1672 GiB |
+
+**全层同档臂的 b̄ 复现到 1e-4**：bf16 16.0000 / int8 8.2500 / fp8 8.4999 / nvfp4 4.4999 / iso3 4.4999 / e8 4.2501。
+**iso3 与 nvfp4：payload 完全相同（Δ=0.0000）而 token id 不同（5/48）** ⇒ ISO3 是真档位、共用 plane 几何、codec 确实不同（I1 落地有效）。
+**三个组件开关都真的生效**：rotation off 4/48、row-scale off **1/48**（与 C1 "二阶效应"一致）、v-codec e2m1 5/48；默认表上 rotation off 48/48。
+**负测试**：`--kv-v-codec e2m1` + 冷池被明确拒绝并给出可操作原因：
+`kv-v-codec e2m1: the cold pool requires ISO3 V for NVFP4 layers (the eviction requant is Iso3VG16); use --cold-policy none or keep --kv-v-codec iso3`。
+
+**仪器修正（三处，都是我测试脚本的错，不是引擎）**：
+1. **冷臂缺溢写目录**：我传了 `--cold-disk-path .../spill_i8` 却没建目录 ⇒ 引擎明确报错
+   `error: cold disk open failed: .../ninfer_cold_L0.slot` + rc=1（这正是"实在不行要明确报错"的样式）。
+   ⇒ `acc_battery.sh` 的 cold 相已补 `mkdir -p`（三个溢写目录），冷相将在夜间 S6b 重跑。
+2. **payload 模型常数写死成 0.5/0.5**：那是 262144 档的数字。实测斜率**随 capacity 变**，
+   正确口径是 `capacity × 4096 B 每 (token·bit/el)`（4096 B 来自 nvfp4 的 18,432 B/token ÷ 4.5 bits/el）。
+   在 capacity=8192 上实测 0.033218 GiB/bit/el，几何预期 0.031250，偏差 6.3%（小 capacity 下页对齐噪声占比大）。
+   ⇒ 已改为"按 capacity 推斜率 + ±10% 容差"，并**去掉截距断言**（固定项是 MTP 层，不是截距）。
+3. **混合表/逐层 pin 的臂不做 b̄ 断言**：它们的 MTP 层跑全局 dtype（默认 bf16）而 16 层跑档位，
+   反推 b̄ 必然被抬高（实测 5.03 / 5.18）——**那是"MTP 层占一行"的正确签名**，改用上面三条恒等式检验。
+   ⇒ 用"扣掉 MTP 后的 b̄"判默认表（得到 4.09~4.34 区间 vs 设计 4.34375、与 nvfp4 4.5/e8 4.25 都不同）。
+
+**下一步（夜间自动）**：冷相重跑（验证 int8 冷真的省内存、混合栈按文档 skip）；acc2（F2 代价 + 崩溃复现）；
+1M 阶梯；**硬检索测试**（10 万位数字 + 8 语言复述）；ctest；落地 prefill 索引修复 + 产品侧可达性并重编复验。
+
+### 20. 热 KV 平面熵编码实测（在引擎 dump 的真实设备平面上，非旧数字非权重）
+数据来源：引擎自己的 `NINFER_KVDUMP_DIR` 落盘的真实平面。**真实 byte-rANS 往返校验：192 条流 bit-exact，
+真编码器比解析模型还小 0.6%（模型保守）**。
+
+**收益（真实平面）**：
+| 平面 | 现状 bits/el | +静态熵表 | +逐页表 |
+|---|---|---|---|
+| qwen27 nvfp4（K/V 码面） | 4.5 | **3.15（−30%）** | 3.29 |
+| hd256 nvfp4 | 4.5 | 3.67（−18%） | — |
+| hd256 **e8** | 4.25 | **2.82（−34%）** | — |
+换算 1M 池（16 全注意力层 × kv_heads 4 × hd 256 = 32,768 el/token）：
+nvfp4 **17.17 → 13.99 GiB**，e8 **16.21 → 10.77 GiB**；若坚持固定 stride 则退化为 14.80 / 12.37 GiB。
+
+⚠️ **口径纠正（第二次）**：`4.85e-6 GiB/(token·bit/el)` 偏大 1.22 倍，仓库自己已改成 **3.815e-6**
+⇒ **1M @ 4.34 bits/el 是 16.56 GiB，不是 21 GiB**。另外"权重后剩 ~10.4 GiB"只出自一条 `ctx=65536` 的历史日志行，
+**不是通用常数**，别当预算基准（1M 的真实可行性要由 S4 的真实池分配失败信息给出）。
+
+**⟹ 最重要的一条：这是"零质量风险"的 30% 削减。** 熵编码只是**重打包**，往返逐位还原（192 流 bit-exact）
+⇒ 不动码本、不掉质量、不需要新 kernel 语义，只把已有平面压得更紧。而且实测 **e8+熵编码(2.82) 比"朴素 3-bit 码本+熵编码"(2.90) 还好**
+——**先把现有格式熵编码，比重新设计窄码本更划算、风险更低**。
+
+**逐块自包含的代价（几乎不在熵上，都已量化）**：逐页表的熵反而**低于**全平面表（ΔH = −0.002 ~ −1.17 bit/symbol，
+页间异质性大于小样本噪声）。代价在三处：① 每流 4 B 冲刷，按冷槽 256 B/流设计点 = **+1.2~1.5% of resident**；
+② 频率表头：16 符号码面 ~0.4~1.6%，但 **256/65536 符号的 scale 面高达 12~29%**（fp16 scale 逐页表 0.76 vs 静态表 0.42，差一倍）；
+③ **真正的浪费在固定 stride**：为覆盖尺寸分布尾部，有效体积再涨 **+6~8 个百分点 of resident**（压缩后体积的 8~13%）。
+块粒度：**32 token（半页）对码面最优**——正好是冷槽已有切法；scale 面反之越大越好。
+
+**首选方案**：`(page, kv_head, 半页) 逐块自包含 rANS + 编译期烘焙的 per-format 静态熵表`；
+池内布局用**变长块 + 每页偏移表**，**不要固定 stride**（冷槽今天"数据区=未压缩大小"的零余量配置就是反面教材）。
+分两步：码面 → scale 面；都用 `--kv-entropy-*=off` 开关且**默认不改行为**；验收 = 逐字节往返 bit-exact +
+关掉时逐位等于 baseline + 回退页与关闭时逐位相同。
+**明确不做**：运行时跨页熵表、per-model 训练表、RLE（旧测 +82.5% 负收益）、stride 定在未压缩大小、
+对 scale 面做逐页表、给 e8/iso3/fp8/bf16 混合栈承诺 codec。
+
+**与降位宽的关系（排序结论）**：叠加但熵余量收窄——8-bit FP8 冗余 1.52 bit/el、引擎真实 4-bit 码本 0.48~1.31、
+形状良好的 4-bit 码本只剩 **0.24**。叠加后：8-bit+熵 **6.72** → 4-bit+熵 **3.21** → 3-bit+熵 **2.90 bits/el**
+⇒ **降位宽是更大的杠杆（每档 ≈2~3 bit/el），熵编码是第二位**。两者都做才是 1M 的使能条件。
+
+**两个工程前置障碍（已写进报告）**：
+1. `kvc_*_bt.bin` 其实是 execution tables，**不是逻辑→物理页映射** ⇒ 工程验收前必须先补一个真正的页映射 dump；
+2. 短 prompt 下**未写入行的 code 字节是残留垃圾** ⇒ 编码器必须按 valid token 数决定编码范围（否则会把垃圾编进去）。
+
+### 21. F2 的"并行度代价"实测：**方向相反，是新几何更快**（决策 ③ 结案）
+同口径（ctx 131072、`--max-new 256`、短 prompt ⇒ decode 主导）：
+| 臂 | decode tok/s | ms/token | prefill tok/s | payload |
+|---|---|---|---|---|
+| 默认表 | 167.28 | **5.98** | 1503.89 | 2.67 GiB |
+| int8 | 160.13 | 6.24 | 1452.12 | 4.38 GiB |
+| nvfp4 | 154.61 | 6.47 | 1409.04 | 2.39 GiB |
+| e8 | 133.33 | 7.50 | 1530.81 | 2.26 GiB |
+对照 M3 在**旧二进制（F2 之前，20:30 快照）**同 ctx 的 int8 档：**16.33 ms/token（≈61.2 tok/s）**
+⇒ 新二进制 **快 2.2–2.7 倍**（`model elapsed` 1.585 s / 256 token）。
+
+**判读（含口径限制）**：这是**跨二进制**对照（旧=20:30 快照；新=23:23:28，含 14 组落地 + F2 新几何），
+所以严格说是"F2 新几何 + 其它落地"的**合成**，不能单独归因给 F2；但量级太大（2.2–2.7×）且同向，
+**结论明确：先前担心的"F2 让 split 从 64 降到 3 ⇒ 慢"在这个仪器上没有出现，F2 保留。**
+（我先前那个担心取自 F2 报告里另一组窗口配置 131072+4096 的数字；在"活窗口很小"的这里反而是它更快。）
+若要**同二进制** A/B，必须回退 F2 再重编一次（约 40 分钟），夜间不做；作为待办保留。
+
+**附带读数**：档位速度序 默认 > int8 > nvfp4 > e8（e8 最慢而 payload 最小 ⇒ e8 解码路径本身更贵，与晶格解码一致）；
+prefill 在 ctx 131072 上 1409–1531 tok/s。
+
+### 22. ngram 的思路纠正（用户指出方向）：不是"用 ngram 替换 KV 页"，而是"外挂知识库 + 按轮次召回"
+**用户原话**："ngram 应该是实现思路有问题……查一查 qwen3.8 flash next 的 ngram 那 51b；
+在现成模型上做到那样很难，但既然有算力看有没有办法把上下文搞成那样的格式，或者那些最远古的上下文
+召回的时候去 SSD 上搜，**以对话为单位召回**，而不是长期卡在 KV 里，也就是搞成**类似外挂知识库**的形式，
+那样 **SSD 带宽就不会成为瓶颈**。"
+
+**联网查到的 Qwen3.8-Flash-Next 事实（务必注意与"替换 KV"是两件事）**：
+- 125B 主模型 + **51B ngram embedding 参数**（BF16 ≈95.4 GiB），每 token 激活 6B；原生 262,144，YaRN 到 1M。
+- 那 51B 是**哈希寻址的稀疏查表（PLE 式，受 Gemma 3n PLE 与 DeepSeek Engram 启发）**：约 2000 万行 × 160 B；
+  每 token 读 **16 行**（8 个 2-gram 头用 x_{t-1},x_t + 8 个 3-gram 头用 x_{t-2},x_{t-1},x_t），拼成 [2560]；
+  层位置在 **decoder block 1**；**确定性寻址 ⇒ 几乎不占每 token 算力预算**；表可放**主机内存并异步预取**
+  （SGLang：pinned host + Triton UVA 只 gather 16 行 ⇒ 显存 83.91 → 60.45 GiB/卡）。
+- **长上下文是另一套**：GDN（4 层里 3 层把历史压成固定尺寸递归状态，不涨 KV）+ **QSA（块级/micro-block 稀疏检索）**：
+  轻量 indexer 把序列聚成 micro-block、估块级重要性、只选相关区域（块级，非 DSA 的 token 级）。1M 下 prefill 7.6× / decode 4.9×。
+- 生态：`EngramDB`（把这类确定性哈希 ngram 表当数据库：落盘/索引/预取/单机 CPU+NVMe 服务，含 vLLM/SGLang 补丁）、
+  `ngram-knowledge-injector`（用热插拔 `.plepatch` 往 GGUF 的 PLE 表注入知识，不重写 ~54 GB 表）、
+  **NGM: A Plug-and-Play Training-Free Memory Module for LLMs**（Causal N-gram Encoder + Cosine-Gated Memory Injector，
+  在 Qwen3 0.6B–14B 上评测 ⇒ **免训练注入现成模型**这条路的现成参考）、
+  "On the Design of Qwen3.8-Next Architecture"（消融 ngram 层位置，第 2 层最优）。
+
+**关键区分（决定了我们该做什么）**：那 51B 表承载的是**预训练期把语料统计成型**，不是运行期把当前对话写进去；
+所以"把上下文搞成那个格式"有三条完全不同的路：① 训练期（现成模型做不到）；② **免训练注入**（NGM / injector 那条，风险与代价要评）；
+③ **运行期外挂召回**（把对话存成可检索的形态，召回时重算或载入）——**用户说的 SSD 召回属于 ③**。
+
+**用户方向的合理性（与我先前实测不冲突）**：我测的是"逐页精确共享 KV ⇒ 0.000% 覆盖"，
+但用户要的是**稀疏粗粒度高精度召回**（一次查询只取少数几轮），是完全不同的机制：
+- 粒度：以**轮/对话**为单位（比 64-token 页粗 1~2 个数量级）；
+- 正确性：召回后**重新 prefill 或按页载入该轮的 KV**，不要求与历史位置逐位相同 ⇒ 绕开"KV 是前缀函数、序列内不可共享"的死结；
+- 字节账（我算的，待 agent 复核）：nvfp4 KV ≈ **18,432 B/token**，而**文本只有 ~4 B/token**；重 prefill 实测 **~1450 tok/s**。
+  一轮 2k token：KV 36.9 MB、文本 8 KB；一次查询召回 3~5 轮 ⇒ 读 ~150 MB（SSD 3–7 GB/s ⇒ 0.02–0.05 s）对比
+  "把 1M KV 全留显存 = 16.6 GiB" ⇒ **SSD 带宽确实不成瓶颈**（用户判断正确）。
+
+**已派两路**：① 情报深挖（Qwen ngram/QSA/GDN + EngramDB/injector/NGM，落成"最少改动路径"清单）；
+② 架构与量化（文本外挂重算 vs 打包 KV 载入 vs 混合；召回质量 Recall@k；字节/算力账；热窗口 N∈{32k,128k,512k} 下 1M 的显存占用）。
+
+**顺带确认两条本轮结果**：
+- **F2 的"并行度代价"方向相反**：ctx 131072 同口径下新二进制 5.98–7.50 ms/token，旧（F2 前）16.33 ms/token ⇒ 快 2.2–2.7×（跨二进制对照，合成归因，但量级明确）。
+- **M3 的偶发 SIGABRT 在新二进制上 10/10 未复现**（`--kv-dtype nvfp4 --spec none` 连跑 10 次全 rc=0）。
+- **我脚本的一个隐患已修**：`trap release_lock EXIT INT TERM` 在 TERM 时只释放锁然后**继续跑** ⇒ 进程杀不掉、还占着锁，
+  害我白等 15 分钟并让 S4 差点被锁住。改成 `trap 'release_lock; exit 130' INT TERM` + `trap release_lock EXIT`。
+
+### 23. 1M 阶梯第一段实测 + 权威内存预算（含边界钉点）
+**极限几何（`--max-context 1000000 --yarn --kv-capacity 65536`，池只给 64k）四档全部通过并正常生成**：
+| 臂 | max context | kv payload | free after weights |
+|---|---|---|---|
+| default 表 | **1000000** | 1.34 GiB | 10.80 GiB |
+| e8 | **1000000** | 1.13 GiB | 10.75 GiB |
+| nvfp4 | **1000000** | 1.20 GiB | 10.80 GiB |
+| int8 | **1000000** | 2.19 GiB | 10.75 GiB |
+（int8 在 ctx 131072 上限的 decode 速度 140 tok/s。）
+
+**边界钉点**：**不带 `--yarn` 时 `--max-context 1000000` 被明确拒绝**：
+`error: max_context exceeds the variant native context capacity` ⇒ rope/原生容量这道闸门有效且报错明确；
+带 `--yarn` 时 262144 通过，1010000 / 1048576 / 1048577 / 2000000 正在依次钉（结果见 s4_1m_rerun.log）。
+
+**⟹ 权威内存预算：`free after weights` ≈ 10.75–10.80 GiB**（加载 19.7 GiB 权重之后）。
+用它对照 1M 池需求（口径：3.815e-6 GiB/(token·bit/el)，即 nvfp4 18,432 B/token ÷ 4.5）：
+| 档位 | bits/el | 1M 池 | vs 10.8 GiB |
+|---|---|---|---|
+| bf16 | 16.0 | ~62 GiB | ✗ |
+| int8 | 8.25 | 31.5 GiB | ✗ |
+| fp8 | 8.5 | 32.4 GiB | ✗ |
+| nvfp4 | 4.5 | 17.17 GiB | ✗ |
+| e8 | 4.25 | 16.21 GiB | ✗ |
+| **e8 + 逐块 rANS（无损）** | **2.82** | **10.76 GiB** | **边缘（≈刚好）** |
+| 3-bit 码本 + 熵 | 2.90 | 11.06 GiB | 略超 |
+| nvfp4 + 熵 | 3.15 | 12.02 GiB | ✗ |
+| **年龄分层（热 e8 + 冷 2-bit/熵）** | ≲2.6 | **< 10 GiB** | ✔ |
+⇒ **结论：1M 不需要新码本就先到边缘了**——只要给 e8 加**逐块自包含 rANS 重打包**（无损、不动码本、不改质量），
+1M 池 16.21 → 10.76 GiB，正好压进 10.8 GiB 的预算；再加上按年龄分层（久远上下文降档）就有余量。
+**这条把"1M 差在哪"从"缺 6 GiB"变成"缺一次无损重打包"。**
+
+**工具修复（我的 bug）**：硬检索测试第一次跑崩在 `_posix_spawn`，因为我用 `--prompt` 传 286 KB 文档 ⇒ **argv 超限 E2BIG**。
+已改成写 `messages.json` 并用 `--messages <file>`（JSON 的 `content` 允许纯字符串，
+源码依据 `src/serve/anthropic_messages_request.cpp:53-58`）。
+
+### 24. **更正 §23 的乐观结论** + 1M 真实缺口（引擎自报数字）与可达路径
+§23 我写"e8+熵编码 10.76 GiB 正好压进 10.8 GiB 预算"——**错了**：我用了裸 payload（16.21 GiB），
+而引擎的 **runtime reservation 还包含 workspace/池开销**。以引擎**自己报的**数字为准：
+
+**边界钉点（实测）**：
+- `--max-context 1010000 --yarn` ⇒ **通过**（`max context 1010000`）
+- `--max-context 1048576 --yarn` ⇒ **失败**：`error: gqa_attention workspace: invalid profile or interval`
+  ⇒ **名义 YaRN 容量 1,048,576 在实际 workspace 档位上不可用**；可用上限其实是 **1,010,000**（`kGqaAttentionMaximumVisibleKeys`）
+- `1048577` / `2000000` ⇒ 拒绝：`max_context exceeds the variant YaRN-extended context capacity`（报错明确）
+- 不带 `--yarn` 给 1000000 ⇒ 拒绝：`max_context exceeds the variant native context capacity`
+
+**真 1M 池（`--kv-capacity auto`）的精确缺口（e8 档，引擎原文）**：
+```
+error: minimum Engine runtime reservation requires 18912736512 bytes in addition to
+       1073741824 bytes of automatic headroom, but only 11600323584 bytes are available after weights
+```
+⇒ 需要 **17.61 GiB + 1.00 GiB 余量 = 18.61 GiB**，可用 **10.80 GiB** ⇒ **缺 7.81 GiB**（当前 e8 档，4.25 bits/el）。
+
+**按真实口径重算"要多少 bits/el 才能装下 1M"**（以 17.61 GiB 为 4.25 bits/el 的基准，线性缩放）：
+| 有效 bits/el | 1M 池需要 | +1 GiB 余量 | vs 10.80 GiB |
+|---|---|---|---|
+| 4.25（e8 现状） | 17.61 GiB | 18.61 | **缺 7.81** |
+| 3.15（nvfp4 + 熵） | 13.05 | 14.05 | 缺 3.25 |
+| **2.82（e8 + 逐块 rANS，无损）** | **11.68** | **12.68** | **缺 1.88** |
+| 2.37 | 9.82 | 10.82 | **刚好** |
+| 2.25（2-bit 码本 + 熵） | 9.32 | 10.32 | **够，余 0.48** |
+| 2.00 | 8.29 | 9.29 | 够，余 1.51 |
+⇒ **结论（诚实版）：1M 今天差 7.81 GiB；单靠"e8 + 无损熵编码"能把缺口从 7.81 收到 1.88 GiB，但仍不够；
+需要再叠一层（或换一项）才落进预算。可达路径按性价比排**：
+1. **无损熵编码（e8 平面）**：缺 7.81 → 1.88 GiB（不动码本、不掉质量，最强的一步）；
+2. **按上下文年龄分层**：久远 token 降到 2-bit/熵 ⇒ 有效 ≈2.2–2.4 bits/el ⇒ **装下并留余量**（这也是用户要的"根据上下文制定 KV"）；
+3. **V 侧跨位置共享**（ngram 设计已证 V 不受 RoPE 约束、K 侧受）：V 占一半 ⇒ 再省最多 25%；
+4. **权重卸载/释放显存**：把 10.80 GiB 的可用预算做大（1M 的预算瓶颈之一就是权重占 19.7 GiB）；
+5. **按轮次外挂召回**（用户新方向）：把远古轮次移出常驻 KV，直接改变"1M 需要多少常驻"这个前提本身。
+
+### 25. S6 重编 rc=2 的真因（**不是补丁问题，是我的启动环境**）+ 两份补丁已落且自检通过
+**症状**：`Error 127` 于 `gqa_attention_decode.cu.o` / `_smallt.cu.o` / `_prefill.cu.o` 三个 TU。
+**真因**：`Error 127 = command not found`。CMake 把 CUDA 编译器前置成 **ccache**，而 ccache 在
+`/home/user/.local/bin`，**非登录 shell 的 PATH 里没有**；夜间流水线是用 `nohup setsid bash ...` 起的 ⇒ PATH 不全
+⇒ 编译器启动失败。**这正是本会话早先踩过并记录过的同一个坑**，我给自己的脚本都加了 `export PATH`，却漏了 `night_shift2.sh`。
+已修（脚本顶部加 `export PATH="/home/user/.local/bin:$PATH"`）。
+⇒ 结论：**两份补丁落地成功且自检通过**：
+- `--kv-layer-storage`/`--kv-dtype` 相关：prefill 的 `cold_v_valid[.. + Geometry::KVHeads]` 残留 **0**、正确索引 **1**；
+- 产品侧可达性补丁 apply rc=0（19 hunk，含 9 处测试用例改写）。
+**待办**：重编一次（带 PATH；因 prefill 补丁改的是 CUDA 头，4 个重型 TU 要重编，约 40 分钟）→ 跑 KV 单测 → 重跑 cold 相。
+
+### 26. Qwen3.8-Flash-Next 的 51B ngram = 预训练冻结的知识表（**装不了上下文**）+ 对"按轮次外挂召回"的量化落地路径
+**规范来源**：`https://lmsys.org/blog/2026-08-26-qwen-flash-next`（SGLang Day-0，2026-08-26；未进 tagged release，需 PR #36497；
+镜像 `lmsysorg/sglang:qwen38flashnext`；模型 `Qwen/Qwen3.8-Flash-Next{,-FP8}`、`RadixArk/...-NVFP4`）。
+
+**① 那 51B 到底是什么（已纠正我转述的两处数字）**：一张**由"以当前 token 结尾的 2/3-gram"寻址、内容在预训练期冻结的稀疏 embedding 表**。
+16 个头（8 个 2-gram 读 (x_{t-1},x_t)、8 个 3-gram 读 (x_{t-2},x_{t-1},x_t)），uint64 回绕
+`mixed = XOR_i (token_i × multiplier_i)`，`row[h] = mixed % per_head_prime[h] + per_head_prefix_offset[h]`；
+物理落盘 **320,001,536 行 × 160 维**（128 分片；BF16 95.4 GiB / FP8 47.7 GiB）——**不是 2000 万行，2000 万是单头素数模数**；
+每 token gather 16 行拼 `E_t∈R^2560`，在 **第二个 decoder block**（`ple_layer_ids: [2]`）经门控 + kernel=4 深度卷积注入
+4 支 hyper-connection 残差后 HC-Mix 折回；**运行期只读**、遇 EOS 哈希窗复位。
+⇒ **键只有 2–3 个 token，信息论上不可能寻址整轮对话** ⇒ 它承载的是**预训练语料的知识**，不是上下文。
+
+**② 长上下文是另一套（这才是"以对话为单位召回"的参照）**：48 层 = **36 层 GDN**（把历史压成固定尺寸递归态，不涨 KV）
++ **12 层 QSA**（轻量 indexer 对**压缩比 4** 的块打分，**保留最好的 512 块**，展开成 **2048 个逻辑位置**）；
+1M 下 prefill 10.2× / decode 6.6×（相对 Qwen3.7-Plus）；另有 IndexShare MTP（草稿步复用 QSA 的 top-k，省 indexer 调用）。
+
+**③ PLE 主机内存卸载的确切做法（可借鉴）**：`--ple-offload-embedding`（vLLM：`VLLM_PLE_CPU_OFFLOAD=1`）；
+查表位置**预先算好并异步预取** ⇒ 永不常驻显存（省 95.4 GiB BF16 / 47.7 GiB FP8）。
+
+**④ 对我们（现成模型 + 自己的引擎）的结论与路径**（判定依据来自本轮情报）：
+- **训练期 PLE 不可行**（要重训预训练 + 改残差流结构）；**`.plepatch`/`.pleo` 不适用**（要求模型**已有** PLE 表，我们没有）；
+  **NGM 免训练模块**可用（零新权重、一个新算子）但收益仅 +0.5~1.2 分且**与长上下文召回无关** ⇒ 别当替代。
+- **该做的是运行期外挂召回，两步走**：
+  **步骤 1（纯宿主 / 零新算子 / 默认关）**：append-only **轮次日志**（`turn_id → token span, rope base, identity digest`）
+  + 轮次级**文本**召回，用现有 `ResidentPrefixIdentity` + `reuse_base` 整前缀复用重 prefill ⇒ 先回答"召回有没有用"。
+  **步骤 2（新 dump / 仍零新算子）**：每轮**一个连续文件**的 KV dump = **resident nvfp4 payload 原样**（18,432 B/token）
+  + GDN 层固定尺寸递归态 blob；召回 = 一次顺序读 + 页表恢复，只 prefill 新后缀 ⇒ 回答"召回省多少"。
+- **带宽/算力汇率（实测口径）**：每 token 历史，**SSD 读打包 KV = 2.6 µs（7 GB/s）/ 6.1 µs（3 GB/s）**，
+  而**重新 prefill 同一 token = 690 µs**（1450 tok/s）⇒ **约 105–260 : 1，用 SSD 带宽买算力买得过**（KV:文本 = 18,432:4 = 4,608:1）。
+  1M 会话（40 轮 × 25K）召回连续 128K = 2.36 GB / 0.34–0.79 s；最坏从第 1 轮起 18.0 GiB / 2.6–6.1 s — 仍只有重 prefill 1M（690 s）的 **1/175**。
+  **关键前提：这成立是因为"每轮一次"**。若做成**逐 token 流式读 KV 做注意力** = 18.0 GiB/step ⇒ 7 GB/s 下 **0.38 tok/s，必崩**。
+- **两个必须写进设计的坑**：(a) **KV 是前缀函数** ⇒ v1 只做"**连续后缀**"零近似召回；非连续远端轮次要 v2 的
+  CacheBlend 式 RoPE recovery + top-r% 重算（劣化 ≤1–3%）。(b) **冷池不能当地基**：冷槽 9536 B > 常住 9216 B/head-page（净亏 320 B），
+  且出厂默认 10×E8+6×NVFP4 下 `--cold-policy host` **直接不可用**（"[cold] admits nothing on this model"）⇒ L2 必须**独立于冷池**。
+- **一条硬约束**：ContiguousKV（arXiv 2601.13631）证明"细粒度选择 + 粗粒度存储"会带来 **12–56× 读放大** ⇒ **每轮必须存连续 blob**。
+- **现成范本**：llama.cpp PR #24003/#24004（"递归态一起落盘 + 默认关且行为逐位不变"）。
+
+**⑤ 最该先做的三件事**：1) L0 轮次日志 + 文本召回最小闭环（纯宿主、可开关；验收：40 轮会话针放第 3 轮命中率不塌 +
+TTFT 下降达阈值 + identity 不等必须拒绝复用，不静默近似）；2) **把 `suffix_lookup` 接成候选轮次生成器**（内核/wrapper/CMake 全在树里、
+fuzz 4000/0、**引擎零调用**，`lookup_fuse::suffix_best` 已有 CPU 参考；验收：真核与 CPU 参考逐用例一致 + 端到端跑通）；
+3) **KV per-turn dump/restore**（raw resident payload + GDN 状态，**不转冷 codec**；验收：`dump→restore→续跑` logits 与不 dump **逐位一致**）。
+
+### 27. 1M 的**权威**二元拟合（用引擎自报的两个档位需求点）+ 一条性能异常
+**两个实测点（引擎原文数字，均 `--max-context 1000000 --kv-capacity auto`）**：
+| 档位 | bits/el | 需要的 runtime reservation | +1 GiB 余量 |
+|---|---|---|---|
+| e8 | 4.25 | 18,912,736,512 B = **17.61 GiB** | 18.61 GiB |
+| nvfp4 | 4.5 | 20,000,740,608 B = **18.63 GiB** | 19.63 GiB |
+可用（`available after weights`）= 11,600,323,584 B = **10.80 GiB**。
+
+**拟合**（需求 = k · bits · tokens + c，两点解出）：
+- k = **4.08e-6 GiB / (token · bit/el)**，c ≈ **0.27 GiB**（固定项：workspace/池结构）
+- 两档之比 18.63/17.61 = **1.058** ≈ bits 之比 4.5/4.25 = **1.059** ⇒ **需求对 bits/el 严格线性**（这就是为什么能外推）
+
+**⇒ 要装下 1M，有效位宽必须 ≤ (10.80 − 1.00 − 0.27) / (4.08e-6 × 1e6) = ≈ 2.33 bits/el**
+（与 §24 的独立估计 2.37 吻合到 2%。）
+| 方案 | 有效 bits/el | 1M 需要 | +1 GiB 余量 | vs 10.80 |
+|---|---|---|---|---|
+| e8 现状 | 4.25 | 17.61 | 18.61 | **缺 7.81** |
+| nvfp4 + 熵 | 3.15 | 13.12 | 14.12 | 缺 3.32 |
+| **e8 + 逐块 rANS（无损）** | **2.82** | **11.78** | **12.78** | **缺 1.98** |
+| **2-bit 码本 + 熵（或年龄分层到此水平）** | **2.25** | **9.45** | **10.45** | **够，余 0.35** |
+| 2.00 | 2.00 | 8.43 | 9.43 | 够，余 1.37 |
+⇒ **一句话：1M 今天缺 7.81 GiB；无损熵编码把它收到 1.98 GiB；再叠一层年龄分层（久远→2-bit）就装下。**
+
+**⚠️ 一条性能异常（待查）**：长文 perplexity 两臂（`--quick`、261,167 计分 token、**同一份语料**）
+分数**逐位相同**（ppl 4.095580317272603、mean_nll 1.4099084208842896 —— 因为 65k 的流在两档下都只排出一个窗口，这是**预期**），
+但 `score_seconds` **67.75 s（ctx 131072，3855 tok/s）vs 270.65 s（ctx 262144，965 tok/s）⇒ 同一份工作量慢 4 倍**。
+⇒ 说明**评分成本随 `max_context`（池大小）增长，而不只随活跃 token 数**——这与 M3 在 *decode* 上的结论（"池大小不构成代价"）不同，
+因为这里是 **prefill 主导**。需单独立项：prefill/attention 的成本是否随池容量而非活跃窗口增长（若是，2M 及以上的可行性要重估）。
