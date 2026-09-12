@@ -2,6 +2,8 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/tensor.h"
+#include "ninfer/ops/scalar.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/causal_score_core.h"
@@ -10,6 +12,7 @@
 
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -17,6 +20,27 @@
 
 namespace ninfer {
 namespace {
+
+// CUDA resolves the engine's kernel library lazily, on the first launch of any kernel in
+// it: measured one cuLibraryLoadData of 3787.9 ms followed by a 1286.2 ms first
+// cudaLaunchKernel, and every engine kernel shares that single module. Today that
+// resolution lands in the middle of the weight streaming, where nothing is in flight (the
+// nsys timeline shows zero copies overlapping it, because the loader thread is the one
+// blocked inside the load). Warming it here, from a helper thread and on the engine's own
+// stream, overlaps it with the streaming instead.
+void warm_kernel_module(DeviceContext& device) noexcept {
+    try {
+        device.bind_to_current_thread_noexcept();
+        std::int32_t* scratch = nullptr;
+        if (cudaMalloc(&scratch, sizeof(std::int32_t)) != cudaSuccess) { return; }
+        Tensor scalar(scratch, DType::I32, {1});
+        ops::set_i32_scalar(scalar, 0, device.stream);
+        (void)cudaStreamSynchronize(device.stream);
+        (void)cudaFree(scratch);
+    } catch (...) {
+        // Best effort: a failed warmup only means the first real launch pays the cost.
+    }
+}
 
 EngineOptions normalize_engine_options(EngineOptions options) {
     switch (options.purpose) {
@@ -220,10 +244,12 @@ public:
         : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
         device.yarn_enabled = options.yarn_enabled;
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        std::thread module_warmup([&device = device] { warm_kernel_module(device); });
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
+        module_warmup.join();
         core              = std::visit(
             [&](auto& target_ptr) -> Core {
                 using Instance =
