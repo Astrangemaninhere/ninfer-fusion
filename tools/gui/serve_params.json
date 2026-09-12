@@ -1,0 +1,317 @@
+{
+ "total": 56,
+ "groups": {
+  "core": [
+   {
+    "flag": "--api-key",
+    "arg": "KEY",
+    "takes_value": true
+   },
+   {
+    "flag": "--default-max-tokens",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--device",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--host",
+    "arg": "H",
+    "takes_value": true
+   },
+   {
+    "flag": "--kv-capacity",
+    "arg": "must",
+    "takes_value": true
+   },
+   {
+    "flag": "--max-concurrency",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--max-context",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--max-pending-requests",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--model-id",
+    "arg": "ID",
+    "takes_value": true
+   },
+   {
+    "flag": "--pending-timeout-ms",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--port",
+    "arg": "N",
+    "takes_value": true
+   }
+  ],
+  "kv": [
+   {
+    "flag": "--cold-disk-bytes",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--cold-disk-path",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--cold-host-bytes",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--cold-keep-tokens",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--cold-policy",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--device-state-slots",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--host-kv-mib",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--host-state-slots",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--kv-dtype",
+    "arg": "bf16|int8|fp8",
+    "takes_value": true
+   },
+   {
+    "flag": "--kv-layer-storage",
+    "arg": "",
+    "takes_value": false
+   }
+  ],
+  "speculative": [
+   {
+    "flag": "--draft-tokens",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--lm-head-draft",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--spec",
+    "arg": "mtp|dflash",
+    "takes_value": true
+   }
+  ],
+  "sampling": [
+   {
+    "flag": "--frequency-penalty",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--greedy",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--min-p",
+    "arg": "F",
+    "takes_value": true
+   },
+   {
+    "flag": "--presence-penalty",
+    "arg": "F",
+    "takes_value": true
+   },
+   {
+    "flag": "--seed",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--temperature",
+    "arg": "F",
+    "takes_value": true
+   },
+   {
+    "flag": "--top-k",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--top-p",
+    "arg": "F",
+    "takes_value": true
+   }
+  ],
+  "thinking": [
+   {
+    "flag": "--default-thinking-budget",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--no-thinking",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--preserve-thinking",
+    "arg": "",
+    "takes_value": false
+   }
+  ],
+  "media": [
+   {
+    "flag": "--media-cache-mib",
+    "arg": "N",
+    "takes_value": true,
+    "default": "1024; 0 disables retained media reuse\\n",
+    "type": "string"
+   },
+   {
+    "flag": "--media-live-mib",
+    "arg": "N",
+    "takes_value": true,
+    "default": "2048 and bounds all live BF16 patch payloads\\n",
+    "type": "string"
+   },
+   {
+    "flag": "--media-preprocess-threads",
+    "arg": "N",
+    "takes_value": true,
+    "default": "0 (auto, at most 16 workers)\\n",
+    "type": "string"
+   },
+   {
+    "flag": "--vision",
+    "arg": "",
+    "takes_value": false
+   }
+  ],
+  "perf": [
+   {
+    "flag": "--no-auto-system-shared-prefix",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--no-cuda-graph",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--no-prefix-reuse",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--prefill-chunk",
+    "arg": "N",
+    "takes_value": true
+   }
+  ],
+  "network": [
+   {
+    "flag": "--cors",
+    "arg": "",
+    "takes_value": false
+   },
+   {
+    "flag": "--max-request-mib",
+    "arg": "N",
+    "takes_value": true,
+    "default": "384 and is enforced before JSON parsing\\n",
+    "type": "string"
+   }
+  ],
+  "diagnostics": [
+   {
+    "flag": "--log-stats-interval-ms",
+    "arg": "N",
+    "takes_value": true,
+    "default": "5000; 0 disables periodic throughput logs\\n",
+    "type": "string"
+   },
+   {
+    "flag": "--request-log-jsonl",
+    "arg": "FILE",
+    "takes_value": true
+   }
+  ],
+  "advanced": [
+   {
+    "flag": "--context-cost-presets",
+    "arg": "FILE",
+    "takes_value": true
+   },
+   {
+    "flag": "--max-long-anchors-per-continuation",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--max-private-continuations",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--max-shared-prefixes",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--response-store-max-mib",
+    "arg": "N",
+    "takes_value": true
+   },
+   {
+    "flag": "--response-store-max-records",
+    "arg": "N",
+    "takes_value": true
+   }
+  ]
+ },
+ "ungrouped": [
+  {
+   "flag": "--help",
+   "arg": "",
+   "takes_value": false
+  },
+  {
+   "flag": "--kv-residual-layers",
+   "arg": "",
+   "takes_value": false
+  },
+  {
+   "flag": "--yarn",
+   "arg": "",
+   "takes_value": false
+  }
+ ]
+}

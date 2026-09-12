@@ -1,0 +1,83 @@
+{
+  "model_id": "muse-nvfp4",
+  "family": "auto",
+  "hf": {
+    "model_type": "muse_glimmer_text",
+    "architectures": [
+      "MuseGlimmerForConditionalGeneration"
+    ]
+  },
+  "geometry": {
+    "hidden": 6656,
+    "layers": 52,
+    "query_heads": 32,
+    "kv_heads": 2,
+    "head_dim": 128,
+    "vocab": 202048,
+    "max_ctx": 131072,
+    "intermediate": 19968,
+    "rms_eps": 1e-05
+  },
+  "notes": "derived from config.json",
+  "layer_types": [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention"
+  ],
+  "attention": {
+    "attention_bias": false,
+    "rope_parameters": {
+      "rope_theta": 500000.0,
+      "rope_type": "default"
+    }
+  }
+}
