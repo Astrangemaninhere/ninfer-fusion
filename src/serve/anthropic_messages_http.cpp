@@ -40,6 +40,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_context        = options_.max_context;
         request                   = parse_anthropic_messages_request(parse_json_body(req), limits,
                                                                      anthropic_thinking_signer_);
     } catch (const ApiException& exception) {

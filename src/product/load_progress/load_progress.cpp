@@ -1,6 +1,14 @@
 #include "product/load_progress/load_progress.h"
 
+// The only POSIX dependency in this file. MSVC has no <unistd.h> (MEASURED: C1083) and does
+// not define STDERR_FILENO (MEASURED), so the Windows arm takes the CRT descriptor of
+// stderr instead: ::_fileno(stderr) was measured 2, the same number POSIX uses.
+#if defined(_WIN32)
+#    include <cstdio>
+#    include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -60,7 +68,14 @@ std::string format_line(std::string_view phase, std::uint64_t done, std::uint64_
 } // namespace
 
 LoadProgressRendererOptions stderr_load_progress_options() noexcept {
+#if defined(_WIN32)
+    // ::_isatty returns the device BITS, not 1: MEASURED 64 for a console and for NUL, 0 for a
+    // regular file. `isatty(fd) == 1` therefore translates to `!= 0` on this CRT rather than to
+    // `== 1`, which would silently take the Log branch on a terminal.
+    if (::_isatty(::_fileno(stderr)) != 0) {
+#else
     if (::isatty(STDERR_FILENO) == 1) {
+#endif
         return LoadProgressRendererOptions{
             .mode                 = LoadProgressOutputMode::Interactive,
             .min_refresh_interval = std::chrono::milliseconds(200),

@@ -19,6 +19,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -27,6 +29,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -111,13 +114,183 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+// The official Qwen3.6-27B HF directory (base-hf-bf16) is an opt-in *resource*, never a
+// path this tree knows: point NINFER_FRONTEND_TEST_ROOT at it to enable the sub-tests
+// that need the real tokenizer files. This mirrors the sibling real-artifact tests
+// (test_load_plan, test_engine_*), which read NINFER_* variables and report 77 when
+// those are absent.
+//
+// THREE states, and ctest must not read them the same way:
+//   * unset/empty                              -> never provisioned   -> SKIP (exit 77)
+//   * set, and the directory holds all 3 files -> run the sub-tests  -> exit 0 or 1
+//   * set, but the directory is not usable     -> MISPECONFIGURATION -> exit 1, never 77
+// plus a state that used to be invisible: a variable whose NAME is one keystroke away from
+// kOfficialResourceRoot. That is a typo, not "not deployed", and it produced a skip whose
+// message was byte-for-byte the unset one -- which ctest then printed as a pass, because
+// this target carries SKIP_RETURN_CODE 77. Both halves are the same defect the sibling
+// tests tests/targets/qwen3_6_27b/test_load_plan.cpp and
+// tests/targets/qwen3_6_35b_a3b/test_dflash_load_plan.cpp were split for.
+constexpr const char* kOfficialResourceRoot = "NINFER_FRONTEND_TEST_ROOT";
+
+// Sub-tests that could not run because the opt-in directory was never provisioned; main()
+// turns a non-zero count into exit 77.
+int official_resource_skips = 0;
+
+const std::array<const char*, 3>& official_resource_files() {
+    static const std::array<const char*, 3> files = {
+        "tokenizer.json", "tokenizer_config.json", "generation_config.json"};
+    return files;
+}
+
+// Levenshtein distance <= 1 -- what a hand-typed variable name actually produces (one
+// substitution, insertion, deletion or transposition). Deliberately not a general edit
+// distance: it only answers "is this name a typo of kOfficialResourceRoot", so a name that
+// is further away (NINFER_PLE_SIDECAR_ROOT, six substitutions) is left alone.
+//
+// NOT TRANSFERABLE AS-IS. one_edit_apart("NINFER_QWEN3_8_27B_WEIGHTS",
+// "NINFER_QWEN3_6_27B_WEIGHTS") is true, and both of those are names this repository really
+// reads (tests/targets/qwen3_6_27b/test_engine_prefix_real.cpp). Renaming
+// kOfficialResourceRoot is therefore not enough to reuse this detector in
+// test_load_plan.cpp / test_engine_prefix_real.cpp: with the sibling model's variable set and
+// the test's own variable unset, a legitimate configuration would be reported as a typo and
+// hard-fail. Use one_edit_apart_typo() below; it keeps the same reach for genuine hand
+// typing slips but never reports a name that differs only in a whole numeric component.
+bool one_edit_apart(const std::string& a, const std::string& b) {
+    if (a == b) { return false; }
+    const std::string& shorter = a.size() <= b.size() ? a : b;
+    const std::string& longer  = a.size() <= b.size() ? b : a;
+    if (longer.size() - shorter.size() > 1) { return false; }
+    std::size_t i = 0;
+    while (i < shorter.size() && shorter[i] == longer[i]) { ++i; }
+    if (shorter.size() == longer.size()) {
+        if (i + 1 < shorter.size() && shorter[i] == longer[i + 1] &&
+            shorter[i + 1] == longer[i] &&
+            shorter.compare(i + 2, std::string::npos, longer, i + 2, std::string::npos) == 0) {
+            return true;  // one transposition
+        }
+        return shorter.compare(i + 1, std::string::npos, longer, i + 1, std::string::npos) == 0;
+    }
+    return shorter.compare(i, std::string::npos, longer, i + 1, std::string::npos) == 0;
+}
+
+// The `_`-separated component of `name` that contains byte offset `at`.
+std::string name_component_at(const std::string& name, std::size_t at) {
+    const std::size_t previous = at > 0 ? name.rfind('_', at - 1) : std::string::npos;
+    const std::size_t start    = previous == std::string::npos ? 0 : previous + 1;
+    const std::size_t stop     = name.find('_', at);
+    return name.substr(start, (stop == std::string::npos ? name.size() : stop) - start);
+}
+
+bool all_numeric_component(const std::string& value) {
+    return !value.empty() && value.find_first_not_of("0123456789") == std::string::npos;
+}
+
+// The criterion callers must use. A one-character difference that lives inside a single
+// whole numeric component ("6" -> "8", the only way two of this repository's legitimate
+// Qwen3 weight variables differ) names a different model, not a misspelling, so it is never
+// reported. Everything one_edit_apart() accepts that is not exempted by that rule is a
+// hand-typing slip.
+bool one_edit_apart_typo(const std::string& a, const std::string& b) {
+    if (!one_edit_apart(a, b)) { return false; }
+    std::size_t at = 0;
+    while (at < a.size() && at < b.size() && a[at] == b[at]) { ++at; }
+    if (at == std::min(a.size(), b.size()) && at > 0) { --at; }
+    const std::string left  = name_component_at(a, at);
+    const std::string right = name_component_at(b, at);
+    return !(left != right && all_numeric_component(left) && all_numeric_component(right));
+}
+
+// The name a near-miss of kOfficialResourceRoot was actually spelled with, or empty. Only
+// names in this project's own namespace are considered, so an unrelated environment cannot
+// trip it.
+std::string official_resource_root_typo() {
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        const std::string item(*entry);
+        const std::size_t equals = item.find('=');
+        if (equals == std::string::npos) { continue; }
+        const std::string name = item.substr(0, equals);
+        if (name == kOfficialResourceRoot || name.rfind("NINFER_", 0) != 0) { continue; }
+        if (one_edit_apart_typo(name, kOfficialResourceRoot)) { return name; }
+    }
+    return {};
+}
+
+// The opt-in root, resolved once, with the three states kept apart instead of collapsed
+// into "not available".
+struct OfficialResource {
+    bool configured = false;  // the variable was set to a non-empty value
+    bool present    = false;  // ...and that directory really holds all three files
+    std::string root;         // the value as given, with trailing '/' trimmed
+    std::string typo;         // a near-miss NAME of the variable found in the environment
+};
+
+const OfficialResource& official_resource() {
+    static const OfficialResource value = [] {
+        OfficialResource resource;
+        resource.typo   = official_resource_root_typo();
+        const char* raw = std::getenv(kOfficialResourceRoot);
+        if (raw == nullptr || *raw == '\0') { return resource; }
+        resource.configured = true;
+        resource.root       = raw;
+        while (!resource.root.empty() && resource.root.back() == '/') {
+            resource.root.pop_back();
+        }
+        std::error_code error;
+        resource.present = !resource.root.empty();
+        for (const char* name : official_resource_files()) {
+            if (!std::filesystem::is_regular_file(resource.root + "/" + name, error)) {
+                resource.present = false;
+                break;
+            }
+        }
+        return resource;
+    }();
+    return value;
+}
+
+std::string official_resource_root() { return official_resource().root; }
+
+bool official_resources_available() { return official_resource().present; }
+
+std::string read_official_resource(const char* name) {
+    const std::string path = official_resource_root() + "/" + name;
+    return read_file(path.c_str());
+}
+
+bool official_resources_missing() {
+    if (official_resources_available()) { return false; }
+    ++official_resource_skips;
+    return true;
+}
+
+// The reason main() must FAIL, or empty when there is nothing to report. A configured root
+// that does not work, and a typo'd variable name, are both operator errors: reported as
+// SKIP_RETURN_CODE 77 they would make ctest print a pass for a run in which every check that
+// needs the real tokenizer silently did nothing.
+std::string official_resource_misconfiguration() {
+    const OfficialResource& resource = official_resource();
+    if (resource.configured && !resource.present) {
+        return std::string(kOfficialResourceRoot) + " was set to \"" + resource.root +
+               "\" but that directory does not hold tokenizer.json, tokenizer_config.json and "
+               "generation_config.json; refusing to report a skip for an explicitly configured "
+               "root";
+    }
+    if (!resource.configured && !resource.typo.empty()) {
+        return "the environment variable \"" + resource.typo +
+               "\" is one keystroke away from " + kOfficialResourceRoot +
+               ", which is unset -- so those checks would have vanished as a skip; set " +
+               kOfficialResourceRoot + " instead";
+    }
+    return {};
+}
+
 const fi::Tokenizer& official_tokenizer() {
     static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_official_resource("tokenizer.json");
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_official_resource("tokenizer_config.json");
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_official_resource("generation_config.json");
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -366,6 +539,8 @@ bool throws_context_length(Callable&& callable) {
 }
 
 int test_official_tokenizer_merge() {
+    if (official_resources_missing()) { return 0; }
+
     const fi::Tokenizer& tokenizer = official_tokenizer();
 
     constexpr std::array<std::pair<const char*, int>, 7> appended = {{
@@ -423,6 +598,8 @@ int test_bpe_merge_order() {
 }
 
 int test_boundary_aware_tokenization() {
+    if (official_resources_missing()) { return 0; }
+
     const std::string tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
@@ -465,6 +642,8 @@ int test_boundary_aware_tokenization() {
 }
 
 int test_literal_added_token_provenance() {
+    if (official_resources_missing()) { return 0; }
+
     const fi::Tokenizer& tokenizer    = official_tokenizer();
     constexpr std::string_view marker = "<|image_pad|>";
     constexpr std::array<fi::ByteSpan, 2> split_literal{
@@ -494,6 +673,8 @@ int test_literal_added_token_provenance() {
 }
 
 int test_repeated_special_tokens_scan_linearly() {
+    if (official_resources_missing()) { return 0; }
+
     constexpr std::string_view token = "<|image_pad|>";
     std::string text;
     text.reserve(token.size() * 5'000);
@@ -505,6 +686,8 @@ int test_repeated_special_tokens_scan_linearly() {
 }
 
 int test_bounded_tokenizer_prefix() {
+    if (official_resources_missing()) { return 0; }
+
     const fi::Tokenizer& tokenizer = official_tokenizer();
     const std::string text =
         "<|im_start|>user\nA bounded tokenizer must preserve the exact ordinary and special-token "
@@ -679,6 +862,8 @@ int test_official_chat_template() {
 }
 
 int test_ordered_instruction_turns() {
+    if (official_resources_missing()) { return 0; }
+
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
 
@@ -1013,6 +1198,8 @@ int test_rewrite_checkpoint_trace() {
 }
 
 int test_adjacent_tool_message_boundary() {
+    if (official_resources_missing()) { return 0; }
+
     fi::ChatMessage assistant = chat_message(ninfer::ChatRole::Assistant, "");
     assistant.tool_calls.push_back(
         {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
@@ -1058,6 +1245,34 @@ int test_official_resource_guards() {
                   capabilities.reasoning_effort.xhigh &&
                   capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
               "Frontend did not expose capabilities from its loaded chat template");
+
+    // Standing guard for the near-miss criterion itself, so that it cannot be quietly
+    // weakened into a detector that swallows the legitimate sibling model variables, nor
+    // over-tightened until real misspellings stop being caught. The three twin rows are the
+    // empirically demonstrated misfire: the raw one-edit distance reports TRUE for all of
+    // them (see the note above one_edit_apart), which is exactly why this criterion must not
+    // be copied into a test whose own variable has such a twin.
+    const std::array<const char*, 7> near_miss_names = {"NINFER_FRONTEND_TEST_ROOTS",
+                                                       "NINFER_FRONTENT_TEST_ROOT",
+                                                       "NINFER_FRONTEND_TEST_ROO",
+                                                       "NINFER_FRONTEND_TESR_ROOT",
+                                                       "NINFER_QWEN3_8_27B_WEIGHTS",
+                                                       "NINFER_QWEN3_6_27B_WEIGHTS",
+                                                       "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS"};
+    const std::array<const char*, 7> intended_names = {"NINFER_FRONTEND_TEST_ROOT",
+                                                      "NINFER_FRONTEND_TEST_ROOT",
+                                                      "NINFER_FRONTEND_TEST_ROOT",
+                                                      "NINFER_FRONTEND_TEST_ROOT",
+                                                      "NINFER_QWEN3_6_27B_WEIGHTS",
+                                                      "NINFER_QWEN3_8_27B_WEIGHTS",
+                                                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS"};
+    for (std::size_t index = 0; index < near_miss_names.size(); ++index) {
+        const bool is_typo = one_edit_apart_typo(near_miss_names[index], intended_names[index]);
+        failures += check(index < 4 ? is_typo : !is_typo,
+                          index < 4
+                              ? "near-miss criterion stopped catching a real misspelling"
+                              : "near-miss criterion misfired on a legitimate sibling variable");
+    }
 
     return failures;
 }
@@ -1199,6 +1414,8 @@ int test_text_and_image_prepare(const Frontend& frontend) {
 }
 
 int test_literal_control_tokens_with_media() {
+    if (official_resources_missing()) { return 0; }
+
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
     const fi::RenderedChat literal_rendered =
@@ -1221,13 +1438,13 @@ int test_literal_control_tokens_with_media() {
             "<|im_start|>user\n<tool_response>\nimported result\n</tool_response><|im_end|>\n",
         "leading tool result was rendered without its user-role envelope");
 
-    FrontendResources official = resources();
+    FrontendResources official = resources(reasoning_effort_template_source());
     official.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_official_resource("tokenizer.json");
     official.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_official_resource("tokenizer_config.json");
     official.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_official_resource("generation_config.json");
     const Frontend frontend = FrontendFactory::create_component(official);
 
     auto text_part = [](std::string text) {
@@ -1372,13 +1589,15 @@ int test_image_resize_rejection_policy() {
 }
 
 int test_explicit_leading_instruction_cache_boundary() {
-    FrontendResources official = resources();
+    if (official_resources_missing()) { return 0; }
+
+    FrontendResources official = resources(reasoning_effort_template_source());
     official.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_official_resource("tokenizer.json");
     official.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_official_resource("tokenizer_config.json");
     official.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_official_resource("generation_config.json");
     const Frontend frontend           = FrontendFactory::create_component(official, false);
     constexpr std::string_view stable = "stable cache section.";
     ninfer::ChatMessage system;
@@ -1420,6 +1639,8 @@ int test_explicit_leading_instruction_cache_boundary() {
 }
 
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
+    if (official_resources_missing()) { return 0; }
+
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
     ninfer::ChatMessage message;
@@ -1621,13 +1842,15 @@ int test_terminal_flush(const Frontend& frontend) {
 }
 
 int test_structured_tool_output() {
-    FrontendResources owned = resources();
+    if (official_resources_missing()) { return 0; }
+
+    FrontendResources owned = resources(reasoning_effort_template_source());
     owned.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_official_resource("tokenizer.json");
     owned.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_official_resource("tokenizer_config.json");
     owned.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_official_resource("generation_config.json");
     const Frontend frontend = FrontendFactory::create_component(owned);
 
     ninfer::ChatMessage message;
@@ -2211,5 +2434,24 @@ int main() {
     failures += test_media_preparation_cancellation();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
-    return failures == 0 ? 0 : 1;
+
+    if (failures != 0) { return 1; }
+    // A configured-but-unusable root, or a variable name that is a typo of the one to
+    // configure, is an operator error rather than a missing resource: it must fail here,
+    // BEFORE the legitimate skip below, so that ctest cannot print a pass for a run whose
+    // official-resource checks never executed.
+    if (const std::string problem = official_resource_misconfiguration(); !problem.empty()) {
+        std::cerr << "FAIL: " << problem << '\n';
+        return 1;
+    }
+    // Without the opt-in NINFER_FRONTEND_TEST_ROOT directory the checks that need the
+    // official Qwen3.6-27B tokenizer never ran, so ctest must read this as SKIP
+    // (SKIP_RETURN_CODE in tests/CMakeLists.txt), not as a pass.
+    if (official_resource_skips != 0) {
+        std::cerr << "skip: " << official_resource_skips
+                  << " sub-test(s) need the official Qwen3.6-27B resources; set "
+                  << kOfficialResourceRoot << " to the base-hf-bf16 directory\n";
+        return 77;
+    }
+    return 0;
 }

@@ -4,7 +4,7 @@
 输入: serve stderr 的 '[ft] layer=N mean_l=X rounds=M' 行 (NINFER_FT_STATS=1 产出)
 策略: 深层保护 (§46/§47 验收) + 能量分位 (§41 步 2):
   - 深层 (最后 20% 全注意力层) 强制 NVFP4 — 深层敏感, 不参与压缩
-  - 其余层按 mean_l 分位切 3 挡: 高能量=iso3, 中=nvfp4, 低=e8
+  - 其余层按 mean_l 分位切 3 挡: 高能量=iso4e, 中=nvfp4, 低=rk4v4
 输出: --kv-layer-storage '...' 规格串 (可直接透传 serve)
 
 用法: python3 ft_tiers.py <serve_log> [层总数] [--deep-frac 0.2]
@@ -29,7 +29,7 @@ def parse_stats(log: str) -> dict[int, float]:
 
 def build_spec(energy: dict[int, float], total_full_attn: int,
                deep_frac: float = 0.2,
-               tiers: tuple[str, str, str] = ("e8", "iso3", "nvfp4")) -> str:
+               tiers: tuple[str, str, str] = ("rk4v4", "iso4e", "nvfp4")) -> str:
     deep_start = int(total_full_attn * (1 - deep_frac))
     deep = [l for l in range(total_full_attn) if l >= deep_start]
     measured = {l: e for l, e in energy.items() if l < deep_start}
@@ -44,7 +44,7 @@ def build_spec(energy: dict[int, float], total_full_attn: int,
         n = len(items)
         n_low = max(1, n // 3)
         for i, (l, _e) in enumerate(items):
-            # 能量最低的 1/3 -> e8, 中间 1/3 -> iso3, 高能量 -> nvfp4
+            # 能量最低的 1/3 -> rk4v4, 中间 1/3 -> iso4e, 高能量 -> nvfp4
             t = low if i < n // 3 else (mid if i < 2 * (n // 3) else hi)
             parts.append(f"{l}:{t}")
     return ",".join(parts)

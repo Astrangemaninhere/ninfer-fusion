@@ -871,6 +871,7 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
     }
     if (limit) {
         if (*limit < 0) { bad_request(std::string(param) + " must be nonnegative", param); }
+        validate_output_budget(*limit, limits.max_context, param);
         output.generation.max_tokens  = *limit;
         output.output_tokens_explicit = true;
     } else {

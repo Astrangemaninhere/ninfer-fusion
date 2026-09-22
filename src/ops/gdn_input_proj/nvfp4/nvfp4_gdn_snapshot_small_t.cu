@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <stdexcept>
 #include <utility>
 
 namespace ninfer::ops::detail {
@@ -79,9 +80,10 @@ constexpr auto make_record_launchers(std::index_sequence<Offsets...>) {
         &launch_record_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
-constexpr auto kRecordLaunchers =
-    make_record_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
+constexpr auto kLaunchers =
+    make_launchers(std::make_index_sequence<kNvfp4GdnConvA16Ceiling - kNvfp4FirstSmallT + 1>{});
+constexpr auto kRecordLaunchers = make_record_launchers(
+    std::make_index_sequence<kNvfp4GdnConvA16Ceiling - kNvfp4FirstSmallT + 1>{});
 
 } // namespace
 
@@ -90,9 +92,10 @@ void nvfp4_gdn_snapshot_small_t_launch(const Tensor& x, const Weight& weight,
                                        const Tensor& valid_columns, const Tensor& initial_slot,
                                        const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
                                        Tensor& value, Tensor& z, cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
-    kLaunchers[index](x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                      snapshot_base_slot, query, key, value, z, stream);
+    nvfp4_small_t_launcher<kNvfp4GdnConvA16Ceiling>(
+        kLaunchers, x.ne[1], "nvfp4 gdn snapshot small_t")(
+        x, weight, conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot,
+        query, key, value, z, stream);
 }
 
 void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
@@ -100,9 +103,10 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      const Tensor& valid_columns, const Tensor& initial_slot,
                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                      Tensor& z, cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
-    kRecordLaunchers[index](x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                            conv_record, query, key, value, z, stream);
+    nvfp4_small_t_launcher<kNvfp4GdnConvA16Ceiling>(
+        kRecordLaunchers, x.ne[1], "nvfp4 gdn record small_t")(
+        x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record, query,
+        key, value, z, stream);
 }
 
 } // namespace ninfer::ops::detail

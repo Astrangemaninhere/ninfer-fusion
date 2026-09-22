@@ -249,6 +249,21 @@ std::int32_t schedule_cols(W8PairScheduleId schedule) {
         return 256;
     case W8PairScheduleId::DualSplitKMmaExactT:
         throw std::logic_error("w8 pair exact-T schedule has runtime column tile");
+    // The seven ExactConcatMma<R,C> ids are mapped by homogeneous_schedule()
+    // (:98-:117) onto their ConcatMma<R,C> representative, and this switch is ON the
+    // homogeneous form -- so it can never be entered with them.  Named rather than
+    // `default:`ed so a future enumerator still reports here; the refusal is the one
+    // the trailing throw gave, with a message that names which situation this is.
+    case W8PairScheduleId::ExactConcatMmaR32C96:
+    case W8PairScheduleId::ExactConcatMmaR32C128:
+    case W8PairScheduleId::ExactConcatMmaR64C96:
+    case W8PairScheduleId::ExactConcatMmaR64C128:
+    case W8PairScheduleId::ExactConcatMmaR96C96:
+    case W8PairScheduleId::ExactConcatMmaR128C64:
+    case W8PairScheduleId::ExactConcatMmaR128C80:
+        throw std::logic_error(
+            "w8 pair: exact concat schedule has no runtime column tile "
+            "(homogeneous_schedule maps it onto its ConcatMma representative)");
     }
     throw std::logic_error("w8 pair: unknown schedule");
 }

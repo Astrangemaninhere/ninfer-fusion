@@ -123,8 +123,49 @@ struct Bf16LinearDecodeScheduleSelector<Bf16GemvGeometry<5120, 6144>> {
 template <class Geometry>
 using Bf16LinearDecodeSchedule = typename Bf16LinearDecodeScheduleSelector<Geometry>::Type;
 
-template <class Geometry, int ActiveTokens>
+// ---------------------------------------------------------------------------
+// ⚠️ DIAGNOSTIC ONLY -- PATCH A1 (scratch/PATCHSET/A1_schedule_pin.diff)
+// ---------------------------------------------------------------------------
+// PIN THE SCHEDULE KEY TO ONE CONSTANT, so that ONE build can run two arms
+// (width 9 vs width 10) under an IDENTICAL small-T schedule. This is the
+// decisive experiment the predecessor named and did NOT run.
+//
+// WHY IT IS DECISIVE. MEASURED, not quoted: the per-T schedule this header actually
+// produces for the 5120x6144 output projection was dumped by host-compiling this very
+// header (scratch/PATCHSET/REPORT.md section 2) and is
+//   T=2      RPW4 VPL8  WP Seq unroll2      T=3      RPW4 VPL16 WP Seq unroll2
+//   T=4      RPW2 VPL8  WP Seq unroll2      T=5,7    RPW4 VPL8  WP Seq unroll2
+//   T=6      RPW2 VPL8  WP Seq unroll2      T=8      RPW4 VPL16 WP Seq unroll2
+//   T=9      RPW2 VPL8  DS Seq unroll1      T=10..16 RPW2 VPL8  DS RowSwizzled unroll2
+// (T=1 is NOT an instance of this schedule at all: bf16_launch.h:13 sets
+//  kBf16SmallTMinTokens == 2 and the static_assert below refuses T < 2.)
+// So the sweep is not "3 classes": T<=8 alone is FOUR distinct tuples.
+// ⚠️ THE SHARP FORM OF THE CONTRADICTION: T=10..16 is ONE template parameter tuple,
+// byte-for-byte, and yet the measurement splits it -- w10 -> ae102e65a14de985 while
+// w11..16 -> 1a13d088fd735fb2, with w11 == w16 byte-identically. ONE schedule cannot
+// produce TWO answers, so the schedule CANNOT be the whole story.
+// ⚠️ AND THE NEUTRALITY PROOF CUTS THE OTHER WAY: `--spec none` is bit-identical to
+// `--draft-tokens 7`, i.e. the output does NOT move across four distinct T<=8 tuples
+// (VPL16 at T=3/T=8, RPW2 at T=4/T=6) -- so a schedule change of this size is
+// numerically NEUTRAL there, and "the schedule" is not a free variable that can be
+// judged by inspection either way. Pinning settles it in ONE build instead of a
+// 16-arm sweep: under kSchedulePin = 8, T=9 and T=10 run the SAME tuple as T=8, so
+//   * both arms == 01e4e0d4fa414b71 (== `--spec none`)  => the schedule IS the cause;
+//   * both arms equal but != 01e4e0d4fa414b71          => a width-dependent path, not tiling;
+//   * the arms still differ from each other            => the sweep is not even the whole
+//                                                         width dependence.
+//
+// `phase0` (bf16_small_t.cuh:101-103: Sequential => 0, else a row-rotated
+// phase) IS the fp32 K-accumulation order, because AccumulatorChains is 1 in
+// the instantiation below; so this pin moves real arithmetic order, not just
+// occupancy, which is exactly what makes it a usable probe.
+//
+// ONE-LINE REVERT: set kSchedulePin below back to 0 (0 = off, sweep restored).
+template <class Geometry, int ActiveTokensRequested>
 struct Bf16LinearSmallTProductionSchedule {
+    static constexpr int kSchedulePin = 0; // ⚠️ DIAGNOSTIC: 0 = off (per-T sweep)
+    static constexpr int ActiveTokens =
+        kSchedulePin != 0 ? kSchedulePin : ActiveTokensRequested;
     static_assert(ActiveTokens >= 2 && ActiveTokens <= 32);
     static constexpr bool kOutputProjectionGeometry =
         Geometry::kOutputRows == 5120 && Geometry::kInputRows == 6144;

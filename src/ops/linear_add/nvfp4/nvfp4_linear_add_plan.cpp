@@ -23,9 +23,13 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported policy");
     }
-    // UNIFY-A: `first_w4a4` (7 for K=6144, 8 for K=17408) made T=1..6/7 a different
-    // precision tier than the verify widths. One tier for the whole small-T family.
-    return Nvfp4LinearAddRoute::W4A4;
+    // widebw: the 17408 leg started W4A4 at 8, i.e. INSIDE the batch-1 verify domain
+    // [1, kVerifyWidthCeiling=16]. Move it above that domain so every verify width keeps
+    // the A16 route the T=1 decode uses (FIX-C's rule for the three fp8 ops), which is
+    // also the 80-CTA -> 160-CTA grid repair on this family (see landq/widebw/README.md).
+    // The 6144 leg keeps its measured 7.
+    const std::int32_t first_w4a4 = input_rows == 6144 ? 7 : 17;
+    return tokens >= first_w4a4 ? Nvfp4LinearAddRoute::W4A4 : Nvfp4LinearAddRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
@@ -38,8 +42,11 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStr
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor residual_chunk(output, DType::BF16, {weight.n, active});
-        // UNIFY-A: one route for the whole small-T family (T=1 included).
-        nvfp4_linear_add_small_t_launch(input_chunk, weight, residual_chunk, stream);
+        if (active == 1) {
+            nvfp4_linear_add_decode_launch(input_chunk, weight, residual_chunk, stream);
+        } else {
+            nvfp4_linear_add_small_t_launch(input_chunk, weight, residual_chunk, stream);
+        }
     }
 }
 

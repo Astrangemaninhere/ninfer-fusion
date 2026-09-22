@@ -77,6 +77,12 @@ __device__ __forceinline__ bool causal_valid_q_head(int kv_head, int q_head) {
            q_head < (kv_head + 1) * Geometry::GroupSize && q_head < Geometry::QHeads;
 }
 
+// FIX-A note: `window` here is the RUNNING ROW's own visible-key count (the partial kernel
+// computes it as pos[width - 1] + 1 and clips every split range to it), so this device-side
+// policy is already a function of the row's own key prefix and not of the enclosing launch's
+// draft window. The host-side ladder that selects this kernel's (WarpsPerCta, KeyBlock) rung
+// is the part that used to key on the envelope's live window instead -- see
+// causal_attention_small_t_launch_for in small_t.cu.
 template <typename Geometry>
 __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     int target_keys_per_split = 480 / Geometry::SmallTSplitScale;
@@ -131,6 +137,26 @@ __device__ __forceinline__ int causal_small_t_fp8_active_splits(int window, int 
 
 __device__ __forceinline__ int causal_small_t_tc_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+}
+
+// INTEGRATE4 (landing order row 4): landed from sergiuszm/ninfer-4090 @ rtx4090-port,
+// small_t.cuh, verbatim. A NEW helper that CALLS the existing causal_small_t_tc_swz above; it is
+// not a rename of causal_small_t_tc_swz (which has 10 users and is untouched here) and it is not
+// causal_small_t_tc_swz32 (which follows it unchanged and is a different thing: a fixed row&3
+// swizzle, where this one takes the b16 stride as a parameter and does the byte packing).
+//
+// NOT landed with it, each refusal a measurement: the fork's `causal_partial_acc_value` overloads,
+// its `PartialAcc` re-templating of the reduce kernel, and its removal of the FIX-A note -- 0
+// consumers in this tree name `causal_partial_acc_value` or `PartialAcc` (git grep --untracked).
+// The fork's rename causal_small_t_fp8_active_splits -> causal_small_t_quantized_active_splits is
+// ALSO refused, and that refusal is the SPLIT-7 finding: see the INTEGRATE4 report.
+template <typename Byte>
+__device__ __forceinline__ void causal_small_t_store_byte_swizzled(Byte* tile, int row, int d,
+                                                                   int d_b16_stride, Byte code) {
+    const int col_b16 = d >> 1;
+    const int byte    = d & 1;
+    const int off     = (row * d_b16_stride + causal_small_t_tc_swz(row, col_b16)) * 2 + byte;
+    tile[off]         = code;
 }
 
 __device__ __forceinline__ int causal_small_t_tc_swz32(int row, int col) {

@@ -8,13 +8,36 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/softmax_attention.h"
+// d256_kv_cache_is_e8_family(): the one place the ops layer names the e8 family. Host-only,
+// no device code, so it costs this TU nothing in the ptxas budget.
+#include "ops/kv_cache/d256_profile.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
 
+// FIX-A item 2/4 instrument and contract switch, the causal-cache twin of the one in
+// ops/launcher/gqa_attention_decode_partial.cuh (see that file for the full rationale).
+inline bool causal_splitdbg_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("NINFER_SPLITDBG");
+        return env != nullptr && *env != '\0' && !(env[0] == '0' && env[1] == '\0');
+    }();
+    return enabled;
+}
+
+inline bool causal_verify_exact() {
+    static const bool strict = [] {
+        const char* env = std::getenv("NINFER_VERIFY_EXACT");
+        if (env == nullptr || *env == '\0') { return true; }
+        return !(env[0] == '0' && env[1] == '\0');
+    }();
+    return strict;
+}
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
 // envelope. Eager calls normally pass an exact window; graph calls pass their target-private
 // replay interval. The dtype-aware wrapper below adds the measured INT8 specializations.
@@ -238,6 +261,24 @@ bool causal_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                              DType cache_dtype,
                                              CausalAttentionExecutionEnvelope envelope) {
+    // ⚠ THE e8 FAMILY IS REFUSED BY NAME HERE, AND THE REFUSAL IS LOAD-BEARING.
+    // This arm has no e8 kernel. causal_attention_small_t_launch dispatches
+    // {FP8_E4M3FN -> fp8 launcher} and then, for EVERYTHING else, the bf16-or-i8 launcher
+    // whose cache element type is selected by `cache.dtype == DType::I8`
+    // (small_t.cu:420). An e8 cache is packed (128 / 96 / 64 B/row, not 256), so it would
+    // take the `false` branch and be read as __nv_bfloat16 -- a silent wrong answer, not a
+    // refusal. The prompt arm has the same shape (prompt.cu:34 i8, else bf16), so there is
+    // no route in this family that can serve e8: unlike the gqa family, which HAS e8 kernels
+    // (gqa_attention_prefill_e8_launch / gqa_attention_decode_e8_launch) and routes there.
+    // Excluding the family is therefore CORRECT; what was wrong was that a VALID e8 profile
+    // was reported as an "invalid profile", which names the wrong defect. The generic
+    // allow-list below is unchanged and still catches every dtype this arm has never priced.
+    if (d256_kv_cache_is_e8_family(cache_dtype)) {
+        throw std::invalid_argument(
+            "causal_softmax_attention split capacity: the e8 family (E8Kv/E8K3Kv/E8K2Kv) "
+            "has no causal small-T kernel -- this arm launches bf16 or i8 staging only, and "
+            "a packed e8 plane would be read at the bf16 extent");
+    }
     if (tokens < 1 || tokens > 6 ||
         (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
          cache_dtype != DType::FP8_E4M3FN) ||
@@ -262,9 +303,48 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                                          Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                          Tensor& out, cudaStream_t stream) {
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
+    // FIX-A item 2 - the geometry ladder must be a function of the window the kernel will
+    // actually use for its own columns, NOT of the draft window k.
+    //
+    // envelope.max_visible_keys is the LAST visible key of the whole round: an MTP verify
+    // carries frontier + k + 1 for every chunk it dispatches, so a ladder keyed on it moves
+    // with k. A chunk's own columns are [column_begin, column_begin + width) of a
+    // full_width-column round, so the last column of THIS launch sits
+    // (full_width - column_begin - width) positions below the round's last one, and the
+    // window the kernel derives from pos[width - 1] is exactly `max_visible_keys` minus that
+    // gap. That value is a function of the launch's own columns alone: for width ==
+    // full_width (a batch-1 decode, or an unchunked launch) it is max_visible_keys itself, so
+    // the batch-1 decode of a row and the chunk that contains it select the SAME rung.
+    //
+    // NOTE (measured): CausalAttentionExecutionEnvelope has only these two fields -- it has
+    // no pinned split_reference_keys (unlike ops::GqaExecutionEnvelope), so this family has no
+    // pin to fall back on and the per-column window above is the only k-free window it can
+    // express. NINFER_VERIFY_EXACT=0 restores the legacy ladder input. The split CAPACITY is
+    // not affected either way: it is an upper bound over the whole envelope interval and is
+    // what the partial workspace is sized from, so narrowing it here would be wrong.
+    const auto column_window_gap =
+        static_cast<std::int32_t>(invocation.full_width) - invocation.column_begin -
+        invocation.width;
+    const auto implementation_window =
+        causal_verify_exact() && column_window_gap >= 0
+            ? static_cast<std::int32_t>(envelope.max_visible_keys) - column_window_gap
+            : static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits =
         causal_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
+    if (causal_splitdbg_enabled()) {
+        std::fprintf(stderr,
+                     "[splitdbg] launch family=causal_cached route=%s dtype=%d width=%d "
+                     "full_width=%d column_begin=%d batch=%d min_visible=%u max_visible=%u "
+                     "logical_capacity=%d schedule_window=%d splits=%d verify_exact=%d "
+                     "q_heads=%d kv_heads=%d\n",
+                     (invocation.column_begin != 0 || invocation.width < invocation.full_width)
+                         ? "chunked_small_t"
+                         : "small_t",
+                     static_cast<int>(cache.dtype), invocation.width, invocation.full_width,
+                     invocation.column_begin, invocation.batch_size, envelope.min_visible_keys,
+                     envelope.max_visible_keys, logical_capacity, implementation_window, splits,
+                     causal_verify_exact() ? 1 : 0, Geometry::QHeads, Geometry::KVHeads);
+    }
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.

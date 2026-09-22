@@ -31,6 +31,12 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    // Device bitset [ceil(token_domain/32)] i32, or null for "every row allowed".  Added for the
+    // copied Flash-Next target, which masks structured-output-constrained rows through it; the
+    // donor carries the same appended field (igorls/ninfer @ 5e4a66d include/ninfer/ops/sampling.h:34).
+    // NOTE: this field is populated by callers only.  The kernels ignore it today -- a producer
+    // that honours it has NOT been wired in this tree.
+    const std::int32_t* allowed_tokens = nullptr;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

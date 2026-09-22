@@ -78,6 +78,33 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {4304, 1152, 139U, Comparison::Sampled, false, kN4304K1152});
 
+    // The 4096-wide GDN-hybrid text stack's four q4 geometries: [24576,4096] MLP gate/up,
+    // [10240,4096] the MTP packed attention input, [4096,4096] the MTP q / output-gate row views,
+    // and [4096,8192] the MTP FC input projection (embedding+hidden concatenated back down).
+    constexpr std::array kN24576K4096{
+        a16(1), a16(2), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {24576, 4096, 223U, Comparison::Sampled, false, kN24576K4096});
+
+    constexpr std::array kN10240K4096{
+        a16(1), a16(2), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {10240, 4096, 227U, Comparison::Sampled, false, kN10240K4096});
+
+    constexpr std::array kN4096K4096{
+        a16(1), a16(2), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {4096, 4096, 229U, Comparison::Sampled, false, kN4096K4096});
+
+    constexpr std::array kN4096K8192{
+        a16(1), a16(2), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
+                          {4096, 8192, 233U, Comparison::Sampled, false, kN4096K8192});
+
     return failures;
 }
 

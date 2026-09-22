@@ -8,8 +8,10 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#include "ninfer/targets/qwen3_6/prepared_prompt.h"
 #include "targets/registry.h"
 
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -49,7 +51,30 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::CausalScoring:
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
-        options.prefill_chunk        = 3072;
+        // prefill_chunk here is the SCORE TILE -- the initial prefill unit -- and, through
+        // layouts_impl.h:1295 (min(prefill_chunk, max_context)) and program_impl.h:782, the
+        // capacity the scoring plan sizes its prefill scratch for. It is not a runtime constant
+        // on this path either, it is simply immutable: a CausalScoreCore owns no Scheduler and no
+        // governor, so nothing shrinks it while the engine runs. Overwriting every caller's value
+        // with 3072 made --prefill-chunk (and any API caller) silently inert here, so keep what
+        // the caller asked for and normalize only the two spellings layouts_impl.h:853 rejects:
+        // 0 (unset -> today's default tile) and a value off the 128-token prefill alignment.
+        if (options.prefill_chunk == 0) { options.prefill_chunk = 3072; }
+        options.prefill_chunk -= options.prefill_chunk % 128;
+        if (options.prefill_chunk < 128) { options.prefill_chunk = 128; }
+        // The same immutability decides the MODE, and it is not an assumption: this path has no
+        // Scheduler and no governor (the sentence above), so the tile can only be manual -- and a
+        // caller who explicitly asked for `dynamic` is refused HERE, by name, rather than accepted
+        // and quietly downgraded to a mode that does nothing the caller asked for. A flag that
+        // parses and changes nothing is the failure this whole surface exists to avoid.
+        if (options.prefill_chunk_mode == PrefillChunkMode::Dynamic) {
+            throw std::invalid_argument(
+                "--prefill-chunk-mode dynamic needs a Scheduler with a bandwidth governor to do "
+                "the adapting, and the CausalScoring path has neither: its score tile is immutable "
+                "(engine.cpp normalize_engine_options). Use --prefill-chunk-mode manual, which is "
+                "what this path runs.");
+        }
+        options.prefill_chunk_mode = PrefillChunkMode::Manual;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
@@ -59,6 +84,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     default:
         throw std::invalid_argument("Engine purpose is invalid");
     }
+    // The prefill unit's mode: "an engaged CLI mode > NINFER_FT_BW_GOV > Dynamic", resolved once,
+    // here, for the whole engine path. This is the only place the environment is read for the
+    // engine, so the governor's own switch, the worker loop's install, the trace line and
+    // Engine::options() are all the same answer -- and the answer is written back into `options`
+    // because Engine::options() describes the run, not the request (same contract as the settled
+    // chunk the memory ladder produces above). EngineCore reads the same resolved field, so this
+    // line is what makes --prefill-chunk-mode reach the mechanism rather than the options struct.
+    options.prefill_chunk_mode = runtime::BandwidthGovernor::resolve_mode(options.prefill_chunk_mode);
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
@@ -73,7 +106,32 @@ EngineOptions normalize_engine_options(EngineOptions options) {
              *cache.max_long_anchors_per_continuation != 0)) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
-        cache.device_state_slots                = 0;
+        // The disabled branch owns the pledged spare ONLY when the one leg that consumes it
+        // is armed. A root request materializes read==write PLUS one pledged spare for the
+        // `[context-rebuild]` discard destination (`start_sequence`'s `if (state_slots == 2)`
+        // in program_impl.h, materialized by `reserve_state_entitlement`), and
+        // `prepare_materialization` reserves exactly
+        // `demand.reservation_added.device.state_slots` destinations off this pool. That spare
+        // is a whole extra StateImage slot per lane, and a slot is not free: `layouts_impl.h`
+        // sizes the device pool as `state_image_slots = max_concurrency + device_state_slots`
+        // and every linear-attention conv/recurrent tensor carries `slot_count` as its last
+        // dimension (`state_image.cpp`, `linear_attention_state.cpp`), so
+        // `device_state_slots = concurrency` doubles those tensors. On qwen3.6-27b that is
+        // 146.82 MiB per slot (48 layers x 3.00 MiB FP32 recurrent + 2.81 MiB conv + 0.01 MiB
+        // continuation hidden), charged to EVERY run whether the leg runs or not.
+        //
+        // The leg is gated on BOTH environment keys: `NINFER_RECALL_TEXT` selects the
+        // text-cargo path and `NINFER_RECALL_TEXT_REBUILD` inside it selects the
+        // redirect-to-the-spare arm. The pool follows that same conjunction -- nothing else --
+        // so an unarmed run reserves no spare. `plan_request` plans the matching root demand
+        // (request_plan_impl.h: the spare is pledged only when the pool holds one beyond
+        // `max_concurrency`), and that pairing is what keeps `demand <= pool` true on both
+        // sides: the previous unconditional `= 0` refused every root request, and the
+        // unconditional `= concurrency` charged every run an extra slot whether or not
+        // anything asked for it.
+        const bool discard_spare_armed = std::getenv("NINFER_RECALL_TEXT") != nullptr &&
+                                         std::getenv("NINFER_RECALL_TEXT_REBUILD") != nullptr;
+        cache.device_state_slots                = discard_spare_armed ? concurrency : 0U;
         cache.host_state_slots                  = 0;
         cache.host_kv_capacity_bytes            = 0;
         cache.max_private_continuations         = concurrency;
@@ -165,6 +223,10 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
+std::vector<TokenId> PreparedPrompt::prompt_token_ids() const {
+    if (impl_ == nullptr) { return {}; }
+    return targets::qwen3_6::PreparedPromptAccess::view(impl_->value).token_ids;
+}
 
 class GenerationHandle::Impl {
 public:
@@ -172,6 +234,7 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
+        virtual void append_context_tokens(std::span<const TokenId> tokens) = 0;
     };
 
     template <class Submission>
@@ -182,6 +245,10 @@ public:
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
             return submission_.wait(sink, cancellation);
+        }
+
+        void append_context_tokens(std::span<const TokenId> tokens) override {
+            submission_.append_context_tokens(tokens);
         }
 
     private:
@@ -197,6 +264,10 @@ public:
 
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
+    }
+
+    void append_context_tokens(std::span<const TokenId> tokens) {
+        state_->append_context_tokens(tokens);
     }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
@@ -228,6 +299,11 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
+void GenerationHandle::append_context_tokens(std::span<const TokenId> tokens) {
+    if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
+    impl_->append_context_tokens(tokens);
+}
+
 class Engine::Impl {
 public:
     using Core27      = runtime::EngineCore<targets::Qwen3_6_27BInstance>;
@@ -236,9 +312,12 @@ public:
     using ScoreCore27 = runtime::CausalScoreCore<targets::Qwen3_6_27BInstance>;
     using ScoreCore35 = runtime::CausalScoreCore<targets::Qwen3_6_35BA3BInstance>;
     using ScoreCoreMuse = runtime::CausalScoreCore<targets::MuseGlimmer30BInstance>;
+    using Core9B        = runtime::EngineCore<targets::Qwen3_5_9BInstance>;
+    using ScoreCore9B   = runtime::CausalScoreCore<targets::Qwen3_5_9BInstance>;
     using Core = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>,
                               std::unique_ptr<CoreMuse>, std::unique_ptr<ScoreCore27>,
-                              std::unique_ptr<ScoreCore35>, std::unique_ptr<ScoreCoreMuse>>;
+                              std::unique_ptr<ScoreCore35>, std::unique_ptr<ScoreCoreMuse>,
+                              std::unique_ptr<Core9B>, std::unique_ptr<ScoreCore9B>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
@@ -250,6 +329,16 @@ public:
         // "terminate called without an active exception" abort. jthread joins on scope exit.
         std::jthread module_warmup([&device = device] { warm_kernel_module(device); });
         auto constructed  = targets::construct_target(options, device);
+        // The memory ladder inside construct_target() may have lowered the prefill unit to fit the
+        // device runtime budget, and everything downstream -- the sequence plan, the Program's
+        // prefill_chunk_capacity, the prefill loop -- was built at THAT value. `options` here is
+        // the request. Adopting the settled value is what makes Engine::options() describe the run
+        // instead of the request: apps/perplexity/main.cpp:376 reads it back to report the run's
+        // chunk, and before this adoption the report named a chunk the engine never used whenever
+        // the ladder fired. 0 means the target reported nothing, in which case the request stands.
+        if (constructed.effective_prefill_chunk != 0) {
+            options.prefill_chunk = constructed.effective_prefill_chunk;
+        }
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
@@ -270,12 +359,31 @@ public:
                     }
                     return std::make_unique<Core35>(*target_ptr, device, options,
                                                     std::move(constructed.context_cost));
-                } else {
+                } else if constexpr (std::is_same_v<Instance, targets::MuseGlimmer30BInstance>) {
                     if (options.purpose == EnginePurpose::CausalScoring) {
                         return std::make_unique<ScoreCoreMuse>(*target_ptr, device);
                     }
                     return std::make_unique<CoreMuse>(*target_ptr, device, options,
                                                       std::move(constructed.context_cost));
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_9BInstance>) {
+                    if (options.purpose == EnginePurpose::CausalScoring) {
+                        return std::make_unique<ScoreCore9B>(*target_ptr, device);
+                    }
+                    return std::make_unique<Core9B>(*target_ptr, device, options,
+                                                    std::move(constructed.context_cost));
+                } else {
+                    // A new target family must be dispatched HERE, explicitly.  This branch
+                    // used to be an unconditional `else` that built the Muse core, so a
+                    // fourth `ActiveTarget` alternative was silently handed to
+                    // `EngineCore<MuseGlimmer30BInstance>` -- a wrong-core bind that only
+                    // surfaced as a wall of conversion errors inside the Muse template.  The
+                    // static_assert is what makes the next family fail with one readable
+                    // sentence at the line that has to change.
+                    static_assert(!std::is_same_v<Instance, Instance>,
+                                  "new target instance reached the ActiveTarget variant "
+                                  "without an implicit engine-core dispatch branch in "
+                                  "src/runtime/engine/engine.cpp");
+                    throw std::logic_error("target instance has no engine core");
                 }
             },
             active);
@@ -378,7 +486,8 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreMuse>>) {
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreMuse>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore9B>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -450,6 +559,11 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
                 return std::move(result);
             }
+
+            void append_context_tokens(std::span<const TokenId>) {
+                throw std::logic_error(
+                    "a request with no output budget has no context-append target");
+            }
         } immediate{.consumer_mode = consumer_mode};
 
         immediate.result.prompt                     = prompt_summary;
@@ -469,8 +583,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
                                  std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>> ||
-                                 std::is_same_v<CoreState,
-                                                std::unique_ptr<Impl::ScoreCoreMuse>>) {
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreMuse>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore9B>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 auto submission =
@@ -488,6 +602,12 @@ GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options,
     const OutputConsumerMode consumer_mode =
         sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate;
     return submit(std::move(prompt), std::move(options), consumer_mode).wait(sink, cancellation);
+}
+
+void Engine::append_context_tokens(GenerationHandle& handle, std::span<const TokenId> tokens) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (!handle) { throw std::invalid_argument("GenerationHandle is empty"); }
+    handle.append_context_tokens(tokens);
 }
 
 const EngineOptions& Engine::options() const {
@@ -570,7 +690,8 @@ void Engine::reset_memory_peaks() noexcept {
 
 void Engine::reload_kv_storage(
     std::array<KvCacheStorage, kKvLayerStorageSlots> layer_storage,
-    std::array<bool, kKvLayerStorageSlots> residual_layers) {
+    std::array<bool, kKvLayerStorageSlots> residual_layers,
+    std::array<bool, kKvLayerStorageSlots> layer_storage_set) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("reload_kv_storage requires a Generation Engine");
@@ -579,6 +700,11 @@ void Engine::reload_kv_storage(
     // drain (no active request admitted) is what makes this program swap safe.
     impl_->device.bind_to_current_thread();
     impl_->options.kv_layer_storage          = layer_storage;
+    // Table and mask are set together, from the same caller-side parse: a mask that
+    // said "written" for a slot this table does not carry would be a per-layer
+    // request for a storage nobody chose, and a table without its mask silently
+    // turns every bf16 slot back into "inherit the global dtype".
+    impl_->options.kv_layer_storage_set      = layer_storage_set;
     impl_->options.kv_layer_storage_explicit = true;
     impl_->options.kv_residual_layers        = residual_layers;
     impl_->options.kv_residual_explicit      = true;

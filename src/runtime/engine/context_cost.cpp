@@ -1,5 +1,7 @@
 #include "runtime/engine/context_cost.h"
 
+#include "targets/declared_capabilities.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -12,7 +14,14 @@
 #include <system_error>
 #include <utility>
 
+// The only POSIX dependency in this file, and it is the same one src/serve/request_log.cpp
+// has: MSVC has no <unistd.h> (MEASURED: C1083) and no ::getpid, so the Windows arm names
+// <process.h> instead.
+#if defined(_WIN32)
+#    include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::runtime {
 
@@ -24,6 +33,10 @@ namespace {
 
 using Json = nlohmann::json;
 using U128 = unsigned __int128;
+
+// The artifact identity key the presets are declared with: the same key type the target packages
+// declare their accepted identities with (src/targets/declared_capabilities.h).
+using targets::WeightsIdentityKey;
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -202,13 +215,31 @@ const ContextCostMachinePreset* find_machine(const std::vector<ContextCostMachin
     return found == presets.end() ? nullptr : &*found;
 }
 
+// One definition of "this preset is for this artifact": a preset declares an identity and the
+// artifact declares its own, so the pair is the key. The lookup, the duplicate check in
+// `validate_presets` and the calibration writer below all compare this key, so a preset for an
+// alias identity (a different source flavour of the same tensors) is a declared row rather than a
+// second copy of the coefficients.
+[[nodiscard]] WeightsIdentityKey declared_identity(const ContextPrefillPreset& preset) noexcept {
+    return WeightsIdentityKey{.model_id = preset.model_id, .weights_id = preset.weights_id};
+}
+
 const ContextPrefillPreset* find_prefill(const ContextCostMachinePreset& machine,
                                          std::string_view model_id,
                                          std::string_view weights_id) noexcept {
+    const WeightsIdentityKey wanted{.model_id = model_id, .weights_id = weights_id};
+    const auto found = std::find_if(machine.prefill.begin(), machine.prefill.end(),
+                                    [wanted](const ContextPrefillPreset& preset) {
+                                        return declared_identity(preset) == wanted;
+                                    });
+    return found == machine.prefill.end() ? nullptr : &*found;
+}
+
+const ContextPrefillPreset* find_prefill_by_weights(const ContextCostMachinePreset& machine,
+                                                    std::string_view weights_id) noexcept {
     const auto found =
-        std::find_if(machine.prefill.begin(), machine.prefill.end(), [&](const auto& preset) {
-            return preset.model_id == model_id && preset.weights_id == weights_id;
-        });
+        std::find_if(machine.prefill.begin(), machine.prefill.end(),
+                     [&](const auto& preset) { return preset.weights_id == weights_id; });
     return found == machine.prefill.end() ? nullptr : &*found;
 }
 
@@ -242,8 +273,7 @@ void validate_presets(const std::vector<ContextCostMachinePreset>& presets,
             validate_prefill(prefill.cost, machine_context + ".prefill[" +
                                                std::to_string(prefill_index) + "].coefficients");
             for (std::size_t prior = 0; prior < prefill_index; ++prior) {
-                if (machine.prefill[prior].model_id == prefill.model_id &&
-                    machine.prefill[prior].weights_id == prefill.weights_id) {
+                if (declared_identity(machine.prefill[prior]) == declared_identity(prefill)) {
                     throw std::invalid_argument(
                         "duplicate context-cost prefill identity: " + machine.hardware_class + "/" +
                         prefill.model_id + "/" + prefill.weights_id);
@@ -296,8 +326,15 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
+#if defined(_WIN32)
+    // Same substitution as src/serve/request_log.cpp: the UCRT spelling, MEASURED equal to
+    // GetCurrentProcessId() here. The suffix only has to be unique per process.
+    temporary += ".tmp." + std::to_string(static_cast<long long>(::_getpid())) + "." +
+                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+#else
     temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
     try {
         {
             std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -374,6 +411,30 @@ std::uint64_t ContextMachineCostModel::prefill_ns(PrefillWork work) const noexce
     return result;
 }
 
+// The cost-table key for one machine: "<card name>-sm<major><minor>".
+//
+// WHAT THIS IS NOT: a capability test, and not a gate. The arch digits only
+// select among MEASURED cost coefficients; nothing here can refuse a request or
+// reject a device. An unrecognised machine has no row of its own and falls back
+// to the documented generic table (compiled_context_cost_defaults() is the
+// single table; generic_context_transfer_cost() / generic_context_prefill_cost()
+// are its conservative numerical floor), which is pinned by
+// tests/test_context_cost.cpp's "unmeasured-machine" case: it resolves to
+// GenericDefault, never to an error. A wrong refusal is therefore impossible
+// from this function; the worst case is a slightly wrong RANKING of cached
+// context reuse on a machine nobody calibrated.
+//
+// The digits come from the DEVICE (cudaDeviceProp major/minor), so sm_120 and
+// sm_120a both spell "sm120": the codegen feature set is deliberately not part
+// of the key, because the coefficients were measured per CARD, and adding a
+// suffix would orphan every landed preset row (they are keyed
+// "nvidia-geforce-rtx-5090-sm120", see context_cost_defaults.cpp).
+//
+// OVERRIDABLE: a locally measured table wins over the compiled one --
+// ContextCostIdentity.hardware_class may be spelled by the caller, and
+// resolve_context_machine_cost(identity, external_preset_path) prefers
+// `--context-cost-presets` / EngineOptions.context_cost.preset_path. So the
+// heuristic is a default, never a verdict.
 std::string context_cost_hardware_class(std::string_view gpu_name, int major, int minor) {
     std::string slug;
     slug.reserve(gpu_name.size() + 20);
@@ -487,6 +548,12 @@ resolve_context_machine_cost(const ContextCostIdentity& identity,
                 find_prefill(*machine, identity.model_id, identity.weights_id)) {
             model.prefill  = prefill->cost;
             prefill_source = ContextCostPresetSource::CompiledDefault;
+        } else if (const ContextPrefillPreset* by_weights =
+                       find_prefill_by_weights(*machine, identity.weights_id)) {
+            // A registered model with no row of its own is closer to another model in the same
+            // weight format than to the generic profile, which is the slowest measured one.
+            model.prefill  = by_weights->cost;
+            prefill_source = ContextCostPresetSource::CompiledWeightsFallback;
         }
     }
 
@@ -553,10 +620,17 @@ void upsert_context_prefill_cost_atomic(const std::filesystem::path& path,
                      {"weights_id", identity.weights_id},
                      {"coefficients", prefill_json(prefill)},
                      {"provenance", parse_provenance(provenance_json)}};
-    Json& entries    = machine.at("prefill");
+    Json& entries = machine.at("prefill");
+    // The written identity and the read identity are the same key, so a calibration recorded for one
+    // weights flavour is found again for that flavour only.
+    const WeightsIdentityKey replaced{.model_id   = identity.model_id,
+                                      .weights_id = identity.weights_id};
     const auto found = std::find_if(entries.begin(), entries.end(), [&](const Json& value) {
-        return value.at("model_id").get_ref<const std::string&>() == identity.model_id &&
-               value.at("weights_id").get_ref<const std::string&>() == identity.weights_id;
+        const WeightsIdentityKey stored{
+            .model_id   = value.at("model_id").get_ref<const std::string&>(),
+            .weights_id = value.at("weights_id").get_ref<const std::string&>(),
+        };
+        return stored == replaced;
     });
     if (found == entries.end()) {
         entries.push_back(std::move(replacement));

@@ -48,10 +48,11 @@ int verify_output(std::string_view label, const GuardedBf16Tensor& output,
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value,
-                   std::int32_t tokens) {
-    constexpr std::int32_t kHidden      = 5120;
-    constexpr std::int32_t kQRows       = 6144;
-    constexpr std::int32_t kKvRows      = 1024;
+                   std::int32_t tokens, std::int32_t hidden, std::int32_t query_rows,
+                   std::int32_t kv_rows) {
+    const std::int32_t kHidden          = hidden;
+    const std::int32_t kQRows           = query_rows;
+    const std::int32_t kKvRows          = kv_rows;
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 101U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
@@ -84,17 +85,26 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     return failures;
 }
 
+// {hidden, parent_rows, query_rows, kv_rows}. Both projection weights are [parent_rows, hidden]
+// and parent_rows is query_rows + kv_rows. The second row is the 4096-wide GDN-hybrid text stack,
+// which is admitted by this op's own registration table.
 int run_q4_q5() {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kParent = 7168;
-    DevicePackedWeight query_key(
-        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 103U));
-    DevicePackedWeight gate_value(
-        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
-
+    constexpr std::int32_t kGeometries[][4]{
+        {5120, 7168, 6144, 1024},
+        {4096, 5120, 4096, 1024},
+    };
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
-        failures += run_q4_q5_case(query_key, gate_value, tokens);
+    for (const auto& geometry : kGeometries) {
+        const std::int32_t kHidden = geometry[0];
+        const std::int32_t kParent = geometry[1];
+        DevicePackedWeight query_key(
+            quantized_weight::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 103U));
+        DevicePackedWeight gate_value(
+            quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
+        for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+            failures += run_q4_q5_case(query_key, gate_value, tokens, geometry[0], geometry[2],
+                                       geometry[3]);
+        }
     }
     return failures;
 }
@@ -374,8 +384,10 @@ int run_fp8_target() {
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 1);
     const std::size_t ten = ops::attn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 10, 10);
-    const std::size_t eleven = ops::attn_input_proj_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 11, 11);
+    const std::size_t sixteen = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 16, 16);
+    const std::size_t seventeen = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 17, 17);
     const std::size_t forty_eight = ops::attn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 48, 48);
     const std::size_t hot_interval = ops::attn_input_proj_workspace_capacity_bytes(
@@ -384,8 +396,9 @@ int run_fp8_target() {
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1024, 1024);
     const std::size_t a16 = ops::attn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::A16Only, 1, 2048);
-    if (one != 0 || ten != 0 || eleven == 0 || forty_eight <= eleven ||
-        hot_interval != forty_eight || exact_1024 <= forty_eight || a16 != 0) {
+    if (one != 0 || ten != 0 || sixteen != 0 || seventeen == 0 ||
+        forty_eight <= seventeen || hot_interval != forty_eight || exact_1024 <= forty_eight ||
+        a16 != 0) {
         std::cerr << "FP8 attention input workspace interval contract mismatch\n";
         ++failures;
     }

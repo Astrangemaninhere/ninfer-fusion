@@ -67,11 +67,18 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
-                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
+                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent,
+                         std::uint32_t mtp_tree_paths, std::uint32_t mtp_tree_depth) {
     card.set_sampling(sampling);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
+    // --draft-tree L,d (L > 1): the shape the PREFILL proposal block must publish a lattice for.
+    // It travels with mtp_proposal_extent because the two describe the same round's proposal
+    // (the node budget L*d is the extent) and because the prefill frame's lattice is produced by
+    // TextContext, while MtpDecodeState::draft_tree_paths -- the decode loop's copy -- is not in
+    // scope on the prefill side.
+    card.set_mtp_tree_shape(mtp_tree_paths, mtp_tree_depth);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -258,17 +265,39 @@ void dump_kv_cache(const PrefillContext& state, std::int32_t tokens, cudaStream_
         kvdump_dump_tensor(stream, view.v_residual_pages, max_pages, prefix + "_vr.bin");
         std::FILE* meta = std::fopen((prefix + "_meta.txt").c_str(), "w");
         if (meta == nullptr) { continue; }
-        std::fprintf(meta,
-                     "layer=%u dtype=%d v_dtype=%d quant_group=%d v_quant_group=%d head_dim=%d "
-                     "num_kv_heads=%d slot_bytes=%d cold_slot_bytes=%d layer_index=%d tokens=%d\n",
-                     layer, static_cast<int>(view.dtype), static_cast<int>(view.v_dtype),
-                     view.quant_group, view.v_quant_group, view.head_dim, view.num_kv_heads,
-                     view.slot_bytes, view.cold_slot_bytes, view.layer_index, tokens);
+        // L26 instrument (D5): a layer whose planes were DISCARDED by
+        // NINFER_KV_DROP_LAYERS owns no storage at all, so batch_layer_view() hands back
+        // the EMPTY view and the block below used to publish that struct's DEFAULT
+        // member -- dtype=0, i.e. BF16, with addr=(nil) -- for a layer that has no plane
+        // of any kind. A reader cannot tell that apart from "a BF16 layer whose pages
+        // are not written yet" (res_l26c/REPORT.md 10.5, the red at
+        // kvc_48_t4_L3_meta.txt). Name the state instead of publishing a dtype the layer
+        // does not have. The fact is read off PagedKVCache, which is per-INSTANCE: the
+        // MTP cache is planned with an empty drop spec and answers false for every
+        // layer. Never add a field to PagedKVBatchLayerView -- the ops API takes these
+        // views BY VALUE, so a size change silently breaks any prebuilt
+        // libninfer_ops.a.
+        if (state.text_cache.layer_is_dropped(layer)) {
+            std::fprintf(meta,
+                         "layer=%u dtype=dropped v_dtype=dropped quant_group=%d "
+                         "v_quant_group=%d head_dim=%d num_kv_heads=%d slot_bytes=%d "
+                         "cold_slot_bytes=%d layer_index=%d tokens=%d\n",
+                         layer, view.quant_group, view.v_quant_group, view.head_dim,
+                         view.num_kv_heads, view.slot_bytes, view.cold_slot_bytes,
+                         view.layer_index, tokens);
+        } else {
+            std::fprintf(meta,
+                         "layer=%u dtype=%d v_dtype=%d quant_group=%d v_quant_group=%d head_dim=%d "
+                         "num_kv_heads=%d slot_bytes=%d cold_slot_bytes=%d layer_index=%d tokens=%d\n",
+                         layer, static_cast<int>(view.dtype), static_cast<int>(view.v_dtype),
+                         view.quant_group, view.v_quant_group, view.head_dim, view.num_kv_heads,
+                         view.slot_bytes, view.cold_slot_bytes, view.layer_index, tokens);
+        }
         kvdump_describe(meta, "k", view.k_pages);
         kvdump_describe(meta, "v", view.v_pages);
         kvdump_describe(meta, "ks", view.k_scale_pages);
         kvdump_describe(meta, "vs", view.v_scale_pages);
-        // Raw device addresses: two layers sharing bytes (e8 plane aliasing,
+        // Raw device addresses: two layers sharing bytes (rk4v4 plane aliasing,
         // _TODO.md 96) show up as overlapping [data, data+bytes) ranges.
         std::fprintf(meta, "addr k=%p v=%p ks=%p vs=%p bytes k=%zu v=%zu ks=%zu vs=%zu\n",
                      view.k_pages.data, view.v_pages.data, view.k_scale_pages.data,
@@ -287,7 +316,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+                        state.state_destination_slot, state.mtp_proposal_extent,
+                        state.mtp_tree_paths, state.mtp_tree_depth);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -324,7 +354,8 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+                        state.state_destination_slot, state.mtp_proposal_extent,
+                        state.mtp_tree_paths, state.mtp_tree_depth);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);

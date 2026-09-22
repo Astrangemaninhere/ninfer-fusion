@@ -25,6 +25,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::BlockScaleK16M128x4V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
+    case NumericFormat::Count:
+        break; // not a format; the enum's own count (artifact/reader.h)
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -49,6 +51,8 @@ QType qtype_for(NumericFormat format) {
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
+    case NumericFormat::Count:
+        break; // not a format; the enum's own count (artifact/reader.h)
     }
     throw std::logic_error("unhandled numeric format");
 }

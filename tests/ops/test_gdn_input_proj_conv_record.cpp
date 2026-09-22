@@ -542,26 +542,63 @@ int run_fp8() {
 } // namespace
 
 int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
+    // ⚠ rebuild1, 2026-09-22. Everything below this line is pure HOST-side capacity
+    // arithmetic: it needs no device. It used to sit AFTER the cuda_unavailable() early
+    // return, which is why both GDN capacity tests read `***Skipped` on every recorded
+    // baseline from 2026-09-14 (build/ctest_full_wB.txt) through 2026-09-21
+    // (dl/redctest/TRANSITIONS.txt) -- and why the FIX-C route change of 2026-09-17 hid
+    // behind that skip for five days instead of going red on the day it landed. The device
+    // gate now sits at the END of this block, so a route-pin failure is reported even when
+    // the CUDA half has to skip.
     int failures                   = 0;
     const auto fp8_record_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                         std::int32_t min_width, std::int32_t max_width) {
         return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 16384, 5120, policy, batch, min_width, max_width);
     };
+    // ⚠ RE-PINNED (rebuild1, 2026-09-22). The batch-1 chain-verify domain is width in [1,16]
+    // and FIX-C (src/ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp, mtime 2026-09-17 16:08)
+    // deleted the batch-1 `AllowA8 && width >= 10 -> MaterializedA8` clause so that every
+    // verify width takes the SAME activation precision as the batch-1 decode. fp8_b1_w10
+    // therefore reads 0 on the landed tree and read 51240 on the byte-exact pre-image, so
+    // the width-10 facts below are asserted the other way round and the entire domain is
+    // pinned by the sweep under them, which is a strictly stronger statement than the two
+    // literals it replaces.
+    // MEASURED out of tree, byte-exact pre-image vs landed tree
+    // (dl/rebuild1/logs/s05_probe_A1.txt vs s05_probe_A0.txt):
+    //   fp8_b1_w10  pre-FIX-C 51240 | landed 0
+    //   fp8_b2_w4   pre-FIX-C 40992 | landed 40992   (FIX-C never touched B > 1)
+    // Restoring the pre-FIX-C clause turns the `fp8_b1_w10 != 0` term and the sweep red
+    // again -- measured: arm A1 of dl/rebuild1/probe/build_probe.sh.
     const std::size_t fp8_b1_w10 = fp8_record_capacity(ops::LinearPolicy::AllowA8, 1, 10, 10);
     const std::size_t fp8_b2_w4  = fp8_record_capacity(ops::LinearPolicy::AllowA8, 2, 4, 4);
     if (fp8_record_capacity(ops::LinearPolicy::A16Only, 1, 2, 16) != 0 ||
-        fp8_record_capacity(ops::LinearPolicy::AllowA8, 1, 2, 9) != 0 || fp8_b1_w10 == 0 ||
+        fp8_record_capacity(ops::LinearPolicy::AllowA8, 1, 2, 9) != 0 || fp8_b1_w10 != 0 ||
         fp8_record_capacity(ops::LinearPolicy::AllowA8, 1, 2, 10) != fp8_b1_w10 ||
         fp8_record_capacity(ops::LinearPolicy::AllowA8, 2, 2, 3) != 0 || fp8_b2_w4 == 0 ||
         fp8_record_capacity(ops::LinearPolicy::AllowA8, 2, 2, 4) != fp8_b2_w4) {
         std::cerr << "FP8 record capacity did not preserve measured route witnesses\n";
         ++failures;
+    }
+    // The batch-1 verify domain of an MTP round is `--draft-tokens + 1`, capped at 16, and
+    // on it the policy must not move the route: A8 quantises the activations to FP8, which
+    // is a different arithmetic from the batch-1 decode's A16, not a re-ordering of it.
+    // B > 1 still splits on the policy (fp8_b2_w4 above is non-zero, rec(..,2,2,3) is zero).
+    for (std::int32_t width = 2; width <= 16; ++width) {
+        if (fp8_record_capacity(ops::LinearPolicy::AllowA8, 1, width, width) !=
+            fp8_record_capacity(ops::LinearPolicy::A16Only, 1, width, width)) {
+            std::cerr << "FP8 record capacity: batch-1 width " << width
+                      << " resolves under AllowA8 where A16Only does not\n";
+            ++failures;
+        }
+    }
+    if (failures != 0) {
+        std::cout << "FAIL gdn_input_proj_conv_record\n";
+        return 1;
+    }
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
     }
     failures += run_q4_q5();
     failures += run_w8();

@@ -82,6 +82,53 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
     return failures;
 }
 
+// Headwise scalar gate: x is [head_dim, heads, tokens], gate is [heads, tokens].
+int run_headwise_case(const char* label, std::int32_t head_dim, std::int32_t heads,
+                      std::int32_t tokens, std::uint32_t seed) {
+    const std::size_t count  = static_cast<std::size_t>(head_dim) * heads * tokens;
+    const std::size_t gcount = static_cast<std::size_t>(heads) * tokens;
+    std::vector<float> gate(gcount), x(count);
+    fill_uniform(gate, seed, -12.0f, 12.0f);
+    fill_uniform(x, seed + 1, -8.0f, 8.0f);
+    round_to_bf16(gate);
+    round_to_bf16(x);
+
+    // Oracle: element (d,h,t) of x is scaled by sigmoid(gate[h + heads*t]).
+    std::vector<double> expected(count);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t h = 0; h < heads; ++h) {
+            const double s = 1.0 / (1.0 + std::exp(-static_cast<double>(gate[h + heads * t])));
+            for (std::int32_t d = 0; d < head_dim; ++d) {
+                const std::size_t i =
+                    static_cast<std::size_t>(d) +
+                    static_cast<std::size_t>(head_dim) *
+                        (static_cast<std::size_t>(h) + static_cast<std::size_t>(heads) * t);
+                expected[i] = static_cast<double>(x[i]) * s;
+            }
+        }
+    }
+
+    const auto gate_bits = encode_bf16(gate);
+    const auto x_bits    = encode_bf16(x);
+    GuardedDeviceBuffer device_gate(gate_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_x(x_bits.size() * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
+    device_x.copy_from_host(x_bits.data(), device_x.bytes());
+
+    Tensor gate_tensor(device_gate.data(), DType::BF16, {heads, tokens});
+    Tensor x_tensor(device_x.data(), DType::BF16, {head_dim, heads, tokens});
+    ops::sigmoid_mul(gate_tensor, x_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_pointwise(label, from_device_bf16(device_x.data(), count), expected,
+                                    sigmoid_mul_bf16_criterion());
+    failures += verify_exact("sigmoid_mul headwise gate unchanged",
+                             from_device<std::uint16_t>(device_gate.data(), gcount), gate_bits);
+    failures += device_gate.verify_guards("sigmoid_mul headwise gate");
+    failures += device_x.verify_guards("sigmoid_mul headwise x");
+    return failures;
+}
+
 int run_edge_case() {
     std::vector<float> gate{-40.0f, -12.0f, -1.0f, 0.0f, 1.0f, 12.0f, 40.0f};
     std::vector<float> x{7.0f, -6.0f, 5.0f, -4.0f, 3.0f, -2.0f, 1.0f};
@@ -127,6 +174,14 @@ int main() {
     failures += run_case("sigmoid_mul [4096,17]", 4096, 17, 201u);
     failures += run_case("sigmoid_mul [4096,128]", 4096, 128, 301u);
     failures += run_edge_case();
+    // Headwise scalar form: Spark-X2.5 16 heads x 256 head_dim, decode and prefill widths.
+    failures += run_headwise_case("sigmoid_mul headwise 16x256x1", 256, 16, 1, 401u);
+    failures += run_headwise_case("sigmoid_mul headwise 16x256x6", 256, 16, 6, 402u);
+    failures += run_headwise_case("sigmoid_mul headwise 16x256x12", 256, 16, 12, 403u);
+    failures += run_headwise_case("sigmoid_mul headwise 32x128x3", 128, 32, 3, 404u);
+    failures += run_headwise_case("sigmoid_mul headwise 4x256x5", 256, 4, 5, 405u);
+    // A per-element square call must keep the per-element interpretation.
+    failures += run_case("sigmoid_mul [256,256]", 256, 256, 501u);
     std::cout << (failures ? "FAIL" : "OK") << " sigmoid_mul\n";
     return failures ? 1 : 0;
 }

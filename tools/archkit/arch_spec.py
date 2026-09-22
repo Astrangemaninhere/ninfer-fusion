@@ -21,6 +21,10 @@ REQUIRED = ["model_id", "geometry"]
 OPTIONAL = [
     "family", "hf", "layer_types", "attention", "mlp", "moe", "gdn",
     "ple", "mtp", "indexer", "vision", "weights", "notes",
+    # §121 (2): the importer persists these so that a re-read of the spec file sees
+    # the same facts the detectors used (see adapt.extract_spec).
+    "head_dim", "rope", "rope_by_kind", "partial_rotary_by_kind", "partial_rotary_factor",
+    "hidden_act", "knobs", "layer_kind_order", "multimodal",
 ]
 
 # 需要浮点/整型转换时用的取值帮助 (值直接照抄 config 即可)
@@ -39,6 +43,17 @@ def load_spec(path: str) -> dict:
     missing = [k for k in REQUIRED if k not in spec]
     if missing:
         raise ValueError("spec missing required fields: %s" % missing)
+    # `geometry` present-but-empty used to pass the key test above, after which every
+    # consumer silently reads its own default.  Two files in this tree are exactly
+    # that shape (specs/qwen4-exp_spec.json:8, specs/specs_spec.json:8): both were
+    # produced by running hf_to_spec() on a *spec* instead of on a config.json, so no
+    # geometry key was ever copied and nobody noticed.  A spec with no geometry is
+    # not a spec.
+    if not spec.get("geometry"):
+        raise ValueError(
+            "spec %s has an empty 'geometry' object; an extraction that found no geometry "
+            "keys must not pass as a spec (did hf_to_spec() get a spec instead of a "
+            "config.json?)" % path)
     unknown = [k for k in spec if k not in REQUIRED + OPTIONAL]
     if unknown:
         print("warning: unknown spec fields: %s" % unknown)

@@ -243,9 +243,20 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
+    // --prefill-chunk-mode: the mode has to cross this boundary or the server's flag would parse,
+    // be validated and then be dropped -- exactly the "accepted but changes nothing" shape. Only an
+    // engaged mode is copied: an unset one is resolved by the engine, which owns the
+    // NINFER_FT_BW_GOV fallback.
+    if (options_.prefill_chunk_mode.has_value()) {
+        engine_options.prefill_chunk_mode = options_.prefill_chunk_mode;
+    }
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.kv_cache_explicit        = options_.kv_cache_explicit;
     engine_options.kv_layer_storage         = options_.kv_layer_storage;
+    // The mask must cross this boundary with the table: without it the engine sees
+    // every bf16 slot as "unset" and `--kv-layer-storage 0-11:bf16` silently keeps
+    // inheriting --kv-dtype (the flag parses, is validated, and changes nothing).
+    engine_options.kv_layer_storage_set     = options_.kv_layer_storage_set;
     engine_options.kv_layer_storage_explicit = options_.kv_layer_storage_explicit;
     // --kv-residual-layers: per-layer NVFP4 second-stage residual planes. The
     // planner gates on kv_residual_explicit and only then reads the table
@@ -257,6 +268,19 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_bit_budget_bits      = options_.kv_bit_budget_bits;
     engine_options.kv_bit_budget_explicit  = options_.kv_bit_budget_explicit;
     engine_options.kv_bit_budget_ranges    = options_.kv_bit_budget_ranges;
+    // The two-score knobs and the two K/V bit-width entries (product/kv_kv_bits.h).
+    // The planner is the only consumer, so nothing between here and there may drop
+    // them: this copy is the whole reason the server's slider can act at all.
+    engine_options.kv_quality_weight       = options_.kv_quality_weight;
+    engine_options.kv_tier_scores          = options_.kv_tier_scores;
+    engine_options.kv_joint_bits           = options_.kv_joint_bits;
+    engine_options.kv_k_bits               = options_.kv_k_bits;
+    engine_options.kv_v_bits               = options_.kv_v_bits;
+    engine_options.kv_kv_bits_explicit     = options_.kv_kv_bits_explicit;
+    engine_options.kv_bits_mode            = options_.kv_bits_mode;
+    engine_options.kv_bits_mode_explicit   = options_.kv_bits_mode_explicit;
+    engine_options.kv_k_tier_scores        = options_.kv_k_tier_scores;
+    engine_options.kv_v_tier_scores        = options_.kv_v_tier_scores;
     engine_options.kv_tier_formats_spec     = options_.kv_tier_formats_spec;
     engine_options.kv_tier_formats_explicit = options_.kv_tier_formats_explicit;
     engine_options.kv_nvfp4_pure            = options_.kv_nvfp4_pure;
@@ -276,10 +300,14 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.cold_policy              = options_.cold_policy;
     engine_options.cold_keep_tokens         = options_.cold_keep_tokens;
     engine_options.max_cold_pages           = options_.max_cold_pages;
+    engine_options.unload_watermark_pages   = options_.unload_watermark_pages;
     engine_options.cold_host_bytes          = options_.cold_host_bytes;
     engine_options.cold_disk_path           = options_.cold_disk_path;
     engine_options.cold_disk_bytes          = options_.cold_disk_bytes;
     engine_options.weight_host_offload_bytes = options_.weight_host_offload_bytes;
+    engine_options.weight_device_arena_bytes = options_.weight_device_arena_bytes;
+    engine_options.weight_prefetch_layers    = options_.weight_prefetch_layers;
+    engine_options.weight_span_floor_bytes   = options_.weight_span_floor_bytes;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
@@ -383,6 +411,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
+        // mtplogx: read before the move into submit() below.
+        prepared.prompt_token_ids = prompt.prompt_token_ids();
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
@@ -456,6 +486,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.reasoning           = std::move(result.reasoning);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
+    outcome.generated_token_ids = std::move(result.generated_token_ids);
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
     outcome.finish_reason       = result.finish_reason;
@@ -514,7 +545,11 @@ void GenerationService::warmup() {
 
 void GenerationService::reload_kv_storage(std::string_view kv_layer_storage_spec) {
     // Parse before gating so a malformed spec never disturbs live traffic.
-    const auto table = ninfer::product::parse_kv_layer_storage(kv_layer_storage_spec);
+    // Both halves of the parse: the relayout loop names every layer it decides on
+    // ("3:rk4v4,4:iso4e,..."), and those slots must stay "written" across the replan or
+    // the table the engine builds is not the one the loop chose. A spec entry the
+    // loop did NOT name keeps its unset meaning (a bf16 slot inherits --kv-dtype).
+    const auto parsed = ninfer::product::parse_kv_layer_storage_spec(kv_layer_storage_spec);
     std::lock_guard reload_lock(reload_mutex_);
     reload_in_progress_.store(true, std::memory_order_release);
     try {
@@ -535,11 +570,11 @@ void GenerationService::reload_kv_storage(std::string_view kv_layer_storage_spec
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         write_console_log(ConsoleLogLevel::Info, "drained; re-running KV sequence plan");
-        // The replan contract carries the layer-storage table AND the residual table
-        // (include/ninfer/engine.h); passing {} here would silently clear
-        // --kv-residual-layers on the first relayout. Reuse the startup table so a
-        // relayout only changes what the spec actually named.
-        engine_->reload_kv_storage(table, options_.kv_residual_layers);
+        // The replan contract carries the layer-storage table, the residual table AND
+        // the write mask (include/ninfer/engine.h); passing {} here would silently
+        // clear --kv-residual-layers on the first relayout, and dropping the mask
+        // would silently turn this relayout's bf16 slots into "inherit --kv-dtype".
+        engine_->reload_kv_storage(parsed.table, options_.kv_residual_layers, parsed.set);
     } catch (...) {
         reload_in_progress_.store(false, std::memory_order_release);
         throw;

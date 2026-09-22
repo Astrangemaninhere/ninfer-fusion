@@ -63,6 +63,24 @@ __device__ __forceinline__ int gqa_prefill_i8_p_swz(int row, int col) {
     return gqa_prefill_swz(row, col);
 }
 
+// A NEGATIVE block-table entry is the Revision 2b cold-slot encoding (the page was
+// retired to the cold pool and the entry became -(slot + 2)). It may only be used as
+// a physical page index by a launch that was handed the cold planes AND the matching
+// per-layer record stride. Every other launch must treat the whole key tile as absent:
+// paged_kv_page_head_offset() with a negative page walks BACKWARDS out of this layer's
+// plane, so the tile silently reads another region of the shared KV page pool. That
+// read stays inside the pool allocation, which is why compute-sanitizer reports
+// nothing (_TODO.md 96: "silent logic/aliasing, not out-of-bounds"). The E8 prompt arm
+// (gqa_attention_prefill_e8.cu: attention_e8_for) and the int8 prompt arm both launch
+// this kernel without the cold planes, so they must never take the cold path.
+__device__ __forceinline__ bool gqa_prefill_i8_tile_is_cold(int table_entry,
+                                                           const std::uint8_t* cold_k_slots,
+                                                           const std::uint8_t* cold_v_slots,
+                                                           int slot_bytes) {
+    return table_entry <= -2 && cold_k_slots != nullptr && cold_v_slots != nullptr &&
+           slot_bytes >= ninfer::ops::kColdI8SlotBytes;
+}
+
 __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* codes8,
                                                              __half scale) {
     const int2 raw       = load_vec<int2>(codes8);
@@ -132,27 +150,31 @@ __launch_bounds__(256) __global__
     page             = __shfl_sync(FullMask, page, 0);
 
     if constexpr (E8) {
-        // E8 tier: Hadamard-rotate 8-dim sub-blocks, project onto the E8
-        // lattice, pack integer coords 4-bit; V is scalar i4. g64 scale /8.
-        // The rotation runs BEFORE the group max: it raises the peak by 1.4-15x
-        // while the code range is only +-7, so a pre-rotation scale clipped the
-        // top of the range (measured on dumped source K: rel-err 0.45 -> 0.094
-        // and clamp rate 3.2% -> 0.1% once the max is taken post-rotation,
+        // E8 tier: Hadamard-rotate 8-dim sub-blocks, pack the resulting integer
+        // coordinates 4-bit; V is scalar i4. g64 scale /8 over codes [-8,7]
+        // (AMAXFIX; was /7 over [-7,7]). Both come from gqa_attention_kv_quant.cuh.
+        // The rotation runs BEFORE the group max (a pre-rotation scale clipped the
+        // top of the range: rel-err 0.45 -> 0.094 once the max is post-rotation,
         // _TODO.md 116/116b).
+        //
+        // NO e8_project_8d_warp() here. The code plane holds one integer per
+        // coordinate while E8 = D8 U (D8 + 1/2), and 47.6% of blocks project into
+        // the half-integer coset, which the trailing rint() then destroys: measured
+        // -3.65 dB (2.32x MSE) versus plain rounding at identical bits/el. See the
+        // long note in gqa_attention_decode_i8.cuh and scratch/fixE1/e8verify.cpp.
         gqa_kv_hadamard64(k0, k1, FullMask);
         float k_abs_e = fmaxf(fabsf(k0), fabsf(k1));
         k_abs_e       = warp_max(k_abs_e, FullMask);
-        const __half ksh_e = __float2half_rn(k_abs_e > 0.0f ? k_abs_e / 7.0f : 0.0f);
-        const __half vsh_e = __float2half_rn(v_abs > 0.0f ? v_abs / 7.0f : 0.0f);
+        const __half ksh_e =
+            kv_scale_half(k_abs_e > 0.0f ? k_abs_e / kGqaKvI4ScaleDivisor : 0.0f);
+        const __half vsh_e =
+            kv_scale_half(v_abs > 0.0f ? v_abs / kGqaKvI4ScaleDivisor : 0.0f);
         const float ks_e   = __half2float(ksh_e);
         const float vs_e   = __half2float(vsh_e);
         const float kinv_e = ks_e > 0.0f ? 1.0f / ks_e : 0.0f;
         const float vinv_e = vs_e > 0.0f ? 1.0f / vs_e : 0.0f;
-        float k0_scaled = k0 * kinv_e;
-        float k1_scaled = k1 * kinv_e;
-        e8_project_8d_warp(k0_scaled, k1_scaled, lane);
-        const int c0  = max(-7, min(7, static_cast<int>(rintf(k0_scaled))));
-        const int c1  = max(-7, min(7, static_cast<int>(rintf(k1_scaled))));
+        const int c0  = static_cast<int>(gqa_kv_quant_i4_code(k0, kinv_e));
+        const int c1  = static_cast<int>(gqa_kv_quant_i4_code(k1, kinv_e));
         if (token == 0 && kv_head == 0 && group == 0 && lane == 1) {
         }
         if (token == 0 && kv_head == 0 && group == 0 && lane == 0) {
@@ -163,14 +185,11 @@ __launch_bounds__(256) __global__
         // are derived from the shuffled raw values.
         const float k0n_nb = __shfl_xor_sync(FullMask, k0, 1);
         const float k1n_nb = __shfl_xor_sync(FullMask, k1, 1);
-        float k0n_s = k0n_nb * kinv_e;
-        float k1n_s = k1n_nb * kinv_e;
-        e8_project_8d_warp(k0n_s, k1n_s, lane);
         const float v0n_nb = __shfl_xor_sync(FullMask, v0, 1);
         const float v1n_nb = __shfl_xor_sync(FullMask, v1, 1);
         if ((lane & 1) == 0) {
-            const int c0n  = max(-7, min(7, static_cast<int>(rintf(k0n_s))));
-            const int c1n  = max(-7, min(7, static_cast<int>(rintf(k1n_s))));
+            const int c0n  = static_cast<int>(gqa_kv_quant_i4_code(k0n_nb, kinv_e));
+            const int c1n  = static_cast<int>(gqa_kv_quant_i4_code(k1n_nb, kinv_e));
             const int vc0n = static_cast<int>(gqa_kv_quant_i4_code(v0n_nb, vinv_e));
             const int vc1n = static_cast<int>(gqa_kv_quant_i4_code(v1n_nb, vinv_e));
             const std::int64_t kb0 =
@@ -273,40 +292,37 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
 
     if constexpr (E8) {
         // Same defect family as the already-fixed fill path above (see that block's
-        // comment; _TODO.md 116/116c). Three things were wrong here at once: the group
-        // max was taken BEFORE any rotation while the reader rotates Q; the E8 code
-        // range is +-7 (not 127) so the scale was ~18x too small and every code
-        // saturated the clamp; and the E8 lattice projection was missing entirely, so
-        // this wrote plain rounded coordinates where the reader expects E8 ones.
+        // comment; _TODO.md 116/116c). Two things were wrong here at once: the group
+        // max was taken BEFORE any rotation while the reader rotates Q; and the E8
+        // code range is +-7 (not 127) so the scale was ~18x too small and every code
+        // saturated the clamp. Both are fixed above.
+        // The E8 lattice projection stays OUT of this path as well -- see the long
+        // note in gqa_attention_decode_i8.cuh (it costs -3.65 dB in an integer plane).
         // Muse is the only geometry that reaches this kernel (KVHeads == 2).
         gqa_kv_hadamard64(k0, k1, FullMask);
         float k_abs_e = fmaxf(fabsf(k0), fabsf(k1));
         k_abs_e       = warp_max(k_abs_e, FullMask);
-        const __half ksh_e = __float2half_rn(k_abs_e > 0.0f ? k_abs_e / 7.0f : 0.0f);
-        const __half vsh_e = __float2half_rn(v_abs > 0.0f ? v_abs / 7.0f : 0.0f);
+        const __half ksh_e =
+            kv_scale_half(k_abs_e > 0.0f ? k_abs_e / kGqaKvI4ScaleDivisor : 0.0f);
+        const __half vsh_e =
+            kv_scale_half(v_abs > 0.0f ? v_abs / kGqaKvI4ScaleDivisor : 0.0f);
         const float ks_e   = __half2float(ksh_e);
         const float vs_e   = __half2float(vsh_e);
         const float kinv_e = ks_e > 0.0f ? 1.0f / ks_e : 0.0f;
         const float vinv_e = vs_e > 0.0f ? 1.0f / vs_e : 0.0f;
-        float k0_scaled = k0 * kinv_e;
-        float k1_scaled = k1 * kinv_e;
-        e8_project_8d_warp(k0_scaled, k1_scaled, lane);
-        const int c0  = max(-7, min(7, static_cast<int>(rintf(k0_scaled))));
-        const int c1  = max(-7, min(7, static_cast<int>(rintf(k1_scaled))));
+        const int c0  = static_cast<int>(gqa_kv_quant_i4_code(k0, kinv_e));
+        const int c1  = static_cast<int>(gqa_kv_quant_i4_code(k1, kinv_e));
         const int vc0 = static_cast<int>(gqa_kv_quant_i4_code(v0, vinv_e));
         const int vc1 = static_cast<int>(gqa_kv_quant_i4_code(v1, vinv_e));
         // All 32 lanes must execute the FullMask shuffle; the neighbor codes
         // are derived from the shuffled raw values.
         const float k0n_nb = __shfl_xor_sync(FullMask, k0, 1);
         const float k1n_nb = __shfl_xor_sync(FullMask, k1, 1);
-        float k0n_s = k0n_nb * kinv_e;
-        float k1n_s = k1n_nb * kinv_e;
-        e8_project_8d_warp(k0n_s, k1n_s, lane);
         const float v0n_nb = __shfl_xor_sync(FullMask, v0, 1);
         const float v1n_nb = __shfl_xor_sync(FullMask, v1, 1);
         if ((lane & 1) == 0) {
-            const int c0n  = max(-7, min(7, static_cast<int>(rintf(k0n_s))));
-            const int c1n  = max(-7, min(7, static_cast<int>(rintf(k1n_s))));
+            const int c0n  = static_cast<int>(gqa_kv_quant_i4_code(k0n_nb, kinv_e));
+            const int c1n  = static_cast<int>(gqa_kv_quant_i4_code(k1n_nb, kinv_e));
             const int vc0n = static_cast<int>(gqa_kv_quant_i4_code(v0n_nb, vinv_e));
             const int vc1n = static_cast<int>(gqa_kv_quant_i4_code(v1n_nb, vinv_e));
             const std::int64_t kb0 =
@@ -328,9 +344,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
         }
         if (lane == 0) {
             const std::int64_t scale_offset =
-                paged_kv_page_head_offset<kGqaKvQuantGroups, Geometry::KVHeads>(physical_page,
-                                                                                kv_head) +
-                static_cast<std::int64_t>(page_off) * kGqaKvQuantGroups + group;
+                gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, group, page_off);
             scale_k[scale_offset] = ksh_e;
             scale_v[scale_offset] = vsh_e;
         }
@@ -338,17 +352,15 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     }
 
     const std::int64_t code_base =
-        paged_kv_page_head_offset<kGqaKvQuantHeadDim, Geometry::KVHeads>(physical_page, kv_head) +
-        static_cast<std::int64_t>(page_off) * kGqaKvQuantHeadDim + group * kGqaKvQuantGroup;
+        gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, group * kGqaKvQuantGroup,
+                                          page_off);
     cache_k[code_base + lane]      = gqa_kv_quant_code(k0, kinv);
     cache_k[code_base + lane + 32] = gqa_kv_quant_code(k1, kinv);
     cache_v[code_base + lane]      = gqa_kv_quant_code(v0, vinv);
     cache_v[code_base + lane + 32] = gqa_kv_quant_code(v1, vinv);
     if (lane == 0) {
         const std::int64_t scale_offset =
-            paged_kv_page_head_offset<kGqaKvQuantGroups, Geometry::KVHeads>(physical_page,
-                                                                            kv_head) +
-            static_cast<std::int64_t>(page_off) * kGqaKvQuantGroups + group;
+            gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, group, page_off);
         scale_k[scale_offset] = ksh;
         scale_v[scale_offset] = vsh;
     }
@@ -451,9 +463,12 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         // and skip the cp.async pipeline: the double-buffer prefetch would
         // otherwise overwrite the tile being consumed. Cold tiles are rare
         // (one per window crossing), so the lost overlap is negligible.
-        const bool tile_cold  = table_entry <= -2 && cold_k_slots != nullptr &&
-                               cold_v_slots != nullptr &&
-                               slot_bytes >= ninfer::ops::kColdI8SlotBytes;
+        const bool tile_cold =
+            gqa_prefill_i8_tile_is_cold(table_entry, cold_k_slots, cold_v_slots,
+                                        slot_bytes);
+        // A negative entry without the cold planes is NOT a page index.
+        // Zero-fill the tile instead of silently aliasing another layer's plane.
+        const bool tile_absent = table_entry < 0 && !tile_cold;
         const std::int64_t slot_flat =
             static_cast<std::int64_t>(-table_entry - 2) * (2 * Geometry::KVHeads) + kv_head;
         const std::uint8_t* k_slot = tile_cold ? cold_k_slots + slot_flat * slot_bytes
@@ -495,22 +510,58 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                     continue;
                 }
                 const int row = key & kPagedKVPageMask;
-                std::int8_t row_codes[kGqaKvQuantHeadDim];
-                __half row_scales[kGqaKvQuantGroups];
-                ninfer::ops::detail::cold_i8_decode_row(k_slot, row, row_codes, row_scales);
-#pragma unroll 4
-                for (int d = 0; d < kGqaKvQuantHeadDim; ++d) {
-                    gqa_prefill_i8_store_swz(k_i8, key_l, d, row_codes[d]);
-                }
+                if constexpr (E8) {
+                    // UNLOAD-NORMALQUANT E4-prefill. The e8 tier's cold record is the SAME
+                    // raw slot the int8 tier writes, but its code plane holds the tier's
+                    // packed 4-bit lattice codes VERBATIM (entropy_cold_requant's E8KvG64
+                    // arm copies them byte-for-byte and only requantizes the g64 fp16 scale
+                    // into the E4M3 g16 tail) rather than a requantized E2M1 code. Feeding
+                    // those bytes to cold_i8_decode_row -- the E2M1 x E4M3 decoder the
+                    // non-E8 arm below uses -- would read every nibble through the wrong
+                    // alphabet, and it would ALSO leave the tile in the unpacked layout
+                    // while unpack_tile (which runs for every e8 tile, :621/:861) expands it
+                    // a second time as if it were packed. So this arm stages exactly what
+                    // the hot e8 path stages: eight bytes of codes per sixteen dims into
+                    // the packed smem position gqa_kv_i4_code_index addressed, and the four
+                    // g64 scales from the tail byte the requant replicated (g reads tail
+                    // byte 4*g). Nothing about QK/PV changes, so a cold key row is decoded
+                    // by the same instructions as a hot one.
+                    const std::uint8_t* k_row_s =
+                        ninfer::ops::detail::cold_i8_slot_scales(k_slot) + row * 16;
+                    const std::uint8_t* v_row_s =
+                        ninfer::ops::detail::cold_i8_slot_scales(v_slot) + row * 16;
 #pragma unroll
-                for (int g = 0; g < Groups; ++g) { kd[g] = row_scales[g]; }
-                ninfer::ops::detail::cold_i8_decode_row(v_slot, row, row_codes, row_scales);
+                    for (int g = 0; g < Groups; ++g) {
+                        kd[g] = __float2half_rn(gqa_kv_nvfp4_e4m3_to_f32(k_row_s[g * 4]));
+                        vd[g] = __float2half_rn(gqa_kv_nvfp4_e4m3_to_f32(v_row_s[g * 4]));
+                    }
+                    const std::uint8_t* k_codes = ninfer::ops::detail::cold_i8_slot_codes(k_slot);
+                    const std::uint8_t* v_codes = ninfer::ops::detail::cold_i8_slot_codes(v_slot);
+#pragma unroll 1
+                    for (int dc = 0; dc < D / 16; ++dc) {
+                        std::int8_t* kdst =
+                            &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 8)) * 2];
+                        cp_async<8>(kdst, k_codes + row * 128 + dc * 8);
+                        cp_async<8>(&v_i8[key_l * D + dc * 16], v_codes + row * 128 + dc * 8);
+                    }
+                } else {
+                    std::int8_t row_codes[kGqaKvQuantHeadDim];
+                    __half row_scales[kGqaKvQuantGroups];
+                    ninfer::ops::detail::cold_i8_decode_row(k_slot, row, row_codes, row_scales);
 #pragma unroll 4
-                for (int d = 0; d < kGqaKvQuantHeadDim; ++d) {
-                    v_i8[key_l * D + d] = row_codes[d];
-                }
+                    for (int d = 0; d < kGqaKvQuantHeadDim; ++d) {
+                        gqa_prefill_i8_store_swz(k_i8, key_l, d, row_codes[d]);
+                    }
 #pragma unroll
-                for (int g = 0; g < Groups; ++g) { vd[g] = row_scales[g]; }
+                    for (int g = 0; g < Groups; ++g) { kd[g] = row_scales[g]; }
+                    ninfer::ops::detail::cold_i8_decode_row(v_slot, row, row_codes, row_scales);
+#pragma unroll 4
+                    for (int d = 0; d < kGqaKvQuantHeadDim; ++d) {
+                        v_i8[key_l * D + d] = row_codes[d];
+                    }
+#pragma unroll
+                    for (int g = 0; g < Groups; ++g) { vd[g] = row_scales[g]; }
+                }
             }
             ninfer::ops::cp_commit();
             ninfer::ops::cp_wait<0>();
@@ -520,7 +571,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             const int key = tile_k0 + key_l;
             __half* kd    = &k_scale_s[key_l * Groups];
             __half* vd    = &v_scale_s[key_l * Groups];
-            if (key <= max_query_abs) {
+            if (key <= max_query_abs && !tile_absent) {
                 const std::int64_t off =
                     gqa_kv_quant_scale_index<Geometry>(table_entry, kv_head, 0, key_l);
                 ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
@@ -538,7 +589,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             const int key   = tile_k0 + key_l;
             std::int8_t* kd = &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 8)) * 2];
             std::int8_t* vd = &v_i8[key_l * D + d];
-            if (key <= max_query_abs) {
+            if (key <= max_query_abs && !tile_absent) {
                 if constexpr (E8) {
                     // Packed 4-bit tier: 8 bytes per 16 dims; the unpack pass
                     // after cp_wait expands them into i8 in place.
@@ -561,46 +612,33 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     };
 
     auto unpack_tile = [&](int tile_k0) {
+        // Same rule as issue_kv_tile: only expand a tile that was actually filled.
+        const int table_entry = block_table[tile_k0 >> kPagedKVPageShift];
+        // FIX (E8 read side): this gate must be the SAME predicate issue_kv_tile uses,
+        // i.e. "negative entry AND not a cold slot".  Bare
+        // `!gqa_prefill_i8_tile_is_cold(...)` is TRUE for every ordinary (non-negative)
+        // block-table entry, so the E8-only unpack pass below was skipped for every
+        // normal tile and the QK/PV math read the raw PACKED nibble bytes as if they
+        // were one int8 code each.
+        const bool tile_absent =
+            table_entry < 0 && !gqa_prefill_i8_tile_is_cold(table_entry, cold_k_slots,
+                                                            cold_v_slots, slot_bytes);
         for (int chunk = tid; chunk < Bc * (D / 16); chunk += kGqaPrefillI8Threads) {
             const int key_l = chunk / (D / 16);
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
-            if (key <= max_query_abs) {
+            if (key <= max_query_abs && !tile_absent) {
                 std::int8_t* kdst = &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 8)) * 2];
                 std::int8_t* vdst = &v_i8[key_l * D + d];
                 const int2 kpacked = load_vec<int2>(kdst);
                 const int2 vpacked = load_vec<int2>(vdst);
-                std::int8_t kout[16];
-                std::int8_t vout[16];
+                std::int8_t kout[kGqaKvUnpackWidth];
+                std::int8_t vout[kGqaKvUnpackWidth];
                 gqa_kv_unpack_i4x16(reinterpret_cast<const std::uint8_t*>(&kpacked), kout);
                 gqa_kv_unpack_i4x16(reinterpret_cast<const std::uint8_t*>(&vpacked), vout);
-                store_vec(kdst, make_int4(
-                                    static_cast<int>(kout[0]) | (static_cast<int>(kout[1]) << 8) |
-                                        (static_cast<int>(kout[2]) << 16) |
-                                        (static_cast<int>(kout[3]) << 24),
-                                    static_cast<int>(kout[4]) | (static_cast<int>(kout[5]) << 8) |
-                                        (static_cast<int>(kout[6]) << 16) |
-                                        (static_cast<int>(kout[7]) << 24),
-                                    static_cast<int>(kout[8]) | (static_cast<int>(kout[9]) << 8) |
-                                        (static_cast<int>(kout[10]) << 16) |
-                                        (static_cast<int>(kout[11]) << 24),
-                                    static_cast<int>(kout[12]) | (static_cast<int>(kout[13]) << 8) |
-                                        (static_cast<int>(kout[14]) << 16) |
-                                        (static_cast<int>(kout[15]) << 24)));
-                store_vec(vdst, make_int4(
-                                    static_cast<int>(vout[0]) | (static_cast<int>(vout[1]) << 8) |
-                                        (static_cast<int>(vout[2]) << 16) |
-                                        (static_cast<int>(vout[3]) << 24),
-                                    static_cast<int>(vout[4]) | (static_cast<int>(vout[5]) << 8) |
-                                        (static_cast<int>(vout[6]) << 16) |
-                                        (static_cast<int>(vout[7]) << 24),
-                                    static_cast<int>(vout[8]) | (static_cast<int>(vout[9]) << 8) |
-                                        (static_cast<int>(vout[10]) << 16) |
-                                        (static_cast<int>(vout[11]) << 24),
-                                    static_cast<int>(vout[12]) | (static_cast<int>(vout[13]) << 8) |
-                                        (static_cast<int>(vout[14]) << 16) |
-                                        (static_cast<int>(vout[15]) << 24)));
+                store_vec(kdst, gqa_kv_pack_i8x16_to_int4(kout));
+                store_vec(vdst, gqa_kv_pack_i8x16_to_int4(vout));
             }
         }
         __syncthreads();

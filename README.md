@@ -37,8 +37,18 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Tests, benchmarks, and maintainer tools are excluded from the default build. There is no install
-target or packaged binary distribution; run NInfer from its source build tree.
+Tests, benchmarks, and maintainer tools are excluded from the default build. Install the product
+binaries into a prefix with:
+
+```bash
+cmake --install build --prefix /path/to/prefix
+```
+
+`--prefix` is optional; without it the `CMAKE_INSTALL_PREFIX` chosen at configure time is used.
+The install tree is `bin/` (the three executables) plus `share/doc/ninfer/` (this README, the
+LICENSE, `CONTRIBUTING.md`, and a generated `ninfer-install-manifest.txt`). There is no packaged
+binary distribution, no installer and no release archive: `cmake --install` is the deployment
+path, and the binaries still run straight out of the source build tree if you prefer that.
 
 Download the artifact used by this example with the Hugging Face CLI:
 

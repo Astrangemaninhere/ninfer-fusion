@@ -290,6 +290,18 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // --draft-tree L,d (L > 1): the tree shape THIS prefill's proposal loop must also publish a
+    // lattice for (MtpPrefillState::lattice_ids), beside the per-depth draft token it already
+    // produces. The decode loop's own lattice (MtpDecodeEgress::next_proposal_ids) is published by
+    // mtp_impl.h; the round-1 lattice has to come from the PREFILL proposal block, which is
+    // TextContext::prefill_chunk -- see extract_mtp_proposal_lattice(). paths <= 1 / depth == 0 is
+    // the chain spelling and launches no extra work at all, which keeps --draft-tokens
+    // bit-identical.
+    void set_mtp_tree_shape(std::uint32_t paths, std::uint32_t depth) noexcept {
+        mtp_tree_paths_ = paths;
+        mtp_tree_depth_ = depth;
+    }
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -320,12 +332,14 @@ public:
                                Tensor& logits);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             const Tensor& column_masks, const Tensor& kv_table_rows,
+                             const Tensor& linear_state_source_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             const Tensor& column_masks, const Tensor& kv_table_rows,
+                             const Tensor& linear_state_source_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -342,6 +356,12 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::GqaExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+    // --draft-tree L,d (L > 1): publish the depth-`depth` top-L candidate rows of the SAME logits
+    // window that just produced the depth-`depth` draft token, into the prefill frame's
+    // lattice_ids. A no-op for the chain spelling and for a depth past the tree's own depth; the
+    // definition states why this belongs to the proposal block and not to the bridge.
+    void extract_mtp_proposal_lattice(Tensor& logits, std::uint32_t depth);
+
 private:
     void bind();
 
@@ -359,7 +379,7 @@ private:
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,
-                                  const Tensor& kv_table_rows,
+                                  const Tensor& column_masks, const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
                                   ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
@@ -414,6 +434,8 @@ private:
     const Tensor* active_linear_state_source_slots_                                = nullptr;
     const Tensor* active_linear_state_destination_slots_                           = nullptr;
     const Tensor* active_valid_columns_                                            = nullptr;
+    // M1: the per-column ancestor masks of a tree verify round. Null = no tree this round.
+    const Tensor* active_column_masks_                                             = nullptr;
     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
     const ops::GqaExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;
@@ -433,6 +455,9 @@ private:
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
+    // --draft-tree L,d (L > 1): see set_mtp_tree_shape(). Read only by extract_mtp_proposal_lattice().
+    std::uint32_t mtp_tree_paths_             = 0;
+    std::uint32_t mtp_tree_depth_             = 0;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

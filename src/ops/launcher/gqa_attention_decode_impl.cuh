@@ -130,16 +130,45 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
     Tensor& cache_v = cache.v_pages;
+    // BF16-COLD-LAND A4: a bf16 layer's cold record IS the int8 raw slot
+    // (decoder_state.cpp cold_slot_codec_of, A1), so this body reads the same slot the
+    // i8 body reads, through the same device helpers. Plane-relative bases, as in the
+    // i8/nvfp4 partials. The dtype is part of the guard because a cache whose dtype
+    // disagrees with the codec has no correct answer here, and reading a slot through
+    // the wrong codec is worse than not reading it at all.
+    const bool cold_bf16_ok = cache.dtype == DType::I8 || cache.dtype == DType::BF16;
+    const std::uint8_t* cold_k_slots =
+        cache.cold_slots.data != nullptr && cold_bf16_ok
+            ? static_cast<const std::uint8_t*>(cache.cold_slots.data)
+            : nullptr;
+    const std::uint8_t* cold_v_slots =
+        cold_k_slots != nullptr && cache.cold_slots.nb[2] != 0
+            ? cold_k_slots + cache.cold_slots.nb[2]
+            : nullptr;
+    const std::int32_t* cold_k_valid =
+        cold_k_slots == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(cache.cold_slot_valid.data);
+    const std::int32_t* cold_v_valid =
+        cold_k_valid == nullptr
+            ? nullptr
+            : reinterpret_cast<const std::int32_t*>(
+                  reinterpret_cast<const std::uint8_t*>(cold_k_valid) +
+                  cache.cold_slot_valid.nb[1]);
     // bf16 kernel uses only static smem (no dynamic staging).
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
                                                  Masked, CacheInput><<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), input,
         static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
-        static_cast<__nv_bfloat16*>(cache_v.data),
+        static_cast<__nv_bfloat16*>(cache_v.data), cold_k_slots, cold_v_slots, cold_k_valid,
+        cold_v_valid, cache.slot_bytes,
         static_cast<const std::int32_t*>(cache.block_tables.data),
         invocation.valid_columns == nullptr
             ? nullptr
             : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+        invocation.column_masks == nullptr
+            ? nullptr
+            : static_cast<const std::uint64_t*>(invocation.column_masks->data),
         invocation.table_rows == nullptr
             ? nullptr
             : static_cast<const std::int32_t*>(invocation.table_rows->data),

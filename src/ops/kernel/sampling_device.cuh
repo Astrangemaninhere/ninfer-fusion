@@ -138,6 +138,10 @@ __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
     float x = raw;
+    if (c.allowed_tokens != nullptr &&
+        !(static_cast<unsigned int>(c.allowed_tokens[v / 32]) & (1U << (v % 32)))) {
+        return -CUDART_INF_F;
+    }
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
     for (int j = 0; j < overlay_len; ++j) {

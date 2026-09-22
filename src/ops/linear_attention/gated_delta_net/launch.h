@@ -3,6 +3,8 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
+#include "ops/linear_attention/gated_delta_net/chunked/launch.h"
+
 
 #include <cuda_runtime.h>
 
@@ -44,6 +46,11 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                              Tensor& out, cudaStream_t stream);
 
+/// True when `launch_replay_fold` has a compiled kernel instantiation for this record geometry.
+/// This is the fold's ONE geometry registry: the plan validator in replay.cpp asks this rather
+/// than keeping a second copy of the list, so a new instantiation cannot be half-added.
+[[nodiscard]] bool replay_fold_geometry_supported(const GdnReplayRecordSpec& spec) noexcept;
+
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream);
@@ -53,6 +60,7 @@ std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t token
 void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                     const Tensor& beta, float scale, const Tensor& ssm_state_in,
                     Tensor& ssm_state_out, Tensor& out, void* workspace,
-                    std::size_t workspace_bytes, cudaStream_t stream);
+                    std::size_t workspace_bytes, cudaStream_t stream,
+                    const chunked::GdnChunkedStageHook* hook = nullptr);
 
 } // namespace ninfer::ops::detail::gated_delta_net

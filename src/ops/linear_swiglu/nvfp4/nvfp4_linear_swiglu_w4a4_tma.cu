@@ -62,6 +62,12 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
         throw std::invalid_argument(
             "nvfp4 LinearSwiGLU TMA requires a positive M256 full-tile token count");
     }
+    // The host half of the arch decision. Same predicate as launch_tma's, single-sourced in
+    // nvfp4_w4a4_tma.cuh, because this TU launches a kernel whose body the SAME device guard
+    // compiles out (src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh).
+    if (!nvfp4_tma_rung_has_the_mxf4_channel()) {
+        throw std::runtime_error(nvfp4_tma_below_floor_refusal());
+    }
 
     using Geometry                     = Nvfp4MlpGateUpGeometry;
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4LinearSwiGluTmaSharedStorage<M256N128S3>);

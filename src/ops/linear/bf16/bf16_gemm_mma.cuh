@@ -130,7 +130,25 @@ bf16_mma_tile_coordinates(std::int32_t linear, std::int32_t tiles_m, std::int32_
     }
 }
 
-template <class Geometry, class Schedule, bool FullTokens, class Output>
+// SplitK is the donor's fifth template parameter (igorls/ninfer @ 5e4a66d
+// src/ops/linear/bf16/bf16_gemm_mma.cuh:134). It was never ported with the FlashNext target, and
+// that target instantiates it -- src/targets/qwen3_8_flash_next/impl/hyper_connection_kernels.cu
+// :640,:644,:674 pass `kHyperDownSplitK` as a fifth argument (the prefill down-projection is
+// N=320 x T; the 32x32 tile yields only 40 CTAs at T=128 on this box's 188 SMs, so it splits K
+// four ways and reduces the partials afterwards). Without the parameter the explicit argument
+// list failed to substitute and the device TU did not compile at all:
+//   hyper_connection_kernels.cu(639): error: no instance of overloaded function
+//   "cudaFuncSetAttribute" matches the argument list
+//   hyper_connection_kernels.cu(644): error: no instance of function template
+//   "ninfer::ops::detail::bf16_gemm_mma_kernel" matches the argument list
+//
+// ADDITIVE AND BEHAVIOUR-PRESERVING AT THE DEFAULT. With SplitK == 1 the three touched bodies
+// reduce to exactly what they were before this edit -- `split` is 0, `kTiles` is `K / BK`, and
+// `k0` is `k_tile * BK` -- so every existing 4-argument instantiation generates the same code.
+// blockIdx.y is only read when SplitK > 1; a 1-D launch leaves it 0 and unused otherwise.
+// The asserts follow the donor: ((K / BK) % SplitK) == 0 keeps the K tiling even, and
+// (K / BK) / SplitK >= S keeps the pipeline full across the split.
+template <class Geometry, class Schedule, bool FullTokens, class Output, int SplitK = 1>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
     std::int32_t tokens) {
@@ -149,7 +167,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
     constexpr int THREADS = Schedule::kThreads;
     static_assert(M % BM == 0);
     static_assert(K % BK == 0);
-    static_assert(K / BK >= S);
+    static_assert(SplitK >= 1 && ((K / BK) % SplitK) == 0);
+    static_assert((K / BK) / SplitK >= S);
 
     extern __shared__ __align__(16) unsigned char shared_raw[];
     auto* As = reinterpret_cast<__nv_bfloat16*>(shared_raw);
@@ -165,6 +184,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
 
     constexpr int tiles_m = M / BM;
     const int tiles_n     = tokens / BN + static_cast<int>(tokens % BN != 0);
+    // The split index. At SplitK == 1 this is a constant 0 and blockIdx.y is never touched, which
+    // is what keeps the single-split launch shape byte-identical to the pre-split-kernel one.
+    const int split       = SplitK == 1 ? 0 : static_cast<int>(blockIdx.y);
     int tile_m            = 0;
     int tile_n            = 0;
     bf16_mma_tile_coordinates<Schedule>(static_cast<int>(blockIdx.x), tiles_m, tiles_n, tile_m,
@@ -182,8 +204,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
     const int b_inner_row  = lane & 7;
     const int b_k_offset   = ((lane >> 3) & 1) << 3;
 
+    constexpr int kTiles = (K / BK) / SplitK;
+
     auto stage_inputs = [&](int stage, int k_tile) {
-        const int k0  = k_tile * BK;
+        const int k0  = (split * kTiles + k_tile) * BK;
         auto* a_stage = As + stage * BM * BK;
         auto* b_stage = Bs + stage * BN * BK;
 
@@ -216,7 +240,6 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
         }
     };
 
-    constexpr int kTiles = K / BK;
 #pragma unroll
     for (int stage = 0; stage < S; ++stage) {
         stage_inputs(stage, stage);

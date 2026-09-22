@@ -69,9 +69,19 @@ int expect_fail(const std::string& what, const std::string& detail) {
     return 1;
 }
 
-} // namespace
+// Local copy of tests/ops/op_tester.h's gate. This TU deliberately does not include that header (it
+// is std + cuda_runtime only), and a non-"unavailable" driver error is NOT swallowed here.
+bool cuda_unavailable() {
+    int device_count    = 0;
+    const cudaError_t e = cudaGetDeviceCount(&device_count);
+    if (e == cudaSuccess) { return device_count == 0; }
+    return e == cudaErrorNoDevice || e == cudaErrorInsufficientDriver;
+}
 
-int main(int argc, char** argv) {
+// The selftest body, renamed out of main() so that a top-level handler can turn an escaping
+// exception into a diagnostic. Pre-change, a box with no device aborted here with
+// "terminate called ... PLE cache cudaHostAlloc: no CUDA-capable device is detected", rc=134.
+int selftest(int argc, char** argv) {
     // "real" mode: validate against an actual Qwen4Exp PLE sidecar (manifest +
     // data files under the given root). Skips the synthetic cross-check; the
     // gather is validated for finiteness and non-degeneracy.
@@ -108,6 +118,13 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("real row location OK (%zu rows)\n", rows.size());
+
+        // Everything above in this branch is host-only (manifest parse, derivation, row location) and
+        // has already been judged. The gather below needs a device.
+        if (cuda_unavailable()) {
+            std::printf("SKIP: no usable CUDA device\n");
+            return 77;
+        }
 
         ninfer::ops::ple::PleTableOptions opts;
         opts.sidecar_root = root_dir;
@@ -191,6 +208,15 @@ int main(int argc, char** argv) {
     std::printf("PLE layout row derivation matches the llama.cpp reference (%d tokens x %d heads)\n",
                 kNTokens, kHeads);
 
+    // Sections 1-4 above are host-only and have already been judged by the time the print above
+    // runs, so a red host half was already reported as rc=1 through expect_fail(). Section 5 needs a
+    // device: with none, report the repository's skip code rather than letting the pinned-cache
+    // allocation escape as an exception out of main().
+    if (cuda_unavailable()) {
+        std::printf("SKIP: no usable CUDA device\n");
+        return 77;
+    }
+
     // 5. Device-side gather: rows were written as their own row id, so the
     //    gathered halves must equal the derived row ids.
     ninfer::ops::ple::PleTableOptions opts;
@@ -228,4 +254,18 @@ int main(int argc, char** argv) {
     std::printf("PLE UVA gather round-trip OK (%d rows through pinned cache)\n",
                 kNTokens * kHeads);
     return 0;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    try {
+        return selftest(argc, argv);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: ple_layout selftest threw: %s\n", error.what());
+        return 1;
+    } catch (...) {
+        std::fprintf(stderr, "FAIL: ple_layout selftest threw a non-std exception\n");
+        return 1;
+    }
 }

@@ -28,7 +28,7 @@ from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
 from tools.convert.qwen3_6.common import official_resources
 
-from . import draft_head, inventory, recipe
+from . import draft_head, inventory, recipe, text_core
 
 
 RECIPE_ID = "qwen3_6_27b-v2"
@@ -115,6 +115,16 @@ def _check_members(
 def validate_config(config: Mapping[str, object]) -> dict[str, object]:
     """Validate the exact registered checkpoint dimensions and summarize them."""
 
+    # A *text-core* source of the same registered geometry carries no
+    # `text_config`/`vision_config` shell and no vision token ids, so the
+    # registered contract below cannot describe it: it refuses on the shell
+    # before it ever compares the geometry.  Such a source is routed to the
+    # text-core validator, which pins the same twelve numbers and measures the
+    # layer schedule off the tensors.  The registered path is untouched -- any
+    # source that declares the shell takes the body below, byte for byte.
+    if not text_core.looks_like_registered_multimodal(config):
+        return text_core.validate_text_config(config)
+
     _check_members("config", config, _ROOT_CONFIG)
     text = config.get("text_config")
     vision = config.get("vision_config")
@@ -160,6 +170,21 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
             )
         },
     }
+
+
+def is_text_core_source(model_dir: str | Path) -> bool:
+    """True when this source is a text core rather than the registered checkpoint.
+
+    The decision is the same one `validate_config` makes, asked of a directory
+    instead of a mapping, so the front door's route (which calls `validate_config`)
+    and this converter's route cannot disagree about the same source.
+    """
+
+    path = Path(model_dir) / "config.json"
+    if not path.is_file():
+        return False
+    return not text_core.looks_like_registered_multimodal(
+        family_conversion.load_json(path))
 
 
 def preflight_inventory() -> None:
@@ -295,6 +320,16 @@ def convert(
 ) -> Path:
     """Run the complete registered conversion and return the report path."""
 
+    # The object closure is chosen from what the source carries.  A text-core
+    # source has no tensors for MTP / draft head / vision, so
+    # `text_core.convert` includes only the groups it can actually build and
+    # names each omission in the report; the identity written is unchanged.
+    if is_text_core_source(model_dir):
+        return text_core.convert(
+            model_dir, out_path, device=device,
+            model_id=inventory.MODEL_ID, weights_id=inventory.WEIGHTS_ID,
+            target_key=inventory.TARGET_KEY)
+
     started = time.perf_counter()
     model = Path(model_dir)
     output = Path(out_path)
@@ -309,7 +344,7 @@ def convert(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
-    with ShardReader(model) as reader:
+    with recipe.source_reader(model) as reader:
         with ArtifactWriter(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
@@ -367,7 +402,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--resources", action="append", default=None,
+                        help="前端资源的搜索根（可重复；默认读 $NINFER_RESOURCE_ROOTS）")
     args = parser.parse_args(argv)
+    if is_text_core_source(args.model):
+        text_core.convert(args.model, args.out, device=args.device,
+                          resources=args.resources,
+                          model_id=inventory.MODEL_ID, weights_id=inventory.WEIGHTS_ID,
+                          target_key=inventory.TARGET_KEY)
+        return
     convert(args.model, args.out, device=args.device)
 
 

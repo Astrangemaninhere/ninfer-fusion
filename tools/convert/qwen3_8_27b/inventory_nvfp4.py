@@ -39,12 +39,25 @@ LAYOUT_NAMES = (
     ROW_SCALE_LAYOUT,
 )
 
-FULL_ATTENTION_LAYERS = tuple(range(3, 64, 4))
+TEXT_LAYERS = tuple(range(64))
+FULL_ATTENTION_LAYERS = tuple(range(3, len(TEXT_LAYERS), 4))
 GDN_LAYERS = tuple(
-    layer for layer in range(64) if layer not in FULL_ATTENTION_LAYERS
+    layer for layer in TEXT_LAYERS if layer not in FULL_ATTENTION_LAYERS
 )
-NVFP4_MLP_LAYERS = tuple(range(56))
-FP8_MLP_LAYERS = tuple(range(56, 64))
+# The FP8/NVFP4 split of the MLP is the *source artifact's own declaration*, not
+# a geometry field: `quantization_config.config_groups[*].targets` in the
+# quantized source's config.json names the MLP of its last layers as
+# float-quantized, and a different source of the same family declares a
+# different split (see convert_modelopt.py, which reads that declaration instead
+# of restating it).  Since two sources of one model disagree about it, no
+# geometry field can carry it.  What must not happen is the same boundary being
+# written down twice - `FP8_MLP_FIRST_LAYER` is the one copy, and
+# `convert_nvfp4._validate_float_group` checks it against the declaration the
+# source itself carries on every conversion, so a source whose split differs is
+# refused instead of converted with the wrong layer set.
+FP8_MLP_FIRST_LAYER = 56
+NVFP4_MLP_LAYERS = tuple(range(FP8_MLP_FIRST_LAYER))
+FP8_MLP_LAYERS = tuple(range(FP8_MLP_FIRST_LAYER, len(TEXT_LAYERS)))
 
 
 def tensor_spec(
@@ -69,7 +82,7 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = [
         tensor_spec("text/token_embedding", (248320, 5120), FP8),
     ]
-    for layer in range(64):
+    for layer in TEXT_LAYERS:
         prefix = f"text/layers/{layer}/"
         specs.append(tensor_spec(prefix + "input_norm", (5120,), BF16))
         if layer in FULL_ATTENTION_LAYERS:
@@ -423,6 +436,7 @@ __all__ = [
     "FORMAT_NAMES",
     "FP32",
     "FP8",
+    "FP8_MLP_FIRST_LAYER",
     "FP8_MLP_LAYERS",
     "FP8_TENSOR_SPECS",
     "FULL_ATTENTION_LAYERS",
@@ -449,6 +463,7 @@ __all__ = [
     "TARGET_KEY",
     "TENSOR_SPECS",
     "TEXT_CORE_TENSOR_SPECS",
+    "TEXT_LAYERS",
     "TensorSpec",
     "VISION_TENSOR_SPECS",
     "W8",

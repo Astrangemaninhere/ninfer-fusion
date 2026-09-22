@@ -3,8 +3,8 @@
 Canonical invocation::
 
     python -m tools.convert.qwen3_6_35b_a3b.convert \
-      --model /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16 \
-      --dflash-model /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/dflash-bf16 \
+      --model <hf-bf16-dir> \
+      --dflash-model <dflash-bf16-dir> \
       --out out/qwen3_6_35b_a3b.ninfer
 
 The target deliberately reuses the measured 27B ranking because both checkpoints
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import time
 from typing import Mapping, Sequence
@@ -34,9 +35,12 @@ from . import draft_head, inventory, recipe
 
 RECIPE_ID = "qwen3_6_35b_a3b-v2"
 ENCODER_PROFILE = "MAXABS_F16_RECIP_RNE_V1"
+# Provenance of the ranking evidence: an operator input (NINFER_35B_GGUF_EVIDENCE), never
+# a baked-in machine path. Recorded in the report, never read.
 GGUF_EVIDENCE_PATH = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/"
-    "gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    os.environ.get(
+        "NINFER_35B_GGUF_EVIDENCE", "gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    )
 )
 
 _ROOT_CONFIG = {

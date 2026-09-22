@@ -19,6 +19,120 @@
 
 namespace ninfer::ops {
 
+// ===========================================================================
+// winmech LOUD CHECK -- Site A.  Two contracts, both of which FAIL THE BUILD.
+//
+// This translation unit opens no warning flags, so a silent wrong answer would
+// otherwise be invisible.  -DNDEBUG also makes `assert` dead, so the guard here
+// is deliberately NOT a runtime assert: it is a constant-expression check on the
+// SAME functions the kernel calls, so if either contract is broken again the
+// build stops and says which one.
+//
+// CONTRACT 1 (origin): the mask origin must be the DECLARED oldest visible key,
+//   max(0, context - sliding_window).  Rounding it UP to the Bc grid -- which is
+//   what the kernel used to do, because the STAGING wanted the alignment -- makes
+//   the mask exclude up to Bc-1 keys the declaration says are visible.  Measured
+//   on one vehicle/binary/flag set: W=7552 DEGENERATE, W=7553 clean, W=7569
+//   DEGENERATE (non-monotone), and the defect is decode-side from step 2
+//   (dl/winmech/REPORT.md).
+//
+// CONTRACT 2 (tile frame): staging and compute must enumerate the SAME absolute
+//   keys.  A run-1 draft of this fix re-based the staging on `stage_begin` and
+//   left the compute frame on `window_begin`; the two frames then differ by
+//   `stage_skew`, which silently attributes one key's data to another key and
+//   never stages the top `stage_skew` keys of the range.  The check below states
+//   the two properties that make the shifted frame sound: the first tile starts
+//   at or below the range start, and the last tile covers the range top.
+// ===========================================================================
+constexpr int kWmIso3Bc = 32;  // == KeyBlock; the kernel static_asserts Bc == 32.
+
+__host__ __device__ constexpr int gqa_wm_iso3_window_origin(int token_begin) {
+    // The DECLARED oldest visible key.  Never rounded.
+    return token_begin > 0 ? token_begin : 0;
+}
+
+__host__ __device__ constexpr int gqa_wm_iso3_stage_begin(int window_begin, int bc) {
+    // Floor, never ceil: keys below window_begin are staged and then rejected by the
+    // mask, which is the safe direction.  A ceil puts keys IN the window out of reach.
+    return (window_begin / bc) * bc;
+}
+
+__host__ __device__ constexpr int gqa_wm_iso3_first_tile(int split_start, int stage_skew,
+                                                         int bc) {
+    // The split's offset expressed in the staging frame, floored onto the tile grid.
+    return ((split_start + stage_skew) / bc) * bc;
+}
+
+__host__ __device__ constexpr int gqa_wm_iso3_key_blocks(int first_tile, int split_end,
+                                                          int stage_skew, int bc) {
+    return ((split_end + stage_skew - first_tile) + bc - 1) / bc;
+}
+
+// The witness table.  Its LENGTH is asserted below, so a later edit cannot quietly
+// delete the cases that make the contracts load-bearing -- deleting a case removes
+// the evidence, not the defect.  The origins are the measured arms's origins
+// (context - window at P=7680 and P=4028); the split offsets are the family's fixed
+// split grid (split_units = 512).
+struct GqaWmIso3Witness {
+    int window_begin;
+    int split_start;
+    int split_end;
+};
+constexpr GqaWmIso3Witness kGqaWmIso3Witness[] = {
+    {127, 0, 127},    // wm_a    origin 7680-7553  -> skew 31 (the worst case)
+    {127, 96, 127},   // wm_a    last split
+    {128, 0, 128},    // t_7552  origin 7680-7552  -> skew 0 (already aligned)
+    {111, 0, 111},    // wm_b    origin 7680-7569  -> skew 15
+    {64, 0, 64},      // t_7616  origin 64         -> skew 0
+    {64, 32, 64},     // t_7616  split 1
+    {1, 0, 1},        // t_7679  origin 1          -> skew 1
+    {128, 0, 512},    // s_m128  a full split_units row
+    {31, 0, 512},     // skew 31 with a partial split grid
+    {0, 0, 0},        // b_262144: the window is a no-op; the kernel early-outs
+};
+constexpr int kGqaWmIso3WitnessCount = 10;
+static_assert(sizeof(kGqaWmIso3Witness) / sizeof(kGqaWmIso3Witness[0]) ==
+                  kGqaWmIso3WitnessCount,
+              "winmech SITE A: the window-origin witness table lost a case. These cases ARE "
+              "the check that the mask origin never excludes more keys than the sliding "
+              "window declares; deleting one to make the build pass removes the check, not "
+              "the defect (dl/winmech/REPORT.md).");
+
+constexpr bool gqa_wm_iso3_contract_holds() {
+    for (int i = 0; i < kGqaWmIso3WitnessCount; ++i) {
+        const int wb = kGqaWmIso3Witness[i].window_begin;
+        const int ss = kGqaWmIso3Witness[i].split_start;
+        const int se = kGqaWmIso3Witness[i].split_end;
+        if (wb < 0) { return false; }
+        // CONTRACT 1, stated as an identity on the audited function: the origin of a
+        // context/window pair is its declared oldest key.  A ceil-round-up anywhere in
+        // this function makes these two disagree.
+        if (gqa_wm_iso3_window_origin(wb) != wb) { return false; }
+        if (gqa_wm_iso3_window_origin(-1) != 0) { return false; }
+        const int stage = gqa_wm_iso3_stage_begin(wb, kWmIso3Bc);
+        if (stage > wb) { return false; }                     // floor, never above
+        if ((wb - stage) >= kWmIso3Bc) { return false; }      // ... and never a whole tile
+        if ((stage % kWmIso3Bc) != 0) { return false; }       // the staging base is aligned
+        const int skew = wb - stage;
+        if (ss >= se) { continue; }  // the kernel early-outs before computing any tile
+        // CONTRACT 2: the tile grid, in the staging frame.
+        const int ft = gqa_wm_iso3_first_tile(ss, skew, kWmIso3Bc);
+        if ((ft % kWmIso3Bc) != 0) { return false; }  // every staged tile is on the grid
+        if (ft > ss + skew) { return false; }          // ... and never above the range start
+        const int kb = gqa_wm_iso3_key_blocks(ft, se, skew, kWmIso3Bc);
+        if (kb <= 0) { return false; }
+        if (ft + kb * kWmIso3Bc < se + skew) { return false; }  // the range TOP is covered
+    }
+    return true;
+}
+static_assert(gqa_wm_iso3_contract_holds(),
+              "winmech SITE A: the decode window is not the declared sliding window. EITHER "
+              "the mask origin is not max(0, context - sliding_window) -- i.e. the Bc "
+              "round-up is back, and up to Bc-1 declared-visible keys are silently excluded "
+              "-- OR the staging/compute tile frame is not the 32-aligned `stage_begin` "
+              "frame widened by `stage_skew`, so staged data and attended keys disagree "
+              "(dl/winmech/REPORT.md).");
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput, bool Nvfp4K = false>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_iso3_kernel(
@@ -43,7 +157,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_iso3_
     constexpr int PVNt    = D / 8;
     constexpr int PVKs    = Bc / 16;
     // The YaRN-extended 1,010,000-key maximum envelope spans at most 186 pages in one 27B split.
-    constexpr int PageIds       = 256;
+    constexpr int PageIds       = paged_kv_page_ids(kCausalAttentionMaximumVisibleKeysYarn);
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     constexpr int QkvRows       = 2 * Bc;
@@ -128,35 +242,38 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_iso3_
         return;
     }
 
+    // The window ORIGIN is the DECLARED origin, never rounded: the Bc alignment belongs
+    // to `stage_begin` below, which is the base of every absolute key in this kernel.
+    // Rounding the origin up to the Bc grid here silently dropped up to Bc-1 keys the
+    // declaration said were visible. See the winmech block above for the contract.
     const int window_full = last_pos + 1;
     const int token_begin = (sliding_window > 0) ? window_full - sliding_window : 0;
-    const int window_begin =
-        (sliding_window > 0) ? ((max(0, token_begin) + Bc - 1) / Bc) * Bc : 0;
-    const int window = window_full - window_begin;
+    const int window_begin  = gqa_wm_iso3_window_origin(token_begin);
+    const int window        = window_full - window_begin;
+    const int stage_begin   = gqa_wm_iso3_stage_begin(window_begin, Bc);
+    const int stage_skew    = window_begin - stage_begin;
     // Fixed split grid (split_units > 0): split s owns the keys
     // [s*split_units, min((s+1)*split_units, window)). Its interior boundaries are
-    // launch constants, so the partial a split contributes for a key range -- and the
-    // fp32 addition order it used to build it -- no longer move when the launch covers
-    // a different number of tokens. The live window still clips every range (no split
+    // launch constants, so the partial a split contributes for a key range -- and the fp32
+    // addition order it used to build it -- no longer move when the launch covers a
+    // different number of tokens. The live window still clips every range (no split
     // addresses a key past the last valid one) and split_units == 0 keeps the legacy
     // window-driven partition.
-    int active_split_count = 0;
-    int split_start        = 0;
-    int split_limit        = 0;
-    if (split_units > 0) {
-        active_split_count = gqa_small_t_split_active(window, split_units, split_count);
-        split_start        = split * split_units;
-        split_limit        = split_start + split_units;
-    } else {
-        active_split_count =
-            gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
-        const int logical_tiles = div_up(window, Bc);
-        const bool tile_split   = logical_tiles >= active_split_count;
-        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
-                                               : div_up(window, active_split_count);
-        split_start = split * units_per_split * (tile_split ? Bc : 1);
-        split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    }
+    //
+    // The count and the tiling come from gqa_small_t_split_range, the family's one
+    // definition of "which keys does split s own" (ops/kernel/gqa_attention_decode.cuh).
+    // With NINFER_VERIFY_EXACT=1 the token tile cannot reach either of them: with a pinned
+    // split_units the range is [s*split_units, ...) outright, and the legacy branch derives
+    // its tiling from `window` alone because the active count does. At one and the same
+    // window, and for one and the same dtype, the tiling and the count are therefore
+    // identical for TokenTile == 1 and TokenTile == 6 (item 3 of the fix), and the KV dtype
+    // no longer moves the lossless-region bound (item 1 / H39).
+    const GqaSmallTSplitRange split_range =
+        gqa_small_t_split_range<Geometry, false>(window, split_count, split_units, TokenTile,
+                                                  Bc, split, gqa_verify_exact_mode());
+    const int active_split_count = split_range.active;
+    const int split_start        = split_range.start;
+    const int split_limit        = split_range.limit;
     if (split >= active_split_count) { return; }
 
     const int split_end = (split_limit < window) ? split_limit : window;
@@ -164,11 +281,24 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_iso3_
         write_neutral();
         return;
     }
-    const int first_tile = (split_start / Bc) * Bc;
-    const int key_blocks = div_up(split_end - first_tile, Bc);
-    const int first_global_page = (window_begin + first_tile) >> kPagedKVPageShift;
+    // The tile grid lives in the STAGING frame: `stage_skew` moves the split's offsets
+    // onto it, so the first tile starts at or below the range start and the last tile
+    // covers the range top. `first_global_page` uses the staging base; `page_count` keeps
+    // the window's own top, so the load span is
+    // [stage_begin + first_tile, window_begin + split_end) and no visible key is unloaded.
+    const int first_tile = gqa_wm_iso3_first_tile(split_start, stage_skew, Bc);
+    const int key_blocks = gqa_wm_iso3_key_blocks(first_tile, split_end, stage_skew, Bc);
+    const int first_global_page = (stage_begin + first_tile) >> kPagedKVPageShift;
     const int page_count =
         ((window_begin + split_end - 1) >> kPagedKVPageShift) - first_global_page + 1;
+    // Contract: page_count is bounded by PageIds =
+    // paged_kv_page_ids(envelope) for every split a launcher can dispatch.
+    // Without this check a larger envelope would run off the end of shared
+    // memory silently instead of declining the split.
+    if (page_count > PageIds) {
+        write_neutral();
+        return;
+    }
     for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_global_page + page];
     }
@@ -333,7 +463,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_iso3_
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0        = first_tile + kb * Bc;
-        const int global_k0 = window_begin + k0;
+        const int global_k0 = stage_begin + k0;
         if (kb != 0 && (global_k0 & kPagedKVPageMask) == 0) {
             physical_page =
                 physical_pages_s[(global_k0 >> kPagedKVPageShift) - first_global_page];

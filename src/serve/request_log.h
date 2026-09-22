@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -41,6 +42,12 @@ struct RequestLogContext {
     ninfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     ninfer::PromptPreparationStats preparation;
+    // mtplogx: the prompt ids this request was prepared from. Filled only when
+    // NINFER_SERVE_TOKEN_IDS asks for it (make_request_log_context below) and empty
+    // otherwise, so a default run's record keeps the field set it had. mtplogx added
+    // the <vector> include above for this member but never the member itself, which
+    // is why the serve target did not compile from 2026-09-21 11:11.
+    std::vector<ninfer::TokenId> prompt_token_ids;
 };
 
 struct RequestLogMetadata {
@@ -89,6 +96,11 @@ struct ThroughputReport {
     std::uint64_t decode_row_rounds       = 0;
     ninfer::RuntimeStats previous;
     ninfer::RuntimeStats current;
+    // mtplogx: counted from 1 by make_throughput_report() in http_server.cpp. The first interval
+    // is the one in which a request's prefill and decode share a bucket, so naming it lets a
+    // consumer drop it instead of inferring it. `interval_seconds`, and the two rates built on it,
+    // are NOT redefined.
+    std::uint64_t interval_index = 0;
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,

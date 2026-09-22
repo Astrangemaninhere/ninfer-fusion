@@ -165,7 +165,8 @@ std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_
 }
 
 std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
-                                                               std::uint32_t draft_window) {
+                                                               std::uint32_t draft_window,
+                                                               bool ladder_capture) {
     if (draft_window == 0 || capacity == 0) { return {}; }
     // Bound the final AR window E+2K at split-policy transitions until the grid reaches its cap.
     std::vector<std::uint32_t> ends;
@@ -175,9 +176,24 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
         add_shifted(visible_end, 2 * draft_window);
     }
-    // Target verify and MTP batch both have T=K+1 and W=E+K+1. Preserve one concrete INT8
-    // implementation per range at the T=4/5/6 launch boundaries.
-    if (draft_window == 3) {
+    // Target verify and MTP batch both have T=K+1 and W=E+K+1. The small-T target-verify split
+    // forks at the visible ends 128 / 160 / 512 / 1029 / 2054 / 8198 -- measured for T=4 at
+    // 1029, T=5 at 128/512/1029 and T=6 at 128/160/2054/8198 -- and each range must hold exactly
+    // one concrete INT8 implementation, because a range that straddles a fork would need a
+    // node's kernel function to change and cudaGraphExecUpdate refuses that.
+    //
+    // A fixed-k run therefore keeps the exact measured boundary set for its own T (a larger T is
+    // single-implementation and needs no addition). A LADDER capture applies the UNION of the
+    // measured forks to every width rung: an extra boundary only splits a range (it costs one
+    // more profile, not one more executable, because the topology class is per width), while a
+    // missing one is a hard install failure. The union is a conservative superset of the
+    // measured forks; if some width's fork is not at one of these visible ends the install still
+    // fails loudly and adding that end here is the fix -- a measurement, not a guess.
+    if (ladder_capture) {
+        for (const std::uint32_t visible_end : {128U, 160U, 512U, 1029U, 2054U, 8198U}) {
+            add_shifted(visible_end, draft_window + 1);
+        }
+    } else if (draft_window == 3) {
         add_shifted(1029, draft_window + 1);
     } else if (draft_window == 4) {
         for (const std::uint32_t visible_end : {128U, 512U, 1029U}) {

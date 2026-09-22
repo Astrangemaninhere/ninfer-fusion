@@ -8,10 +8,44 @@
 
 namespace ninfer::ops {
 
-// Fixed slot budget covering the rANS max: 320 B header + 32 streams x 256 B
-// + 1024 B scale tail. The INT8 tier packs its raw 9232 B layout into the
-// same buffer, so one pool size serves both codecs.
-inline constexpr std::int32_t kEntropyNvfp4SlotBytes = 9536;
+// Fixed slot budget covering the rANS MAX -- and "max" is the load-bearing word in
+// that sentence, because it is the one this file used to be wrong about.
+//
+// This is the record the encoder is handed, and the encoder reads its per-stream
+// budget out of it at RUNTIME: budget = (slot_bytes - 320 - 1024) / 32, unclamped,
+// and a stream that does not fit clears the slot's valid flag so the page stays hot
+// (ops/kernel/entropy_nvfp4_slot_kernels.cuh pass A and pass B). So the record's own
+// width IS the budget, and the budget must cover the largest stream the codec really
+// produces. Measured on the real encoder over the 2048 K streams of 16 engine-dumped
+// Qwen3.8 27B pages (dl/ransceil/rans_probe.cu includes THIS header's kernel and runs
+// it; see dl/ransceil/REPORT.md): K min 243 / p50 250 / p90 252 / p99 254 / max
+// 259 B per 512-symbol stream. 259 B over 512 symbols is 4.0469 bits/symbol, ABOVE
+// the 4-bit nibble width, because the requantized K codes are near-uniform.
+//
+// Hence: 320 B header + 32 streams x 259 B (ceil(512 codes x 4.04 / 8)) + 1024 B
+// scale tail = 9632 B. The literal was 6688 (32 x 167 B, the 2.60 bits/code ceiling)
+// until 2026-09-18, when the encoder was run for the first time on real planes and
+// that record was measured to validate 0 of 64 K slots and 0 of 64 V slots: the codec
+// produced nothing at all while the cost model advertised 2528 B/head-page saved.
+// The ceiling that justified 2.60 came from a "2.0-2.6 bits/code" band that
+// entropy_cold_requant.h now retracts; the same instrument measures 3.31-3.86
+// bits/code of marginal entropy, and the per-stream worst case is 4.0469.
+//
+// THE PRICE, so no reader has to derive it: 9632 B is ABOVE the 9216 B nvfp4 resident
+// plane pair this record gives back, so on the 4-bit classes the cold rANS tier is a
+// net device-memory COST (+416 B/head-page on nvfp4/iso4e, +928 on rk4v4). It is not a
+// saving and must not be reported as one. 9536 B (the 4-bit no-expansion record) is
+// narrower but validates only 61 of 64 K slots; 6688 B is narrower still and validates
+// none. There is no rANS record that both validates and is narrower than the plane.
+//
+// This literal is a mirror, not a second decision: decoder_state.cpp derives the
+// stride from kColdSlotRansBitsPerCodeX100 (404) and static_asserts that the two agree;
+// product/kv_tier_formats.h states the same integer ceil host-side and
+// product/kv_bit_budget.h carries the same number as the ladder's cold grid point.
+//
+// The INT8 tier packs its raw 9232 B layout into the same buffer, so one pool
+// size serves both codecs.
+inline constexpr std::int32_t kEntropyNvfp4SlotBytes = 9632;
 
 /**
  * Page-slot NVFP4 E2M1 rANS codec. One slot stores the 8192 packed code bytes

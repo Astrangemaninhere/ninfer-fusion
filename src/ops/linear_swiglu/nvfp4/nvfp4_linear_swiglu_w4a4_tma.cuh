@@ -63,6 +63,16 @@ __global__ __launch_bounds__(
     static_assert((kIntermediate % kPairN) == 0);
     static_assert((kIntermediate % 128) == 0);
 
+#if !NINFER_NVFP4_TMA_DEVICE_ARCH
+    // THE SECOND USER OF THE GUARDED HELPERS, and it was the one remaining red TU at sm_75
+    // once the other five were fixed: this kernel calls nvfp4_mbarrier_init/wait/arrive and
+    // nvfp4_tma_load_2d, so compiling those out in nvfp4_w4a4_tma.cuh without compiling THIS
+    // body out leaves an undefined identifier. Same floor (sm_100a+, see the table in
+    // nvfp4_w4a4_tma.cuh), same shape: defined-but-trapping so the arm TU still links, and
+    // unreachable because the launcher refuses on the host first
+    // (nvfp4_tma_rung_has_the_mxf4_channel()).
+    __trap();
+#else
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Nvfp4LinearSwiGluTmaSharedStorage<Schedule>*>(shared_bytes);
     const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
@@ -259,6 +269,7 @@ __global__ __launch_bounds__(
                       row_vector * 8,
                   values);
     }
+#endif // NINFER_NVFP4_TMA_DEVICE_ARCH
 }
 
 } // namespace ninfer::ops::detail

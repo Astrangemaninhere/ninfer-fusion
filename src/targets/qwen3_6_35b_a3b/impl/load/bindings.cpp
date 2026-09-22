@@ -2,6 +2,8 @@
 
 #include "artifact/typed_binding.h"
 
+#include <ninfer/targets/qwen3_6/hybrid_topology.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -15,11 +17,33 @@ namespace {
 
 using artifact::NumericFormat;
 
-bool is_full_layer(std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; }
+// Layer topology is declared once, by the family's own topology header, and
+// TextConfig::is_full_attention is the runtime's reading of that same
+// declaration.  Spelling the interval and its offset out again here made the
+// loader a second, independent copy of the rule: the loader and the runtime
+// would bind different layer families the moment either copy moved.
+bool is_full_layer(std::size_t layer) {
+    return qwen3_6::is_full_attention_layer(static_cast<std::int32_t>(layer));
+}
 
-NumericFormat routed_down_format(std::size_t layer) {
-    return layer == 34 || layer == 38 || layer == 39 ? NumericFormat::Q6G64_F16S
-                                                     : NumericFormat::Q5G64_F16S;
+// Read-only lookup of what the artifact declares under `name`, restricted to the
+// precisions this object is registered in.  Deciding the stored precision from
+// the layer index instead has to be written a second time wherever the same
+// object is materialized, and the two copies disagree the moment the source's
+// declaration changes; the artifact already states the precision per object.
+NumericFormat declared_format(const artifact::Binder& binder, std::string_view name,
+                              std::initializer_list<NumericFormat> allowed) {
+    const artifact::TensorDescriptor* tensor = binder.find_tensor(name);
+    if (tensor == nullptr) {
+        throw artifact::ArtifactError("required artifact tensor is missing: " +
+                                      std::string(name));
+    }
+    for (const NumericFormat candidate : allowed) {
+        if (tensor->format == candidate) { return tensor->format; }
+    }
+    throw artifact::ArtifactError(std::string(name) + " is declared " +
+                                  std::string(artifact::format_name(tensor->format)) +
+                                  ", which is outside this object's registered precision set");
 }
 
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
@@ -43,22 +67,31 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
 }
 
 MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFormat routed_gate_up,
-                 NumericFormat routed_down, artifact::TensorPlacement placement) {
+                 artifact::TensorPlacement placement) {
     const auto bind = [&](std::string_view name, NumericFormat format,
                           std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, placement);
     };
+    // routed_down is the one MoE object whose stored precision differs per layer:
+    // Q6 on the layer numbers this source names, Q5 elsewhere, W8 for the MTP
+    // expert block.  Read it, and hand the same value to materialization through
+    // the plan instead of recomputing it there.
+    const NumericFormat routed_down =
+        declared_format(binder, prefix + "routed_down",
+                        {NumericFormat::Q5G64_F16S, NumericFormat::Q6G64_F16S,
+                         NumericFormat::W8G32_F16S});
     return MoePlan{
         .router_shared_gate = bind(prefix + "router_shared_gate", NumericFormat::BF16, {257, 2048}),
         .routed_gate_up     = bind(prefix + "routed_gate_up", routed_gate_up, {262144, 2048}),
         .routed_down        = bind(prefix + "routed_down", routed_down, {524288, 512}),
         .shared_gate_up = bind(prefix + "shared_gate_up", NumericFormat::W8G32_F16S, {1024, 2048}),
         .shared_down    = bind(prefix + "shared_down", NumericFormat::W8G32_F16S, {2048, 512}),
+        .routed_down_format = routed_down,
     };
 }
 
 SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtifact& materialized,
-                          NumericFormat routed_gate_up, NumericFormat routed_down) {
+                          NumericFormat routed_gate_up) {
     return SparseMoePayload{
         .op = {
             .router_shared_gate = artifact::materialized_weight(
@@ -66,7 +99,7 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
             .routed_gate_up = artifact::materialized_weight(materialized, plan.routed_gate_up,
                                                             routed_gate_up, 262144, 2048),
             .routed_down    = artifact::materialized_weight(materialized, plan.routed_down,
-                                                            routed_down, 524288, 512),
+                                                            plan.routed_down_format, 524288, 512),
             .shared_gate_up = artifact::materialized_weight(materialized, plan.shared_gate_up,
                                                             NumericFormat::W8G32_F16S, 1024, 2048),
             .shared_down    = artifact::materialized_weight(materialized, plan.shared_down,
@@ -137,7 +170,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {2048});
         target.moe = bind_moe(binder, prefix + "moe/", NumericFormat::Q4G64_F16S,
-                              routed_down_format(layer), artifact::TensorPlacement::Device);
+                              artifact::TensorPlacement::Device);
     }
 
     out.final_norm =
@@ -176,7 +209,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {2048});
     out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
-                                  NumericFormat::W8G32_F16S, mtp_placement);
+                                  mtp_placement);
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
 
     const artifact::TensorPlacement vision_placement =
@@ -228,6 +261,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
+    // W13: publish the artifact's weight-offload runtime to the layer-boundary hook.
+    // Null unless a host budget was set, so the hook stays a no-op by default.
+    runtime.backing.bind(backing.weight_residency());
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
@@ -258,7 +294,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
             target.post_mixer =
-                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S);
         } else {
             GdnWeights& target = gdn_layers.at(gdn_index++);
             target.input_norm  = artifact::materialized_tensor(backing, source.input_norm,
@@ -280,7 +316,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
             target.post_mixer =
-                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S);
         }
     }
     if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {
@@ -320,8 +356,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                        NumericFormat::W8G32_F16S, 2048, 4096);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {2048});
-        mtp.post_mixer =
-            load_moe(plan.mtp.moe, backing, NumericFormat::W8G32_F16S, NumericFormat::W8G32_F16S);
+        mtp.post_mixer = load_moe(plan.mtp.moe, backing, NumericFormat::W8G32_F16S);
         mtp.final_norm = artifact::materialized_tensor(backing, plan.mtp.final_norm,
                                                        NumericFormat::BF16, {2048});
     }

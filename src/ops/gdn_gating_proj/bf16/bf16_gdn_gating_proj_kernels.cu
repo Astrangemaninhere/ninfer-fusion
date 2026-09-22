@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -139,6 +140,146 @@ __global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restri
     const float sp               = softplus(acc_a + dt_bias[row]);
     g[out_index]                 = -expf(A_log[row]) * sp;
     beta[out_index]              = sigmoid(acc_b);
+}
+
+// ---- kernfuse: GDN-gating partial+reduce fused into one launch (OPT-IN) ---------------
+// Zero-initialised by the CUDA runtime at module load, and handed back in the zero state by
+// the final CTA of every launch, so no per-launch memset is needed and the module-level zero
+// init is a one-time precondition rather than something the launcher has to maintain.
+__device__ unsigned int g_kernfuse_gdn_gate_arrivals = 0u;
+
+inline bool kernfuse_gdn_gate_fused() {
+    static const bool on = [] {
+        const char* env = std::getenv("NINFER_GDN_GATE_FUSED");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return on;
+}
+
+template <int TokenTile, int KSlice, int RowsPerBlock>
+__global__ void bf16_gdn_gating_proj_small_t_partial_reduce_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
+    const __nv_bfloat16* __restrict__ b_weight, float* __restrict__ partial, std::int32_t t,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias, float* __restrict__ g,
+    float* __restrict__ beta) {
+    static_assert(TokenTile == kSmallTMax, "small-T token tile is fixed to 8");
+    static_assert(KSlice == kSmallTKSlice, "small-T K split is fixed to 512");
+    static_assert(RowsPerBlock == kSmallTRowsPerBlock, "small-T rows/block mismatch");
+    constexpr int kVecsPerCol = KSlice / 8;
+
+    __shared__ __align__(16) __nv_bfloat16 x_sh[TokenTile][KSlice];
+    __shared__ int reduce_here;
+
+    auto* x_sh_v  = reinterpret_cast<uint4*>(x_sh);
+    const int lane   = static_cast<int>(threadIdx.x) & 31;
+    const int warp   = static_cast<int>(threadIdx.x) >> 5;
+    const int token0 = static_cast<int>(blockIdx.z) * TokenTile;
+    const int split  = static_cast<int>(blockIdx.y);
+    const int k0     = split * KSlice;
+    const int logical_row = static_cast<int>(blockIdx.x) * RowsPerBlock + warp;
+    // `active` replaces the two early returns of the two-launch form.  A CTA with no token, or
+    // a warp with no row, must still reach the arrival counter, or the final ticket is never
+    // drawn and the reduction silently never runs.
+    const bool active = (token0 < t) && (logical_row < kLogicalRows);
+    const int ncols   = active ? min(TokenTile, t - token0) : 0;
+
+    if (active) {
+        for (int i = static_cast<int>(threadIdx.x); i < ncols * kVecsPerCol;
+             i += static_cast<int>(blockDim.x)) {
+            const int col = i / kVecsPerCol;
+            const int vec = i - col * kVecsPerCol;
+            x_sh_v[col * kVecsPerCol + vec] =
+                load_vec<uint4>(x + static_cast<std::int64_t>(token0 + col) * kK + k0 + vec * 8);
+        }
+    }
+    __syncthreads();
+
+    if (active) {
+        const bool is_b = logical_row >= kN;
+        const int row   = is_b ? logical_row - kN : logical_row;
+        const __nv_bfloat16* wrow =
+            (is_b ? b_weight : a_weight) + static_cast<std::int64_t>(row) * kK + k0;
+
+        float acc[TokenTile];
+#pragma unroll
+        for (int tt = 0; tt < TokenTile; ++tt) { acc[tt] = 0.0f; }
+
+        for (int vec = lane; vec < kVecsPerCol; vec += 32) {
+            const uint4 wv   = load_vec<uint4>(wrow + vec * 8);
+            const float2 wf0 = bf16x2_bits_to_float2(wv.x);
+            const float2 wf1 = bf16x2_bits_to_float2(wv.y);
+            const float2 wf2 = bf16x2_bits_to_float2(wv.z);
+            const float2 wf3 = bf16x2_bits_to_float2(wv.w);
+
+#pragma unroll
+            for (int tt = 0; tt < TokenTile; ++tt) {
+                if (tt < ncols) {
+                    const uint4 xv   = x_sh_v[tt * kVecsPerCol + vec];
+                    const float2 xf0 = bf16x2_bits_to_float2(xv.x);
+                    const float2 xf1 = bf16x2_bits_to_float2(xv.y);
+                    const float2 xf2 = bf16x2_bits_to_float2(xv.z);
+                    const float2 xf3 = bf16x2_bits_to_float2(xv.w);
+                    acc[tt]          = fmaf(wf0.x, xf0.x, acc[tt]);
+                    acc[tt]          = fmaf(wf0.y, xf0.y, acc[tt]);
+                    acc[tt]          = fmaf(wf1.x, xf1.x, acc[tt]);
+                    acc[tt]          = fmaf(wf1.y, xf1.y, acc[tt]);
+                    acc[tt]          = fmaf(wf2.x, xf2.x, acc[tt]);
+                    acc[tt]          = fmaf(wf2.y, xf2.y, acc[tt]);
+                    acc[tt]          = fmaf(wf3.x, xf3.x, acc[tt]);
+                    acc[tt]          = fmaf(wf3.y, xf3.y, acc[tt]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int tt = 0; tt < TokenTile; ++tt) {
+            if (tt < ncols) {
+                float sum = warp_reduce_sum(acc[tt]);
+                if (lane == 0) {
+                    const int token = token0 + tt;
+                    partial[(static_cast<std::int64_t>(split) * t + token) * kLogicalRows +
+                            logical_row] = sum;
+                }
+            }
+        }
+    }
+
+    // Arrival counter.  The fence from EVERY thread (not just thread 0) is what makes the
+    // partial rows written by other CTAs visible to whichever CTA draws the final ticket.
+    __syncthreads();
+    __threadfence();
+    if (threadIdx.x == 0) {
+        const unsigned int total  = gridDim.x * gridDim.y * gridDim.z;
+        const unsigned int ticket = atomicAdd(&g_kernfuse_gdn_gate_arrivals, 1u);
+        reduce_here               = (ticket + 1u == total) ? 1 : 0;
+        if (reduce_here == 1) {
+            atomicExch(&g_kernfuse_gdn_gate_arrivals, 0u);
+        }
+    }
+    __syncthreads();
+
+    if (reduce_here == 0) { return; }
+    __threadfence(); // acquire side of the arrival handshake before reading other CTAs' rows
+
+    const int block_threads = static_cast<int>(blockDim.x);
+    const int elems         = kN * t;
+    for (int i = static_cast<int>(threadIdx.x); i < elems; i += block_threads) {
+        const int row   = i % kN;
+        const int token = i / kN;
+        float acc_a     = 0.0f;
+        float acc_b     = 0.0f;
+#pragma unroll
+        for (int sp = 0; sp < kSmallTSplits; ++sp) {
+            const std::int64_t base =
+                (static_cast<std::int64_t>(sp) * t + token) * kLogicalRows;
+            acc_a += partial[base + row];
+            acc_b += partial[base + kN + row];
+        }
+        const std::int64_t out_index = static_cast<std::int64_t>(token) * kN + row;
+        const float spv              = softplus(acc_a + dt_bias[row]);
+        g[out_index]                 = -expf(A_log[row]) * spv;
+        beta[out_index]              = sigmoid(acc_b);
+    }
 }
 
 __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
@@ -363,6 +504,21 @@ void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& 
     dim3 partial_block(kSmallTThreads);
     dim3 partial_grid(div_up(kLogicalRows, kSmallTRowsPerBlock), kSmallTSplits,
                       div_up(t, kSmallTMax));
+    if (kernfuse_gdn_gate_fused()) {
+        // kernfuse: one launch instead of two.  The final CTA's per-(token,row) split loop is
+        // the same order the standalone reduce kernel used, so g/beta are bit-identical.
+        bf16_gdn_gating_proj_small_t_partial_reduce_kernel<kSmallTMax, kSmallTKSlice,
+                                                          kSmallTRowsPerBlock>
+            <<<partial_grid, partial_block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const __nv_bfloat16*>(a_weight.qdata),
+                static_cast<const __nv_bfloat16*>(b_weight.qdata),
+                static_cast<float*>(workspace), t, static_cast<const float*>(A_log.data),
+                static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
+                static_cast<float*>(beta.data));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     bf16_gdn_gating_proj_small_t_partial_kernel<kSmallTMax, kSmallTKSlice, kSmallTRowsPerBlock>
         <<<partial_grid, partial_block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),

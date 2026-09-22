@@ -3,8 +3,10 @@
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
-sys.path.insert(0, '/mnt/c/Users/User/Documents/ziqinzhang/ninfer-fusion-repo/tools/archkit')
+# Import the generators from this file's own directory: no machine path to another checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import flavors
 import gen_variant as gv
 

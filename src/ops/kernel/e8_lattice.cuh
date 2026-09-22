@@ -122,6 +122,20 @@ __device__ __forceinline__ void e8_project_8d_fast(const float x[8], float out[8
     }
 }
 
+// !! READ THIS BEFORE CALLING THE PROJECTIONS ON THE KV WRITE PATH !!
+// e8_project_* implements the Conway-Sloane nearest-point rule correctly (verified
+// exhaustively against a 2x2^8-candidate exact search on 20000 random blocks,
+// scratch/fixE1/e8verify.cpp: 0/20000 strictly non-nearest), but its OUTPUT CANNOT BE
+// STORED in the KV code plane the reader uses. That plane is one signed integer per
+// coordinate; the projection returns either D8 points (integer coords) or D8 + 1/2
+// points (ALL-EIGHT-coordinates half-integer), and 47.6% of real K/V blocks on the
+// L13-L15 forensics dumps take the half-integer coset. The `rintf` that necessarily
+// follows therefore moves those coordinates 0.5 step, which measured +3.65 dB of
+// error (2.32x MSE) at the same bit rate versus plain rounding.
+// Use these only where the half-integer coset is representable (a code plane holding
+// 2*coordinate, i.e. 5 bits at +-15 = +1 bit/el) or where the consumer reconstructs
+// the lattice point rather than an integer code.
+//
 // Warp-Cooperative 8D E8 Projection across 8 lanes in a 32-thread warp
 __device__ __forceinline__ float e8_project_8d_warp_single(float x, int lane, unsigned sub_mask) {
     const int sub_lane = lane & 7;

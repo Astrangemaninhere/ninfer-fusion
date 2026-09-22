@@ -37,7 +37,8 @@ struct GdnReplayFoldRow {
  * disjointness once. execute() validates only active rows, state selectors and commit extents.
  * The bound record/state addresses must remain stable for the plan lifetime.
  *
- * The Op admits the two registered all-layer geometries only, owns no workspace or device
+ * The Op admits the registered all-layer fold geometries only (see
+ * replay_fold_geometry_supported), owns no workspace or device
  * allocation, and does not read query or generate token output. The four record planes are
  * read-only, disjoint, and do not overlap either state region.
  */

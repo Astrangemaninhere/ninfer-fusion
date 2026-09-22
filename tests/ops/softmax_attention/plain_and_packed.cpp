@@ -240,35 +240,49 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
 } // namespace
 
 int run_softmax_attention_plain_and_packed_tests() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: CUDA device unavailable\n";
-        return 77;
-    }
-
-    int failures = 0;
+    // The rectangular-envelope capacity contract is pure host arithmetic over
+    // ops::packed_softmax_attention_workspace_capacity_bytes: it is settled BEFORE the device gate
+    // so that a broken contract cannot be reported as a skip on a box with no device.
+    int host_failures = 0;
     if (ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 4, 194, 1, 1) != 0 ||
         ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 4, 194, 1, 3) !=
             ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 194, 194, 3, 3)) {
         std::cerr
             << "packed_softmax_attention rectangular capacity missed its maximal legal pair\n";
-        ++failures;
+        ++host_failures;
     }
     try {
         (void)ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 1, 2, 3, 4);
         std::cerr << "packed_softmax_attention accepted an envelope without a legal segment pair\n";
-        ++failures;
+        ++host_failures;
     } catch (const std::invalid_argument&) {}
-    failures += run_case({0, 4}, 11u, StorageProfile::Contiguous, PublicEntry::Plain);
-    failures += run_case({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
-    failures += run_case({0, 4, 11}, 7u, StorageProfile::InterleavedQkv,
-                         PublicEntry::CuSeqlensArena, InputProfile::SegmentIsolation);
-    failures += run_case({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv,
-                         PublicEntry::CuSeqlensArena);
-    failures +=
-        run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
-    failures +=
-        run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
 
+    if (cuda_unavailable()) {
+        if (host_failures != 0) {
+            std::cerr << "packed_softmax_attention host_term=" << host_failures
+                      << " device_term=not-run\n";
+            return 1;
+        }
+        std::cout << "SKIP: CUDA device unavailable\n";
+        return 77;
+    }
+
+    // The device half is NOT short-circuited by a red host half.
+    int device_failures = 0;
+    device_failures += run_case({0, 4}, 11u, StorageProfile::Contiguous, PublicEntry::Plain);
+    device_failures += run_case({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
+    device_failures += run_case({0, 4, 11}, 7u, StorageProfile::InterleavedQkv,
+                                PublicEntry::CuSeqlensArena, InputProfile::SegmentIsolation);
+    device_failures += run_case({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv,
+                                PublicEntry::CuSeqlensArena);
+    device_failures += run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv,
+                                PublicEntry::UniformSegments);
+    device_failures += run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv,
+                                PublicEntry::CuSeqlensArena);
+
+    const int failures = host_failures + device_failures;
+    std::cout << "packed_softmax_attention host_term=" << host_failures
+              << " device_term=" << device_failures << '\n';
     if (failures != 0) {
         std::cerr << "packed_softmax_attention failures=" << failures << '\n';
         return 1;

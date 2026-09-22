@@ -1,16 +1,14 @@
 #pragma once
 
-// FlashNext (Qwen4Exp) package 占位 — P0 骨架。
-// 完整 package (frontend/bindings/weights profile) 依赖:
-//   1) MoE swiglu 专家内核 (new_op 工作包)
-//   2) PLE n-gram gather 表 (sidecar 构建器已闭环, 引擎真表 gather 待验证)
-//   3) 多层 MTP (现有单层 MTP 扩展)
-// 本占位仅注册 identity, 供 registry 编译与 GUI 引擎列表可见。
+// 历史占位文件。原内容把 identity 内联在这里，并且带着生成器吐出的 `{{` 双花括号
+// 缺陷（非法 C++；S33 的 6 项"不存在"之一、_TODO.md 72.3 记录）。
+//
+// S37 阶段 (a) 起，identity 与几何交叉核验搬到引擎 include 路径上的导出头
+// <ninfer/targets/qwen4_exp/package.h>；本文件保留为薄别名，免得旧的引用路径断掉。
+//
+// 位置说明：目标根不是族约定位置 —— 兄弟目标是
+// src/targets/<id>/export/ninfer/targets/<id>/package.h（见 muse_glimmer_30b）。
+// 真正的 Package（LoadPlan/LoadedModel/Frontend/SequencePlan/Program/...）是阶段 (b)
+// 起的产物，见 _collab/B_s37_flashnext_p1.md 的分阶段计划。
 
-#include "impl/config.h"
-
-namespace ninfer::targets::qwen4_exp {{
-
-inline constexpr const char* kModelId = "qwen4-exp";
-
-}} // namespace ninfer::targets::qwen4_exp
+#include <ninfer/targets/qwen4_exp/package.h>

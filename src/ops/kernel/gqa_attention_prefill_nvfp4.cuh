@@ -21,6 +21,7 @@
 
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/kernel/gqa_iso3_codec.cuh"
 #include "ops/kernel/gqa_isoquant_rot.cuh"
 #include "ops/kernel/gqa_isoquant_row_scale.cuh"
 #include "ops/kernel/entropy_nvfp4_slot.cuh"
@@ -58,21 +59,10 @@ __device__ __forceinline__ unsigned gqa_prefill_nvfp4_nibble_bits(std::uint8_t c
     return bits;
 }
 
-// ISO3 = sign-magnitude INT3: low 3 bits encode magnitude 0..7, bit3 is the
-// sign (1 = negative). Negative zero encodes as zero.
-__device__ __forceinline__ std::uint8_t gqa_iso3_nibble(float value, float scale) {
-    float mag = roundf(fabsf(value) / scale);
-    if (mag > 7.0f) { mag = 7.0f; }
-    if (mag < 0.0f) { mag = 0.0f; }
-    std::uint8_t code = static_cast<std::uint8_t>(mag);
-    if (value < 0.0f && code != 0) { code |= 0x08u; }
-    return code;
-}
-
-__device__ __forceinline__ float gqa_iso3_decode(std::uint8_t code) {
-    const float mag = static_cast<float>(code & 0x07u);
-    return (code & 0x08u) != 0 ? -mag : mag;
-}
+// The ISO3 nibble codec (gqa_iso3_nibble / gqa_iso3_decode) now lives in
+// ops/kernel/gqa_iso3_codec.cuh. One definition for every writer and reader;
+// do not paste a local copy back in here (that is what desynchronised the
+// prefill writer from the cold-requant reader before 2026-09-13).
 
 // ---- native mxf4nvf4 QK staging (NVFP4 K only) ----
 //
@@ -430,8 +420,8 @@ __device__ __forceinline__ void gqa_prefill_fp8_stage_kv(__nv_bfloat16* dst,
             __nv_bfloat162 pair[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const float lo = gqa_kv_nvfp4_e4m3_to_f32(bytes[2 * i]) * scale;
-                const float hi = gqa_kv_nvfp4_e4m3_to_f32(bytes[2 * i + 1]) * scale;
+                const float lo = gqa_kv_nvfp4_data_e4m3_to_f32(bytes[2 * i]) * scale;
+                const float hi = gqa_kv_nvfp4_data_e4m3_to_f32(bytes[2 * i + 1]) * scale;
                 pair[i]        = __floats2bfloat162_rn(lo, hi);
             }
             store_vec(p0, make_int4(*reinterpret_cast<const int*>(&pair[0]),
@@ -895,7 +885,7 @@ __launch_bounds__(256) __global__
             page, kv_head, page_off, group * 16 + lane * 4);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            cache_k[base + j] = gqa_kv_nvfp4_fp32_to_e4m3(kx[j] / kscale);
+            cache_k[base + j] = gqa_kv_nvfp4_data_fp32_to_e4m3(kx[j] / kscale);
         }
     }
     if (lane == 0) {
@@ -916,7 +906,7 @@ __launch_bounds__(256) __global__
     if (lane < 16) {
         const std::int64_t base = paged_kv_element_offset<Geometry::HeadDim, Geometry::KVHeads>(
             page, kv_head, page_off, group * 16 + lane);
-        cache_v[base] = gqa_kv_nvfp4_fp32_to_e4m3(v0 / vscale);
+        cache_v[base] = gqa_kv_nvfp4_data_fp32_to_e4m3(v0 / vscale);
     }
     if (lane == 0) {
         scale_v[gqa_kv_nvfp4_scale_index<Geometry>(page, kv_head, group, page_off)] =

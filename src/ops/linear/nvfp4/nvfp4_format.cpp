@@ -64,7 +64,7 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
         std::fprintf(stderr,
                      "[nvfp4] invalid weight n=%d k=%d qtype=%d layout=%d scale_dt=%d gs=%d g=%d "
                      "ndim=%d sh=(%d,%d) pad=(%d,%d) payload=%d req=%llu wsdiv=%g isdiv=%g "
-                     "algn=%d/%d qhigh=%d hpb=%d\n",
+                     "algn=%d/%d qhigh=%d hpb=%lu\n",
                      weight.n, weight.k, static_cast<int>(weight.qtype),
                      static_cast<int>(weight.layout), static_cast<int>(weight.scale_dtype),
                      weight.group_size, weight.group, weight.ndim, weight.shape[0], weight.shape[1],

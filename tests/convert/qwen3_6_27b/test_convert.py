@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
 import torch
 
 from tools.artifact.container import (
@@ -17,12 +19,16 @@ from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_
 from tools.convert.qwen3_6_27b import convert, inventory, recipe
 
 
-OFFICIAL_MODEL = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
+#: Opt-in official HF directory: the tree bakes in no machine path, and the check
+#: that reads it skips when NINFER_OFFICIAL_27B_DIR is unset.
+OFFICIAL_MODEL = (
+    Path(value) if (value := os.environ.get("NINFER_OFFICIAL_27B_DIR", "")) else None
 )
 
 
 def test_official_config_uses_only_nested_mtp_field():
+    if OFFICIAL_MODEL is None:
+        pytest.skip("set NINFER_OFFICIAL_27B_DIR to the official Qwen3.6-27B HF directory")
     config = json.loads((OFFICIAL_MODEL / "config.json").read_text())
 
     assert "mtp_num_hidden_layers" not in config

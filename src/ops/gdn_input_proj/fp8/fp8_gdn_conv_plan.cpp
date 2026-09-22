@@ -85,9 +85,16 @@ Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t w
         throw std::invalid_argument("fp8 GDN snapshot: invalid B/W domain");
     }
     if (batch_size == 1) {
-        if (policy == LinearPolicy::AllowA8 && width >= 10) {
-            return {Fp8GdnConvScheduleId::MaterializedA8};
-        }
+        // ⚠️ FIX-C. A8 quantizes the ACTIVATIONS to FP8, so it is not a re-ordering of the
+        // same arithmetic, it is a different arithmetic. The batch-1 chain-verify domain is
+        // width in [2, kVerifyWidthCeiling = 16] and it must use the SAME activation precision
+        // as the batch-1 decode, which reaches this projection at T=1 and therefore takes the
+        // BF16-activation (A16) route. The `AllowA8 && width >= 10` clause used to put every
+        // width >= 10 on MaterializedA8 - a percent-level change in q/k/v/z that no per-layer
+        // BF16 rounding absorbs. MEASURED: `--spec mtp --draft-tokens 9` (width 10) was the
+        // first arm to differ from `--spec none` at LAYER 0's gdn output, column 0, and the
+        // first arm whose 100k-token run degenerated (last-decile novel-token rate 0.000).
+        // A8 stays available above the verify domain, where only prefill runs, and for B > 1.
         return b1_a16_plan(width);
     }
     if (policy == LinearPolicy::AllowA8 && width * batch_size >= 9) {
@@ -103,9 +110,16 @@ Fp8GdnConvPlan fp8_gdn_record_resolve_plan(LinearPolicy policy, std::int32_t wid
         throw std::invalid_argument("fp8 GDN record: invalid B/W domain");
     }
     if (batch_size == 1) {
-        if (policy == LinearPolicy::AllowA8 && width >= 10) {
-            return {Fp8GdnConvScheduleId::MaterializedA8};
-        }
+        // ⚠️ FIX-C. A8 quantizes the ACTIVATIONS to FP8, so it is not a re-ordering of the
+        // same arithmetic, it is a different arithmetic. The batch-1 chain-verify domain is
+        // width in [2, kVerifyWidthCeiling = 16] and it must use the SAME activation precision
+        // as the batch-1 decode, which reaches this projection at T=1 and therefore takes the
+        // BF16-activation (A16) route. The `AllowA8 && width >= 10` clause used to put every
+        // width >= 10 on MaterializedA8 - a percent-level change in q/k/v/z that no per-layer
+        // BF16 rounding absorbs. MEASURED: `--spec mtp --draft-tokens 9` (width 10) was the
+        // first arm to differ from `--spec none` at LAYER 0's gdn output, column 0, and the
+        // first arm whose 100k-token run degenerated (last-decile novel-token rate 0.000).
+        // A8 stays available above the verify domain, where only prefill runs, and for B > 1.
         return b1_a16_plan(width);
     }
     if (policy == LinearPolicy::AllowA8 && width * batch_size >= 8) {

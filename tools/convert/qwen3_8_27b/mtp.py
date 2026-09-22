@@ -32,10 +32,10 @@ import numpy as np
 # repository bootstrap (the repo is imported, never modified)
 # --------------------------------------------------------------------------
 
-_REPO_CANDIDATES = (
-    Path("/home/user/ninfer-fusion"),
-    Path(__file__).resolve().parents[1],
-)
+#: The checkout that owns this file (tools/convert/qwen3_8_27b -> repo root). The module
+#: never points at somebody else's absolute path; parents[1] here is tools/convert, which
+#: holds no tools/artifact, so the old fallback could never succeed either.
+_REPO_CANDIDATES = (Path(__file__).resolve().parents[3],)
 
 
 def _bootstrap_repo() -> Path:

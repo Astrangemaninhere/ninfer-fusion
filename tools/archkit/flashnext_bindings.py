@@ -193,35 +193,152 @@ e("output_norm", "[2560]",
 
 
 # ---------------------------------------------------------------------------
-def audit(sources: list[str]) -> dict:
-    """Match checkpoint keys against alias patterns; report coverage both ways."""
-    matched: dict[str, str] = {}     # source key -> engine name
-    engine_hit: dict[str, str] = {}  # engine name -> source key
-    unmatched_src: list[str] = []
-    for key in sources:
-        hit = None
-        for entry in E:
-            for pat in entry["alias"]:
-                if fnmatch.fnmatch(key, pat):
-                    hit = entry["engine"]
-                    break
-            if hit:
-                break
-        if hit:
-            matched[key] = hit
-            engine_hit.setdefault(hit, key)
+# Source-key normalization.
+#
+# The real Qwen3.8-Flash-Next checkpoint nests the language tower one segment
+# deeper than the HF Qwen-MoE convention these aliases are written in:
+#     model.language_model.layers.5.linear_attn.in_proj_qkv.weight
+# where the contract (and llama.cpp's qwen4exp reader) says
+#     model.layers.5.linear_attn.in_proj_qkv.weight
+# Without this rewrite exactly 1 of the 74,520 entries matches. Re-derived from
+# the shipped index (296,475 keys, 'model.language_model' x296,110).
+_PREFIX_REWRITES: tuple[tuple[str, str], ...] = (
+    ("model.language_model.", "model."),
+)
+
+# Regions the checkpoint carries that this text contract deliberately does not
+# bind. Each is named with why it is not a silent drop.
+UNBOUND_REGIONS: tuple[tuple[str, str], ...] = (
+    ("model.visual.", "vision tower encoder; consumed by the vision target, not by this text contract"),
+    ("mtp.", "MTP draft head; bound by the MTP binder, not by this text contract"),
+)
+
+
+def normalize_source_key(key: str) -> str:
+    """Map a checkpoint key onto the contract's naming convention."""
+    for old, new in _PREFIX_REWRITES:
+        if key.startswith(old):
+            return new + key[len(old):]
+    return key
+
+
+def _layer_of(engine: str) -> "str | None":
+    m = re.match(r"layer\.(\d+)\.", engine)
+    return m.group(1) if m else None
+
+
+def _expected_source_keys(entry: dict) -> list:
+    """Concrete source keys this entry accepts, in alias order.
+
+    Each entry already carries its layer index (it is in the engine name), so
+    matching needs no scan of the checkpoint: build the candidate keys and test
+    set membership. The previous implementation tested every entry against
+    every source key (74,520 x 296,475 ~= 2.2e10 comparisons), which is why the
+    audit recorded in M_flashnext_contract.md never returned a result.
+    """
+    layer = _layer_of(entry["engine"])
+    out = []
+    for pat in entry["alias"]:
+        if "{i}" in pat:
+            if layer is None:
+                continue
+            out.append(pat.replace("{i}", layer))
         else:
-            unmatched_src.append(key)
-    missing = [entry["engine"] for entry in E if entry["engine"] not in engine_hit]
+            out.append(pat)
+    return out
+
+
+# NVFP4 publishes each logical tensor as a quad; the contract names only the
+# `.weight` member, so the converter has to derive the rest or drop them.
+_NVFP4_COMPANIONS = ("weight_scale", "weight_scale_2", "input_scale")
+_LEAF_RE = re.compile(r"^(?P<stem>.+)\.(?P<leaf>[A-Za-z0-9_]+)$")
+
+
+def audit(sources) -> dict:
+    """Two-way coverage audit of the contract against a real key set.
+
+    Forward:  every contract entry must find a source key, else the engine
+              tensor has no weight source.
+    Reverse:  every source key must be consumed, be a derived NVFP4 companion,
+              or fall in a named UNBOUND_REGIONS prefix, else it is silently
+              dropped.
+    """
+    srcset = set(sources)
+    norm = {normalize_source_key(k) for k in srcset}
+
+    matched = {}      # normalized source key -> engine
+    engine_hit = {}   # engine -> normalized source key
+    ambiguous = []
+    for entry in E:
+        if entry["engine"] in engine_hit:
+            continue
+        hits = [k for k in _expected_source_keys(entry) if k in norm]
+        if not hits:
+            continue
+        if len(hits) > 1:
+            ambiguous.append("%s: %r" % (entry["engine"], hits))
+        engine_hit[entry["engine"]] = hits[0]
+        matched[hits[0]] = entry["engine"]
+
+    missing = [e["engine"] for e in E if e["engine"] not in engine_hit]
+
+    consumed = set(matched)
+    companions = set()
+    for k in consumed:
+        m = _LEAF_RE.match(k)
+        if m and m.group("leaf") == "weight":
+            for c in _NVFP4_COMPANIONS:
+                ck = "%s.%s" % (m.group("stem"), c)
+                if ck in norm:
+                    companions.add(ck)
+
+    unbound = {}
+    unexpected = []
+    for k in norm:
+        if k in consumed or k in companions:
+            continue
+        for prefix, _reason in UNBOUND_REGIONS:
+            if k.startswith(prefix):
+                unbound[prefix] = unbound.get(prefix, 0) + 1
+                break
+        else:
+            unexpected.append(k)
+
+    # A tensor is a quad only if it starts one: flag a stem when at least one
+    # companion is present but the set is not complete. Tensors that carry a
+    # bare `.weight` and no companion at all are simply not quantised in this
+    # checkpoint (measured: only the 512-expert MoE tensors are).
+    quantised = set()
+    incomplete = []
+    for k in consumed:
+        m = _LEAF_RE.match(k)
+        if not (m and m.group("leaf") == "weight"):
+            continue
+        stem = m.group("stem")
+        present = [c for c in _NVFP4_COMPANIONS if "%s.%s" % (stem, c) in norm]
+        if not present:
+            continue
+        quantised.add(stem)
+        if len(present) != len(_NVFP4_COMPANIONS):
+            incomplete.append("%s (has %s)" % (stem, ",".join(present)))
+
     return {
         "contract_entries": len(E),
+        "source_keys": len(srcset),
         "matched_sources": len(matched),
         "engines_covered": len(engine_hit),
-        "missing_engines": missing[:40] + ([f"... (+{len(missing)-40})"] if len(missing) > 40 else []),
+        "ambiguous_aliases": ambiguous[:10],
+        "missing_engines": missing[:40] + (["... (+%d)" % (len(missing) - 40)] if len(missing) > 40 else []),
         "missing_count": len(missing),
-        "unmatched_sources": unmatched_src[:40],
-        "unmatched_count": len(unmatched_src),
-        "complete": len(missing) == 0 and len(unmatched_src) == 0,
+        "companion_keys_consumed": len(companions),
+        "quantised_tensors": len(quantised),
+        "unbound_regions": unbound,
+        "unexpected_sources": sorted(unexpected)[:40],
+        "unexpected_count": len(unexpected),
+        "incomplete_nvfp4_quads": sorted(incomplete)[:20],
+        "incomplete_quad_count": len(incomplete),
+        "complete": (len(missing) == 0 and len(unexpected) == 0
+                     and len(incomplete) == 0 and len(ambiguous) == 0),
     }
 
 

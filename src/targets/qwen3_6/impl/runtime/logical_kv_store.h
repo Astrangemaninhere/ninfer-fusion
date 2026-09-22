@@ -770,8 +770,11 @@ public:
     // predates the cold requant, so it doubles as the higher-fidelity backup.
     void transfer_to_cold(LogicalKVPageHandle handle, DeviceKVPageReservation& reservation) {
         Page& page = require(handle);
+        // [SPILL-GATE] a live writer flag no longer blocks the transfer -- see the note on
+        // can_cold_transfer below. This guard MUST be relaxed together with the predicate,
+        // or the caller (program_impl.h enqueue_cold_compressions) would throw on page one.
         if (page.source_pins != 0 || page.destination_pinned || !page.device_replica ||
-            page.cold_compressed || page.writer_references != 0 || page.references == 0) {
+            page.cold_compressed || page.references == 0) {
             throw std::logic_error("logical KV page is not cold-transferable");
         }
         physical_->dematerialize_one(reservation, std::move(*page.device_replica));
@@ -791,9 +794,29 @@ public:
         // writer flag (which the paged store keeps until page release) does
         // not block the transfer. Pins/fork ties still block, and the page
         // must currently hold its device replica to copy from.
-        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
-               !page.destination_pinned && page.device_replica.has_value() &&
-               !page.cold_compressed;
+        // A page a SECOND address still maps (references > 1: a published shared prefix,
+        // i.e. an active-capture checkpoint, or a prefix fork) must keep its device
+        // replica. The cold path was the only detach path that did not already refuse
+        // these pages -- can_dematerialize above requires references == 1 -- and the cold
+        // bookkeeping lives on the OWNING SequenceState alone (program.h ColdPageEntry /
+        // cold_pages), so a shared prefix that later materializes such a page finds it
+        // cold_compressed with source_state == nullptr (program_impl.h "cold checkpoint
+        // page has no source bookkeeping"), and once the owner is gone --
+        // release_sequence_kv clears its cold_pages -- the bytes are not recoverable at
+        // all. The refusal lasts exactly as long as the second address exists: when the
+        // alias is dropped references returns to 1 and the page is cold-eligible again.
+        // [SPILL-GATE] `writer_references == 0` REMOVED. The paragraph above states the
+        // design intent in as many words -- "a live writer flag (which the paged store keeps
+        // until page release) does not block the transfer" -- and the paged store really does
+        // keep it: activate() sets the writer on every unique page (logical_kv_store.h:1126-1129)
+        // and the only sites that clear it are deactivate() (:1146, at unbind) and
+        // commit_active_snapshot() (:1502/:1509, which simultaneously retain a second reference
+        // so `references == 1` fails instead). A pass invoked from decode_raw (program_impl.h)
+        // or from advance_prefill therefore ran with EVERY candidate page holding the writer
+        // flag, so the predicate was unsatisfiable and not one byte was ever spilled.
+        return page.references == 1 &&
+               page.source_pins == 0 && !page.destination_pinned &&
+               page.device_replica.has_value() && !page.cold_compressed;
     }
 
     [[nodiscard]] bool cold_compressed(LogicalKVPageHandle handle) const noexcept {
@@ -811,14 +834,37 @@ public:
     // path instead, which is exactly why the Host replica must be current here.
     void transfer_to_cold_host(LogicalKVPageHandle handle, DeviceKVPageReservation& reservation) {
         Page& page = require(handle);
-        if (page.source_pins != 0 || page.destination_pinned || !page.device_replica ||
-            page.cold_compressed || page.writer_references != 0 || page.references == 0 ||
-            !page.host_replica || page.host_replica->content_epoch != page.content_epoch ||
-            page.host_replica->committed_columns != page.committed_columns) {
+        // Exactly the predicate the eviction consumer gates on: if can_cold_host_transfer says
+        // yes, this cannot throw.  Only the page's own state at the call site is re-read.
+        if (!can_cold_host_transfer(handle)) {
             throw std::logic_error("logical KV page is not cold-Host-transferable");
         }
         physical_->dematerialize_one(reservation, std::move(*page.device_replica));
         page.device_replica.reset();
+    }
+
+    // ONE RULE, ONE PLACE.  The three Cold-Host sites below used to spell this conjunction out
+    // by hand: can_cold_host_prepare (:833), can_cold_host_transfer (:844) and the inline guard
+    // inside transfer_to_cold_host (:815).  They meant the same thing, so a one-sided edit could
+    // only ever WEDGE them -- the eviction consumer keys on can_cold_host_prepare
+    // (program_impl.h:11298) and then calls transfer_to_cold_host, whose guard would throw
+    // `logical KV page is not cold-Host-transferable`, i.e. a logic_error-family exception on a
+    // legal eviction => the engine stops.  Stated once, it cannot drift.
+    //
+    // The rule is "a current Host replica can carry the restore", which is the Host tier's spelling
+    // of can_drop_device_replica.  `references` is deliberately NOT part of it: HostKVExtentStore
+    // refuses to release that replica while `!device_resident(page) && address_references(page) != 0`
+    // (host_kv_extent_store.h:276-279, :555-558) and its sweep only releases zero-reference runs
+    // (:387), and reserve_device_replica restores from the replica without consulting `references`
+    // (:485-495) -- so a page a second address still maps is not unrecoverable here.  That is the
+    // whole difference from the COLD POOL, whose restore source is the owning sequence's cold_pages
+    // slot, which is why can_cold_transfer above keeps `references == 1`.
+    [[nodiscard]] bool cold_host_device_replica_releasable(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
+               !page.destination_pinned && page.device_replica.has_value() &&
+               !page.cold_compressed;
     }
 
     // Cold Host eligibility, BEFORE the Host copy exists: committed history
@@ -830,9 +876,7 @@ public:
     [[nodiscard]] bool can_cold_host_prepare(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
-        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
-               !page.destination_pinned && page.device_replica.has_value() &&
-               !page.cold_compressed && !page.host_replica;
+        return cold_host_device_replica_releasable(handle) && !page.host_replica;
     }
 
     // Cold Host eligibility, AFTER the Host copy is published: the surviving copy
@@ -840,10 +884,7 @@ public:
     // not be released.
     [[nodiscard]] bool can_cold_host_transfer(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
-        const Page& page = pages_[handle.index_];
-        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
-               !page.destination_pinned && page.device_replica.has_value() &&
-               !page.cold_compressed && host_replica_current(handle);
+        return cold_host_device_replica_releasable(handle) && host_replica_current(handle);
     }
 
     // Cold-pool restore: allocate a fresh physical page for a cold descriptor
@@ -901,13 +942,57 @@ private:
         return epoch == 0 ? 1 : epoch;
     }
 
+    // `valid()` above is a conjunction of four terms, so the two refusals below -- which name only
+    // "stale" -- send the reader to the wrong explanation in the middle of a failure. This helper
+    // names the term that actually failed and prints every value that was compared. The term that
+    // fires most often, `handle.owner_ == this`, is not staleness at all: `LogicalKVPageHandle` is
+    // publicly default-constructible with `owner_ == nullptr`, so a handle that belongs to another
+    // store, or to nothing at all, is rejected by the ownership term alone. Only the generation
+    // term is staleness.
+    [[nodiscard]] std::string describe_unusable_page_handle(LogicalKVPageHandle handle) const {
+        const Page* descriptor = nullptr;
+        if (handle.index_ < pages_.size()) { descriptor = &pages_[handle.index_]; }
+        const char* owner = "another store";
+        if (handle.owner_ == this) {
+            owner = "this store";
+        } else if (handle.owner_ == nullptr) {
+            owner = "none";
+        }
+        std::string state      = "out-of-range";
+        std::string generation = "n/a";
+        if (descriptor != nullptr) {
+            state      = descriptor->occupied ? "occupied" : "free";
+            generation = std::to_string(descriptor->generation);
+        }
+        std::string reason;
+        if (handle.owner_ != this) {
+            reason = handle.owner_ == nullptr
+                         ? "the handle names no page store, so nothing ever published it"
+                         : "the handle belongs to another logical KV page store";
+        } else if (descriptor == nullptr) {
+            reason = "the handle index is outside this store's descriptor range";
+        } else if (!descriptor->occupied) {
+            reason = "the named descriptor is not currently occupied";
+        } else {
+            reason = "the handle is stale: the descriptor was recycled since publication";
+        }
+        return "logical KV page handle is unusable: " + reason + " (owner=" + owner +
+               ", index=" + std::to_string(handle.index_) + " of capacity " +
+               std::to_string(pages_.size()) + ", state=" + state + ", handle generation=" +
+               std::to_string(handle.generation_) + ", live generation=" + generation + ")";
+    }
+
     [[nodiscard]] Page& require(LogicalKVPageHandle handle) {
-        if (!valid(handle)) { throw std::invalid_argument("logical KV page handle is stale"); }
+        if (!valid(handle)) {
+            throw std::invalid_argument(describe_unusable_page_handle(handle));
+        }
         return pages_[handle.index_];
     }
 
     [[nodiscard]] const Page& require(LogicalKVPageHandle handle) const {
-        if (!valid(handle)) { throw std::invalid_argument("logical KV page handle is stale"); }
+        if (!valid(handle)) {
+            throw std::invalid_argument(describe_unusable_page_handle(handle));
+        }
         return pages_[handle.index_];
     }
 
@@ -996,13 +1081,13 @@ public:
     }
 
     void activate(KVAddressSpaceHandle handle, std::uint32_t entitlement,
-                  std::int32_t execution_row) {
+                  std::int32_t execution_row, cudaStream_t stream = nullptr) {
         Address& address = require(handle);
         if (entitlement < address.page_count) {
             throw std::logic_error("KV address space is not activatable");
         }
         auto reservation = prepare_activation(handle, entitlement, execution_row);
-        commit_activation(std::move(reservation));
+        commit_activation(std::move(reservation), stream);
     }
 
     [[nodiscard]] KVActivationReservation
@@ -1049,7 +1134,7 @@ public:
 
     [[nodiscard]] DeviceKVPageReservation& page_reservation(KVActivationReservation& activation) {
         if (activation.owner_ != this || !valid(activation.address_)) {
-            throw std::logic_error("KV activation reservation is stale");
+            throw std::logic_error(describe_unusable_activation_reservation(activation));
         }
         return activation.page_reservation_;
     }
@@ -1930,25 +2015,150 @@ private:
         } catch (...) { std::terminate(); }
     }
 
+    // `valid()` above is a conjunction of four terms, so the four refusals below -- which name only
+    // "stale" -- send the reader to the wrong explanation in the middle of a failure. These helpers
+    // name the term that actually failed and print every value that was compared. The term that
+    // fires most often, `owner_ == this`, is not staleness at all: every handle and reservation
+    // here is publicly default-constructible with `owner_ == nullptr` (`KVAddressSpaceHandle` :78,
+    // `KVActivationReservation` :99, `KVPrefixForkReservation` :133,
+    // `KVActiveSnapshotReservation` :204), and every move constructor exchanges `owner_` to
+    // `nullptr`, so a handle or reservation that belongs to another store, or to nothing at all,
+    // is rejected by the ownership term alone. Only a generation mismatch is staleness.
+    // `commit_activation` (:1099-:1106) already separates these causes into distinct messages; the
+    // refusals here did not.
+    [[nodiscard]] std::string describe_unusable_address_handle(KVAddressSpaceHandle handle) const {
+        const Address* descriptor = nullptr;
+        if (handle.index_ < addresses_.size()) { descriptor = &addresses_[handle.index_]; }
+        const char* owner = "another store";
+        if (handle.owner_ == this) {
+            owner = "this store";
+        } else if (handle.owner_ == nullptr) {
+            owner = "none";
+        }
+        std::string state      = "out-of-range";
+        std::string generation = "n/a";
+        if (descriptor != nullptr) {
+            state      = descriptor->occupied ? "occupied" : "free";
+            generation = std::to_string(descriptor->generation);
+        }
+        std::string reason;
+        if (handle.owner_ != this) {
+            reason = handle.owner_ == nullptr
+                         ? "the handle names no address-space store, so nothing published it"
+                         : "the handle belongs to another KV address-space store";
+        } else if (descriptor == nullptr) {
+            reason = "the handle index is outside this store's descriptor range";
+        } else if (!descriptor->occupied) {
+            reason = "the named descriptor is not currently occupied";
+        } else {
+            reason = "the handle is stale: the descriptor was recycled since publication";
+        }
+        return "KV address-space handle is unusable: " + reason + " (owner=" + owner +
+               ", index=" + std::to_string(handle.index_) + " of capacity " +
+               std::to_string(addresses_.size()) + ", state=" + state + ", handle generation=" +
+               std::to_string(handle.generation_) + ", live generation=" + generation + ")";
+    }
+
+    [[nodiscard]] std::string describe_unusable_activation_reservation(
+        const KVActivationReservation& activation) const {
+        const char* owner = "another store";
+        if (activation.owner_ == this) {
+            owner = "this store";
+        } else if (activation.owner_ == nullptr) {
+            owner = "none";
+        }
+        std::string reason;
+        if (activation.owner_ == nullptr) {
+            reason = "the reservation names no store, so it was never prepared";
+        } else if (activation.owner_ != this) {
+            reason = "the reservation belongs to another KV address-space store";
+        } else {
+            reason = "the reservation's address handle is unusable: " +
+                     describe_unusable_address_handle(activation.address_);
+        }
+        return "KV activation reservation is unusable: " + reason + " (owner=" + owner +
+               ", entitlement=" + std::to_string(activation.requested_entitlement_) +
+               ", has execution row=" + (activation.row_ ? "yes" : "no") + ")";
+    }
+
+    // A prefix fork is refused by three terms collapsed into one name, and the two address terms
+    // are the ones a corrupt or foreign reservation actually hits.
+    [[nodiscard]] std::string describe_unusable_prefix_fork(
+        const KVPrefixForkReservation& fork) const {
+        const char* owner = "another store";
+        if (fork.owner_ == this) {
+            owner = "this store";
+        } else if (fork.owner_ == nullptr) {
+            owner = "none";
+        }
+        std::string reason;
+        if (fork.owner_ == nullptr) {
+            reason = "the reservation names no store, so it was never prepared";
+        } else if (fork.owner_ != this) {
+            reason = "the reservation belongs to another KV address-space store";
+        } else if (!valid(fork.source_)) {
+            reason = "the reservation's source address handle is unusable: " +
+                     describe_unusable_address_handle(fork.source_);
+        } else {
+            reason = "the reservation's destination address handle is unusable: " +
+                     describe_unusable_address_handle(fork.destination_);
+        }
+        return "KV prefix-fork reservation is unusable: " + reason + " (owner=" + owner +
+               ", frontier=" + std::to_string(fork.frontier_) +
+               ", full pages=" + std::to_string(fork.full_pages_) +
+               ", tail columns=" + std::to_string(fork.tail_columns_) + ")";
+    }
+
+    [[nodiscard]] std::string describe_unusable_active_snapshot(
+        const KVActiveSnapshotReservation& snapshot) const {
+        const char* owner = "another store";
+        if (snapshot.owner_ == this) {
+            owner = "this store";
+        } else if (snapshot.owner_ == nullptr) {
+            owner = "none";
+        }
+        std::string reason;
+        if (snapshot.owner_ == nullptr) {
+            reason = "the reservation names no store, so it was never prepared";
+        } else if (snapshot.owner_ != this) {
+            reason = "the reservation belongs to another KV address-space store";
+        } else if (!valid(snapshot.source_)) {
+            reason = "the reservation's source address handle is unusable: " +
+                     describe_unusable_address_handle(snapshot.source_);
+        } else {
+            reason = "the reservation's destination address handle is unusable: " +
+                     describe_unusable_address_handle(snapshot.destination_);
+        }
+        return "active KV snapshot reservation is unusable: " + reason + " (owner=" + owner +
+               ", frontier=" + std::to_string(snapshot.frontier_) +
+               ", full pages=" + std::to_string(snapshot.shape_.full_pages) +
+               ", tail columns=" + std::to_string(snapshot.shape_.tail_columns) +
+               ", entitlement=" + std::to_string(snapshot.entitlement_) + ")";
+    }
+
     [[nodiscard]] Address& require(KVAddressSpaceHandle handle) {
-        if (!valid(handle)) { throw std::invalid_argument("KV address-space handle is stale"); }
+        if (!valid(handle)) {
+            throw std::invalid_argument(describe_unusable_address_handle(handle));
+        }
         return addresses_[handle.index_];
     }
 
     [[nodiscard]] const Address& require(KVAddressSpaceHandle handle) const {
-        if (!valid(handle)) { throw std::invalid_argument("KV address-space handle is stale"); }
+        if (!valid(handle)) {
+            throw std::invalid_argument(describe_unusable_address_handle(handle));
+        }
         return addresses_[handle.index_];
     }
 
     void require_prefix_fork(const KVPrefixForkReservation& fork) const {
         if (fork.owner_ != this || !valid(fork.source_) || !valid(fork.destination_)) {
-            throw std::logic_error("KV prefix-fork reservation is stale");
+            throw std::logic_error(describe_unusable_prefix_fork(fork));
         }
     }
 
     void require_active_snapshot(const KVActiveSnapshotReservation& snapshot) const {
         if (snapshot.owner_ != this || !valid(snapshot.source_) || !valid(snapshot.destination_)) {
-            throw std::logic_error("active KV snapshot reservation is stale");
+            throw std::logic_error(describe_unusable_active_snapshot(snapshot));
         }
     }
 

@@ -92,6 +92,11 @@ struct TextLayerPlan {
 };
 
 struct MtpPlan {
+    //: Whether the ARTIFACT declares an MTP block (all 12 objects found in its object table).
+    //: The handles below are only meaningful when this is true; a recipe with no draft payload
+    //: writes none of them (tools/convert/qwen3_6_27b/text_core.py excludes them), and the
+    //: binder skips the group instead of refusing the artifact.
+    bool declared = false;
     artifact::ObjectHandle input_projection;
     artifact::ObjectHandle embedding_norm;
     artifact::ObjectHandle hidden_norm;
@@ -163,6 +168,13 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
+    // Which OPTIONAL groups this artifact declares, read from its own object table in
+    // `bind_artifact`.  False means the group is absent from the artifact (the text-core
+    // recipe writes no draft head and no vision tower at all) and the handles above are
+    // meaningless: `bind_artifact` refuses a run that selects an absent group by name.
+    bool draft_head_declared = false;
+    bool mtp_declared        = false;
+    bool vision_declared     = false;
     DFlashPlan dflash;
     DFlash2Plan dflash2;
 

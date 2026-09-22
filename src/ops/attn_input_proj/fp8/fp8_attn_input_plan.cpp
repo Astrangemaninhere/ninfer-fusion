@@ -14,13 +14,23 @@ enum class Fp8AttnInputRoute : std::uint8_t {
     A8,
 };
 
+// ⚠️ FIX-C (scratch/PATCHSET/FIX-C/gdn_chunk_exactness.diff). A8 quantizes the ACTIVATIONS
+// to FP8, so it is not a re-ordering of the same arithmetic, it is a different arithmetic. A
+// `--spec mtp --draft-tokens k` chain-verify round presents `width = k + 1` columns and must
+// reproduce the batch-1 decode token for token; the decode reaches this projection at T=1,
+// i.e. on A16. The old `tokens >= 11` crossover therefore made every width >= 11 (k >= 10) a
+// percent-level different Q/K/V/GATE projection while the widths below it stayed A16. The
+// crossover now sits ABOVE the widest chain-verify round (kMtpDecodeMaximumDrafts + 1 = 16)
+// and is kept for the larger column counts that only prefill (and the draft model) reach.
+inline constexpr std::int32_t kVerifyWidthCeiling = 16;
+
 Fp8AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 attn_input_proj: T must be positive"); }
     if (policy == LinearPolicy::A16Only) { return Fp8AttnInputRoute::A16; }
     if (policy != LinearPolicy::AllowA8) {
         throw std::invalid_argument("fp8 attn_input_proj: unsupported policy");
     }
-    return tokens >= 11 ? Fp8AttnInputRoute::A8 : Fp8AttnInputRoute::A16;
+    return tokens > kVerifyWidthCeiling ? Fp8AttnInputRoute::A8 : Fp8AttnInputRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
@@ -45,9 +55,13 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
         Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
         Tensor key_chunk(key, DType::BF16, {kKvRows, active});
         Tensor value_chunk(value, DType::BF16, {kKvRows, active});
-        // UNIFY-A: one route for the whole small-T family (T=1 included).
-        fp8_attn_input_small_t_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
-                                      value_chunk, stream);
+        if (active == 1) {
+            fp8_attn_input_decode_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
+                                         value_chunk, stream);
+        } else {
+            fp8_attn_input_small_t_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
+                                          value_chunk, stream);
+        }
     }
 }
 

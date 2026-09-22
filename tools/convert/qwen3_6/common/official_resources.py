@@ -36,6 +36,40 @@ OFFICIAL_RESOURCE_SHA256 = {
     ),
 }
 
+#: Revisions of the same six resources that a *registered variant* legitimately ships,
+#: keyed by resource name and then by sha256, with the provenance of each hash.
+#:
+#: This is not a relaxation of the pin: each entry is the recorded digest of one
+#: reviewed file that belongs to a registered upstream release, it only ever answers
+#: for the resource name it is filed under, and any digest outside both tables stays
+#: ``unproven`` and stays fatal without ``--allow-frontend-drift``.  It exists because
+#: the single pin describes one revision of one release; a variant of the same base
+#: model that ships its own tokenizer_config / template / generation_config would
+#: otherwise be refused for being a different *revision* rather than a different
+#: *model*, and the only way past that today is the blanket opt-out.
+REGISTERED_RESOURCE_SHA256 = {
+    "frontend/tokenizer_config.json": {
+        "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27": (
+            "Qwen3.8-27B 的注册钉死值：tools/convert/qwen3_8_27b/convert.py 的 "
+            "OFFICIAL_RESOURCE_SHA256 就是这一份，该 target 的转换器直接接受它"
+        ),
+    },
+    "frontend/chat_template.jinja": {
+        "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041": (
+            "Qwen3.8-27B 的注册钉死值：tools/convert/qwen3_8_27b/convert.py 的 "
+            "OFFICIAL_RESOURCE_SHA256 就是这一份，该 target 的转换器直接接受它"
+        ),
+    },
+    "frontend/generation_config.json": {
+        "b8eb74d15e0a56623d00ccd14950a4bb87fabbf84b5cc030dcc904b899fb1eb5": (
+            "Qwen3.8-27B-ET-Uncensored-NVFP4/W4A4+W8A8 随件（214 B）；内容只声明 "
+            "bos_token_id=248044 / eos_token_id=[248046, 248044] / pad_token_id=248044 "
+            "（与 config.json 逐项一致）与 do_sample/temperature=1.0/top_k=20/top_p=0.95 "
+            "（与 Qwen3.8 的采样默认值逐项一致），不含任何分词规则或词表"
+        ),
+    },
+}
+
 
 def validate_official_resource_hashes(
     actual_hashes: Mapping[str, str],
@@ -91,6 +125,7 @@ def load_official_resources(
 
 __all__ = [
     "OFFICIAL_RESOURCE_SHA256",
+    "REGISTERED_RESOURCE_SHA256",
     "load_official_resources",
     "validate_official_resource_hashes",
     "validate_official_resources",

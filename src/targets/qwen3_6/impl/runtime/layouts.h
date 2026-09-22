@@ -91,13 +91,23 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
+    // MTP capture-width ladder rungs (kMtpWindowLadder, clamped to the target's MTP draft
+    // domain). Empty = fixed-k: one captured width, no width selection. Non-empty = adaptive:
+    // one captured graph per rung, selected per round by the survival/cost criterion, and
+    // draft_window is the ladder top (the widest rung, which sizes the MTP decode frame).
+    std::vector<std::uint32_t> mtp_ladder;
+    // --draft-tree L,d (MTP only): the tree shape whose node budget L*d is draft_window above.
+    // {0,0} = no tree. Both are carried into the plan so the runtime can tell a tree round from
+    // a chain round without re-parsing the command line.
+    std::uint32_t draft_tree_paths = 0;
+    std::uint32_t draft_tree_depth = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     std::array<DType, 64> layer_kv_dtypes{};
     // Per-layer two-stage residual planes for the NVFP4 tier.
     std::array<bool, 64> kv_residual_layers{};
-    // SEPARATION: V codec of the NVFP4 tier (iso3 default, e2m1 ablation).
+    // SEPARATION: V codec of the NVFP4 tier (iso4e default, e2m1 ablation).
     KvVCodec kv_v_codec = KvVCodec::Iso3;
     // SEPARATION: SO(4) rotation of K on write / Q on read; true = identity.
     bool kv_rotation_off = false;
@@ -113,12 +123,26 @@ struct SequencePlanningInputs {
     // --max-cold-pages override: 0 = derive from the policy (see layouts_impl).
     std::uint32_t max_cold_pages    = 0;
     std::uint32_t cold_keep_tokens = 128;
-    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    // The unload watermark (EngineOptions::unload_watermark_pages): free text-KV
+    // pool pages at or below which the Engine proactively unloads what its
+    // semantic directory judges unloadable. 0 = off; kUnloadWatermarkDerive =
+    // derive the reserve from the plan's own prefill chunk.
+    std::uint32_t unload_watermark_pages = kUnloadWatermarkDerive;
+    std::uint64_t cold_host_bytes  = 7ULL << 30;
     // ColdPolicy::Disk: spill directory and budget.
     std::string cold_disk_path;
     std::uint64_t cold_disk_bytes = 32ULL << 30;
     int device          = 0;
     ContextCacheOptions context_cache;
+    // WHICH layers the per-layer spec actually WROTE, for layer_kv_dtypes above
+    // (see EngineOptions::kv_layer_storage_set). true makes layer_kv_dtypes[L]
+    // authoritative even when it is DType::BF16, which is the only spelling of a
+    // real per-layer BF16 tier under a quantized kv_dtype. All-false is the
+    // pre-mask inheritance rule, bit-for-bit.
+    // LAST MEMBER ON PURPOSE: appending cannot move an existing field's offset, so
+    // an object compiled before this field existed still reads every field it
+    // knows where it expects it.
+    std::array<bool, 64> layer_kv_dtypes_set{};
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -134,13 +158,18 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
+    // See SequencePlanningInputs: empty = fixed-k, non-empty = the adaptive capture ladder.
+    std::vector<std::uint32_t> mtp_ladder;
+    // See SequencePlanningInputs: {0,0} = no tree, else L paths per depth over d steps.
+    std::uint32_t draft_tree_paths         = 0;
+    std::uint32_t draft_tree_depth         = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     std::array<DType, 64> layer_kv_dtypes{};
     // Per-layer two-stage residual planes for the NVFP4 tier.
     std::array<bool, 64> kv_residual_layers{};
-    // SEPARATION: V codec of the NVFP4 tier (iso3 default, e2m1 ablation).
+    // SEPARATION: V codec of the NVFP4 tier (iso4e default, e2m1 ablation).
     KvVCodec kv_v_codec = KvVCodec::Iso3;
     // SEPARATION: SO(4) rotation of K on write / Q on read; true = identity.
     bool kv_rotation_off = false;
@@ -154,7 +183,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     // --max-cold-pages override: 0 = derive from the policy (see layouts_impl).
     std::uint32_t max_cold_pages    = 0;
     std::uint32_t cold_keep_tokens = 128;
-    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    // See SequencePlanningInputs::unload_watermark_pages: this is the resolved
+    // copy, so ProgramImplCore reads ONE value and never re-derives it.
+    std::uint32_t unload_watermark_pages = kUnloadWatermarkDerive;
+    std::uint64_t cold_host_bytes  = 7ULL << 30;
     // ColdPolicy::Disk: spill directory and budget.
     std::string cold_disk_path;
     std::uint64_t cold_disk_bytes = 32ULL << 30;
@@ -166,6 +198,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;
     std::size_t device_reservation_bytes = 0;
+    // The "was this slot written?" mask for layer_kv_dtypes above; see
+    // SequencePlanningInputs and EngineOptions::kv_layer_storage_set.
+    // LAST MEMBER ON PURPOSE, same reason as SequencePlanningInputs.
+    std::array<bool, 64> layer_kv_dtypes_set{};
 };
 
 template <>

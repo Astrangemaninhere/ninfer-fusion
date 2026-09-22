@@ -279,6 +279,57 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    // THE ADMISSION RESERVES THE RESIDENT WORKING SET, NOT THE WHOLE SPAN, whenever
+    // the unload leg is armed -- and this is the line that makes "a single
+    // conversation longer than the pool" expressible at all.
+    //
+    // WHY IT WAS IMPOSSIBLE BEFORE: this entitlement is the whole point of the
+    // 5-hop chain that ends in the admission refusal. root_demand (:434-439) is
+    // built from it, isolated_request_feasible compares root_demand against
+    // admission_capacity() whose device.main_kv_pages is page_pool().capacity_pages()
+    // -- i.e. --kv-capacity -- and ResourceManager::inspect turns "does not fit" into
+    // Readiness::PermanentlyInfeasible (resource_manager.h:274-276), which the Engine
+    // reports as "request reservation exceeds Engine shared KV capacity"
+    // (engine_core.h:1770-1777). So a prompt longer than the pool was refused at
+    // ADMISSION, before any cold or recall decision could be taken: pool < prompt
+    // meant a flat refusal, and pool >= prompt meant no pressure at all. Both arms of
+    // that dilemma are the same defect -- the reservation was the whole sequence.
+    //
+    // WHAT REPLACES IT: the same quantity the watermark keeps free, from the ONE
+    // source (resident_text_kv_pages_required, program.h). The min() is not a
+    // compromise: with the leg armed a sequence NEVER needs the whole span resident,
+    // so the reservation must not exceed the resident requirement -- and it must not
+    // exceed the whole span either, so a short prompt keeps its exact old reservation
+    // and this change is invisible to it.
+    if (const std::uint32_t resident_pages = resident_text_kv_pages_required();
+        resident_pages != 0) {
+        const std::uint32_t span_pages = pages_for_tokens(reserved_context_tokens);
+        base->text_kv_page_entitlement =
+            resident_pages < span_pages ? resident_pages : span_pages;
+    }
+    // -----------------------------------------------------------------------
+    // bandfail: THE BAND, REFUSED BY NAME AT THE REQUIREMENT.
+    // -----------------------------------------------------------------------
+    // The constructor can only see the plan's CEILING, so it names the band and stops
+    // paying for a pool that cannot close it (program_impl.h). The refusal belongs HERE,
+    // where `reserved_context_tokens` is the frontier this REQUEST actually asks for: a
+    // serve declared at 1M that only sends 8K is untouched, and a request that really
+    // needs more pages than device + cold-host can hold is refused before any work, with
+    // the tree's own text and the "raise --cold-host-bytes by at least N pages" quantity.
+    // Gated exactly as the constructor is: a live host rung, an all-non-zero window table.
+    // D is `admission_capacity().device.main_kv_pages` -- the same call `fits()` compares
+    // against (this file's own note at :327-328), so the plan and the refusal cannot
+    // disagree about the capacity they are talking about.
+    if (cold_host_tier != nullptr && cold_host_tier->enabled()) {
+        const std::string band_refusal = cold_host_band_refusal_at(
+            cold_policy, decoder->text_kv.layer_sliding_windows(),
+            pages_for_tokens(reserved_context_tokens), admission_capacity().device.main_kv_pages,
+            cold_host_tier->budget().host_bytes,
+            static_cast<std::uint64_t>(cold_host_tier->budget().host_page_bytes));
+        if (!band_refusal.empty()) {
+            throw std::invalid_argument("cold-host window: " + band_refusal);
+        }
+    }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
@@ -286,9 +337,24 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
+    // HOW MANY STATEIMAGE SLOTS A ROOT REQUEST PLEDGES. A root materializes read==write and,
+    // when the pool holds one, ONE pledged spare for the `[context-rebuild]` discard
+    // destination (`start_sequence`'s `if (state_slots == 2)`, consumed by the
+    // `no-spare-state-slot-for-discard` gate). The spare is planned ONLY when the pool can back
+    // it: `layouts_impl.h` builds the device pool as
+    // `state_image_slots = max_concurrency + device_state_slots`, so a pool of exactly
+    // `max_concurrency` has nothing to pledge and the demand has to say so. A two-slot demand
+    // against a one-slot pool is what admission reports as PermanentlyInfeasible ("request
+    // reservation exceeds Engine shared KV capacity"), and it would also make this pledge a
+    // promise `reserve_destination` cannot keep at materialization time.
+    // Reading the pool through `admission_capacity()` -- the same call `fits()` compares
+    // against -- is deliberate: the plan and the admission test cannot then disagree about the
+    // capacity they are talking about.
+    const std::uint32_t pool_state_slots = admission_capacity().device.state_slots;
+    const std::uint32_t root_state_slots = pool_state_slots > max_concurrency ? 2U : 1U;
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
-        .state_slots      = 1U,
+        .state_slots      = root_state_slots,
         .main_kv_pages    = base->text_kv_page_entitlement,
         .backend_kv_pages = base->backend_kv_page_entitlement,
     };
@@ -429,7 +495,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             group.identity = std::move(identity);
         }
     }
-    root_active.state_slots = 1U;
+    root_active.state_slots = root_state_slots;
     const detail::PhysicalResources root_vector{.device = root_active};
     base->root_demand = detail::PhysicalDemand{
         .active_entitlement       = root_vector,
@@ -996,11 +1062,11 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 const std::uint32_t required = pages_for_tokens(frontier);
                 const std::uint64_t final_without_release =
                     static_cast<std::uint64_t>(required) + active_pages;
-                const std::uint32_t capacity = pages.physical_pool().capacity_pages();
-                if (final_without_release <= capacity) { return true; }
+                const std::uint32_t pool_capacity = pages.physical_pool().capacity_pages();
+                if (final_without_release <= pool_capacity) { return true; }
                 if (!prefix_fork || frontier == 0 ||
                     frontier % static_cast<std::uint32_t>(kPagedKVPageSize) == 0 ||
-                    final_without_release != static_cast<std::uint64_t>(capacity) + 1U ||
+                    final_without_release != static_cast<std::uint64_t>(pool_capacity) + 1U ||
                     required > addresses.mapped_pages(address)) {
                     return false;
                 }

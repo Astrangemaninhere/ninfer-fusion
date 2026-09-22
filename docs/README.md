@@ -1,7 +1,9 @@
 # NInfer documentation
 
 Start with the [project README](../README.md) to build NInfer, download a published artifact, and
-run the CLI or HTTP server.
+run the CLI or HTTP server. [CHANGELOG.md](../CHANGELOG.md) records what changed in
+each landing batch, naming the flag, environment variable, build option, or contract that
+moved.
 
 ## User guides
 
@@ -43,6 +45,9 @@ Runtime and Op references:
 - [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
 - [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
+- [MTP draft-tree verify shape (`--draft-tree L,d`)](maintainer/mtp-draft-tree.md)
+- [Multi-device sharding, the per-architecture route table, and the capability gate](maintainer/multi-device-and-shard-plan.md)
+- [`KvCacheStorage` name table, `dtype_of` refusals, and the switch-coverage gate](maintainer/kv-storage-names-and-switch-gates.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)

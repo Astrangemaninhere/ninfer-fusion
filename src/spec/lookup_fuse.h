@@ -9,6 +9,8 @@
 //   - 部分匹配 (min_len <= L < Q): 提出 1 个试探 token (历史在匹配段后的首 token),
 //     下轮把该 token 并入查询再查 (渐进扩展); 引擎侧每轮调用一次本函数。
 //   - L < min_len: 不出草案 (回退 drafter/MTP)。
+#include "ninfer/ops/suffix_lookup.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -21,12 +23,15 @@ struct SuffixHit {
 };
 
 // 纯宿主后缀匹配 (与 suffix_lookup 内核同语义; 单行, 供策略测试/宿主回退)。
-// 只搜严格更早的非重叠位置: o + query_len <= query_start。
+// 扫描边界由 include/ninfer/ops/suffix_lookup.h 的 suffix_lookup_scan_limit 单点给出:
+// 严格更早、不重叠、且给 K 个续写留出空间 —— 与内核逐字同一判据。
+// continuation_tokens 必须与将要填入草稿块的 K 相同, 否则选出的 offset 会与内核不同。
 inline SuffixHit suffix_best(const std::vector<std::int32_t>& ids, std::int32_t query_start,
-                             std::int32_t query_len, std::int32_t min_len) {
+                             std::int32_t query_len, std::int32_t min_len,
+                             std::int32_t continuation_tokens = 0) {
     SuffixHit best;
-    const std::int32_t limit =
-        std::min(static_cast<std::int32_t>(ids.size()) - query_len, query_start);
+    const std::int32_t limit = ninfer::ops::suffix_lookup_scan_limit(
+        query_start, static_cast<std::int32_t>(ids.size()), query_len, continuation_tokens);
     for (std::int32_t o = 0; o < limit; ++o) {
         std::int32_t l = 0;
         for (std::int32_t q = 0; q < query_len; ++q) {
@@ -52,7 +57,7 @@ inline std::int32_t fuse_chain(const std::vector<std::int32_t>& ids,
                                std::int32_t query_start, std::int32_t query_len,
                                std::int32_t min_len, std::int32_t k,
                                std::int32_t* out) {
-    const SuffixHit hit = suffix_best(ids, query_start, query_len, min_len);
+    const SuffixHit hit = suffix_best(ids, query_start, query_len, min_len, k);
     if (hit.length < min_len) { return 0; }
     const auto fill = [&](std::int32_t n) {
         std::int32_t filled = 0;

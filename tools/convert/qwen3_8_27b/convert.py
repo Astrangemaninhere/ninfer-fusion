@@ -24,6 +24,7 @@ from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
 from tools.convert.qwen3_6_27b import convert as qwen3_6_convert
+from tools.convert.qwen3_6_27b import text_core
 from tools.convert.qwen3_6_27b import draft_head, recipe
 
 from . import inventory
@@ -190,6 +191,27 @@ def convert(
     *,
     device: str | torch.device = "cuda",
 ) -> Path:
+    # See `tools/convert/qwen3_6_27b/convert.py`: a text-core source cannot
+    # fill this package's MTP / draft-head / vision objects, so it takes the
+    # source-driven closure instead, under this row's registered identity.
+    # The front door reaches the 27b module's `validate_config` through this
+    # module's attribute table, so both rows accept together; whichever row it
+    # picks, the converter behind it must route the same way or it would print
+    # a command that cannot run.
+    if qwen3_6_convert.is_text_core_source(model_dir):
+        return text_core.convert(
+            model_dir, out_path, device=device,
+            model_id=inventory.MODEL_ID, weights_id=inventory.WEIGHTS_ID,
+            target_key=inventory.TARGET_KEY,
+            # The storage roles for THIS identity live in this module, not in the
+            # module `text_core` imports: `_w8_vocabulary_endpoint` below puts
+            # `text/token_embedding` and `text/output_head` on W8, which is what
+            # `endpoint_format(Qwen38GroupwiseInt)` requires at load time
+            # (src/targets/qwen3_6_27b/impl/load/bindings.cpp:38-40), and
+            # package.h:189-192 names this module as the row's provenance.
+            # Without this argument the W8 override is never walked.
+            specs_module=inventory)
+
     started = time.perf_counter()
     model = Path(model_dir)
     output = Path(out_path)
@@ -204,7 +226,7 @@ def convert(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
-    with ShardReader(model) as reader:
+    with recipe.source_reader(model) as reader:
         with ArtifactWriter(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
@@ -262,7 +284,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--resources", action="append", default=None,
+                        help="前端资源的搜索根（可重复；默认读 $NINFER_RESOURCE_ROOTS）")
     args = parser.parse_args(argv)
+    if qwen3_6_convert.is_text_core_source(args.model):
+        text_core.convert(args.model, args.out, device=args.device,
+                          resources=args.resources,
+                          model_id=inventory.MODEL_ID, weights_id=inventory.WEIGHTS_ID,
+                          target_key=inventory.TARGET_KEY,
+                          specs_module=inventory)
+        return
     convert(args.model, args.out, device=args.device)
 
 

@@ -1052,6 +1052,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
                         "max_tokens", "cache_prewarm_not_supported");
         }
         if (*max_tokens < 0) { bad_request("max_tokens must be positive", "max_tokens"); }
+        validate_output_budget(*max_tokens, limits.max_context, "max_tokens");
         result.generation.max_tokens = *max_tokens;
     } else {
         result.generation.max_tokens = limits.default_max_tokens;

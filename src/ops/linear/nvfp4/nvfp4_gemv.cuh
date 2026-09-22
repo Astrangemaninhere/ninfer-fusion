@@ -63,7 +63,58 @@ stage_nvfp4_scales(const std::uint8_t* __restrict__ scales,
     if constexpr (Schedule::kScaleAccess == Nvfp4ScaleAccess::StagedRaw) {
         constexpr int kQuartetsPerCta = Schedule::kRowsPerCta / 4;
         constexpr int kTasks          = Geometry::kScaleTilesPerRow * kQuartetsPerCta;
-        for (int task = static_cast<int>(threadIdx.x); task < kTasks; task += Schedule::kThreads) {
+        constexpr int kLoadsPerThread = (kTasks + Schedule::kThreads - 1) / Schedule::kThreads;
+        // Register bound for the pipeline below: at most kPipelineSlots uint4 are held at once
+        // (4 registers each). For the 17408-column geometry kLoadsPerThread is 5, so the tail
+        // loop below is provably dead there and costs nothing; for a hypothetical wider CTA the
+        // trips past the slot count fall through to the rolled tail instead of growing registers.
+        constexpr int kPipelineSlots = kLoadsPerThread < 8 ? kLoadsPerThread : 8;
+        static_assert(kPipelineSlots >= 1);
+
+        // PIPELINED STAGING. Every load of this thread is issued into its own uint4 before any
+        // destination is written. The rolled form this replaces reused ONE uint4 register set for
+        // all kLoadsPerThread trips, so the write-after-read dependency on that set serialised the
+        // trips into kLoadsPerThread full memory round trips back to back -- and every one of
+        // them sat before the __syncthreads() below, so no code load was in flight anywhere on
+        // the device for that whole window. Evidence: on the sm_120a SASS of the pinned baseline
+        // build/apps/ninfer 7e576566 the staging loop bodies sit at 0x1e0..0x280 with a single
+        // LDG.E.128 target set, BAR.SYNC is at 0x550 and the first mainloop LDG.E.64 is at 0x560,
+        // while the fp8 sibling of this kernel has STS/LDS/BAR counts of 0/0/0 and issues its
+        // first weight load at 0x190. See dl/nvfp4down/REPORT.md.
+        uint4 staged[kPipelineSlots];
+#pragma unroll
+        for (int slot = 0; slot < kPipelineSlots; ++slot) {
+            const int task = static_cast<int>(threadIdx.x) + slot * Schedule::kThreads;
+            if (task < kTasks) {
+                const int scale_tile = task / kQuartetsPerCta;
+                const int quartet    = task - scale_tile * kQuartetsPerCta;
+                const std::int64_t source_offset =
+                    static_cast<std::int64_t>(m_tile * Geometry::kScaleTilesPerRow + scale_tile) *
+                        512 +
+                    static_cast<std::int64_t>(rmod_base + quartet) * 16;
+                staged[slot] = load_vec<uint4>(scales + source_offset);
+            }
+        }
+#pragma unroll
+        for (int slot = 0; slot < kPipelineSlots; ++slot) {
+            const int task = static_cast<int>(threadIdx.x) + slot * Schedule::kThreads;
+            if (task < kTasks) {
+                const int scale_tile         = task / kQuartetsPerCta;
+                const int quartet            = task - scale_tile * kQuartetsPerCta;
+                const std::uint32_t words[4] = {staged[slot].x, staged[slot].y, staged[slot].z,
+                                                staged[slot].w};
+#pragma unroll
+                for (int quartile = 0; quartile < 4; ++quartile) {
+                    const int local_row = quartet * 4 + quartile;
+                    auto* destination   = reinterpret_cast<std::uint32_t*>(
+                        shared.raw_scales + local_row * Geometry::kGroupsPerRow + scale_tile * 4);
+                    *destination = words[quartile];
+                }
+            }
+        }
+        // Trips past the slot count keep the original rolled body verbatim (dead on 5120x17408).
+        for (int task = static_cast<int>(threadIdx.x) + kPipelineSlots * Schedule::kThreads;
+             task < kTasks; task += Schedule::kThreads) {
             const int scale_tile = task / kQuartetsPerCta;
             const int quartet    = task - scale_tile * kQuartetsPerCta;
             const std::int64_t source_offset =
@@ -145,6 +196,60 @@ __device__ __forceinline__ void load_nvfp4_coefficients(
     }
 }
 
+// ONE PHASE of the K loop, factored out of compute_nvfp4_rows ONLY so that the unroll of
+// the phase loop can be selected by the schedule (Schedule::kPhaseUnroll). Factoring is not
+// a semantic change: this body is the loop body it replaces, character for character, and
+// the caller below differs only in which `#pragma unroll` it applies. The default
+// kPhaseUnroll == 0 reproduces the previous `#pragma unroll` (full) exactly.
+template <class Geometry, class Schedule>
+__device__ __forceinline__ void compute_nvfp4_phase(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales,
+    const Nvfp4GemvSharedStorage<Geometry, Schedule>& shared, float inverse_weight_divisor,
+    const int (&parent_rows)[Schedule::kRowsPerWarp], int flat_row0, int lane, int phase,
+    float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains]) {
+    constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;
+    constexpr int kGroupsPerLane =
+        Schedule::kValuesPerLane < 16 ? 1 : Schedule::kValuesPerLane / 16;
+    const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
+
+    float coefficients[Schedule::kRowsPerWarp][kGroupsPerLane];
+    Nvfp4CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp];
+#pragma unroll
+    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+        load_nvfp4_coefficients<Geometry, Schedule>(
+            scales, shared, parent_rows[local_row], flat_row0 + local_row, phase, lane,
+            inverse_weight_divisor, coefficients[local_row]);
+        const std::int64_t code_offset =
+            static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
+            phase * (kValuesPerPhase / 2) + lane * (Schedule::kValuesPerLane / 2);
+        row_codes[local_row] = load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
+            codes + code_offset);
+    }
+
+#pragma unroll
+    for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
+        const int activation_index =
+            phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
+        const float2 activation = bf16x2_bits_to_float2(activation_pairs[activation_index]);
+        const int group         = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            const std::uint32_t word  = row_codes[local_row].words[pair / 4];
+            const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
+            const float2 code         = decode_nvfp4_e2m1x2(packed);
+            const float coefficient   = coefficients[local_row][group];
+            constexpr int kChainMask  = Schedule::kAccumulatorChains - 1;
+            accumulators[local_row][(2 * pair) & kChainMask] =
+                fmaf(code.x * coefficient, activation.x,
+                     accumulators[local_row][(2 * pair) & kChainMask]);
+            accumulators[local_row][(2 * pair + 1) & kChainMask] =
+                fmaf(code.y * coefficient, activation.y,
+                     accumulators[local_row][(2 * pair + 1) & kChainMask]);
+        }
+    }
+}
+
 template <class Geometry, class Schedule>
 __device__ __forceinline__ void
 compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
@@ -155,47 +260,20 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
                    float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains]) {
     constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;
     constexpr int kPhases         = Geometry::kInputRows / kValuesPerPhase;
-    constexpr int kGroupsPerLane =
-        Schedule::kValuesPerLane < 16 ? 1 : Schedule::kValuesPerLane / 16;
     static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
-    const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
-
-#pragma unroll
-    for (int phase = 0; phase < kPhases; ++phase) {
-        float coefficients[Schedule::kRowsPerWarp][kGroupsPerLane];
-        Nvfp4CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp];
-#pragma unroll
-        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-            load_nvfp4_coefficients<Geometry, Schedule>(
-                scales, shared, parent_rows[local_row], flat_row0 + local_row, phase, lane,
-                inverse_weight_divisor, coefficients[local_row]);
-            const std::int64_t code_offset =
-                static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
-                phase * (kValuesPerPhase / 2) + lane * (Schedule::kValuesPerLane / 2);
-            row_codes[local_row] = load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
-                codes + code_offset);
+    if constexpr (Schedule::kPhaseUnroll > 0) {
+#pragma unroll Schedule::kPhaseUnroll
+        for (int phase = 0; phase < kPhases; ++phase) {
+            compute_nvfp4_phase<Geometry, Schedule>(x, codes, scales, shared,
+                                                    inverse_weight_divisor, parent_rows, flat_row0,
+                                                    lane, phase, accumulators);
         }
-
+    } else {
 #pragma unroll
-        for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
-            const int activation_index =
-                phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
-            const float2 activation = bf16x2_bits_to_float2(activation_pairs[activation_index]);
-            const int group         = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
-#pragma unroll
-            for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                const std::uint32_t word  = row_codes[local_row].words[pair / 4];
-                const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                const float2 code         = decode_nvfp4_e2m1x2(packed);
-                const float coefficient   = coefficients[local_row][group];
-                constexpr int kChainMask  = Schedule::kAccumulatorChains - 1;
-                accumulators[local_row][(2 * pair) & kChainMask] =
-                    fmaf(code.x * coefficient, activation.x,
-                         accumulators[local_row][(2 * pair) & kChainMask]);
-                accumulators[local_row][(2 * pair + 1) & kChainMask] =
-                    fmaf(code.y * coefficient, activation.y,
-                         accumulators[local_row][(2 * pair + 1) & kChainMask]);
-            }
+        for (int phase = 0; phase < kPhases; ++phase) {
+            compute_nvfp4_phase<Geometry, Schedule>(x, codes, scales, shared,
+                                                    inverse_weight_divisor, parent_rows, flat_row0,
+                                                    lane, phase, accumulators);
         }
     }
 }

@@ -1,16 +1,16 @@
 // ninfer::ops - split-KV GQA small-T launcher and unified route dispatcher.
+// Kept free of every per-tier kernel header and of
+// gqa_attention_decode_partial.cuh: this TU's own body is split arithmetic, so pulling
+// the small-T launch cascade in here would only buy ptxas time. The split policy it does
+// use comes from gqa_attention_decode_split.h.
 #include "ops/launcher/gqa_attention.h"
-#include "ops/launcher/gqa_attention_decode_partial.cuh"
+#include "ops/launcher/gqa_attention_decode_split.h"
 
 #include "ops/common/ft_stats.h"
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_decode.cuh"
-#include "ops/kernel/gqa_attention_decode_bf16.cuh"
-#include "ops/kernel/gqa_attention_decode_fp8.cuh"
-#include "ops/kernel/gqa_attention_decode_iso3.cuh"
-#include "ops/kernel/gqa_attention_decode_i8.cuh"
-#include "ops/kernel/gqa_attention_decode_nvfp4.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/dtype.h"  // DType
 #include "ninfer/ops/gqa_attention.h"
 
 #include <cstdint>

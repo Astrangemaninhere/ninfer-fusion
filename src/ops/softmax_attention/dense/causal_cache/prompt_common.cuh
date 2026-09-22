@@ -79,6 +79,30 @@ __device__ __forceinline__ int causal_prompt_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
+// INTEGRATE4 (landing order row 4): landed from sergiuszm/ninfer-4090 @ rtx4090-port,
+// prompt_common.cuh, verbatim. Two helpers, and NEITHER is a rename of anything:
+//   * causal_prompt_store_byte_swizzled -- a new template that CALLS the existing
+//     causal_prompt_swz above, so landing it adds a caller, not a second spelling.
+//   * causal_prompt_p_swz<Columns> -- the fork keeps the plain causal_prompt_swz AND this
+//     template side by side; Columns == 32 is a genuinely different swizzle (row & 3, not
+//     row & 7) and the default branch forwards to the plain one. It is a missing OVERLOAD.
+// Both were demanded in code by two landed consumers, and both are landed here, in the tree's one
+// home for this vocabulary, rather than in a new header -- one definition, one home.
+template <typename Byte>
+__device__ __forceinline__ void causal_prompt_store_byte_swizzled(Byte* tile, int row, int d,
+                                                                  Byte code) {
+    const int col_b16 = d >> 1;
+    const int byte    = d & 1;
+    const int off = (row * (kCausalPromptHeadDim / 2) + causal_prompt_swz(row, col_b16)) * 2 + byte;
+    tile[off]     = code;
+}
+
+template <int Columns>
+__device__ __forceinline__ int causal_prompt_p_swz(int row, int col) {
+    if constexpr (Columns == 32) { return (((col >> 3) ^ (row & 3)) << 3) | (col & 7); }
+    return causal_prompt_swz(row, col);
+}
+
 __device__ __forceinline__ unsigned causal_prompt_swz_addr(unsigned lane_base, unsigned ck,
                                                            unsigned as, unsigned r) {
     return lane_base + ((ck | as) ^ r);

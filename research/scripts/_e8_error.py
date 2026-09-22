@@ -54,6 +54,10 @@ def hadamard8(x):
     return np.concatenate([x0, x1], axis=0)
 
 
+def decode_dtype(value):
+    return -1 if str(value) == "dropped" else int(value)
+
+
 def read_meta(path):
     m = {}
     for line in open(path):
@@ -72,7 +76,9 @@ def main():
             continue
         meta = read_meta(planes[0])
         head = meta.get("layer=%d" % layer) or meta.get("layer", {})
-        view_dtype = int(head.get("dtype", 0))
+        # l26c3: a layer discarded by NINFER_KV_DROP_LAYERS has no planes, and the
+        # dump now says `dtype=dropped` instead of the empty view's default BF16 code.
+        view_dtype = decode_dtype(head.get("dtype", 0))
         head_dim = int(head.get("head_dim", 256))
         kv_heads = int(head.get("num_kv_heads", 4))
         group = int(head.get("quant_group", 64)) or 64

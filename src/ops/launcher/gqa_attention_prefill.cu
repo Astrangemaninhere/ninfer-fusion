@@ -6,6 +6,10 @@
 #include "ops/kernel/gqa_attention_prefill_bf16.cuh"
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
 #include "ops/kernel/gqa_attention_prefill_nvfp4.cuh"
+// PREVOLTA-ATTN: the FFMA + online-softmax prompt body (no tensor cores, no ldmatrix, no
+// cp.async, no bf16 arithmetic). Same grid, same signature, same bottom-right causal alignment
+// as gqa_attention_prefill_bf16_kernel; selected by gqa_attention_simt_ffma_selected().
+#include "ops/kernel/gqa_attention_simt_ffma.cuh"
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
@@ -30,6 +34,22 @@ void gqa_kv_append_e8_launch(const Tensor& k, const Tensor& v, const Tensor& pos
 void gqa_kv_append_e8_launch_single(const Tensor& k, const Tensor& v, const Tensor& positions,
                                     const PagedKVLayerView& cache, cudaStream_t stream);
 namespace {
+
+// S45 gate. The int8/E8 prompt path (both the append fill and the attention body) is
+// structurally 256-only: kGqaPrefillI8Groups==4 / static_assert(kGqaPrefillI8SmemBytes
+// == 92672) / DB16==128 / static_assert(PVNtPerWarp==8) all derive from the 256
+// reference (gqa_attention_prefill_common.cuh:21, gqa_attention_prefill_i8.cuh:44-51,
+// :382-383). Porting it to head_dim 128 is a tile/smem re-derivation, not a constant
+// swap, so head_dim 128 refuses loudly -- same shape as require_nvfp4_geometry_dim
+// (gqa_attention_decode.cu:27-32). The gate sits in BOTH entry points so that the
+// append fill cannot write a half-fixed plane before the attention throws.
+[[noreturn]] inline void require_i8_prefill_geometry_dim(std::int32_t head_dim) {
+    throw std::invalid_argument(
+        "int8/E8 prefill requires head_dim=256 but this geometry has " +
+        std::to_string(head_dim) +
+        "; the i8/E8 prompt kernels are not ported to 128; use bf16 KV "
+        "(see _collab/E3_s45_i8_plane_stride.md)");
+}
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
@@ -83,6 +103,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8 || cache.dtype == DType::E8Kv) {
+        if constexpr (Geometry::HeadDim != kGqaKvQuantHeadDim) {
+            require_i8_prefill_geometry_dim(Geometry::HeadDim);
+        }
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
@@ -228,6 +251,33 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
+        // PREVOLTA-ATTN: the FFMA + online-softmax arm for this dtype. It is the same launch
+        // geometry (the Br = 64 / Bc = 32 tiling is internal) and the same signature, so the only
+        // thing that changes is which body runs; on a rung without tensor cores this arm is the
+        // only one of the two that can run at all. A cold pool is refused by name rather than
+        // routed back to the tensor-core body, for the same reason the decode arm refuses it.
+        if (gqa_attention_simt_ffma_selected()) {
+            if (cache.cold_slots.data != nullptr) {
+                throw std::invalid_argument(
+                    "the SIMT FFMA prefill route has no cold-slot codec: this layer has an armed "
+                    "cold-slot pool, so it must not be routed here");
+            }
+            // The FFMA body carries kGqaSimtFfmaRowsPerCta rows per CTA (a different row tiling
+            // from the tensor-core body's kGqaPrefillBr), so it derives its own grid; the key tiling
+            // and the causal alignment are internal to the kernel.
+            const dim3 simt_grid(
+                static_cast<unsigned>(div_up(tokens, kGqaSimtFfmaRowsPerCta)),
+                static_cast<unsigned>(Geometry::QHeads), 1u);
+            gqa_attention_simt_ffma_prefill_bf16_kernel<Geometry, Metadata>
+                <<<simt_grid, kGqaSimtFfmaPrefillThreads, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(cache_k.data),
+                    static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         gqa_attention_prefill_bf16_kernel<Geometry, Metadata>
             <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
@@ -246,6 +296,9 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
     if (cache.dtype == DType::I8 || cache.dtype == DType::E8Kv) {
+        if constexpr (Geometry::HeadDim != kGqaKvQuantHeadDim) {
+            require_i8_prefill_geometry_dim(Geometry::HeadDim);
+        }
         if (cache.dtype == DType::E8Kv) {
             if constexpr (std::is_same_v<Metadata, GqaPrefillDirectMetadata>) {
                 gqa_kv_append_e8_launch_single(k, v, positions, cache, stream);
@@ -297,7 +350,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         constexpr int kFillBlock = 256;
         constexpr int kFillWarps = kFillBlock / 32;
         const std::int64_t fill_units =
-            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvNvfp4Groups;
+            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * (Geometry::HeadDim / kGqaKvNvfp4Group);
         const int fill_grid =
             static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
         if (cache.v_dtype == DType::ISO3) {
@@ -344,7 +397,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         constexpr int kFillBlock = 256;
         constexpr int kFillWarps = kFillBlock / 32;
         const std::int64_t fill_units =
-            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvNvfp4Groups;
+            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * (Geometry::HeadDim / kGqaKvNvfp4Group);
         const int fill_grid =
             static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
         gqa_attention_prefill_fill_iso3_kernel<Geometry, Metadata>
@@ -363,7 +416,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         constexpr int kFillBlock = 256;
         constexpr int kFillWarps = kFillBlock / 32;
         const std::int64_t fill_units =
-            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvNvfp4Groups;
+            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * (Geometry::HeadDim / kGqaKvNvfp4Group);
         const int fill_grid =
             static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
         gqa_attention_prefill_fill_fp8_kernel<Geometry, Metadata>
@@ -380,7 +433,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;
         constexpr int kFillVecElems    = 8;
         const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
-                                         (kGqaPrefillHeadDim / kFillVecElems);
+                                         (Geometry::HeadDim / kFillVecElems);
         const int fill_grid =
             static_cast<int>(div_up(kv_elements, static_cast<std::int64_t>(kBlock)));
         gqa_attention_prefill_fill_bf16_kernel<Geometry, Metadata>
@@ -452,8 +505,45 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
-                                 const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream) {
+                                 const Tensor& column_masks, const Tensor& table_rows, float scale,
+                                 PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream) {
+    // M1: the per-column ancestor masks of an MTP tree verify round. This route applies them in
+    // the BF16 prompt body, where the position-causal cut is applied, and nowhere else. Every
+    // property that makes that well defined is REFUSED BY NAME here instead of assumed, because
+    // dropping a mask silently verifies a chain and calls it a tree:
+    //   * the mask row is selected per query row inside the CTA, while this route's metadata
+    //     reduces to ONE table row (GqaPrefillBatchMetadata::block_table() reads table_rows[0]),
+    //     so a batch above 1 has no row to read a mask from;
+    //   * the mask drives the per-key cut of ONE query block (Br = 64 columns), so a round wider
+    //     than that would leave the columns above the block unmasked;
+    //   * only the BF16 body reads the mask -- the i8/E8/packed arms of this route implement the
+    //     `valid_columns` prefix cut only;
+    //   * the mask cannot replace the valid-columns cut: it bounds which KEYS a live column sees,
+    //     not how many columns are live (the runtime states that separately as
+    //     target_valid_columns = extent + 1, program_impl.h:13428).
+    if (column_masks.data != nullptr) {
+        if (valid_columns.data == nullptr) {
+            throw std::invalid_argument(
+                "gqa_attention_prompt_launch: per-column masks (MTP tree verify) need the valid "
+                "column count of the round; this call has no valid-columns tensor");
+        }
+        if (cache.dtype != DType::BF16) {
+            throw std::invalid_argument(
+                "gqa_attention_prompt_launch: per-column masks (MTP tree verify) are implemented "
+                "for the BF16 prompt body only; this call has a quantized or E8 KV tier");
+        }
+        if (q.ne[3] != 1) {
+            throw std::invalid_argument(
+                "gqa_attention_prompt_launch: per-column masks (MTP tree verify) are implemented "
+                "for a single sequence; this call has B = " + std::to_string(q.ne[3]));
+        }
+        if (q.ne[2] > kGqaPrefillBr) {
+            throw std::invalid_argument(
+                "gqa_attention_prompt_launch: per-column masks (MTP tree verify) index one query "
+                "block of at most " + std::to_string(kGqaPrefillBr) +
+                " columns; this call has W = " + std::to_string(q.ne[2]));
+        }
+    }
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -461,6 +551,9 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
+            .column_masks = column_masks.data == nullptr
+                                ? nullptr
+                                : static_cast<const std::uint64_t*>(column_masks.data),
         };
         if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim) {
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);

@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_w4a4_ladder.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
 #include <cuda_bf16.h>
@@ -14,17 +15,6 @@ namespace {
 
 using Geometry = Nvfp4AttnInputGeometry;
 
-constexpr std::int32_t kQueryRows  = 6144;
-constexpr std::int32_t kKeyRows    = 1024;
-constexpr std::int32_t kGateRows   = 6144;
-constexpr std::int32_t kKeyBegin   = kQueryRows;
-constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
-constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
-
-static_assert((kQueryRows % 128) == 0);
-static_assert((kKeyRows % 128) == 0);
-static_assert((kGateRows % 128) == 0);
-
 struct Nvfp4W4a4AttentionOutput {
     __nv_bfloat16* query;
     __nv_bfloat16* key;
@@ -33,16 +23,19 @@ struct Nvfp4W4a4AttentionOutput {
 
     __device__ __forceinline__ __nv_bfloat16* destination(std::int32_t parent_row,
                                                           std::int32_t token) const {
-        if (parent_row < kKeyBegin) {
-            return query + static_cast<std::int64_t>(token) * kQueryRows + parent_row;
+        if (parent_row < kNvfp4AttnKeyBegin) {
+            return query + static_cast<std::int64_t>(token) * kNvfp4AttnQueryRows + parent_row;
         }
-        if (parent_row < kGateBegin) {
-            return key + static_cast<std::int64_t>(token) * kKeyRows + parent_row - kKeyBegin;
+        if (parent_row < kNvfp4AttnGateBegin) {
+            return key + static_cast<std::int64_t>(token) * kNvfp4AttnKeyRows + parent_row -
+                   kNvfp4AttnKeyBegin;
         }
-        if (parent_row < kValueBegin) {
-            return gate + static_cast<std::int64_t>(token) * kGateRows + parent_row - kGateBegin;
+        if (parent_row < kNvfp4AttnValueBegin) {
+            return gate + static_cast<std::int64_t>(token) * kNvfp4AttnGateRows + parent_row -
+                   kNvfp4AttnGateBegin;
         }
-        return value + static_cast<std::int64_t>(token) * kKeyRows + parent_row - kValueBegin;
+        return value + static_cast<std::int64_t>(token) * kNvfp4AttnKeyRows + parent_row -
+               kNvfp4AttnValueBegin;
     }
 
     __device__ __forceinline__ void store_vector(std::int32_t parent_row, std::int32_t token,
@@ -50,13 +43,6 @@ struct Nvfp4W4a4AttentionOutput {
         store_vec(destination(parent_row, token), values);
     }
 };
-
-using M32N64                      = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
-using M32N128                     = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
-using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
-constexpr std::int32_t kTmaBlockM = 256;
 
 template <class Schedule>
 void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
@@ -70,7 +56,7 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
         static_cast<__nv_bfloat16*>(gate.data),
         static_cast<__nv_bfloat16*>(v.data),
     };
-    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    const float alpha = nvfp4_w4a4_alpha(weight);
     nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
@@ -85,28 +71,22 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
                                   cudaStream_t stream) {
     launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_tma_route(x.ne[1]), stream);
     const std::int32_t tokens = x.ne[1];
-    if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
-        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    if (nvfp4_w4a4_tma_route(tokens)) {
+        const float alpha = nvfp4_w4a4_alpha(weight);
         launch_nvfp4_w4a4_tma_attention(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(q.data),
             static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(k.data),
             static_cast<__nv_bfloat16*>(v.data), tokens, alpha, stream);
-    } else if (tokens <= 64) {
-        launch_gemm<M32N64>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 96) {
-        launch_gemm<M32N128>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 128) {
-        launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 192) {
-        launch_gemm<M64N128>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 384) {
-        launch_gemm<M128N128Resident>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 512) {
-        launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else {
-        launch_gemm<M128N128Resident>(weight, q, gate, k, v, workspace, tokens, stream);
+        return;
     }
+    // The T -> schedule decision is shared, not copied: see nvfp4_w4a4_ladder.cuh.
+    nvfp4_w4a4_visit_mma_shape(
+        nvfp4_w4a4_mma_shape(tokens, kNvfp4IsResidualGeometry<Geometry>,
+                             kNvfp4IsGdnInputGeometry<Geometry>),
+        [&](auto schedule) {
+            launch_gemm<decltype(schedule)>(weight, q, gate, k, v, workspace, tokens, stream);
+        });
 }
 
 } // namespace ninfer::ops::detail

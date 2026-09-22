@@ -59,6 +59,14 @@ void test_budget_derivation() {
     check(!disk.host_tier_enabled && disk.disk_tier_enabled,
           "disk policy enables exactly the disk tier");
 
+    // The layered policy is the only one that lights both rungs: the ladder below
+    // was already written for two enabled tiers, it simply had no policy able to
+    // reach that shape.
+    const p::ColdTierBudget layered =
+        p::cold_tier_budget_from(ColdPolicy::HostThenDisk, 4ULL * kGiB, 32ULL * kGiB);
+    check(layered.host_tier_enabled && layered.disk_tier_enabled,
+          "host-then-disk enables both rungs of the ladder");
+
     for (const ColdPolicy policy : {ColdPolicy::None, ColdPolicy::Window}) {
         const p::ColdTierBudget none = p::cold_tier_budget_from(policy, 4ULL * kGiB, 32ULL * kGiB);
         check(!none.host_tier_enabled && !none.disk_tier_enabled,
@@ -245,6 +253,24 @@ void test_validation() {
             p::cold_tier_budget_from(ColdPolicy::Disk, 0, 32ULL * kGiB));
     } catch (...) { threw = true; }
     check(!threw, "a zero host cap under the disk policy is not a contradiction");
+
+    // The layered policy's host cap may be zero: the ladder then spills everything
+    // instead of admitting nothing, so it is not a contradiction.
+    threw = false;
+    try {
+        p::validate_cold_tier_budget(
+            p::cold_tier_budget_from(ColdPolicy::HostThenDisk, 0, 32ULL * kGiB));
+    } catch (...) { threw = true; }
+    check(!threw, "a zero host cap under the layered policy is not a contradiction");
+
+    p::ColdTierBudget layered = p::cold_tier_budget_from(ColdPolicy::HostThenDisk, 0, 32ULL * kGiB);
+    p::validate_cold_tier_budget(layered);
+    layered.host_page_bytes   = 100ULL * kKiB;
+    layered.disk_page_bytes   = 10ULL * kKiB;
+    layered.device_cold_pages = 4;
+    const p::ColdTierDecision spill = p::admit_cold_page(layered, p::ColdTierUsage{});
+    check(spill.tier == p::ColdTier::Disk,
+          "a layered policy with a zero host cap admits on the disk rung");
 
     const std::string summary = p::describe_cold_tier_budget(shipped, 41943, 3355443);
     check(summary.find("host tier on") != std::string::npos &&

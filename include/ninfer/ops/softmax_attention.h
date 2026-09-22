@@ -17,6 +17,54 @@ namespace ninfer::ops {
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeysYarn = 4 * 262144;
 
+// ---------------------------------------------------------------------------
+// HQ residual-window vocabulary. FORK-SURVEY borrow (Apache-2.0), landed additively
+// by dl/integrate3 (repair (b), 2026-09-18), because three LANDED consumers name these:
+//   src/ops/kv_cache/append/hq_kernel.cuh
+//   src/ops/softmax_attention/dense/causal_cache/prompt_hq.cuh
+//   src/ops/softmax_attention/dense/causal_cache/small_t_hq.cuh
+//   (all three reach them through src/ops/kv_cache/hq_e8_rice_codec.cuh:71)
+// Source repo : cometkim/ninfer      Branch : feat/1m-context
+// Commit      : 2cc56b5db39f951c1e91b2caec8b39274d795682
+// Source path : include/ninfer/ops/softmax_attention.h
+// sha256(src) : 2cb2bf0eaf1cf6fc70a8ed05e14765b3acbd3c96d28f2a3a3b7b1c0b0bb7bd1e
+// The borrow this comes from is a MODIFIES-EXISTING borrow that the additive merge refused
+// in full. Only this additive block is taken; the borrow's value change to
+// kCausalAttentionMaximumVisibleKeys (262144 -> 1048576) and its deletion of
+// kCausalAttentionMaximumVisibleKeysYarn are NOT taken, because both break the tree --
+// MEASURED: paged_kv_address.cuh:45 asserts paged_kv_page_ids(1048576) == 64 and gets 256,
+// and ...Yarn has 9 uses across 7 files. See dl/integrate3/REPORT.md sections 3.3 and 4.
+// ---------------------------------------------------------------------------
+
+// U8 prompt-route scratch band: the one-shot rotated planes are materialized in sequential
+// bands of at most this many keys (the FA2 kernel carries its online-softmax state between
+// bands), bounding the prompt scratch at 1 GiB regardless of the execution envelope.
+inline constexpr std::uint32_t kCausalHqPromptScratchBandKeys = 262144;
+
+// hq-e8-2b residual window: every sequence additionally keeps the first kCausalHqSinkKeys and the
+// last kCausalHqRecentKeys K/V rows EXACT (BF16, codec-rotated frame) in per-slot side planes, and
+// every hq consumer reads those rows from the side planes instead of the codec planes - the
+// per-vector quantization bias compounds over long windows (clean through the native envelope,
+// degrading past it), and exact sink+recent rows are the calibration-free protection. Source
+// selection is PER ROW (the ring boundary sits at an arbitrary window offset), so no tile
+// alignment is required; kCausalHqSinkKeys equals one whole 32-key small-T tile, and the recent
+// window is a power-of-two ring (slot = key & (kCausalHqRecentKeys - 1)).
+inline constexpr std::uint32_t kCausalHqSinkKeys   = 32;
+inline constexpr std::uint32_t kCausalHqRecentKeys = 512;
+
+// The SECOND spelling of kCausalHqRecentKeys / 32 already lives in this tree, as a bare literal:
+// src/core/kv_ring_bits.h:24  `inline constexpr int kKvRingWords = 16;`, whose own comment
+// promises an assertion "at the owning cache, which sees both definitions" -- and MEASURED, that
+// assertion does not exist anywhere in the tree (0 static_asserts mention kKvRingWords).
+//
+// The guard below IS that assertion, written so that no new #include is needed: this header is
+// included by 25 files, so adding a dependency to it in order to guard a constant would be a
+// larger change than the constant itself. Naming the second spelling in the message keeps the
+// link visible; the arithmetic fires if EITHER side moves.
+static_assert(kCausalHqRecentKeys / 32 == 16,
+              "src/core/kv_ring_bits.h kKvRingWords = 16 is the second spelling of this constant; "
+              "changing one requires changing the other");
+
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;

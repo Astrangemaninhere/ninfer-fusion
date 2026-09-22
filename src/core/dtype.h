@@ -22,6 +22,17 @@ enum class DType : std::uint8_t {
     // per-64-channel FP16 scales; consumed by the int8 attention kernels
     // (stage unpacks nibbles to i8). See the per-layer KV storage table.
     E8Kv       = 10,
+    // e8 family, narrower K-plane code widths (e8k3 / e8k2): the SAME K+V plane pair
+    // and the same per-64 FP16 scale plane as E8Kv, with the K code plane packed at 3
+    // or 2 bits per element. Geometry and cost are derived in product/kv_e8_width.h
+    // (K plane 8704 -> 6656 -> 4608 B/head-page; layer 4.25 -> 3.75 -> 3.25 b/element,
+    // K+V averaged, which is what the bit-budget ladder prices).
+    // NOT a different codebook: product/kv_e8_width.h records that the ecosystem's
+    // rk2v4-e8 reproduces this exact GEOMETRY while its 240-root cylinder CODEC does
+    // not, and that the measured lattice floor puts both widths BELOW the projection
+    // they are named for.
+    E8K3Kv     = 11,
+    E8K2Kv     = 12,
 };
 
 

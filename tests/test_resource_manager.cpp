@@ -965,6 +965,20 @@ public:
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
 
+    // mtplogfix: the two cumulative rung-capture counters resource_manager.h reads off the
+    // Program in populate_runtime_stats() (`out.mtp_graph_extension_calls =
+    // program.mtp_graph_extension_calls();`). mtplogx declared them on ProgramImplCore
+    // (targets/qwen3_6/impl/runtime/program.h:1162-1166) and, afterwards, on the Program facade;
+    // it never declared them on this test double, so this TU stopped compiling on 2026-09-21
+    // 11:09. The counter names, the accessor shapes and every consumer stay mtplogx's; the fake
+    // only mirrors them.
+    [[nodiscard]] std::uint64_t mtp_graph_extension_calls() const noexcept {
+        return mtp_graph_extension_calls_;
+    }
+    [[nodiscard]] std::uint64_t mtp_graph_extension_nanoseconds() const noexcept {
+        return mtp_graph_extension_nanoseconds_;
+    }
+
     void invalidate_resources() noexcept { advance_revision(); }
 
     std::size_t required_pressure_actions       = 0;
@@ -990,6 +1004,11 @@ public:
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
+
+    // mtplogfix: the storage behind the two accessors above. Zero for a default-constructed fake,
+    // exactly as ProgramImplCore's members are (program.h:1180-1181, mtplogx's own spelling).
+    std::uint64_t mtp_graph_extension_calls_       = 0;
+    std::uint64_t mtp_graph_extension_nanoseconds_ = 0;
 
     std::uint64_t admission_inspections         = 0;
     std::uint64_t pressure_planning_sessions    = 0;
@@ -2695,12 +2714,21 @@ void test_backfill_proof_and_stats_follow_program_revision() {
         .device_backend_kv_pages = 5,
         .host_kv_bytes           = 4096,
     };
+
+    // mtplogfix: the same door, for mtplogx's two rung-capture counters -- the fake's numbers must
+    // reach RuntimeStats unchanged, exactly as the physical gauges below do.
+    program.mtp_graph_extension_calls_       = 17;
+    program.mtp_graph_extension_nanoseconds_ = 41'000'000;
     RuntimeStats stats;
     manager.populate_runtime_stats(program, stats);
     require(stats.device_state_occupied_slots == 3 && stats.host_state_occupied_slots == 2 &&
                 stats.device_main_kv_occupied_pages == 11 &&
                 stats.device_backend_kv_occupied_pages == 5 && stats.host_kv_occupied_bytes == 4096,
             "runtime physical gauges did not come directly from Program");
+
+    require(stats.mtp_graph_extension_calls == 17 &&
+                stats.mtp_graph_extension_nanoseconds == 41'000'000,
+            "mtplogx rung-capture counters did not come directly from Program");
 }
 
 void test_shortlist_collision_requires_program_exact_verification() {

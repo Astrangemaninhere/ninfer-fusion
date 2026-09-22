@@ -11,6 +11,10 @@ This module separates the two concerns.  Each resource is resolved to exactly
 one of four states, with the evidence that produced it:
 
 ``pinned``      the file's sha256 equals the registered pin;
+``equivalent``  a different revision whose sha256 is in the registered per-resource
+                equivalent set (``REGISTERED_RESOURCE_SHA256``), i.e. a revision that
+                a *registered variant* of the same base model ships and that was
+                reviewed once, with the hash recorded here;
 ``consistent``  a different revision, but its semantic content agrees with what
                 this checkpoint declares (for a tokenizer: the declared special
                 token ids resolve to the right tokens and every id fits inside
@@ -19,9 +23,9 @@ one of four states, with the evidence that produced it:
 ``missing``     no usable file.
 
 ``missing`` is always fatal: an artifact cannot be built without a tokenizer.
-``pinned`` and ``consistent`` are accepted.  ``unproven`` is accepted only when
-the caller explicitly asks for it, and every non-pinned resource is reported so
-the deviation travels with the conversion report instead of being invisible.
+``pinned``, ``equivalent`` and ``consistent`` are accepted.  ``unproven`` is accepted
+only when the caller explicitly asks for it, and every non-pinned resource is reported
+so the deviation travels with the conversion report instead of being invisible.
 """
 
 from __future__ import annotations
@@ -83,6 +87,12 @@ class FrontendProfile:
     @property
     def unproven(self) -> tuple[str, ...]:
         return tuple(item.name for item in self.resolutions if item.status == "unproven")
+
+    @property
+    def equivalent(self) -> tuple[str, ...]:
+        """Resources served by a registered variant revision rather than by the pin."""
+
+        return tuple(item.name for item in self.resolutions if item.status == "equivalent")
 
     @property
     def deviations(self) -> tuple[FrontendResolution, ...]:
@@ -198,6 +208,50 @@ def _hunt(name: str, roots: Sequence[Path], exclude: Path) -> list[Path]:
     return hits
 
 
+#: The pad token the engine's own validate_tokenizer_config requires
+#: (src/targets/qwen3_6/impl/frontend/frontend.cpp:210).
+ENGINE_TOKENIZER_CONFIG_PAD_TOKEN = "<|endoftext|>"
+
+
+def _sibling_template(candidate: Path) -> bytes | None:
+    """The chat_template.jinja beside a candidate resource, when its provider ships one."""
+
+    template = candidate.parent / "chat_template.jinja"
+    return template.read_bytes() if template.is_file() else None
+
+
+def engine_tokenizer_config_reasons(data: bytes, template: bytes | None = None) -> tuple[str, ...]:
+    """Every reason the ENGINE's validate_tokenizer_config would refuse these bytes.
+
+    This restates the engine's validator rather than forming a second opinion about it: the
+    conditions are read off src/targets/qwen3_6/impl/frontend/frontend.cpp:202-225, and an
+    absent ``add_bos_token`` is a refusal because the engine's own default is ``true``.  Only
+    the parts decidable from the candidate's own bytes are reproduced; ``template``, when the
+    provider ships one, supplies the engine's fourth condition (the config's ``chat_template``
+    must be the template the artifact embeds, byte for byte).
+    """
+
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return ("tokenizer_config.json is not readable JSON (%s)" % exc,)
+    if not isinstance(document, Mapping):
+        return ("tokenizer_config.json is not a JSON object",)
+    reasons: list[str] = []
+    if document.get("add_bos_token", True) or document.get("add_prefix_space", True):
+        reasons.append("add_bos_token/add_prefix_space must be false (frontend.cpp:205)")
+    if document.get("pad_token") != ENGINE_TOKENIZER_CONFIG_PAD_TOKEN:
+        reasons.append("pad_token must be %r (frontend.cpp:210)"
+                       % ENGINE_TOKENIZER_CONFIG_PAD_TOKEN)
+    chat_template = document.get("chat_template")
+    if not isinstance(chat_template, str):
+        reasons.append("chat_template must be present as a string (frontend.cpp:216)")
+    elif template is not None and chat_template.encode("utf-8") != template:
+        reasons.append(
+            "chat_template must equal the chat_template.jinja beside it (frontend.cpp:221)")
+    return tuple(reasons)
+
+
 def _provider_matches_family(candidate: Path, config: Mapping[str, Any], tokenizer: bool) -> tuple[bool, str]:
     """Refuse a candidate that belongs to a different model.
 
@@ -218,6 +272,18 @@ def _provider_matches_family(candidate: Path, config: Mapping[str, Any], tokeniz
         return False, "候选 config.json 不是对象"
 
     if tokenizer:
+        if candidate.name == "tokenizer_config.json":
+            # A tokenizer *config* carries no id space, so vocab_size cannot detect the
+            # mismatch the engine actually enforces.  On 2026-09-14 this branch accepted
+            # models/Qwen3.8-27B-NVFP4/tokenizer_config.json -- a multimodal config with
+            # pad_token '<|im_end|>' and no chat_template at all -- for an ornith artifact,
+            # and the engine then refused that artifact at frontend.cpp:205.  The engine's
+            # validator is the authority; this asks it instead of restating a weaker rule.
+            reasons = engine_tokenizer_config_reasons(
+                candidate.read_bytes(), _sibling_template(candidate))
+            if reasons:
+                return False, 'tokenizer_config 与引擎校验不符（' + '；'.join(reasons) + '）'
+            return True, 'tokenizer_config 满足引擎校验'
         mine = _text_config(config).get("vocab_size")
         theirs = _text_config(other).get("vocab_size")
         if mine is None or theirs is None:
@@ -239,14 +305,19 @@ def resolve_frontend_profile(
     config: Mapping[str, Any],
     *,
     pins: Mapping[str, str] | None = None,
+    equivalents: Mapping[str, Mapping[str, str]] | None = None,
     roots: Sequence[str | Path] = (),
 ) -> FrontendProfile:
     """Resolve every pinned resource with an explicit, testable evidence order."""
 
     if pins is None:
-        from .official_resources import OFFICIAL_RESOURCE_SHA256
+        from .official_resources import OFFICIAL_RESOURCE_SHA256, REGISTERED_RESOURCE_SHA256
 
         pins = OFFICIAL_RESOURCE_SHA256
+        if equivalents is None:
+            equivalents = REGISTERED_RESOURCE_SHA256
+    if equivalents is None:
+        equivalents = {}
 
     source = Path(model_dir)
     search_roots = [Path(root) for root in roots]
@@ -259,6 +330,7 @@ def resolve_frontend_profile(
         bare = name.removeprefix("frontend/")
         local = source / bare
         pin = pins[name]
+        registered = equivalents.get(name, {})
 
         if local.is_file():
             local_hash = sha256_file(local)
@@ -266,16 +338,26 @@ def resolve_frontend_profile(
                 resolutions.append(FrontendResolution(
                     name, "pinned", local, local_hash, "sha256 与钉死值一致（源件自带）"))
                 continue
+            if local_hash in registered:
+                resolutions.append(FrontendResolution(
+                    name, "equivalent", local, local_hash,
+                    f"sha256 命中已登记等价 revision（源件自带）；登记依据：{registered[local_hash]}"))
+                continue
             provider, origin = local, "源件自带"
         else:
             local_hash = None
             provider, origin = None, ""
 
-        # A copy that matches the pin is strictly better than a drifted local file.
+        # A copy that matches the pin is strictly better than a drifted local file;
+        # a copy that matches a registered equivalent revision is the second best.
         if provider is None or local_hash != pin:
-            for candidate in _hunt(name, search_roots, source):
-                if sha256_file(candidate) == pin:
-                    provider, origin = candidate, "本地钉死副本"
+            hits = [(candidate, sha256_file(candidate))
+                    for candidate in _hunt(name, search_roots, source)]
+            for wanted, label in ((pin, "本地钉死副本"),
+                                  *((digest, "本地已登记等价副本") for digest in registered)):
+                match = next((path for path, digest in hits if digest == wanted), None)
+                if match is not None:
+                    provider, origin = match, label
                     break
 
         if provider is None:
@@ -303,6 +385,12 @@ def resolve_frontend_profile(
                 name, "pinned", provider, digest, f"{origin}；sha256 与钉死值一致",
             ))
             continue
+        if digest in registered:
+            resolutions.append(FrontendResolution(
+                name, "equivalent", provider, digest,
+                f"{origin}；sha256 命中已登记等价 revision；登记依据：{registered[digest]}",
+            ))
+            continue
         if name == "frontend/tokenizer.json":
             ok, note = tokenizer_consistency(provider, config)
             status = "consistent" if ok else "unproven"
@@ -325,7 +413,14 @@ def resolve_frontend_profile(
 
 
 def acceptability_error(profile: FrontendProfile, *, allow_unproven: bool) -> str | None:
-    """Return the reason the profile cannot be used, or None when it can."""
+    """Return the reason the profile cannot be used, or None when it can.
+
+    An ``equivalent`` resource is accepted here *without* the caller opting in, which
+    is the whole point of registering it: the file is a known revision of a registered
+    variant, not an unidentified one.  This is deliberately not a relaxation - only
+    ``unproven`` is affected by ``allow_unproven``, so a resource that matches neither
+    the pin nor a registered equivalent still needs the explicit flag.
+    """
 
     if profile.missing:
         return (

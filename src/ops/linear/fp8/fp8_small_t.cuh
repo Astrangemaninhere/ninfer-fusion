@@ -57,7 +57,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
     const __nv_bfloat16* __restrict__ row_scales, Output output, Epilogue epilogue = {},
     RowPolicy row_policy = {}) {
-    static_assert(ActiveTokens >= 1);
+    static_assert(ActiveTokens >= 2);
     static_assert(Schedule::kTokenTile <= ActiveTokens);
     static_assert(!PairRows || (Schedule::kRowsPerWarp % 2) == 0);
     constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;

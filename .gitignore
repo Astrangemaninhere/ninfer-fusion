@@ -10,6 +10,9 @@ compile_commands.json
 CMakeUserPresets.json
 .cache/
 
+# PyInstaller packaging output (tools/package/build_exe.ps1 writes dist/ into the checkout)
+dist/
+
 # CUDA / profiling artifacts
 *.nsys-rep
 *.ncu-rep
@@ -76,3 +79,6 @@ mtplg_*.bin
 *.nsys-rep
 *.ncu-rep
 *.sqlite
+
+# Build artifacts: arch-specific dist trees (dist-52/ninfer-serve is ~885 MiB)
+dist-*/

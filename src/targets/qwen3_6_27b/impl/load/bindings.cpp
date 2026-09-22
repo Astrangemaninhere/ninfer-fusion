@@ -22,15 +22,14 @@ namespace {
 
 using artifact::NumericFormat;
 
-bool is_full_layer(std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; }
-
-bool is_early_attention_input(std::size_t layer) {
-    return layer == 3 || layer == 7 || layer == 11 || layer == 15 || layer == 19 || layer == 23;
+// Layer topology is declared once, by the family's own topology header, and
+// TextConfig::is_full_attention is the runtime's reading of that same
+// declaration.  Spelling the interval and its offset out again here made the
+// loader a second, independent copy of the rule: the loader and the runtime
+// would bind different layer families the moment either copy moved.
+bool is_full_layer(std::size_t layer) {
+    return qwen3_6::is_full_attention_layer(static_cast<std::int32_t>(layer));
 }
-
-bool is_bf16_attention_output(std::size_t layer) { return layer == 3 || layer == 7; }
-
-bool is_bf16_gdn_output(std::size_t layer) { return layer == 4; }
 
 NumericFormat endpoint_format(WeightsProfile weights_profile) {
     switch (weights_profile) {
@@ -42,6 +41,7 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     case WeightsProfile::Qwen38Nvfp4:
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
         return NumericFormat::BF16;
@@ -100,6 +100,78 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
                       .format                    = NumericFormat::NVFP4,
                       .weight_scale_divisor_bits = weight_bits,
                       .input_scale_divisor_bits  = input_bits};
+}
+
+// The format of a projection is the artifact's own declaration, not a function of the
+// layer index.  The registered object plan of a mixed-precision source (NVFP4 below
+// layer 56 of the family, FP8 above it) describes exactly one artifact; a later
+// artifact of the same source declares the stored precision per object, and the two
+// disagree layer by layer.  Reading the declaration keeps the NVFP4 contract intact -
+// NVFP4 still has to arrive with its paired input divisor - while letting an object
+// that is stored as FP8 bind as FP8.
+NumericFormat declared_weight_format(const artifact::Binder& binder, std::string_view name) {
+    const artifact::TensorDescriptor* tensor = binder.find_tensor(name);
+    if (tensor == nullptr) {
+        throw artifact::ArtifactError("required artifact tensor is missing: " +
+                                      std::string(name));
+    }
+    return tensor->format;
+}
+
+WeightPlan bind_declared_weight(artifact::Binder& binder, std::string_view name,
+                                std::string_view input_divisor_name,
+                                std::initializer_list<std::uint64_t> shape) {
+    const NumericFormat format = declared_weight_format(binder, name);
+    if (format == NumericFormat::NVFP4) {
+        if (shape.size() != 2) {
+            throw artifact::ArtifactError(std::string(name) +
+                                          ": an NVFP4 weight is a rank-two object");
+        }
+        const std::uint64_t* dims = shape.begin();
+        return bind_nvfp4_weight(binder, name, static_cast<std::int32_t>(dims[0]),
+                                 static_cast<std::int32_t>(dims[1]), input_divisor_name);
+    }
+    if (format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
+        // The registered contract for this object is exactly these two formats.  A
+        // declaration outside the pair is a different artifact, not a different
+        // spelling of the registered one, so it is still refused.
+        throw artifact::ArtifactError(std::string(name) + " is declared " +
+                                      std::string(artifact::format_name(format)) +
+                                      ", but this projection is registered as NVFP4 or "
+                                      "FP8_E4M3FN_ROW_BF16S");
+    }
+    return bind_weight(binder, name, format, shape);
+}
+
+// The additive Qwen3.6-27B NVFP4 source stores three families of projection
+// (attention input, attention output, GDN output) in two precisions: a
+// full-precision BF16 copy for the layers its own declaration names, and an
+// NVFP4 group with a paired input divisor for the rest.  The predicates that
+// used to spell those layer numbers here were a second copy of that
+// declaration, and only the artifact has to agree with itself, so read the
+// precision off the object.  The registered pair stays the contract: nothing
+// outside BF16/NVFP4 may bind through this path, and the paired input divisor
+// is bound exactly where the parent is NVFP4, which is also where the object
+// plan writes one.
+WeightPlan bind_declared_direct_or_nvfp4_weight(artifact::Binder& binder, std::string_view name,
+                                                std::string_view input_divisor_name,
+                                                std::initializer_list<std::uint64_t> shape) {
+    const NumericFormat format = declared_weight_format(binder, name);
+    if (format == NumericFormat::NVFP4) {
+        if (shape.size() != 2) {
+            throw artifact::ArtifactError(std::string(name) +
+                                          ": an NVFP4 weight is a rank-two object");
+        }
+        const std::uint64_t* dims = shape.begin();
+        return bind_nvfp4_weight(binder, name, static_cast<std::int32_t>(dims[0]),
+                                 static_cast<std::int32_t>(dims[1]), input_divisor_name);
+    }
+    if (format != NumericFormat::BF16) {
+        throw artifact::ArtifactError(std::string(name) + " is declared " +
+                                      std::string(artifact::format_name(format)) +
+                                      ", but this projection is registered as BF16 or NVFP4");
+    }
+    return bind_weight(binder, name, format, shape);
 }
 
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
@@ -278,29 +350,18 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                                                 NumericFormat::BF16, {5120});
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
-            WeightPlan input;
-            if (is_early_attention_input(layer)) {
-                input = bind_weight(binder, prefix + "attention/query_key_gate_value",
-                                    NumericFormat::BF16, {14336, 5120});
-            } else {
-                input = bind_nvfp4_weight(
-                    binder, prefix + "attention/query_key_gate_value", 14336, 5120,
-                    prefix + "attention/input_projection/input_scale_divisor");
-            }
-            target.attention.projection =
-                FusedAttentionProjectionPlan{.query_key_gate_value = input};
+            target.attention.projection = FusedAttentionProjectionPlan{
+                .query_key_gate_value = bind_declared_direct_or_nvfp4_weight(
+                    binder, prefix + "attention/query_key_gate_value",
+                    prefix + "attention/input_projection/input_scale_divisor", {14336, 5120}),
+            };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
-            if (is_bf16_attention_output(layer)) {
-                target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                      NumericFormat::BF16, {5120, 6144});
-            } else {
-                target.attention.output =
-                    bind_nvfp4_weight(binder, prefix + "attention/output", 5120, 6144,
-                                      prefix + "attention/output_projection/input_scale_divisor");
-            }
+            target.attention.output = bind_declared_direct_or_nvfp4_weight(
+                binder, prefix + "attention/output",
+                prefix + "attention/output_projection/input_scale_divisor", {5120, 6144});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48});
@@ -321,14 +382,9 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
-            if (is_bf16_gdn_output(layer)) {
-                target.gdn.output =
-                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {5120, 6144});
-            } else {
-                target.gdn.output =
-                    bind_nvfp4_weight(binder, prefix + "gdn/output", 5120, 6144,
-                                      prefix + "gdn/output_projection/input_scale_divisor");
-            }
+            target.gdn.output = bind_declared_direct_or_nvfp4_weight(
+                binder, prefix + "gdn/output", prefix + "gdn/output_projection/input_scale_divisor",
+                {5120, 6144});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
@@ -380,16 +436,17 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (layer < 56) {
-            target.mlp.gate_up =
-                bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
-                                  prefix + "mlp/gate_up_projection/input_scale_divisor");
-            target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
-                                                prefix + "mlp/down_projection/input_scale_divisor");
-        } else {
-            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", kFp8, {34816, 5120});
-            target.mlp.down    = bind_weight(binder, prefix + "mlp/down", kFp8, {5120, 17408});
-        }
+        // gate_up and down carry their own declared precision, and they do not agree
+        // with each other: a layer whose down is stored FP8 can have an NVFP4 gate_up.
+        // The paired input divisor is bound only where the parent is NVFP4, which is
+        // also where the object plan writes one.
+        target.mlp.gate_up =
+            bind_declared_weight(binder, prefix + "mlp/gate_up",
+                                 prefix + "mlp/gate_up_projection/input_scale_divisor",
+                                 {34816, 5120});
+        target.mlp.down = bind_declared_weight(binder, prefix + "mlp/down",
+                                               prefix + "mlp/down_projection/input_scale_divisor",
+                                               {5120, 17408});
     }
 }
 
@@ -438,6 +495,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         bind_qwen38_nvfp4_text_layers(binder, out);
         break;
     default:
@@ -446,21 +504,87 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
     out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
-    const artifact::TensorPlacement proposal_placement =
-        features.optimized_proposal() ? artifact::TensorPlacement::Device
-                                      : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
-                                           {131072, 5120}, proposal_placement);
-    out.draft_head_token_ids = artifact::bind_tensor(
-        binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
-    validate_draft_ids(binder, out.draft_head_token_ids);
+    // ---- the OPTIONAL groups -----------------------------------------------------------
+    // Whether an artifact carries a draft head, an MTP block and a vision tower is a fact about
+    // the RECIPE that wrote it, not about the weights flavour.  The registered `groupwise-int`
+    // flavour has two products on this box: the full closure (1124 objects,
+    // /home/user/models/qwen3_8_27b_nvfp4.ninfer) and the text-core recipe's 777 objects
+    // (/var/tmp/target27/full_q1.ninfer), which declares no mtp/*, no text/draft_head* and no
+    // vision/* object at all.  Requiring all of them of every artifact of the flavour is a
+    // requirement the text-core product cannot answer, and it was the reason it could not load.
+    //
+    // Each group is therefore read from the artifact's OWN object table (`Binder::find_tensor`
+    // reads the directory and consumes nothing):
+    //   * every member present: bound exactly as before -- Device when the resolved run selects
+    //     it, ValidateOnly otherwise, with name, format, shape and layout still checked by
+    //     `Binder::require_tensor`;
+    //   * none present: skipped, and the plan records `*_declared == false`;
+    //   * some present: refused by name -- a half-written group is a broken artifact.
+    // A run that SELECTS a group the artifact does not declare is refused by name below, at the
+    // one place where both facts are in hand.
+    struct GroupPresence {
+        std::size_t present = 0;
+        std::size_t absent  = 0;
+        std::string_view first_absent;
+        [[nodiscard]] bool complete() const noexcept { return absent == 0; }
+        [[nodiscard]] bool partial() const noexcept { return present != 0 && absent != 0; }
+        void note(std::string_view name, bool found) {
+            if (found) {
+                ++present;
+                return;
+            }
+            if (absent == 0) { first_absent = name; }
+            ++absent;
+        }
+    };
+    const auto declares = [&](std::string_view name) {
+        return binder.find_tensor(name) != nullptr;
+    };
+
+    // ---- draft head (2 objects) ----
+    GroupPresence draft_head_group;
+    draft_head_group.note("text/draft_head", declares("text/draft_head"));
+    draft_head_group.note("text/draft_head_token_ids", declares("text/draft_head_token_ids"));
+    if (draft_head_group.partial()) {
+        throw std::invalid_argument(
+            "this artifact declares only part of its draft head: " +
+            std::to_string(draft_head_group.present) + " of its 2 objects are present and " +
+            std::to_string(draft_head_group.absent) + " are absent (first absent: " +
+            std::string(draft_head_group.first_absent) +
+            ").  A draft head is all or nothing: fix the converter, do not trust half of it.");
+    }
+    out.draft_head_declared = draft_head_group.complete();
+    if (out.draft_head_declared) {
+        const artifact::TensorPlacement proposal_placement =
+            features.optimized_proposal() ? artifact::TensorPlacement::Device
+                                          : artifact::TensorPlacement::ValidateOnly;
+        out.draft_head = artifact::bind_tensor(binder, "text/draft_head",
+                                               NumericFormat::Q4G64_F16S, {131072, 5120},
+                                               proposal_placement);
+        out.draft_head_token_ids = artifact::bind_tensor(
+            binder, "text/draft_head_token_ids", NumericFormat::I32, {131072},
+            proposal_placement);
+        validate_draft_ids(binder, out.draft_head_token_ids);
+    } else if (features.optimized_proposal()) {
+        throw std::invalid_argument(
+            "this artifact declares no draft head (neither text/draft_head nor "
+            "text/draft_head_token_ids is in it): its recipe wrote the text core only, so the "
+            "resolved optimized proposal head has nothing to propose with.  Drop --lm-head-draft "
+            "(or whatever spelling selected that head); text generation is unaffected.");
+    }
 
     const artifact::TensorPlacement mtp_placement = features.mtp()
                                                         ? artifact::TensorPlacement::Device
                                                         : artifact::TensorPlacement::ValidateOnly;
+    GroupPresence mtp_group;
     const auto bind_mtp                           = [&](std::string_view name, NumericFormat format,
                               std::initializer_list<std::uint64_t> shape) {
-        return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
+        const bool found = declares(name);
+        mtp_group.note(name, found);
+        // Unused when the group is absent: `out.mtp_declared` is then false and nothing reads
+        // these handles (the materialization below is gated on both flags).
+        return found ? artifact::bind_tensor(binder, name, format, shape, mtp_placement)
+                     : artifact::ObjectHandle{};
     };
     out.mtp.input_projection =
         bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {5120, 10240});
@@ -482,6 +606,22 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {5120, 17408}),
         .format = NumericFormat::W8G32_F16S};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
+    if (mtp_group.partial()) {
+        throw std::invalid_argument(
+            "this artifact declares only part of its mtp block: " +
+            std::to_string(mtp_group.present) + " of its 12 objects are present and " +
+            std::to_string(mtp_group.absent) + " are absent (first absent: " +
+            std::string(mtp_group.first_absent) +
+            ").  A draft block is all or nothing: fix the converter, do not trust half of it.");
+    }
+    out.mtp_declared = mtp_group.complete();
+    if (features.mtp() && !out.mtp_declared) {
+        throw std::invalid_argument(
+            "this artifact declares no mtp draft block (no mtp/* object), so there is nothing "
+            "for the resolved MTP backend to draft with.  Its recipe wrote the text core only.  "
+            "Pass --spec none (or convert a source/recipe that carries the draft block); text "
+            "generation is unaffected.");
+    }
 
     if (weights_profile == WeightsProfile::Qwen38Nvfp4Dspark) {
         const artifact::TensorPlacement dflash_placement =
@@ -590,16 +730,40 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             "dflash2/candidate_selector/successor_codebook", NumericFormat::BF16, {248320, 256});
     }
 
-    const artifact::TensorPlacement vision_placement =
-        features.vision ? artifact::TensorPlacement::Device
-                        : artifact::TensorPlacement::ValidateOnly;
-    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
-    out.vision_merger_fc2   = artifact::bind_tensor(
-        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
-    out.vision_merger_fc2_bias = artifact::bind_tensor(
-        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+    // ---- vision tower (334 objects: patch embedding, merger, 324 layer objects) ----
+    GroupPresence vision_group;
+    for (const std::string_view anchor : {"vision/patch_embedding", "vision/merger/fc1",
+                                          "vision/merger/fc2", "vision/merger/fc2_bias",
+                                          "vision/merger/norm/weight"}) {
+        vision_group.note(anchor, declares(anchor));
+    }
+    if (vision_group.partial()) {
+        throw std::invalid_argument(
+            "this artifact declares only part of its vision tower: " +
+            std::to_string(vision_group.present) + " of the 5 entry objects are present and " +
+            std::to_string(vision_group.absent) + " are absent (first absent: " +
+            std::string(vision_group.first_absent) +
+            ").  A tower is all or nothing: fix the converter, do not trust half of it.");
+    }
+    out.vision_declared = vision_group.complete();
+    if (out.vision_declared) {
+        const artifact::TensorPlacement vision_placement =
+            features.vision ? artifact::TensorPlacement::Device
+                            : artifact::TensorPlacement::ValidateOnly;
+        out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
+        out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
+        out.vision_merger_fc2   = artifact::bind_tensor(
+            binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608},
+            vision_placement);
+        out.vision_merger_fc2_bias = artifact::bind_tensor(
+            binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
+        out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+    } else if (features.vision) {
+        throw std::invalid_argument(
+            "this artifact declares no vision tower (no vision/* object at all): its recipe "
+            "wrote the text core only, so --vision has nothing to load.  Drop --vision; text "
+            "generation is unaffected.");
+    }
 
     load_plan.materialization = binder.finish();
     return load_plan;
@@ -611,6 +775,9 @@ LoadedModelData::LoadedModelData(WeightsProfile weights_profile, BindingPlan pla
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
+    // W13: publish the artifact's weight-offload runtime to the layer-boundary hook.
+    // Null unless a host budget was set, so the hook stays a no-op by default.
+    runtime.backing.bind(backing.weight_residency());
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
@@ -662,7 +829,10 @@ LoadedModelData::LoadedModelData(WeightsProfile weights_profile, BindingPlan pla
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
     output_head = materialized_weight(backing, plan.output_head, 248320, 5120);
-    if (plan.features.optimized_proposal()) {
+    // `*_declared` and the feature are one fact twice: `bind_artifact` refuses a selected
+    // feature whose group the artifact does not declare, so a run that reaches here has the
+    // objects in hand -- and the handles are meaningless when it does not.
+    if (plan.features.optimized_proposal() && plan.draft_head_declared) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
                                                            NumericFormat::Q4G64_F16S, 131072, 5120);
@@ -670,7 +840,7 @@ LoadedModelData::LoadedModelData(WeightsProfile weights_profile, BindingPlan pla
                                                            NumericFormat::I32, {131072});
     }
 
-    if (plan.features.mtp()) {
+    if (plan.features.mtp() && plan.mtp_declared) {
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(
             backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 5120, 10240);
@@ -778,7 +948,7 @@ LoadedModelData::LoadedModelData(WeightsProfile weights_profile, BindingPlan pla
             backing, plan.dflash2.selector_successor_codebook, 248320, 256);
     }
 
-    if (plan.features.vision) {
+    if (plan.features.vision && plan.vision_declared) {
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);

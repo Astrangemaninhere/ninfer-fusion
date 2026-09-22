@@ -12,6 +12,24 @@ namespace {
 
 inline constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
+// ⚠️ FIX-C (scratch/PATCHSET/FIX-C/gdn_chunk_exactness.diff). `split_k` is an ARITHMETIC
+// axis: it fixes how K is cut into partials AND the order the partials are summed in, so two
+// schedules with different split_k do not agree bit-for-bit. A `--spec mtp --draft-tokens k`
+// chain-verify round presents `width = k + 1` token columns at once, and the contract is that
+// greedy speculation reproduces the batch-1 decode token for token, so the whole chain-verify
+// width domain has to reach this Op through ONE reduction grouping.
+//
+// MEASURED BEFORE THIS FIX: cols 1..8 took SmallTSplit10 (10 slices of 512, summed in slice
+// order - the batch-1 decode's grouping) and cols 9..16 took MmaCooperativeSplit8 (8 slices of
+// 640), i.e. a different grouping for the same token column. g and beta are carried into the
+// GDN recurrence and into the conv state, so the difference survives the per-layer BF16
+// rounding of the mixer output and resurfaces at the exponentially sensitive attention layers:
+// `--spec mtp --draft-tokens 8` (width 9) was the first arm whose ids left `--spec none`.
+// kVerifyWidthCeiling is kMtpDecodeMaximumDrafts + 1 = kMtpDecodeMaximumWidth
+// (src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h:17-18): the widest column
+// count any chain verify round can present.
+inline constexpr std::int32_t kVerifyWidthCeiling = 16;
+
 struct ColsSet {
     std::int32_t first;
     std::int32_t last;
@@ -30,11 +48,18 @@ constexpr std::array<RouteSpec, 5> k27Routes{{
     // UNIFY-A: T=1 used GemvPairedRows (split_k = 1) and T in [2,8] used SmallTSplit10
     // (split_k = 10) - a different K-reduction grouping for the same token column.
     // Plain decode (T=1) and dflash2 verify (T=W=8) now share SmallTSplit10.
-    {{1, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
+    // ⚠️ FIX-C: the bucket now covers [1, kVerifyWidthCeiling], not [1, 8]. The [2,8]-shaped
+    // unification stopped one column short of the verify domain: a chain round can present up
+    // to 16 columns, and 9..16 used to fall through to MmaCooperativeSplit8 and change the K
+    // grouping against the decode. The small-T kernel is already column-count agnostic - it
+    // tiles tokens by kSmallTMax = 8 (grid z = div_up(t, 8)) and reduces the SAME 10 slices of
+    // 512 in the SAME order for every token column - so extending the bucket is exactly what
+    // makes a wide round equal to the batch-1 decode.
+    {{1, kVerifyWidthCeiling}, Bf16GdnGatingScheduleId::SmallTSplit10},
     // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
     // of making T a launch limit. Once the unsplit grid has enough independent work, it also
     // removes the cooperative-residency constraint.
-    {{9, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{kVerifyWidthCeiling + 1, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
     {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
@@ -150,7 +175,9 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::GemvPairedRows:
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
-            return problem.cols >= 1 && problem.cols <= 8;
+            // ⚠️ FIX-C: see kVerifyWidthCeiling. The launcher is column-count agnostic
+            // (kSmallTMax = 8 token tiles; workspace = 10 * t * 96 floats).
+            return problem.cols >= 1 && problem.cols <= kVerifyWidthCeiling;
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:

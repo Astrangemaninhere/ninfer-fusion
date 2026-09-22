@@ -1,113 +1,182 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""gui_tips.py — 全参数"大白话"悬浮讲解字典。
+"""gui_tips.py — plain-language hover hints for every knob (zh/en).
 
-新手模式(GUI 首页)会把这些文字渲染成鼠标悬浮提示。每一条都按
-  给谁看 -> 干什么 -> 调大了/调小了会怎样
-的三段式写,禁止出现 AI 行话;能用生活比喻就用比喻。
+Novice mode renders these as mouse-over tooltips. Every entry follows the
+   who reads it -> what it does -> what happens if you raise/lower it
+shape, avoids AI jargon, and prefers a household metaphor over a definition.
 
-键名 = HTML 控件 id (见 ninfer-gui.py)。GUI 启动时自动读取本文件,
-不必写死在页面里 —— 新增参数只需在这里补一条。
+Keys are the HTML control ids (see ninfer-gui.py). The GUI reads this module at
+startup, so a new parameter needs one more entry here and one more row in the
+i18n table -- nothing hardcoded in a page.
+
+The texts themselves live in i18n_misc.py (`tips.*` / `tipg.*` / `tipgl.*`).
+This file pins the ids and resolves them through gui_i18n.t() at ACCESS time
+(`_LiveTable`), so a zh/en switch also updates tooltips that were built earlier,
+and no user-visible text is stored here.
+
+Self-check: python gui_tips.py  -> entry counts + any id missing zh/en.
 """
+from __future__ import annotations
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gui_i18n import t  # noqa: E402
+
+
+class _LiveTable(dict):
+    """id -> text mapping that re-resolves through t() on every access.
+
+    Keeps the historical call shapes (`TIPS['steps']`, `dict(TIPS.items())`,
+    `TIPS.get(id)`) working while the current language may change between two
+    reads.
+    """
+
+    def __init__(self, build):
+        dict.__init__(self)
+        self._build = build
+
+    def _fresh(self) -> dict:
+        return self._build()
+
+    def __getitem__(self, key):
+        return self._fresh()[key]
+
+    def __contains__(self, key):
+        return key in self._fresh()
+
+    def __iter__(self):
+        return iter(self._fresh())
+
+    def __len__(self):
+        return len(self._fresh())
+
+    def get(self, key, default=None):
+        return self._fresh().get(key, default)
+
+    def keys(self):
+        return self._fresh().keys()
+
+    def values(self):
+        return self._fresh().values()
+
+    def items(self):
+        return self._fresh().items()
+
+
 # ---------------------------------------------------------------------------
 # 一、训练参数 (微调 tab)
 # ---------------------------------------------------------------------------
-TIPS = {
-    # ---- 训练 ----
-    "steps": "总共训练多少步。可以把训练想成'让模型做练习题'——步数就是做题数量。\n"
-             "做太少学不会(几万步量级才算入门);做太多会'背题'反而变笨(过拟合)。\n"
-             "一般先跑小步数(如 500)看损失是否下降,再决定加不加。",
-    "batch": "每步同时'做题'的句子数量。调大 = 每次看得更多、学得更稳,但更吃显存。\n"
-             "显存不够就调小;显存够就调大,训练会更快收敛。",
-    "anchors": "每句话里抽出多少个'接龙起点'。模型要学的就是'看到上文,接出下文'。\n"
-               "越多 = 每个句子被利用得越充分,但每步计算量越大。",
-    "ctx": "模型'回忆'上文的最大长度(按 token 计,1 个汉字约 1~2 个 token)。\n"
-           "越长越懂上下文,但显存和计算量越大,训练越慢。",
-    "lr": "学习率 = 每次调整权重的'步子大小'。步子太大容易原地乱跳(损失震荡);\n"
-          "太小则学得慢。常见范围 1e-4 ~ 1e-3。不确定就保持默认。",
-    "resume": "断点续训:填一个之前保存的 step_XXXX.pt 文件路径,就从那里接着练,"
-              "而不是从头开始。留空 = 从头训练。",
-    "ddtree": "树状思维训练开关:让草稿模型不只学'最可能的下一句',还学'第二、第三可能'。\n"
-              "开了之后,推理时'猜多个分支'的成功率会更高(投机解码提速)。",
+def _tips() -> dict:
+    return {
+        # ---- 训练 ----
+        'steps': t('tips.steps'),
+        'batch': t('tips.batch'),
+        'anchors': t('tips.anchors'),
+        'ctx': t('tips.ctx'),
+        'lr': t('tips.lr'),
+        'resume': t('tips.resume'),
+        'ddtree': t('tips.ddtree'),
 
-    # ---- 数据采集 ----
-    "c_rag": "从百科/维基类知识库采集的'知识问答'条数。给模型喂常识。",
-    "c_qa":  "从通用问答语料采集的条数。给模型喂'怎么好好回答'。",
-    "c_code": "从代码语料采集的条数。让模型懂代码(换行缩进括号)。",
-    "c_out": "采集结果存放的目录名。留默认即可,训练脚本会自动去读它。",
+        # ---- 数据采集 ----
+        'c_rag': t('tips.c_rag'),
+        'c_qa': t('tips.c_qa'),
+        'c_code': t('tips.c_code'),
+        'c_out': t('tips.c_out'),
 
-    # ---- 服务(serve)----
-    "smodel": "要启动推理的模型文件(.ninfer 格式)。列表来自模型目录扫描;\n"
-              "刚转换好的模型点'刷新'就会出现。",
-    "sctx": "对话上下文窗口长度:模型能'记住'的最近内容量。\n"
-            "越长越能聊长篇,但显存占用直线上升。显存不够就调小(2048~4096)。",
-    "sspec": "投机解码方案 = '让一个又快又小的小助手先猜答案,大模型只负责检查'。\n"
-             "none=不猜(慢但省事);mtp/dflash/dflash2=不同的小助手。\n"
-             "模型文件自带哪个就用哪个(选错会报错,换 none 即可)。",
-    "sdt": "小助手每次提前猜几个 token(字)。3~8 之间常见。\n"
-           "猜得越多越可能错,大模型检查后要重来,反而变慢——所以不是越大越好。",
-    "slabd": "查表加速(LABD/ngram 链):'翻历史笔记'式的草稿——\n"
-             "对话里经常整句复述或改写前文(代码补全、复述、RAG 问答),\n"
-             "直接从历史里找相似句子当草稿,命中率极高。\n"
-             "引擎下一版接入; 届时与 ngram-SSD 外挂一起出现。",
-    "slabd2": "同上:查表加速。规划中,引擎接入后此选项自动可用。",
-    "scold": "冷存储 = '把暂时用不到的东西挪到硬盘(SSD)'。\n"
-             "显存不够时,让引擎把旧对话/冷数据放 SSD,要用时再取回。\n"
-             "off=全放显存(最快,最吃显存); disk=放 SSD(省显存,慢一点);\n"
-             "window=只保留最近一段。\n"
-             "ngram 查表与 MoE 专家的 SSD 外挂将来都走这条链。",
-    "scold2": "同上:冷存储策略。",
-    "scoldpath": "SSD 缓存目录。留空用引擎默认(通常在系统临时目录)。\n"
-                 "建议填一个空间大的盘,例如 D:\\ninfer-cold。",
-    "scoldgb": "SSD 缓存上限(GB)。0 = 自动。填小一点可防止缓存把盘塞满。",
-    "scoldgb2": "同上:SSD 缓存上限(GB)。",
-    "sktiers": "KV 缓存三层各自的量化精度, 逗号分隔, 组合自由:\n"
-               "  热=正在生成的位置 (必须高精度, 只许 bf16/fp16/int8)\n"
-               "  尾=最近一段 (精度尾, 不能低于热层)\n"
-               "  冷=更老的内容 (可压到 int4/iso4/iso3/e8 省显存)\n"
-               "例: hot=bf16,tail=fp16,cold=iso3。留空 = 引擎默认。\n"
-               "契约已定, 引擎接入此参数后自动生效。",
-    "snvfp4mode": "NVFP4 权重模式:\n"
-                  "  fusion = 融合版全部特性 (E8/冷池/尾窗/iso 全格式可用)\n"
-                  "  pure   = 纯 NVFP4 基线 (只许经典格式), 用来对照'融合到底"
-                  "带来了多少'",
+        # ---- 服务(serve)----
+        'smodel': t('tips.smodel'),
+        'sctx': t('tips.sctx'),
+        'sspec': t('tips.sspec'),
+        'sdt': t('tips.sdt'),
+        'slabd': t('tips.slabd'),
+        'slabd2': t('tips.slabd2'),
+        'scold': t('tips.scold'),
+        'scold2': t('tips.scold2'),
+        'scoldpath': t('tips.scoldpath'),
+        'scoldgb': t('tips.scoldgb'),
+        'scoldgb2': t('tips.scoldgb2'),
+        'sktiers': t('tips.sktiers'),
+        'snvfp4mode': t('tips.snvfp4mode'),
 
-    # ---- 导入向导 (wizard) ----
-    "import_path": "模型所在的文件夹或文件。支持三种:\n"
-                   " 1. .ninfer 文件(本软件自家格式,可直接跑)\n"
-                   " 2. GGUF 文件(很多网站在传的格式,会自动转换)\n"
-                   " 3. 含 config.json 的模型文件夹(HuggingFace 格式)\n"
-                   "在网页里没法弹文件选择框,请复制完整路径粘贴进来,\n"
-                   "例如 C:\\models\\qwen3.8-27b.gguf",
-    "import_run_ctx": "运行时的上下文长度。显存紧张就填 2048~4096,宽裕再往上加。",
-    "wizard_note": "本软件 ≠ 通用的'什么模型都能跑'。\n"
-                  "每个模型架构都要专门的推理引擎,目前支持 Qwen3 家族 27B/64 层规格。\n"
-                  "其它架构(如 DeepSeek、Kimi)的适配框架正在开发中,请关注后续版本。",
-}
+        # ---- 导入向导 (wizard) ----
+        'import_path': t('tips.import_path'),
+        'import_run_ctx': t('tips.import_run_ctx'),
+        'wizard_note': t('tips.wizard_note'),
+    }
+
+
+TIPS = _LiveTable(_tips)
+
+# Ordered ids, for pages that want a stable list instead of dict ordering.
+TIP_IDS = ('steps', 'batch', 'anchors', 'ctx', 'lr', 'resume', 'ddtree',
+           'c_rag', 'c_qa', 'c_code', 'c_out',
+           'smodel', 'sctx', 'sspec', 'sdt', 'slabd', 'slabd2', 'scold',
+           'scold2', 'scoldpath', 'scoldgb', 'scoldgb2', 'sktiers', 'snvfp4mode',
+           'import_path', 'import_run_ctx', 'wizard_note')
+
+
+def tip(control_id: str, default: str = '') -> str:
+    """Tooltip text for one HTML control id, in the current language."""
+    return t('tips.%s' % control_id) if control_id in TIP_IDS else default
+
 
 # ---------------------------------------------------------------------------
 # 二、参数分组 (GUI 按组渲染"这是什么"的小标题)
 # ---------------------------------------------------------------------------
-GROUPS = {
-    "train": "微调训练参数 —— 不懂就保持默认",
-    "collect": "语料采集参数 —— 数量越多训练资料越足",
-    "serve": "推理服务参数 —— 不懂就保持默认",
-    "import": "模型导入 —— 全程有提示,照着做即可",
-}
+def _groups() -> dict:
+    return {
+        'train': t('tipg.train'),
+        'collect': t('tipg.collect'),
+        'serve': t('tipg.serve'),
+        'import': t('tipg.import'),
+    }
+
+
+GROUPS = _LiveTable(_groups)
+
+GROUP_IDS = ('train', 'collect', 'serve', 'import')
+
+
+def group(group_id: str, default: str = '') -> str:
+    """Caption for a parameter group, in the current language."""
+    return GROUPS.get(group_id, default)
+
 
 # ---------------------------------------------------------------------------
 # 三、概念名词解释 (环境自检结果 / 结论卡片里的术语都会用到)
 # ---------------------------------------------------------------------------
-GLOSSARY = {
-    "显存(VRAM)": "显卡自带的内存,决定模型能不能装下、能聊多长的天。\n"
-                  "就像手机内存:App 太大、同时开太多就会卡/闪退。",
-    "token": "模型读文本的最小单位,大致等于半个到一个汉字。",
-    "量化": "把模型权重'压缩'的技术,体积和显存占用变小,精度略降。\n"
-            "就像把高清照片压成 JPEG:小很多,肉眼看几乎没差。",
-    "NVFP4": "本软件采用的一种量化格式,27B 模型压到约 14GB。",
-    "上下文": "模型能看到的最近对话内容,超出部分会被'忘记'。",
-    "投机解码": "让一个小助手先快速猜一串答案,大模型一次检查一串——\n"
-               "猜对了就白赚速度,猜错了只损失一点点时间。",
-    "GGUF": "llama.cpp 生态通用的模型打包格式,网上下载的模型大多是它。",
-    "safetensors": "HuggingFace 生态的模型格式,通常是一整个文件夹。",
-}
+def _glossary() -> dict:
+    """term -> explanation, in the current language."""
+    out = {}
+    for gid in GLOSSARY_IDS:
+        term, text = glossary_entry(gid)
+        out[term] = text
+    return out
+
+
+GLOSSARY_IDS = ('vram', 'token', 'quant', 'nvfp4', 'context', 'spec_decode',
+                'gguf', 'safetensors')
+
+
+def glossary_entry(term_id: str) -> tuple:
+    """(term, explanation) for one glossary id, in the current language."""
+    return t('tipgl.%s.term' % term_id), t('tipgl.%s.text' % term_id)
+
+
+GLOSSARY = _LiveTable(_glossary)
+
+
+if __name__ == '__main__':
+    import gui_i18n as i18n
+
+    rows = ([('tips.%s' % i) for i in TIP_IDS]
+            + [('tipg.%s' % i) for i in GROUP_IDS]
+            + ['tipgl.%s.%s' % (i, s) for i in GLOSSARY_IDS for s in ('term', 'text')])
+    missing = ['%s/%s' % (k, lg) for k in rows for lg in ('zh', 'en')
+               if not i18n.has(k, lg)]
+    print('gui_tips: %d tips / %d groups / %d glossary keys (%d i18n rows)'
+          % (len(TIP_IDS), len(GROUP_IDS), 2 * len(GLOSSARY_IDS), len(rows)))
+    print('missing zh/en entries: %d %s' % (len(missing), missing or '[]'))

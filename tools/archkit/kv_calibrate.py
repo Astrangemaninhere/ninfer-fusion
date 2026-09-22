@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""kv_calibrate.py — KV 量化程度校准器: 扫描 E8 覆盖率, 输出质量-压缩曲线.
+"""kv_calibrate.py — KV 量化程度校准器: 扫描 Rk4v4 覆盖率, 输出质量-压缩曲线.
 
 对每个覆盖点:
-  1. 以 N 层 E8 + (16-N) 层 NVFP4 启动 serve
+  1. 以 N 层 Rk4v4 + (16-N) 层 NVFP4 启动 serve
   2. 跑针尖测试 (57K 上下文, 精确召回)
   3. 记录 (覆盖率, PASS/FAIL, 响应时间)
 输出: 质量-压缩曲线 + 推荐安全上限。
@@ -29,11 +29,11 @@ PORT = 8003
 MODEL = '/home/user/models/qwen3_8_27b_nvfp4.ninfer'
 
 
-def start_serve(n_e8: int) -> bool:
+def start_serve(n_rk4v4: int) -> bool:
     subprocess.run(['bash', '-c',
                     'for pid in $(pgrep -f ninfer-serve); do kill -9 $pid 2>/dev/null; done; sleep 2'],
                    check=False)
-    spec = f'--kv-layer-storage 0-{n_e8 - 1}:e8' if n_e8 > 0 else ''
+    spec = f'--kv-layer-storage 0-{n_rk4v4 - 1}:rk4v4' if n_rk4v4 > 0 else ''
     cmd = (f'nohup env LD_LIBRARY_PATH=/usr/local/cuda-13.3/lib64 '
            f'{MODEL.replace("/models/", "/ninfer-fusion/build/apps/").replace("qwen3_8_27b_nvfp4.ninfer", "ninfer-serve")} '
            f'{MODEL} --port {PORT} --kv-dtype nvfp4 {spec} '
@@ -77,7 +77,7 @@ def main():
     step = int(sys.argv[3]) if len(sys.argv) > 3 else 2
     results = []
     for n in range(start_n, end_n + 1, step):
-        print(f'--- N_E8={n} coverage={n/16*100:.0f}%', flush=True)
+        print(f'--- N_Rk4v4={n} coverage={n/16*100:.0f}%', flush=True)
         if not start_serve(n):
             print('  serve FAILED')
             results.append((n, None, None))
@@ -86,15 +86,15 @@ def main():
         print(f'  hit={hit} t={dt:.0f}s head: {head}')
         results.append((n, hit, dt))
     print('\n== 质量-压缩曲线 ==')
-    print('E8层数 | 覆盖率 | 针尖 | 响应s')
+    print('Rk4v4层数 | 覆盖率 | 针尖 | 响应s')
     print('-------+--------+------+------')
     for n, hit, dt in results:
         cov = f'{n/16*100:.0f}%'
         print(f'{n:5d}  | {cov:6s} | {"PASS" if hit else "FAIL":4s} | {dt}')
     # 找最优
     best = max((n for n, h, _ in results if h), default=0)
-    print(f'\n推荐: E8 ≤ {best} 层 (覆盖率 {best/16*100:.0f}%), 其余 NVFP4')
-    print(f'对应参数: --kv-dtype nvfp4 --kv-layer-storage 0-{best-1}:e8')
+    print(f'\n推荐: Rk4v4 ≤ {best} 层 (覆盖率 {best/16*100:.0f}%), 其余 NVFP4')
+    print(f'对应参数: --kv-dtype nvfp4 --kv-layer-storage 0-{best-1}:rk4v4')
 
 
 if __name__ == '__main__':

@@ -29,6 +29,9 @@ int check(bool condition, const std::string& message) {
 RequestLimits limits() {
     RequestLimits value;
     value.default_max_tokens = 256;
+    // mtplogfix: name the ceiling for the same reason as test_anthropic_schema.cpp's harness;
+    // 8192 is what --max-context carries by default (serve_options.h:29).
+    value.max_context        = 8192;
     return value;
 }
 
@@ -158,6 +161,44 @@ int test_basic_request_and_resolution() {
                   resolved.cache_hints.retention == ninfer::CacheRetentionHint::LiveSession &&
                   resolved.cache_hints.update_session_index,
               "stored root response receives one live Engine session");
+    return failures;
+}
+
+// mtplogfix: the /v1/responses spelling of the output budget is refused by name above the
+// server's ceiling, and the value AT the ceiling still passes -- the matrix def3 applied to
+// chat's max_tokens, applied to the field it did not reach.
+int test_output_budget_ceiling_for_max_output_tokens() {
+    int failures = 0;
+
+    RequestLimits bounded;
+    bounded.default_max_tokens = 256;
+    bounded.max_context        = 512;
+
+    Json at_ceiling                 = {{"model", "m"}, {"input", "hello"}};
+    at_ceiling["max_output_tokens"] = 512;
+    const OpenAIResponsesCreateRequest at_boundary =
+        parse_openai_responses_create_request(at_ceiling, bounded);
+    failures += check(at_boundary.requested_max_output_tokens == 512 &&
+                          at_boundary.prompt.generation.max_tokens == 512,
+                      "max_output_tokens equal to the ceiling still passes");
+
+    Json above                 = {{"model", "m"}, {"input", "hello"}};
+    above["max_output_tokens"] = 513;
+    const ApiError error       = api_error(
+        [&] { (void)parse_openai_responses_create_request(above, bounded); });
+    failures += check(error.status == 400 && error.param == "max_output_tokens" &&
+                          error.message.find("exceeds this server's output ceiling") !=
+                              std::string::npos &&
+                          error.message.find("513") != std::string::npos &&
+                          error.message.find("512") != std::string::npos,
+                      "max_output_tokens above the ceiling is refused by name with both "
+                      "numbers");
+
+    Json at_zero                 = {{"model", "m"}, {"input", "hello"}};
+    at_zero["max_output_tokens"] = 0;
+    failures += check(
+        parse_openai_responses_create_request(at_zero, bounded).requested_max_output_tokens == 0,
+        "the zero budget still passes");
     return failures;
 }
 
@@ -964,6 +1005,7 @@ int main() {
     int failures = 0;
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
+    failures += test_output_budget_ceiling_for_max_output_tokens();
     failures += test_typed_items_and_cache_markers();
     failures += test_contiguous_assistant_items();
     failures += test_response_output_history_round_trip();

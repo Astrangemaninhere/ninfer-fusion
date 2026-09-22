@@ -1,0 +1,106 @@
+=== e8 width codec test (host-only) ===
+
+--- 1. geometry (product/kv_e8_width.h) ---
+PASS  w4 K plane == 8704 B (shipped)
+PASS  w3 K plane == 6656 B
+PASS  w2 K plane == 4608 B
+PASS  w4 layer K+V == 17408 B
+PASS  w3 layer K+V == 15360 B
+PASS  w2 layer K+V == 13312 B
+PASS  w4 cost == 4.25 b/el (the shipped row 425)
+PASS  w3 cost == 3.75 b/el
+PASS  w2 cost == 3.25 b/el
+PASS  V plane is 8704 B at every width (i4, untouched)
+PASS  w2 K plane is D/4 code bytes + g64 fp16 scales (== rk2v4-e8 K geometry)
+PASS  w2 layer == rk2v4-e8's layer cost (K 2-bit, V left at 4-bit)
+  K-plane saved vs w4: w3 2048 B, w2 4096 B per head-page
+
+--- 2. pack(unpack(bytes)) == bytes, exhaustive per width ---
+PASS  w2: 65536/65536 byte patterns round-trip bit-exactly (2 bytes)
+PASS  w3: 16777216/16777216 byte patterns round-trip bit-exactly (3 bytes)
+PASS  w4: 4294967296/4294967296 byte patterns round-trip bit-exactly (4 bytes)
+
+--- 3. unpack(pack(codes)) == codes ---
+PASS  w2: exhaustive, 65536/65536 code tuples exact
+PASS  w3: exhaustive, 16777216/16777216 code tuples exact
+PASS  w4: sampled 2e6, 2000000/2000000 code tuples exact
+
+--- 4. quantize(dequantize(codes)) == codes (requant safety) ---
+PASS  w2: 20000/20000 code sets survive dequant->requant
+PASS  w3: 20000/20000 code sets survive dequant->requant
+PASS  w4: 20000/20000 code sets survive dequant->requant
+
+--- 5. numerical comparison on the same input ---
+  synthetic  bf16 rel-L2 1.645e-03 | w4 1.1466e-01 | w3 2.1560e-01 | w2 4.1382e-01
+             vs w4: w3 1.88x, w2 3.61x the error | w4/bf16 70x
+PASS  w3 is STRICTLY lossier than w4 on the same input (not free)
+PASS  w2 is STRICTLY lossier than w3 on the same input (not free)
+  (no E8V_REAL_K set: synthetic only)
+
+--- 6. cost decomposition ---
+  w2 K: code  4096 B + scale 512 B =  4608 B | + V  8704 B = layer 13312 B (3.25 b/el)
+PASS  K scale plane is 512 B/head-page at every width
+  w3 K: code  6144 B + scale 512 B =  6656 B | + V  8704 B = layer 15360 B (3.75 b/el)
+PASS  K scale plane is 512 B/head-page at every width
+  w4 K: code  8192 B + scale 512 B =  8704 B | + V  8704 B = layer 17408 B (4.25 b/el)
+PASS  K scale plane is 512 B/head-page at every width
+
+--- 7. normalization pins (divisor / clamp / group scale, vs literals) ---
+PASS  w2: scale divisor == 2 (literal)
+PASS  w2: range == [-2,1], i.e. code_min == -divisor and code_max == divisor-1
+PASS  w2: +huge saturates at code_max, -huge at code_min
+PASS  w2: 200000/200000 quantizer outputs inside [-2,1] (the clamp is a codomain)
+PASS  w2: group_scale == amax/2 bit-exactly (amax recomputed here)
+PASS  w2: stored fp16 scale plane == fp16(amax/2) in 32/32 groups
+PASS  w2: stored code plane == clamp(rint(x/scale), -2, 1) in 2048/2048 codes
+PASS  w2: COVERAGE: 26/2048 codes separate the exact float scale from fp16(scale) (must be > 0, else the writer's scale choice is untestable)
+PASS  w2: +amax -> code_max and -amax -> code_min at scale amax/2 (the convention is asymmetric on purpose)
+PASS  w3: scale divisor == 4 (literal)
+PASS  w3: range == [-4,3], i.e. code_min == -divisor and code_max == divisor-1
+PASS  w3: +huge saturates at code_max, -huge at code_min
+PASS  w3: 200000/200000 quantizer outputs inside [-4,3] (the clamp is a codomain)
+PASS  w3: group_scale == amax/4 bit-exactly (amax recomputed here)
+PASS  w3: stored fp16 scale plane == fp16(amax/4) in 32/32 groups
+PASS  w3: stored code plane == clamp(rint(x/scale), -4, 3) in 2048/2048 codes
+PASS  w3: COVERAGE: 30/2048 codes separate the exact float scale from fp16(scale) (must be > 0, else the writer's scale choice is untestable)
+PASS  w3: +amax -> code_max and -amax -> code_min at scale amax/4 (the convention is asymmetric on purpose)
+PASS  w4: scale divisor == 8 (literal)
+PASS  w4: range == [-8,7], i.e. code_min == -divisor and code_max == divisor-1
+PASS  w4: +huge saturates at code_max, -huge at code_min
+PASS  w4: 200000/200000 quantizer outputs inside [-8,7] (the clamp is a codomain)
+PASS  w4: group_scale == amax/8 bit-exactly (amax recomputed here)
+PASS  w4: stored fp16 scale plane == fp16(amax/8) in 32/32 groups
+PASS  w4: stored code plane == clamp(rint(x/scale), -8, 7) in 2048/2048 codes
+PASS  w4: COVERAGE: 25/2048 codes separate the exact float scale from fp16(scale) (must be > 0, else the writer's scale choice is untestable)
+PASS  w4: +amax -> code_max and -amax -> code_min at scale amax/8 (the convention is asymmetric on purpose)
+PASS  w4 codec divisor 8 == shipped row's 8 and range [-8,7] == [-8,7]: the shipped row was corrected toward the codec (AMAXFIX), so the header's 'same choice' claim is now true and must stay true
+PASS  fp16 scale converter: 1.0 -> 0x3C00, -0.5 -> 0xB800, 0.0625 round-trips
+
+--- 8. the real E8 lattice as the W3/W2 codec of record ---
+PASS  8.1 W4 -> Scalar: the lattice codeword has no 32-bit form
+PASS  8.1 W3 -> Lattice: 24-bit codeword == 3 bytes / 8 elements
+PASS  8.1 W2 -> Lattice: 16-bit codeword == 2 bytes / 8 elements
+PASS  8.1 supports() agrees with of_record() at every width
+PASS  8.2 lattice encode at W4 returns FALSE (no silent fallback)
+PASS  8.2 and writes NOTHING (the plane is byte-identical to the sentinel)
+PASS  8.2 lattice decode at W4 returns FALSE too
+PASS  8.3 w2: the Scalar arm through the seam is bit-identical to e8_kv_encode_plane (the control is not a lookalike)
+PASS  8.3 w3: the Scalar arm through the seam is bit-identical to e8_kv_encode_plane (the control is not a lookalike)
+PASS  8.3 w4: the Scalar arm through the seam is bit-identical to e8_kv_encode_plane (the control is not a lookalike)
+PASS  8.4 w2: 2 code bytes per 8 elements
+PASS  8.4 w3: 3 code bytes per 8 elements
+PASS  8.4 w4: 4 code bytes per 8 elements
+PASS  8.5 w2: encode+decode ok, and an INDEPENDENT read of the stored bytes reproduces the decoder bit-for-bit (0 mismatches)
+PASS  8.5 w3: encode+decode ok, and an INDEPENDENT read of the stored bytes reproduces the decoder bit-for-bit (0 mismatches)
+PASS  8.6 w2: exact encoder (rel-L2 0.303058) is not worse than the projection-seeded one (0.476954) -- e8_project_8d_fast() is ON the encode path and is priced, not assumed
+PASS  8.6 w3: exact encoder (rel-L2 0.173127) is not worse than the projection-seeded one (0.370091) -- e8_project_8d_fast() is ON the encode path and is priced, not assumed
+  as-wired rel-L2 (NOT the matched-transform table):
+    w3 scalar 0.188196  lattice 0.175287  -> +0.617 dB
+    w2 scalar 0.388341  lattice 0.305133  -> +2.094 dB
+PASS  8.7 w3: the lattice plane is less distorted than the scalar plane
+PASS  8.7 w2: the lattice plane is less distorted than the scalar plane
+PASS  8.8 w3 (stage 1 + stage 2) is less distorted than w2 (stage 1 only)
+
+== 75/75 ==
+RUNEXIT=0
+FINISHED

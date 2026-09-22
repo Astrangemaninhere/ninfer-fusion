@@ -1258,6 +1258,12 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         if (*max_output < 0) {
             bad_request("max_output_tokens must be non-negative", "max_output_tokens");
         }
+        // mtplogfix (completes def3): the third spelling of this budget. chat's max_tokens /
+        // max_completion_tokens and anthropic's max_tokens already go through
+        // validate_output_budget(); this one kept the engine's silent clamp as its only
+        // answer. Same ceiling, same helper -- RequestLimits::max_context is the
+        // --max-context both responses HTTP assembly points already pass in.
+        validate_output_budget(*max_output, limits.max_context, "max_output_tokens");
         out.requested_max_output_tokens  = *max_output;
         out.prompt.generation.max_tokens = *max_output;
     }

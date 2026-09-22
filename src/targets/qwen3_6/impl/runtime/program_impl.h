@@ -1,13 +1,44 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+// [COLD-FALLBACK CENSUS] the tally that makes the cold rANS codec's fallback rate
+// countable. Pure header, no CUDA; its own header states why it is a counter rather
+// than a print, and why it is reported only at teardown.
+#include "targets/qwen3_6/impl/runtime/cold_fallback_census.h"
+// [COLD-HOST REFETCH CENSUS] the counter that makes the recall window's load-bearing
+// "re-fetch of an evicted page: ZERO" claim (cold_host_tier.h:239) a measurement instead
+// of a sentence. Pure header, no CUDA; incremented at the ONE site that re-materializes a
+// page whose only replica is the Cold Host tier's, reported once per process in this file's
+// destructor beside the cold-fallback census, silent when the count is zero.
+#include "targets/qwen3_6/impl/runtime/cold_refetch_census.h"
+#include "targets/qwen3_6/impl/runtime/cold_page_unit_check.h"  // dl/coldagree: the two page units, side by side
+// [S3 RELEASE CENSUS] which KV tiers may give a device page back at all. Added only after
+// measuring that it moves no token: kv_component_switch.h is already emitted BEFORE this
+// header in every TU that reaches either (4 of 561 in build/compile_commands.json), so the
+// `#pragma once` guard makes this line emit nothing. Re-verified by diffing the real
+// preprocessed text of the engine TU with and without the patch
+// (dl/evictfix/TOKEN_IDENTITY.md, section 6).
+#include "product/kv_component_switch.h"
 #include "ninfer/ops/cold_i8.h"
 #include "ninfer/ops/entropy_cold_requant.h"
 #include "ninfer/ops/entropy_nvfp4_slot.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
+#include "spec/turn_recall_journal.h"
+// THE WATERMARK'S SEMANTIC HALF. sum_dir.h owns the only judge allowed to answer
+// "this block may be unloaded" (its per-block admissibility + the fixed priority in
+// sum_dir_avl_rank); the watermark pass below is its engine-side call site, which
+// sum_dir.h:1813-1815 names as the one piece it deliberately left unwired.
+#include "spec/sum_dir.h"
+#include "spec/sum_dir_reach.h"
+// [SIGNKEY] THE SECOND CANDIDATE SOURCE. `sum_dir_sign_key.h` is the header
+// `dl/fusiondesign/REPORT.md` sec.4.1 proposed and never landed (0 hits tree-wide,
+// dl/signkey/logs/s01_survey.log:66-77). It is host-only and std-only, so this include
+// cannot move an existing behaviour by itself.
+#include "spec/sum_dir_sign_key.h"
 
 #include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/spec_decision.h"
+#include "targets/qwen3_6/impl/runtime/mtp_tree_proposal_fill.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
@@ -21,6 +52,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -59,6 +91,26 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
 
 std::uint32_t kv_pages_for_frontier(std::uint32_t frontier) noexcept {
     return frontier == 0 ? 0U : 1U + (frontier - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+// THE CODEC BRIDGE, recall -> directory. `spec/sum_dir.h` owns the other direction
+// (`sum_dir_codec_to_recall`, :280-290) because THAT is the direction its own admission rule needs;
+// this is the direction the WRITER needs (a row must be born with an admitted codec, and
+// `sum_dir_row_well_formed` refuses `Unset`), and it is spelled as an explicit switch rather than a
+// cast even though the four enumerators are numerically aligned today -- `RecallCodec::Rejected` is
+// 0 while `SumDirCodec::Unset` is 0 and `SumDirCodec::Rejected` is 5, so a cast would map the
+// ledger's "no codec" onto the directory's "unknown codec" and the two would drift the moment
+// either enum gained a value. `Unset` is reachable here (a `Rejected` engine codec) and is refused
+// by the caller rather than written, because a row that describes no codec can never be offered.
+[[nodiscard]] spec::sum_dir::SumDirCodec
+sum_dir_codec_from_recall(spec::turn_recall::RecallCodec codec) noexcept {
+    switch (codec) {
+    case spec::turn_recall::RecallCodec::Nvfp4: return spec::sum_dir::SumDirCodec::Nvfp4;
+    case spec::turn_recall::RecallCodec::Int8:  return spec::sum_dir::SumDirCodec::Int8;
+    case spec::turn_recall::RecallCodec::Mixed: return spec::sum_dir::SumDirCodec::Mixed;
+    case spec::turn_recall::RecallCodec::Rejected: return spec::sum_dir::SumDirCodec::Unset;
+    }
+    return spec::sum_dir::SumDirCodec::Unset;
 }
 
 std::size_t context_resource_index(runtime::ContextResourceClass resource) {
@@ -343,11 +395,55 @@ bool logical_page_matches_prefix(const KVAddressSpaceStore& addresses,
     return addresses.logical_page(*prefix, page_offset) == page;
 }
 
+// A DECLINED HOST RELEASE MUST SAY WHY, AND "NO OWNER" IS NOT "ANOTHER OWNER".
+//
+// `host_extents` is the checkpoint/resume pool. The Cold Host tier publishes into its own store,
+// and `valid()` is `capability.owner_ == this` (host_kv_extent_store.h:230-234), so the two pools
+// can never both claim one capability -- while `can_release_page_replicas` collapses "no pool owns
+// this" and "another pool owns this" into the same `false`. `host_replica_store` (:5256) asks this
+// question canonically, but it is defined below the anonymous namespace that closes at :868 and so
+// cannot be named from here without reordering a 16,655-row header; the predicate is a single
+// expression and is asked here rather than duplicated as a second policy.
+//
+// THIS REPORTS AND DECIDES NOTHING. The run is still declined exactly as it was. Every other reader
+// of a DropHostDuplicate decision names the checkpoint pool too -- :3231, :3325, :4416 (which
+// throws `Host KV extent is stale` on this very term), :6203, :6323 -- and :6409 is
+// `std::terminate()`. Accepting a tier-owned run here would hand those pages to a reader that
+// cannot release them, which is why this is an instrument and not a dispatch: the defect is that
+// the decline was anonymous, not that it happened.
+void report_pressure_host_release_declined(HostKVExtentStore* checkpoint_extents,
+                                           ColdHostTier* cold_host_tier, LogicalKVPageStore& pages,
+                                           std::span<const LogicalKVPageHandle> releases) noexcept {
+    HostKVExtentStore* const tier_extents =
+        (cold_host_tier != nullptr && cold_host_tier->enabled()) ? cold_host_tier->extents()
+                                                                : nullptr;
+    std::size_t tier_owned = 0;
+    std::size_t unowned    = 0;
+    for (const LogicalKVPageHandle page : releases) {
+        if (!pages.valid(page) || !pages.host_resident(page)) {
+            ++unowned;
+            continue;
+        }
+        const HostKVExtentCapability capability = pages.host_replica(page).extent;
+        if (checkpoint_extents != nullptr && checkpoint_extents->valid(capability)) { continue; }
+        if (tier_extents != nullptr && tier_extents->valid(capability)) {
+            ++tier_owned;
+            continue;
+        }
+        ++unowned;
+    }
+    std::fprintf(stderr,
+                 "[host-kv] pressure Host release declined: %zu page(s): %zu owned by the Cold "
+                 "Host tier, %zu owned by no live pool\n",
+                 releases.size(), tier_owned, unowned);
+}
+
 template <class ProtectedPage>
 KVPressureSelection
 select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
-                           HostKVExtentStore* host_extents, bool host_allocation_available,
-                           KVAddressSpaceHandle address, std::optional<std::uint32_t> mapped_limit,
+                           HostKVExtentStore* host_extents, ColdHostTier* cold_host_tier,
+                           bool host_allocation_available, KVAddressSpaceHandle address,
+                           std::optional<std::uint32_t> mapped_limit,
                            std::uint32_t requested_device_pages, std::size_t requested_host_bytes,
                            runtime::ContextResourceClass resource,
                            std::span<const qwen3_6::detail::PressureKVDecision> existing_actions,
@@ -410,6 +506,17 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                 releases.push_back(addresses.logical_page(address, selected_begin + offset));
             }
             if (!host_extents->can_release_page_replicas(pages, releases)) {
+                // Conservative, and no longer anonymous. The eligibility predicate above already
+                // excludes three of `can_release_page_replica`'s four refusal terms (host and
+                // device residency, source pins), so a `false` here is dominated by the ownership
+                // and generation test. Ask WHICH pool owns these pages before declining, so that
+                // "owned elsewhere" stops reading as "owned nowhere". The decline itself is
+                // unchanged: every other reader of a DropHostDuplicate decision names the
+                // checkpoint pool as well (:3231, :3325, :4416, :6203, :6323) and :6409 is
+                // `std::terminate()`, so a run accepted here would be handed to a reader that
+                // cannot release it.
+                report_pressure_host_release_declined(host_extents, cold_host_tier, pages,
+                                                      releases);
                 end = begin;
                 continue;
             }
@@ -618,6 +725,7 @@ float resolved_dspark_svip_threshold() {
     return kThreshold;
 }
 
+
 schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
                                            std::uint32_t k) {
     (void)min_frontier;
@@ -637,11 +745,17 @@ schedule::DFlash2Envelopes dflash2_envelopes(std::uint32_t min_frontier,
     };
 }
 
+// `draft_width` selects one rung of the MTP capture ladder. 0 -- the default, and the only
+// value the ordinary/DFlash families ever carry -- matches "not a rung": every ordinary profile,
+// every DFlash profile, and every profile of a fixed-k MTP run. Selecting on it is what makes the
+// marginal MTP draft column cost b_width instead of the 7.2x-smaller b_mask.
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
-                                         std::uint32_t frontier, const char* label) {
+                                         std::uint32_t frontier, const char* label,
+                                         std::uint32_t draft_width = 0) {
     const auto it = std::find_if(
         family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
-            return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
+            return profile.batch_size == batch_size && profile.draft_width == draft_width &&
+                   profile.min_execution_frontier <= frontier &&
                    frontier <= profile.max_execution_frontier;
         });
     if (it == family.profiles.end()) {
@@ -650,14 +764,62 @@ DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_
     return *it;
 }
 
+// Snap a criterion cut to the TARGET's own MTP ladder.
+//
+// The JUDGEMENT is made on the full decision ladder (kMtpWindowLadder, round_state.h -- the cost
+// model is calibrated on it), but the CAPTURE DOMAIN is the target's, not the model's:
+// mtp_graph_ladder_profiles(capacity, draft_window, mtp_ladder) captures exactly `mtp_ladder`, and
+// layouts_impl.h builds that as "every kMtpWindowLadder member <= kMaximumMtpDraftTokens".  For a
+// target with kMaximumMtpDraftTokens == 5 that domain is {2,3,5}, so a cut taken from the FULL
+// ladder (>= 6, by the ties-up rule) named a rung of 7/9/15 that no captured graph can cover:
+// extend_mtp_graphs cannot build a rung that is not a ladder member and returns immediately, and
+// select_graph_profile then throws "MTP batch CUDA Graph coverage is incomplete" -- an engine stop
+// for a rung this same code chose on purpose.  Snapping on the CAPTURED ladder keeps the criterion
+// and moves only the rung.
+//
+// Ties go UP, the same rule as mtp_window_ladder_index: at a tie the marginal column value equals
+// its cost, and the measured failure mode on this axis is under-drafting.
+//
+// The full decision ladder is still the right answer when the two coincide, i.e. for a target whose
+// kMaximumMtpDraftTokens is the ladder top -- mtp_ladder_round(full, cut) ==
+// mtp_window_ladder_width(cut) there, so this is a no-op for those targets.
+[[nodiscard]] inline std::uint32_t mtp_ladder_round(const std::vector<std::uint32_t>& ladder,
+                                                   std::uint32_t                  cut) {
+    if (ladder.empty()) { return qwen3_6::mtp_window_ladder_width(cut); }
+    std::size_t   best     = 0;
+    std::uint32_t best_gap = ladder[0] > cut ? ladder[0] - cut : cut - ladder[0];
+    for (std::size_t i = 1; i < ladder.size(); ++i) {
+        const std::uint32_t gap = ladder[i] > cut ? ladder[i] - cut : cut - ladder[i];
+        if (gap <= best_gap) { best_gap = gap; best = i; }
+    }
+    return ladder[best];
+}
+
+// THE WIDTH A LADDER-DRIVEN REQUEST STARTS FROM. Deliberately not `mtp_ladder.back()`: the ladder
+// TOP is a decision the criterion has not made yet, and it is the most EXPENSIVE rung on this
+// binary (see kMtpWindowInitialRung in mtp_window_cut.h for the measurement). The result is always
+// a MEMBER of `ladder`, because the write point refuses a rung the captured graphs do not cover --
+// so this takes the widest member that is not above kMtpWindowInitialRung, and the ladder's own
+// first member when it has none that narrow.
+[[nodiscard]] inline std::uint32_t mtp_initial_rung(const std::vector<std::uint32_t>& ladder) {
+    if (ladder.empty()) { return qwen3_6::detail::kMtpWindowInitialRung; }
+    std::uint32_t best = ladder.front();
+    for (const std::uint32_t width : ladder) {
+        if (width <= qwen3_6::detail::kMtpWindowInitialRung) { best = width; }
+    }
+    return best;
+}
+
 // True when no profile of this batch covers the frontier — the caller's cue
 // to extend the family on demand (on-demand graph capture).
 [[nodiscard]] inline bool graph_profile_missing(const DecodeGraphFamily& family,
                                                 std::uint32_t batch_size,
-                                                std::uint32_t frontier) noexcept {
+                                                std::uint32_t frontier,
+                                                std::uint32_t draft_width = 0) noexcept {
     return std::none_of(family.profiles.begin(), family.profiles.end(),
                         [&](const DecodeGraphProfile& profile) {
                             return profile.batch_size == batch_size &&
+                                   profile.draft_width == draft_width &&
                                    profile.min_execution_frontier <= frontier &&
                                    frontier <= profile.max_execution_frontier;
                         });
@@ -744,7 +906,8 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
                     install_and_upload(topology, i);
 
                     DecodeGraphProfile& profile = family.profiles[i];
-                    prepare(profile.min_execution_frontier, profile.batch_size);
+                    prepare(profile.min_execution_frontier, profile.batch_size,
+                            profile.draft_width);
                     device.synchronize();
                     topology.executable.launch(device.stream);
                     device.synchronize();
@@ -762,6 +925,29 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
     }
 }
 
+// THE UNLOAD WATERMARK'S ONE DERIVATION, and the reason it lives here rather than
+// at the option parser: the reserve is expressed in PAGES, but the quantity it has
+// to cover is the plan's own prefill chunk, and the chunk is a target-side number
+// the parser does not have. A chunk's KV cannot be written half-way, so a reserve
+// below one chunk would let the watermark fire later than the write it must make
+// room for -- i.e. it would be a spill threshold wearing a watermark's name.
+//
+// kUnloadWatermarkDerive is the sentinel meaning "derive"; 0 means OFF and stays
+// OFF (it is not a synonym for "derive", or the knob could not be switched off).
+std::uint32_t resolve_unload_watermark_pages(std::uint32_t configured,
+                                             std::uint32_t prefill_chunk) noexcept {
+    if (configured != kUnloadWatermarkDerive) { return configured; }
+    if (prefill_chunk == 0) { return 0; }
+    return 1U + (prefill_chunk - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+// The page arithmetic both halves of the change share, so the reserve the
+// admission computes and the reserve the watermark keeps free cannot drift
+// (they are the same expression, not two statements of the same rule).
+std::uint32_t unload_pages_for_tokens(std::uint32_t tokens) noexcept {
+    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
@@ -771,11 +957,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk_capacity(plan.prefill_chunk), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window),
+      draft_window(plan.draft_window), mtp_ladder(plan.mtp_ladder),
+      draft_tree_paths(plan.draft_tree_paths), draft_tree_depth(plan.draft_tree_depth),
       speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       cold_policy(plan.cold_policy), cold_keep_tokens(plan.cold_keep_tokens),
+      unload_watermark_pages(resolve_unload_watermark_pages(plan.unload_watermark_pages,
+                                                            plan.prefill_chunk)),
       cold_host_bytes(plan.cold_host_bytes), cold_disk_path(plan.cold_disk_path),
       cold_disk_bytes(plan.cold_disk_bytes),
       graph_capture_ceiling(plan.graph_capture_ceiling),
@@ -856,11 +1045,46 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::overflow_error("Qwen3.6 KV transaction address capacity exceeds uint32");
     }
     const auto address_capacity      = static_cast<std::uint32_t>(address_capacity64 + 1U);
-    const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
+    // -------------------------------------------------------------------------
+    // [DESC-CAP] THE LOGICAL DESCRIPTOR LEDGER IS THE ADDRESS SPACE, NOT THE POOL.
+    //
+    // A logical descriptor is the ADDRESS-SPACE ledger: one per MAPPED logical page, and
+    // a cold page KEEPS its descriptor -- that is deliberate and documented at
+    // transfer_to_cold (logical_kv_store.h:764-783: "keeping the descriptor, so the
+    // address membership and its block-table slot stay stable").  The PHYSICAL ledger is
+    // the pool, and the cold tier is what recycles it: dematerialize_one() returns the
+    // page to the free list AND credits the same address's reservation
+    // (paged_kv_cache.cpp:416-427).
+    //
+    // So the descriptor count must cover the extent of ONE address space, and the block
+    // table is what fixes that extent: tables.logical_page_capacity() ==
+    // page_count(--max-context) == 4096 at the acceptance vector -- NOT
+    // page_count(--kv-capacity) == 1024.  The two ledgers were spelled as one number
+    // (`pool.capacity_pages() + host_pages`), so the address space stopped exactly where
+    // the pool stopped and ANY span longer than the pool died in the batch materializer
+    // (logical_kv_store.h:294-296) however much the cold tier had retired.  That is the
+    // fourth wall: "跨 pool 的地址空间" needs descriptors the pool never had to fund.
+    //
+    // WHAT FUNDS A SPAN LONGER THAN THE POOL is unchanged and lives elsewhere: the
+    // watermarked cold transfer retires resident pages ahead of every mapping
+    // (unload_watermark_trigger) and grow_sequence_kv_entitlement_to() re-promises the
+    // pool only as far as the frontier.  This lambda only stops the DESCRIPTOR ledger
+    // from being the shorter of the two.
+    //
+    // The tripwire at logical_kv_store.h:294-296 is NOT weakened or deleted: it still
+    // fires whenever a batch would exceed the FREE descriptors.  It now means what it
+    // says -- "this address space is wider than the descriptor ledger" -- which, with the
+    // ledger covering the block table, is a genuine coverage error instead of the normal
+    // end of a long span.
+    // -------------------------------------------------------------------------
+    const auto logical_page_capacity = [&](const DeviceKVPagePool& pool, const auto& tables) {
         const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
         const std::uint64_t host_pages =
             plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
-        const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
+        const std::uint64_t resident =
+            static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
+        const std::uint64_t span = static_cast<std::uint64_t>(tables.logical_page_capacity());
+        const std::uint64_t total = resident > span ? resident : span;
         if (total > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.6 logical KV page capacity exceeds uint32");
         }
@@ -872,7 +1096,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // pinned Host pool, sized by --cold-host-bytes alone, whose pages are released
     // device pages that no attention kernel can read any more. The pool is built
     // below, once the Host page stride (hence its whole-page capacity) is known.
-    if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk) {
+    // The requant scratch is the SLOT tiers' compressor: Window/Disk pack into
+    // device cold slots with it, and HostThenDisk's disk rung is that same slot
+    // tier. ColdPolicy::Host does not need it (its pages are read-free, so nothing
+    // ever decodes them from a slot).
+    if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk ||
+        cold_policy == ColdPolicy::HostThenDisk) {
         const std::int32_t requant_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
         if (requant_heads > 0) {
             CUDA_CHECK(cudaMalloc(&cold_requant_codes,
@@ -882,8 +1111,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             cold_requant_heads = static_cast<std::uint32_t>(requant_heads);
         }
     }
-    if (cold_policy == ColdPolicy::Disk) {
-        // Per-layer spill files: each slot is a fixed stride of compressed
+    if (cold_policy == ColdPolicy::Disk || cold_policy == ColdPolicy::HostThenDisk) {
+        // Per-layer spill files -- Disk, and HostThenDisk's overflow rung. Each slot
+        // is a fixed stride of compressed
         // bytes, so the file offset is file_slot * stride. Opened once; the
         // engine truncates on start (cold pages are re-spilled as they age).
         const std::uint32_t layers = decoder->text_kv.layers();
@@ -903,11 +1133,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                               static_cast<std::size_t>(view.cold_slots.nb[3]));
         }
         // Size the file-slot space from --cold-disk-bytes (stored in
-        // cold_disk_file_slots, which nothing else reads). One slot per
-        // largest-layer stride keeps the worst case inside the budget.
-        if (cold_disk_slot_bytes != 0) {
-            std::uint64_t slots =
-                cold_disk_bytes / static_cast<std::uint64_t>(cold_disk_slot_bytes);
+        // cold_disk_file_slots, which nothing else reads). ONE FILE SLOT IS ONE
+        // PAGE, and a page is mirrored into EVERY slot-bearing layer's file
+        // (:12224-12246 writes `nb[3]` bytes per layer at `file_slot * nb[3]`),
+        // so the bytes one slot costs are the SUM of the live per-layer strides:
+        // `turn_recall_page_bytes()`, the same quantity the spill ledger charges
+        // (:12483) and the paging plan sizes the disk rung against (:13383).
+        // Dividing by ONE layer's stride (`cold_disk_slot_bytes`, the max, kept
+        // below for the per-layer staging buffers only) admitted sum/max times
+        // too many pages: 16x on the shipped 16-layer stack, so a declared
+        // --cold-disk-bytes 4 GiB admitted 63.9997 GiB of pages
+        // (dl/pagemath/REPORT.md section 1).
+        const std::uint64_t page_record_bytes = turn_recall_page_bytes();
+        if (page_record_bytes != 0) {
+            std::uint64_t slots = cold_disk_bytes / page_record_bytes;
             if (slots == 0) { slots = 1; }  // a zero budget still admits one page
             // The bitmap is host memory, so bound it (2^26 slots = 64 MiB of
             // bitmap, i.e. >= 2 TiB of spill at the largest observed stride,
@@ -922,10 +1161,350 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             CUDA_CHECK(cudaHostAlloc(&cold_disk_staging[1], cold_disk_slot_bytes,
                                      cudaHostAllocDefault));
         }
+
+        // (6) per-round external recall (P5/P6/P7). The L0 journal lives next to the
+        // spill files it mirrors, so it is opened exactly where they are. OFF BY
+        // DEFAULT (NINFER_TURN_RECALL=1 arms it) and the codec gate is a REFUSAL, not a
+        // fallback: a layer with no cold slot (bf16/fp8/iso4e/rk4v4, kv_tier_formats.h:118)
+        // cannot reach the journal at all, and a stack whose slot-bearing codec is not
+        // nvfp4/int8 is refused outright -- rk4v4 measures 9/448 = 0.020 exact-prefix
+        // accuracy, so no external tier may depend on it (spec/turn_recall_journal.h).
+        const char* turn_recall_env = std::getenv("NINFER_TURN_RECALL");
+        if (turn_recall_env != nullptr && std::atoi(turn_recall_env) != 0) {
+            turn_recall_codec = turn_recall_codec_of_layers();
+            // [CODECBLIND] THE COUNT, THE NAME, AND THE LINE THE SILENT CASE LACKED. Until
+            // this, a stack with blind layers BESIDE an admitted codec was labelled with the
+            // admitted one and printed nothing: the chain fired, the record's stride summed
+            // every slot-bearing layer (see turn_recall_page_bytes), and the log named one
+            // codec. The count is stored (not incremented) because arming happens once per
+            // run and this is a property of the resolved table.
+            const std::uint32_t codec_blind_layers = turn_recall_codec_blind_layers();
+            const char* const   codec_blind_codec  = turn_recall_codec_blind_codec();
+            turn_recall_counters.codec_blind_layers =
+                static_cast<std::uint64_t>(codec_blind_layers);
+            if (codec_blind_layers != 0) {
+                std::fprintf(stderr,
+                             "[recall] CODEC-BLIND codec=%s layers=%u policy=%s refusal=%s "
+                             "(these cold-slot-bearing layers ARE in the record's stride and are "
+                             "OUT of the admission decision)\n",
+                             codec_blind_codec,
+                             static_cast<unsigned>(codec_blind_layers),
+                             spec::turn_recall::codec_blind_policy_name(
+                                 spec::turn_recall::kCodecBlindPolicy),
+                             spec::turn_recall::kCodecBlindRefusalName);
+            }
+            // ⛔ THE CHOICE IS NOT THE TREE'S TO LEAVE UNMADE. `Unnamed` is the ABSENCE of a
+            // policy, not one of the two, and the alternative to this assert is that the
+            // blindness stays silent in whichever direction the next edit happens to fall --
+            // the same arrangement kRecallBudgetEdgePolicy and kInexactAdmissionPolicy use,
+            // both ten thousand lines below in the same function family.
+            static_assert(spec::turn_recall::kCodecBlindPolicy !=
+                              spec::turn_recall::CodecBlindPolicy::Unnamed,
+                          "src/spec/turn_recall_journal.h's kCodecBlindPolicy is Unnamed: the "
+                          "tree does not get to leave the classifier's blind spot un-named. "
+                          "Name ReportOnly (today's behaviour, printed by name, the run "
+                          "unchanged) or RefuseRun (the named refusal `refused-codec-blind`, "
+                          "taken before any page is spilled or restored).");
+            if (!spec::turn_recall::recall_codec_admitted(turn_recall_codec)) {
+                // THE CONSEQUENCE IS THE PART THAT WAS MISSING. The old line named a
+                // reason and said nothing about the fact that recall is now OFF for the
+                // whole run -- and because the classifier is stack-level, that is EVERY
+                // spilled page, not only a page with two codecs. The degrade is right
+                // (the journal is a mirror: losing it costs a re-read, never an answer,
+                // the rule the open-failure arm below states); what was wrong was that
+                // the user who explicitly armed NINFER_TURN_RECALL could not tell.
+                ++turn_recall_counters.refused_codec;
+                std::fprintf(stderr,
+                             "[recall] RECALL DISABLED for this run: %s "
+                             "(--cold-* still runs; nothing is recallable this run)\n",
+                             spec::turn_recall::recall_codec_refusal(turn_recall_codec).c_str());
+            } else if (spec::turn_recall::codec_blind_refuses_run(
+                           codec_blind_layers, spec::turn_recall::kCodecBlindPolicy)) {
+                // [CODECBLIND] THE NAMED REFUSAL. Reached ONLY under `RefuseRun`: under the
+                // shipped `ReportOnly` the predicate is false for every count and this arm is
+                // inert, which is what makes the landing behaviour-preserving by construction.
+                // The user who armed NINFER_TURN_RECALL is told WHICH codec and HOW MANY
+                // layers, because "recall is off" without those two facts is the state this
+                // whole block exists to end.
+                ++turn_recall_counters.refused_codec;
+                std::fprintf(stderr,
+                             "[recall] RECALL DISABLED for this run: %s codec=%s layers=%u "
+                             "(--cold-* still runs; nothing is recallable this run)\n",
+                             spec::turn_recall::kCodecBlindRefusalName,
+                             codec_blind_codec,
+                             static_cast<unsigned>(codec_blind_layers));
+            } else {
+                const std::string journal_path = dir + "/ninfer_recall.l0";
+                // THE VALUE IS THE HANDLE, NEVER THE PRESENCE OF THE NAME -- the rule
+                // NINFER_TURN_RECALL itself follows two lines up. This used to read
+                // `std::getenv(...) != nullptr`, which made NINFER_TURN_RECALL_FSYNC=0 (the
+                // spelling every sibling flag uses for OFF) and the empty string both mean
+                // PerRound. The ladder lives with the enum it produces.
+                const spec::turn_recall::JournalFlushPolicy flush_policy =
+                    spec::turn_recall::journal_flush_policy_from_env(
+                        std::getenv("NINFER_TURN_RECALL_FSYNC"));
+                spec::turn_recall::JournalOpenOptions journal_options{};
+                journal_options.path     = journal_path;
+                journal_options.truncate = false;
+                journal_options.flush    = flush_policy;
+                turn_recall_journal =
+                    std::make_unique<spec::turn_recall::TurnRecallJournal>(std::move(journal_options));
+                if (!turn_recall_journal->good()) {
+                    // An unwritable log degrades to "no recall" instead of failing the
+                    // run: the journal is a mirror, so losing it costs a re-read, never
+                    // an answer.
+                    std::fprintf(stderr,
+                                 "[recall] journal not writable at %s; recall disabled\n",
+                                 journal_path.c_str());
+                    turn_recall_journal.reset();
+                } else {
+                    // One batched read per round is the whole point, so the default cap
+                    // is a MEMORY-SAFETY limit rather than a speed limit: a single plan
+                    // of 18.00 GiB (a 1M-token prefix -- TODO.md:5832) is the one shape
+                    // this design forbids by accident. NINFER_TURN_RECALL_BYTES=<MiB>.
+                    //
+                    // [PREFILLBUDGET] WHAT THAT NUMBER IS, AND WHAT IT IS NOT. The default is a
+                    // MEMORY-SAFETY limit and the tree says so above; the ceiling it produces is
+                    // ARITHMETIC, not a policy: 256 MiB / 1,181,696 B per page = 227 whole pages,
+                    // and 227 x 64 tokens per page = 14,528 tokens of re-prefill in ONE round --
+                    // which at the anchored 1,332.78 tok/s (750.31 us/token) is 10.90 s. The tree
+                    // never called that a speed limit, and this comment does not either: it is the
+                    // ACCIDENTAL ceiling the memory figure implies, attached here so the number
+                    // and the caliber travel together. Nothing in src/, apps/ or tests/ spelled
+                    // `14528` before this landing (measured: zero hits), so the number had no
+                    // stated caliber anywhere.
+                    //
+                    // THE SPEED LIMIT IS A DIFFERENT DIMENSION AND IT IS THE VARIABLE BELOW:
+                    // NINFER_RECALL_PREFILL_TOKENS, carried by `--recall-prefill-tokens N`. Its
+                    // edge is a NAMED REFUSAL -- `refused-prefill-budget`, on the plan, before a
+                    // single token is re-prefilled -- and never a truncation (dl/vectorkey
+                    // REPORT.md:44/:282-291). 0 == OFF, which is the default.
+                    turn_recall_byte_budget = 256ULL << 20;
+                    if (const char* budget_env = std::getenv("NINFER_TURN_RECALL_BYTES")) {
+                        turn_recall_byte_budget = std::strtoull(budget_env, nullptr, 10)
+                                                  << 20;
+                    }
+                    turn_recall_prefill_token_budget = 0;
+                    if (const char* prefill_env = std::getenv("NINFER_RECALL_PREFILL_TOKENS")) {
+                        turn_recall_prefill_token_budget =
+                            std::strtoull(prefill_env, nullptr, 10);
+                    }
+                    std::fprintf(stderr,
+                                 "[recall] journal %s codec=%s budget=%llu MiB "
+                                 "prefill_tokens=%llu fsync=%s blind_layers=%u blind_codec=%s\n",
+                                 journal_path.c_str(),
+                                 spec::turn_recall::recall_codec_name(turn_recall_codec),
+                                 static_cast<unsigned long long>(turn_recall_byte_budget >> 20),
+                                 static_cast<unsigned long long>(
+                                     turn_recall_prefill_token_budget),
+                                 spec::turn_recall::journal_flush_policy_name(flush_policy),
+                                 static_cast<unsigned>(codec_blind_layers),
+                                 codec_blind_codec);
+                }
+            }
+        }
+    }
+    // THE SECOND SILENT CASE, and the quieter one. The recall block above lives INSIDE
+    // `if (cold_policy == Disk || HostThenDisk)`, so arming NINFER_TURN_RECALL=1 with
+    // `--cold-policy none`, `window` or `host` reached it NEVER -- no journal, no counter,
+    // no line, rc=0. The gate is correct (there is no spill file to mirror: window/host
+    // retire pages but write no external bytes), but "the arming was read by nothing" is
+    // not something a user can discover without reading this file, so it is counted and
+    // said out loud here, once, in the same vocabulary as the codec refusal.
+    if (!turn_recall_refusal_reported && turn_recall_journal == nullptr) {
+        const char* armed = std::getenv("NINFER_TURN_RECALL");
+        if (armed != nullptr && std::atoi(armed) != 0) {
+            ++turn_recall_counters.refused_medium;
+            std::fprintf(stderr,
+                         "[recall] RECALL DISABLED for this run: --cold-policy is %s, which "
+                         "writes no external spill file for the journal to mirror; "
+                         "NINFER_TURN_RECALL=1 was read by nothing. Use --cold-policy disk "
+                         "(or host-then-disk) to arm recall.\n",
+                         cold_policy == ColdPolicy::None     ? "none"
+                         : cold_policy == ColdPolicy::Window ? "window"
+                         : cold_policy == ColdPolicy::Host   ? "host"
+                         : cold_policy == ColdPolicy::Disk   ? "disk"
+                                                             : "host-then-disk");
+        }
+    }
+    // =========================================================================
+    // [TEXT-CARGO] ITS OWN GROUND. This block used to sit INSIDE the
+    // `Disk || HostThenDisk` branch above, and that nesting was the whole of the
+    // defect: `--cold-policy window` retires pages and writes NO text at all
+    // (measured, D3: `[cold] compressed 6/8/8 prefix pages`, `[textcargo]` printed
+    // 0 times, no cargo file on disk). The cargo is not a disk artifact. It is the
+    // payload of the RETIREMENT EVENT, and that event is `transfer_to_cold`
+    // (logical_kv_store.h:771), which EVERY slot tier runs -- Disk, Window, and
+    // HostThenDisk's disk rung alike. A directory and a size are all the cargo
+    // needs, and it already published both: the directory comes from
+    // `--cold-disk-path` via `recall_cargo_path` (spec/turn_recall_journal.h:923).
+    // The per-layer `.slot` files, the pinned staging buffers, the file-slot ledger
+    // and `--cold-disk-bytes` are the DISK rung's costs, and none of them is the
+    // cargo's.
+    //
+    // WHAT THIS DOES *NOT* DECOUPLE, STATED SO IT IS NOT MISTAKEN FOR DECOUPLED:
+    // the cargo's write leg is still the per-page tail of the same body that packs
+    // (program_impl.h:11779-11814), so a page must still fit a cold slot. That is
+    // not an accident of this code and it cannot be moved by moving this block: a
+    // retired page keeps its block-table membership and the next round's attention
+    // still reads it, so it must leave a DECODABLE source behind, and the tree has
+    // exactly one such source -- the slot, which is what `transfer_to_cold` promises
+    // (`cold_compressed = true` => `restore_from_cold` repopulates in place,
+    // logical_kv_store.h:771-783, :895-914). A slot needs a codec
+    // (product/kv_tier_formats.h:579-581), which is why the POOL is still armed by
+    // the format table. The third page state this would need ("no device copy, no
+    // slot, rebuild by re-prefill") does not exist: `Page`
+    // (logical_kv_store.h:923-935) has `cold_compressed` and `device_replica` and
+    // nothing else, and the only other detach, `transfer_to_cold_host` (:835), is
+    // justified by READ-FREE pages -- and this stack has none
+    // (program_impl.h:12711-12715; the engine says so out loud at :12193-12204).
+    //
+    // SCOPE: the Disk and HostThenDisk arms are unchanged. For both, a disjunct below
+    // is true, the file is opened once at the same path, with the same
+    // `max_concurrency > 1` refusal and the same non-fatal open-failure arm, so the
+    // `--kv-layer-storage all:int8 --cold-policy disk` readings cannot move.
+    if (cold_policy != ColdPolicy::None || !cold_disk_path.empty()) {
+        // The cargo directory is the spill directory when one was named, else /tmp --
+        // the same resolution the Disk rung uses for `dir` above, and the same one
+        // `recall_cargo_path` sums into the file name.
+        const std::string text_cargo_dir =
+            cold_disk_path.empty() ? std::string("/tmp") : cold_disk_path;
+
+        // ===========================================================================================
+        // [MECHMUX] THE THIRD "ARMED BUT UNWRITABLE" CASE, SAID OUT LOUD.
+        //
+        // `NINFER_RECALL_TEXT` is a PRESENCE test (this file, the recall gate below) and the text leg
+        // is gated on `cold_text_cargo != nullptr`, so the only thing between "the operator armed the
+        // text route" and "the text route runs" is this file being openable. But the cargo's WRITE leg
+        // is the per-page tail of `enqueue_cold_compressions`, whose own gate is
+        // `Window || Disk || HostThenDisk` (this file). `--cold-policy host` is INSIDE this branch
+        // (host != None), so under it the file is opened and the index is armed while NOT ONE ROW is
+        // ever written: the Host rung retires READ-FREE pages and writes no external bytes at all.
+        //
+        // The consequence is the class this tree refuses everywhere else: `recall_cargo_read_run`
+        // returns empty for a plan that named pages and the reason printed is
+        // REASON=no-cargo-record-for-planned-pages -- a PLAN-side reason for a POLICY-side cause, and
+        // `no-candidate` is the state the fleet's own record calls indistinguishable from "the corpus
+        // does not mention it".
+        //
+        // This names it once and changes nothing else: no default, no admission, and no refusal of the
+        // run (the KV read-back path is still live and is still the payload).
+        if (std::getenv("NINFER_RECALL_TEXT") != nullptr && cold_policy == ColdPolicy::Host) {
+            std::fprintf(stderr,
+                         "[textcargo] NINFER_RECALL_TEXT is armed and --cold-policy is host: the cargo "
+                         "file is opened but NOTHING can write a record into it (the writer is the slot "
+                         "tier's page tail, Window|Disk|HostThenDisk), so a page a plan names has no "
+                         "cargo record and the miss reports as "
+                         "REASON=no-cargo-record-for-planned-pages. Use --cold-policy "
+                         "window|disk|host-then-disk for the text route, or drop NINFER_RECALL_TEXT.\n");
+        }
+        // [TEXT-CARGO] The cargo file is opened HERE, beside the KV mirror it replaces, so a
+        // run that spills at all already names the directory the payload goes to: no new CLI
+        // flag, no new API, no second lifetime to get wrong. It is opened unconditionally in
+        // this branch and its failure is NOT fatal -- a cargo that cannot be opened must
+        // degrade to "the KV mirror is the only payload" (loudly, below), never take the
+        // engine down, which is the same rule turn_recall_journal.h states for the L0 log.
+        //
+        // [TEXT-CARGO] WHO THE CARGO IS KEYED BY NOW, AND WHY >1 LANE IS STILL REFUSED HERE.
+        //
+        // THE KEY GAINED A WRITER DIMENSION; THIS PARAGRAPH USED TO SAY IT COULD NOT. The key is
+        // no longer the block index alone: `recall_cargo_path` (turn_recall_journal.h:1436-1437)
+        // takes a `writer` and is injective in it, writer 0 keeps the legacy file name
+        // character-for-character, and `recall_cargo_open_writer` (:1917) is the ONE door that
+        // turns a (directory, writer) pair into a handle, which carries and reports that dimension
+        // (`writer()`, :1743). `write_block`/`read_block`/`read_located_block`
+        // (:1785/:1842/:1877) still take no lane -- the writer rides the FILE, not the record.
+        //
+        // SO WHY IS ARMING ABOVE CONCURRENCY 1 STILL REFUSED? NOT BECAUSE OF THE KEY. A DIFFERENT
+        // premise is still open: the DIRECTORY'S join is PAGE-KEYED. `SumDir::row_for_page`
+        // (spec/sum_dir.h:1775) resolves a page through the dense index `ensure_page_index` builds
+        // (:2164), and that index's tie rule is FIRST-WRITER-WINS (:2176-2179) -- the right rule
+        // for an ADDRESS and the WRONG rule for a LENGTH. The engine takes a LENGTH from the same
+        // lookup (`live_row_for_page` -> `sum_dir_row_tokens`, handed to `read_located_block` and
+        // `recall_cargo_read_run` at program_impl.h:13722-13724 and :13918-13919), so when two
+        // writers retire the SAME page with DIFFERENT lengths -- two lanes of one round, the
+        // routine case, not a corner -- a reader can be handed the OTHER writer's length while the
+        // bytes it then reads are its own, and the read consumes its own ZERO PADDING past its
+        // record's real end.
+        //
+        // WARNING -- CITE `ensure_page_index`, NOT THE COMMENT AT `sum_dir.h:1744-1746`. Those
+        // three lines are a COMMENT about the dead unload plan; the live tie rule is the one named
+        // above. A corrected reason that points at prose about a plan that no longer exists is not
+        // corrected, and the next reader inherits the same dead citation.
+        //
+        // THE REPAIR EXISTS AND IS INERT, WHICH IS WHY THE GATE STAYS. The row's own `generation`
+        // column is ALREADY ON THE WIRE -- `SumDirRow::generation` (sum_dir.h:458), written by
+        // `append` (:1584), carried at offset 28 of the fixed 80-byte stride -- and the tagged
+        // join `row_for_page_generation` (:1848) resolves (generation, page) through it, REFUSING
+        // any page two generations cover (`page_conflict_`, set at :2187 and consulted by
+        // `row_for_page` at :1789). It is INERT because the tag is bound NOWHERE:
+        // `SequenceState::recall_sequence_tag` (program.h:546) is declared and NEVER assigned, so
+        // every row a run writes carries generation 0 and no page can collide. Binding it at
+        // program_impl.h:7953 -- the site that already sets `sequence.lane` -- is the prerequisite
+        // spec/sum_dir.h:382-387 names, and that paragraph is explicit that it is "a prerequisite
+        // for landing this feature, not a citation".
+        //
+        // TWO PREMISES, TWO DECISIONS. Closing the tag is NOT permission to arm: the bounded slot
+        // for that tag is `SequenceState::lane`, not a per-incarnation identity, because an
+        // unbounded identity is unbounded files. Arming above concurrency 1 stays a SEPARATE
+        // decision with its own evidence -- a fixed mechanism does not retire its guard.
+        //
+        // Refusing to ARM is still the one answer COMPLETE at this seam: with no handle there is no
+        // file, so no lane can read another lane's text, and the failure mode is a NAMED startup
+        // line instead of a wrong answer. It degrades (never throws) exactly like the open-failure
+        // arm below, for the same reason. The false negative this seam exists to avoid is "no
+        // collision was observed": with `--max-concurrency 1` the answer is not "we measured no
+        // collision", it is "there is no second writer" -- and it is THIS line, not a run, that
+        // makes that true.
+        // [TEXT-CARGO GATE] THE GATE IS HERE -- AND THIS IS WHY IT HOLDS, so that a reader who
+        // later closes the premise below can FIND it and lift it deliberately. The premise is the
+        // DIRECTORY's page-keyed join, NOT the cargo key: `row_for_page` -> `ensure_page_index`
+        // (spec/sum_dir.h:1775, :2164), FIRST-WRITER-WINS (:2176-2179), so a reader can be handed
+        // another writer's LENGTH. Closing it (`row_for_page_generation` :1848, live but INERT
+        // until `SequenceState::recall_sequence_tag` program.h:546 is bound at
+        // program_impl.h:7953) is a SEPARATE decision with its own evidence -- lifting THIS gate is
+        // not an inference from a fixed cargo key.
+        if (max_concurrency > 1) {
+            std::fprintf(stderr,
+                         "[textcargo] REFUSED: the cargo's key now has a writer dimension, but the "
+                         "DIRECTORY's join does not -- `row_for_page` (spec/sum_dir.h:1775) resolves a page under "
+                         "`ensure_page_index` (:2164) with a FIRST-WRITER-WINS tie (:2176-2179), so the LENGTH "
+                         "handed to a reader can be another writer's while the bytes it reads are its own; with %u "
+                         "lanes arming this would splice this writer's zero padding into a read, so it is refused "
+                         "rather than read wrong (the KV mirror stays the only payload). Use --max-concurrency 1 "
+                         "for the text cargo.\n",
+                         max_concurrency);
+        } else {
+            cold_text_cargo = std::make_unique<spec::turn_recall::TurnRecallTextCargo>(
+                spec::turn_recall::recall_cargo_path(text_cargo_dir));
+            if (!cold_text_cargo->good()) {
+                std::fprintf(stderr,
+                             "[textcargo] open failed: %s (the KV mirror stays the only payload)\n",
+                             cold_text_cargo->path().c_str());
+                cold_text_cargo.reset();
+            } else {
+                // [TEXT-CARGO] THE DIRECTORY IS ARMED WITH THE CARGO, AND ONLY WITH IT. See the
+                // member's note in program.h: a page the directory names is read back from THIS
+                // cargo file, so a directory without a cargo could only ever produce misses, and a
+                // cargo without a directory is exactly what this tree shipped -- text stored, text
+                // never findable, because `summaries_` had no producer and the block->row join did
+                // not exist. The `sequence_tag` is `sequence.recall_sequence_tag`, which is 0 for
+                // every lane today (declared, never assigned -- the inventory's FIX item); it is
+                // passed rather than defaulted so that binding it later moves this line's input and
+                // not this line's code.
+                text_directory = std::make_unique<spec::sum_dir::SumDir>(
+                    /*sequence_tag=*/0U, spec::sum_dir::kSumDirBlockTokens);
+                std::fprintf(stderr,
+                             "[textcargo] index armed: directory rows are written per stored block, "
+                             "catalogue lines searchable by token n-gram (QSummarySubstring), "
+                             "fan-out cap=%u page(s) per pass (NINFER_SUM_DIR_BLOCKS)\n",
+                             recall_fanout_blocks());
+            }
+        }
     }
     text_host_kv_page_stride =
         plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
-    if (cold_policy == ColdPolicy::Host) {
+    if (cold_policy == ColdPolicy::Host || cold_policy == ColdPolicy::HostThenDisk) {
         // The tier owns its own pinned arena: --cold-host-bytes is enforced against
         // THIS pool and nothing else (one cap, one pool -- see program.h). The pool
         // is only materialized when the model can actually use it: on a stack with a
@@ -958,9 +1537,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         //
         // Under ColdPolicy::Host the sum is 0 by construction: effective_cold_pages
         // reserves no cold slots, so no layer owns a cold record and there is nothing
-        // to spill. The ladder is then host -> stay hot, which is what makes it fall
-        // through instead of inventing an overflow. The term is still computed the
-        // H1 way so the disk rung is correct the moment a policy enables both tiers.
+        // to spill; the ladder then degenerates to host -> stay hot, which is what
+        // makes it fall through instead of inventing an overflow. Under
+        // ColdPolicy::HostThenDisk the pool IS reserved, so the sum is the real
+        // per-page spill cost and the disk rung is live. Either way the term is
+        // computed the H1 way (sum of the live per-layer strides).
         std::uint64_t spill_page_bytes = 0;
         for (std::uint32_t layer = 0; layer < decoder->text_kv.layers(); ++layer) {
             const Tensor layer_cold_slots = decoder->text_kv.batch_layer_view(layer).cold_slots;
@@ -968,23 +1549,212 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             spill_page_bytes += static_cast<std::uint64_t>(layer_cold_slots.nb[3]);
         }
         cold_budget.disk_page_bytes = spill_page_bytes;
+
+        // =====================================================================
+        // [coldagree] THE HOST PAGE UNIT AND THE COLD RECORD, SIDE BY SIDE.
+        //
+        // The tree has THREE ways to say "one page" and, until this block, no
+        // site that compared any two of them:
+        //   H  = text_host_kv_page_stride (plan_host_kv_page_layout().page_stride,
+        //        set at :1363-1364 and handed to cold_budget.host_page_bytes at
+        //        :1380) -- the RESIDENT page, and the unit the Cold Host tier
+        //        and its HostKVArena are actually built from;
+        //   D1 = turn_recall_page_bytes() -- the COLD RECORD, and the unit the
+        //        file-slot bitmap divides --cold-disk-bytes by (:1134-1143);
+        //   D2 = spill_page_bytes, summed by the loop immediately above.
+        //
+        // H and D are different objects driven by different dtype axes and are
+        // NOT equal on any shipped stack; D1 and D2 are one object spelled
+        // twice, and the comment at :13330-13331 says only that they are
+        // "recomputed from the same views" -- which is a statement about their
+        // INPUTS, not about the two loops. Nothing asserted either pair.
+        //
+        // WHY HERE: this constructor is the only place in the tree where all
+        // three are in scope at once, and it is reached on every run. The house
+        // two-sided static_assert idiom (decoder_state.cpp's ASSERTATOM block)
+        // has NO LEGAL SITE for this pair -- H comes from a throwing runtime
+        // function and D1 from a non-static member needing a live decoder, and
+        // layouts_impl.h:2066-2067 states in words that both are invisible at
+        // the paging-plan site. See dl/coldagree/REPORT.md TASK A.
+        // =====================================================================
+        {
+            const std::uint64_t host_unit   = static_cast<std::uint64_t>(text_host_kv_page_stride);
+            const std::uint64_t record_unit = turn_recall_page_bytes();
+
+            // (1) ONE OBJECT, TWO SPELLINGS. This equality is the one the tree
+            //     already claims in prose (:13330-13331) and never checked. It
+            //     is unreachable from ANY command line: both loops read the same
+            //     live views with no mutation between them, so it can only fire
+            //     on a code defect in one of the two -- which is exactly what it
+            //     is for. It is NOT a new gate on any configuration.
+            if (record_unit != spill_page_bytes) {
+                throw std::logic_error(
+                    "[cold] THE COLD PAGE RECORD IS SPELLED TWICE IN THIS CONSTRUCTOR AND THE "
+                    "TWO SPELLINGS DISAGREE: the per-layer loop above sums " +
+                    std::to_string(spill_page_bytes) + " B (cold_budget.disk_page_bytes, the "
+                    "unit the ladder's disk rung is priced in), turn_recall_page_bytes() sums " +
+                    std::to_string(record_unit) + " B (the unit the file-slot bitmap divides "
+                    "--cold-disk-bytes by). One page cannot cost two different numbers: "
+                    "reconcile program_impl.h's constructor loop with "
+                    "ProgramImplCore::turn_recall_page_bytes() before quoting either. "
+                    "(dl/coldagree/REPORT.md TASK A)");
+            }
+
+            // (2) THE TWO DENOMINATORS THAT ARE *NOT* THE SAME OBJECT. Reported
+            //     only when they disagree about whether the host cap closes the
+            //     committed prefix (frontier <= device + host), i.e. only when
+            //     the answer actually changes -- so the shipped NVFP4/E8Kv
+            //     stacks and every run whose context fits the device pool stay
+            //     silent. On an int8/bf16/fp8 stack the resident page is
+            //     1.83x-3.55x the cold record and this is the difference between
+            //     "1M fits on the host" and "it does not".
+            const std::uint32_t unit_frontier = unload_pages_for_tokens(capacity);
+            const std::uint32_t unit_device =
+                decoder->text_kv.page_pool().capacity_pages();
+            const std::uint32_t unit_required =
+                unit_frontier > unit_device ? unit_frontier - unit_device : 0U;
+            const detail::ColdPageUnitVerdict units = detail::cold_page_unit_verdict(
+                cold_host_bytes, host_unit, record_unit, unit_required);
+            if (units.diverges) {
+                static bool unit_reported = false;
+                if (!unit_reported) {
+                    unit_reported = true;
+                    std::fprintf(stderr, "%s", detail::cold_page_unit_message(
+                                                  cold_host_bytes, host_unit, record_unit,
+                                                  unit_frontier, unit_device, units).c_str());
+                }
+            }
+        }
         cold_budget.device_cold_pages = decoder->text_kv.max_cold_pages();
         if (!cold_host_layers_are_windowed(layer_windows)) {
+            // A stack with any full-attention layer re-reads every committed token, so
+            // no page is ever read-free and the host rung is structurally empty. Under
+            // the layered policy that costs only rung 1: rung 2 is the slot-spill tier
+            // and does not need read-free pages.
+            cold_host_tier_inert_reported = true;
+            if (cold_policy == ColdPolicy::HostThenDisk) {
+                std::fprintf(stderr,
+                             "[cold] --cold-policy host-then-disk: the HOST rung admits nothing on "
+                             "this model (no layer has a sliding window, so no page is ever "
+                             "read-free) and no pinned pool is reserved; the disk rung still "
+                             "applies\n");
+            } else {
+                std::fprintf(stderr,
+                             "[cold] --cold-policy host admits nothing on this model: no layer has "
+                             "a sliding window, so every committed page stays readable by some "
+                             "layer and can never leave the device; no Host pool is reserved (use "
+                             "--cold-policy window|disk for a read-back cold pool)\n");
+            }
+        } else if (static_cast<std::uint64_t>(*std::max_element(layer_windows.begin(),
+                                                                 layer_windows.end())) +
+                       kColdHostPageTokens >
+                   capacity) {
+            // -----------------------------------------------------------------
+            // THE ADMISSION HORIZON: WHEN THE WINDOW CANNOT ADMIT, THE PIN IS NOT PAID.
+            // -----------------------------------------------------------------
+            // `enqueue_cold_host_evictions` scans pages from page 0 and BREAKS at the first
+            // page `cold_host_page_is_read_free` refuses, so the admitted set is a PREFIX and
+            // page 0 is the easiest page there is: its gate is `(0+1)*64 + W_L <= frontier`
+            // for every layer. `frontier` is `sequence.text_kv_valid`, which the plan bounds
+            // by `capacity` (layouts_impl.h:1827 `capacity = options.max_context`, carried to
+            // `paging.max_context_tokens` at :1939). So when page 0 is not read-free AT
+            // `frontier = capacity`, it is not read-free at any frontier this engine can
+            // produce, and NOT ONE PAGE IS EVER ADMITTED -- while the eager pin below still
+            // reserves the FULL cap.
+            //
+            // MEASURED, not argued. `dl/windowsize/REPORT.md` sweeps the SHIPPED predicate
+            // `cold_host_page_is_read_free` (84 points, 0 mismatches against the closed form
+            // `floor((F - W)/64)`, first admission at exactly `W + 64`): with the band-top
+            // window `W = 646,720` tokens the tier admits **0 pages at every context
+            // <= 646,720** -- which is every context the model was trained on (native
+            // 262,144) -- and the first admission is at 646,784. The plan chose that value
+            // as the band's top edge for "most faithful" arithmetic, and it IS the most
+            // faithful window; but paying 7,168 MB from token 0 for a capability that starts
+            // at token 646,784 is what the measurement actually indicts.
+            //
+            // WHY THE FIX IS THE PIN AND NOT `W`: the pin's size is `--cold-host-bytes`
+            // (program.h:829, 7 GiB) and does not depend on `W` at all, so shrinking `W`
+            // cannot remove the cost; and `W` cannot go below the band's own floor (9,379
+            // pages = 600,256 tokens at 1M) without making the band EMPTY and refusing 1M
+            // outright. Making the COST conditional is the only move that removes cost
+            // without removing capability.
+            //
+            // WHY THIS IS SOUND, AND NOT A GATE WEAKENED: it can only suppress a pin in a
+            // run whose admissions are PROVABLY zero, it is derived from the same page-gate
+            // arithmetic the scan uses, and the 8K proof arm (`W = 4,096`: horizon 4,160 <=
+            // 8,192) is above its own horizon and still takes the branch below -- so the
+            // `host_admissions > 0` acceptance is undisturbed.
+            //
+            // THE REMAINING HOLE, STATED RATHER THAN HIDDEN: `capacity` is the plan's
+            // CEILING, not the traffic. A declared-1.01M serve that only ever sends 8K still
+            // pays the full cap. Closing that needs the arena's allocation to become lazy
+            // (`HostKVArena` reserves `budget.host_bytes` up front, hostbudget/REPORT.md:217),
+            // which is a different change in a different file and is NOT claimed here.
+            const std::uint32_t widest_window = *std::max_element(layer_windows.begin(),
+                                                                  layer_windows.end());
             cold_host_tier_inert_reported = true;
             std::fprintf(stderr,
-                         "[cold] --cold-policy host admits nothing on this model: no layer has a "
-                         "sliding window, so every committed page stays readable by some layer "
-                         "and can never leave the device; no Host pool is reserved (use "
-                         "--cold-policy window|disk for a read-back cold pool)\n");
+                         "[cold] no Host pool reserved: the window cannot admit at this "
+                         "context, so the pin is not paid. The widest window on the paged "
+                         "layers is %u tokens, so page 0 is read-free only at frontier >= %u "
+                         "tokens, and the plan's max context is %u -- this configuration "
+                         "would have reserved the full --cold-host-bytes cap and admitted 0 "
+                         "pages for its whole life. Raise the context above %u tokens, or "
+                         "lower the variant's sliding_window, to make the Host rung "
+                         "reachable\n",
+                         widest_window,
+                         static_cast<unsigned>(widest_window) +
+                             static_cast<unsigned>(kColdHostPageTokens),
+                         capacity,
+                         static_cast<unsigned>(widest_window) +
+                             static_cast<unsigned>(kColdHostPageTokens));
+        } else if (const std::string cold_host_band_refusal = cold_host_band_refusal_at(
+                       cold_policy, layer_windows,
+                       capacity == 0 ? 0U
+                                     : 1U + (capacity - 1U) /
+                                                static_cast<std::uint32_t>(kColdHostPageTokens),
+                       decoder->text_kv.page_pool().capacity_pages(), cold_budget.host_bytes,
+                       static_cast<std::uint64_t>(text_host_kv_page_stride));
+                   !cold_host_band_refusal.empty()) {
+            // THE BAND IS EMPTY: no window can close it, so the pin is not paid. The same
+            // shape as the horizon branch above, and for the same reason -- a pool that
+            // cannot change the outcome is a cost with no capability. NAMED, in the tree's
+            // own words, carrying the pages to raise --cold-host-bytes by.
+            cold_host_tier_inert_reported = true;
+            std::fprintf(stderr, "[cold] no Host pool reserved: %s\n",
+                         cold_host_band_refusal.c_str());
         } else {
             const HostKVPageLayout text_host_layout =
                 plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry());
+            // -----------------------------------------------------------------
+            // THE COST THE MEMORY GATE CANNOT SEE, STATED BEFORE IT IS PAID.
+            // -----------------------------------------------------------------
+            // This is an EAGER pin of the FULL cap: HostKVArena allocates
+            // `budget.host_bytes` up front, not on demand (hostbudget/REPORT.md:217), and
+            // the hardware memory gate samples MemAvailable BEFORE this process starts,
+            // so it has no way to observe this allocation. Declaring a sliding window is
+            // what creates the cost: on every variant today `cold_host_layers_are_windowed`
+            // is false, the tier is never constructed and 0 B is pinned -- the 7 GiB flag
+            // is armed but never spent. It is reported here, BEFORE the allocation and not
+            // after, because an OOM that takes the box down leaves no other record, and a
+            // cost the instrument cannot see is this project's most-repeated defect.
+            std::fprintf(stderr,
+                         "[cold] EAGER PIN, about to reserve %.0f MB (%.0f B) of pinned host memory for the Cold Host tier: the FULL --cold-host-bytes cap, allocated up front. The pre-run MemAvailable gate cannot see this allocation. Host total after this reservation: host-KV arena (serve default 8192 MB) + pinned staging (256 MB) + this %.0f MB = %.0f MB\n",
+                         static_cast<double>(cold_budget.host_bytes) / (1024.0 * 1024.0),
+                         static_cast<double>(cold_budget.host_bytes),
+                         static_cast<double>(cold_budget.host_bytes) / (1024.0 * 1024.0),
+                         8192.0 + 256.0 +
+                             static_cast<double>(cold_budget.host_bytes) / (1024.0 * 1024.0));
             cold_host_tier = std::make_unique<ColdHostTier>(
                 cold_budget, std::span<const HostKVPageLayout>(&text_host_layout, 1));
             if (!cold_host_tier->enabled()) {
                 std::fprintf(stderr,
-                             "[cold] --cold-policy host is inert: %llu B does not hold one %zu B "
-                             "page\n",
+                             cold_policy == ColdPolicy::HostThenDisk
+                                 ? "[cold] --cold-policy host-then-disk: the host rung is inert "
+                                   "(%llu B does not hold one %zu B page); the disk rung still "
+                                   "applies\n"
+                                 : "[cold] --cold-policy host is inert: %llu B does not hold one "
+                                   "%zu B page\n",
                              static_cast<unsigned long long>(cold_budget.host_bytes),
                              text_host_kv_page_stride);
             } else {
@@ -995,7 +1765,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         }
     }
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
-        decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
+        decoder->text_kv.page_pool(),
+        logical_page_capacity(decoder->text_kv.page_pool(),
+                              decoder->text_kv.execution_tables()));
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
@@ -1048,7 +1820,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         backend_host_kv_page_stride =
             plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;
         backend_kv_pages = std::make_unique<LogicalKVPageStore>(
-            backend->page_pool(), logical_page_capacity(backend->page_pool()));
+            backend->page_pool(),
+            logical_page_capacity(backend->page_pool(), backend->execution_tables()));
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
@@ -1086,6 +1859,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
 
     io = qwen3_6::RoundState(backing, plan.persistent.round);
+    // TREE-FIX-LAND 打印点 D（HOST ONLY，只读；整块删除即回退）：plan 那份 / spec 那份 /
+    // frame 那份在同一行对账。io.mtp_decode 是 RoundState 的 optional 成员。
+    std::fprintf(stderr,
+                 "[planframe] plan_dtp=%u plan_dtd=%u spec_dtp=%u spec_dtd=%u frame_dtp=%u "
+                 "has_mtp_decode=%d\n",
+                 plan.draft_tree_paths, plan.draft_tree_depth,
+                 plan.persistent.round.spec.draft_tree_paths,
+                 plan.persistent.round.spec.draft_tree_depth,
+                 io.mtp_decode ? io.mtp_decode->draft_tree_paths : 0u,
+                 static_cast<int>(io.mtp_decode.has_value()));
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }
@@ -1180,6 +1963,32 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    // [COLD-FALLBACK CENSUS] the ONE report, once per process, emitted HERE and not on the
+    // pass: the pass runs once per round, so a per-pass line makes the rate converge only
+    // for a reader who diffs consecutive lines, while a per-page line is the 0.932 ms/call
+    // defect this tree already measured once and had to make edge-triggered. Silenced
+    // entirely when nothing was ever seen, so a run in which no page falls back says nothing
+    // at all. It is the FIRST statement in the body on purpose: it is host-only, depends on
+    // no teardown step and no device, and must survive a teardown that later blocks.
+    if (ninfer::targets::qwen3_6::cold_fallback::g_census.any()) {
+        char cold_fallback_line[2048];
+        (void)ninfer::targets::qwen3_6::cold_fallback::g_census.format(
+            cold_fallback_line, sizeof(cold_fallback_line),
+            static_cast<std::uint32_t>(ninfer::ops::kEntropyNvfp4SlotBytes));
+        std::fprintf(stderr, "%s\n", cold_fallback_line);
+    }
+    // [COLD-HOST REFETCH CENSUS] the same ONE-report-per-process discipline, immediately beside
+    // the census above and for the same reasons: the increment site is a per-page loop inside a
+    // materialization, so a per-page or per-round line would be the 0.932 ms/call defect this
+    // tree already measured once. `format()` returns 0 and writes not one byte when nothing was
+    // refetched, so a run whose window held prints NOTHING here and silence means exactly that.
+    {
+        char cold_refetch_line[512];
+        const std::size_t cold_refetch_len =
+            ninfer::targets::qwen3_6::cold_host_refetch::g_census.format(cold_refetch_line,
+                                                                        sizeof(cold_refetch_line));
+        if (cold_refetch_len != 0) { std::fprintf(stderr, "%s\n", cold_refetch_line); }
+    }
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
     if (cold_requant_codes != nullptr) {
@@ -1650,7 +2459,7 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_shared
                             runtime::ContextResourceClass resource, std::uint64_t tag) {
         const bool backend           = resource == runtime::ContextResourceClass::BackendKV;
         KVPressureSelection selected = select_kv_pressure_actions(
-            addresses, pages, host_kv_extents.get(),
+            addresses, pages, host_kv_extents.get(), cold_host_tier.get(),
             host_kv_arena != nullptr && host_kv_extents != nullptr, address, std::nullopt,
             requested, host_kv_remaining, resource, changes,
             [&](std::uint32_t page, LogicalKVPageHandle logical) {
@@ -1878,7 +2687,7 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressu
                             runtime::ContextResourceClass resource, std::uint64_t tag) {
         const bool backend           = resource == runtime::ContextResourceClass::BackendKV;
         KVPressureSelection selected = select_kv_pressure_actions(
-            addresses, pages, host_kv_extents.get(),
+            addresses, pages, host_kv_extents.get(), cold_host_tier.get(),
             host_kv_arena != nullptr && host_kv_extents != nullptr, address, mapped_limit,
             requested, host_kv_remaining, resource, changes,
             [&](std::uint32_t page, LogicalKVPageHandle logical) {
@@ -4529,7 +5338,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
 
         materialization_ledger_.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         materialization_identity_.assign(prompt);
+        // w-find2 D-3 station 1/5 (chain ASSIGN, :4624).
+        const std::size_t wfd2_chain_before_4624 = materialization_prefix_digests_.size();
         materialization_prefix_digests_.assign(prompt);
+        std::fprintf(stderr,
+                     "[recall][D3] site=4624-assign tokens=%zu chain=%zu->%zu live=%zu\n",
+                     prompt.token_ids.size(), wfd2_chain_before_4624,
+                     materialization_prefix_digests_.size(),
+                     turn_recall_journal ? turn_recall_journal->live_count() : 0);
 
         const std::uint32_t initial_mtp_extent =
             speculative_backend == SpeculativeBackend::Mtp
@@ -4812,6 +5628,68 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     (void)checked_resource_difference(details.demand.final_removed, removed);
 }
 
+// WHICH POOL OWNS THIS REPLICA -- one question, asked in one place.
+//
+// A `HostKVExtentCapability` is an (owner, index, generation) triple that only the store which
+// published it may resolve: `HostKVExtentStore::valid()` IS `capability.owner_ == this`
+// (host_kv_extent_store.h:230-234), and every other capability consumer in the tree asks it before
+// acting (`can_release_page_replica` :274-291, `release` :241-272, the internal readers at :331,
+// :492, :540). The restore executor is the one reader that DEREFERENCES a capability, and it used to
+// name a single store for two pools: `host_kv_extents`, the checkpoint/resume pool built at
+// program_impl.h:1449/1462 -- while the Cold Host tier publishes into its OWN store over its own
+// arena (cold_host_tier.h:471 arena_, :478 extents_), reached on the eviction side as
+// `cold_host_tier->extents()` (program_impl.h:12635) and used for the D2H at :12672 and the publish
+// at :12676. A page the tier evicted therefore had no restorable source on this path at all: the
+// read at :5714 threw `std::invalid_argument("Host KV extent is stale")`
+// (host_kv_extent_store.h:451-458) on its ownership term, for EVERY such page, unconditionally.
+//
+// The producing store is not changed here and needs no change: it prepares, copies, publishes and
+// validates through one store and is self-consistent. Only the reader hard-coded a pool, so the
+// reader asks. `owner_ == this` is exclusive, so at most one answer here is ever non-null.
+[[nodiscard]] inline HostKVExtentStore*
+host_replica_store(HostKVExtentStore* checkpoint_extents, ColdHostTier* cold_host_tier,
+                   const HostKVExtentCapability& capability) noexcept {
+    if (checkpoint_extents != nullptr && checkpoint_extents->valid(capability)) {
+        return checkpoint_extents;
+    }
+    if (cold_host_tier != nullptr && cold_host_tier->enabled()) {
+        HostKVExtentStore* const tier_extents = cold_host_tier->extents();
+        if (tier_extents != nullptr && tier_extents->valid(capability)) { return tier_extents; }
+    }
+    return nullptr;
+}
+
+// A STRIDE READ THROUGH A CAPABILITY MUST NAME THE POOL THAT PUBLISHED IT -- and when no pool
+// owns it, that is a fact to REPORT, never a zero to pass on.
+//
+// Three readers below turn a host-resident page into Host KV bytes with
+// `store->view(capability).layout().page_stride`. BOTH pools' layouts come from the SAME call
+// (`plan_host_kv_page_layout`, :1352-1353 for the tier and :1443 for the checkpoint pool), so
+// whichever pool resolves the capability the NUMBER is identical -- which is exactly why naming
+// the wrong one was invisible. `view()` is the only place ownership is ever tested
+// (host_kv_extent_store.h:236-239 -> require :451-458 -> valid :230-234) and there it THROWS.
+// Handing that throw to a `catch (...) { return {}; }` is what turned a wrong lookup into a zero,
+// and the zero is not cosmetic: it fires the `materialization source has no resident state`
+// refusal in `prepare_materialization`, it lands in `demand.active_entitlement` and so in every
+// host-capacity `fits()`, and `host_kv_prefix_bytes`'s zero becomes `plan->source_resources` ->
+// `early_source_release` -> `physical_peak_additional`. So the reader asks its owner, and a
+// reading that cannot be taken SAYS SO before it degrades. The zero stays -- both readers are
+// `noexcept` and a zero is their declared fallback -- but it is no longer anonymous.
+[[nodiscard]] inline std::size_t
+host_replica_page_stride(HostKVExtentStore* checkpoint_extents, ColdHostTier* cold_host_tier,
+                         const HostKVExtentCapability& capability) {
+    HostKVExtentStore* const store =
+        host_replica_store(checkpoint_extents, cold_host_tier, capability);
+    if (store == nullptr) { throw std::logic_error("Host KV replica has no owning Host pool"); }
+    return store->view(capability).layout().page_stride;
+}
+
+// The record that a reading degraded: one line on the stderr the cold rungs already report on,
+// naming the reader and the cause that would otherwise have been discarded silently.
+inline void report_host_kv_reading_degraded(const char* reader, const char* cause) noexcept {
+    std::fprintf(stderr, "[host-kv] %s degraded to zero: %s\n", reader, cause);
+}
+
 void ProgramImplCore::prepare_materialization(MaterializationTransaction& transaction) {
     if (transaction.prepared || !transaction.plan ||
         transaction.destination.value >= max_concurrency ||
@@ -5052,12 +5930,62 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                     }
                     continue;
                 }
-                if (!pages.host_resident(logical) || !host_kv_extents) {
+                if (!pages.host_resident(logical) ||
+                    host_replica_store(host_kv_extents.get(), cold_host_tier.get(),
+                                       pages.host_replica(logical).extent) == nullptr) {
                     throw std::logic_error("checkpoint KV page has no restorable replica");
                 }
                 const HostKVPageReplica replica = pages.host_replica(logical);
                 const DeviceKVPageHandle destination =
                     pages.reserve_device_replica(logical, reservation);
+                // =================================================================================
+                // [THE REFETCH, COUNTED AT THE ONE SITE THAT PERFORMS IT]
+                //
+                // This statement is the only place in the tree that gives a device replica back to
+                // a page whose surviving replica lives in pinned Host memory: `reserve_device_replica`
+                // has exactly this one call site (git grep, whole tree). The page is then handed to
+                // `enqueue_materialization_transfers`, whose `copy_from_host` is the H2D byte mover.
+                //
+                // WHY IT NEEDS COUNTING, AND WHY HERE RATHER THAN IN THE TIER. The recall window's
+                // economy is stated as "re-fetch of an evicted page: ZERO, and that is the entire
+                // point of the window" (cold_host_tier.h:239); without the window, the arm pays a
+                // fresh H2D of every page it admitted EVERY round (the measured 227 pages x 1.127 MiB
+                // = 256 MiB/round against a 26.9 ms unpaged round). `ColdTierCounters` cannot hold
+                // this number -- its own comment says so: "a Host-tier page comes back through the
+                // engine's materialization path, which the tier never sees, so counting them here
+                // would be a lie" (product/kv_cold_tier_budget.h:69-72). This lambda DOES see it.
+                //
+                // THE GATE IS EXACT, NOT A PROXY. `cold_host_tier->extents()->valid(replica.extent)`
+                // is the owning store's own liveness test: a HostKVExtentCapability carries its
+                // `owner_` (logical_kv_store.h:25-39) and `valid()` requires `owner_ == this`
+                // (host_kv_extent_store.h:230-234), so a replica published by the TIER's arena is
+                // counted and a replica from the OTHER pinned pool (`host_kv_extents`, the
+                // resume/checkpoint pool) is not. That distinction matters: only the tier's evictions
+                // are what the window's cost model calls refetches.
+                //
+                // AND NOTE WHAT THIS COUNTER ALSO PROVES WHEN IT FIRES. `enqueue_materialization_transfers`
+                // reads its source bytes from `host_kv_extents->view(restores[begin].extent)`
+                // (:5792) -- the OTHER store's arena -- while a tier-evicted page's capability names
+                // the tier's store. That call validates ownership and throws
+                // `std::invalid_argument("Host KV extent is stale")` (host_kv_extent_store.h:230-234,
+                // :236-239). So on a windowed stack this count is not merely "the window lied": it is
+                // the number of pages that reach a restore which cannot complete from the store it
+                // names. Zero is the only value that keeps that path unreachable, which is exactly
+                // why it must be counted rather than assumed.
+                // *** REPAIRED 2026-09-18 (line: storepair), ADDITIVE, the counter above is
+                // untouched. *** The paragraph above was a correct account of the code as it
+                // stood when this counter landed: the executor DID read `host_kv_extents`
+                // while the tier published into `cold_host_tier->extents()`, so every nonzero
+                // count also meant an impossible restore. The executor now resolves the
+                // capability against its OWNER (`host_replica_store`, declared immediately
+                // above prepare_materialization), so a nonzero count is now only ever the
+                // window's claim failing -- no longer evidence of a dead restore route. See
+                // dl/storepair/REPORT.md.
+                if (cold_host_tier != nullptr && cold_host_tier->enabled() &&
+                    cold_host_tier->extents()->valid(replica.extent)) {
+                    ninfer::targets::qwen3_6::cold_host_refetch::note_refetch_pages(
+                        1U, cold_host_tier->budget().host_page_bytes);
+                }
                 restores.push_back(MaterializationTransaction::KVRestorePage{
                     .logical     = logical,
                     .extent      = replica.extent,
@@ -5249,8 +6177,13 @@ void ProgramImplCore::enqueue_materialization_transfers(MaterializationTransacti
                        restores[end].extent_page == restores[end - 1].extent_page + 1U) {
                     ++end;
                 }
+                HostKVExtentStore* const source_store = host_replica_store(
+                    host_kv_extents.get(), cold_host_tier.get(), restores[begin].extent);
+                if (source_store == nullptr) {
+                    throw std::logic_error("KV restore source has no owning Host pool");
+                }
                 const HostKVAllocationConstView source =
-                    host_kv_extents->view(restores[begin].extent)
+                    source_store->view(restores[begin].extent)
                         .subview(restores[begin].extent_page,
                                  static_cast<std::uint32_t>(end - begin));
                 pages.physical_pool().copy_from_host(
@@ -6571,18 +7504,36 @@ void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
     sequence.prefix_identity.clear();
+    // w-find2 D-3 station 5/5 (chain CLEAR at continuation-slot release, :6666). NOTE:
+    // release_sequence_kv already cleared cold_pages (:10767), so cold=0 here by CONSTRUCTION;
+    // the number that matters at this site is `recorded` -- recall_recorded survives the release.
+    const std::size_t wfd2_chain_before_6666 = sequence.prefix_digests.size();
     sequence.prefix_digests.clear();
+    std::fprintf(stderr,
+                 "[recall][D3] site=6666-slot-release cold=%zu chain=%zu->%zu recorded=%zu "
+                 "live=%zu\n",
+                 sequence.cold_pages.size(), wfd2_chain_before_6666,
+                 sequence.prefix_digests.size(), sequence.recall_recorded.size(),
+                 turn_recall_journal ? turn_recall_journal->live_count() : 0);
     sequence.rope_delta              = 0;
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
     sequence.mtp_draft_count         = 0;
+    // A reused lane must not inherit the previous request's published draft tree: verifying a
+    // stale tree would read the wrong depths and masks for a brand new request.
+    sequence.mtp_tree_columns        = 0;
     // The criterion's depth-conditional accept counts are per request, not per lane: a
     // lane reused for the next request must not start from the previous request's survival
     // record. Both fields are written only under NINFER_MTP_WINDOW_CUT (mtp_window_cut.h),
     // so this is inert for every fixed-k run.
     sequence.mtp_window              = {};
     sequence.mtp_drafted_extent      = 0;
+    // A reused lane must not inherit the previous request's chosen rung, nor its realized-width
+    // average. 0 = "no decision yet", which starts the next request on the ladder top.
+    sequence.mtp_target_width        = 0;
+    sequence.mtp_width_rounds        = 0;
+    sequence.mtp_width_sum           = 0;
     sequence.tail_hidden_valid       = false;
     sequence.endpoint_valid          = false;
     sequence.rewrite_checkpoint      = {};
@@ -6668,11 +7619,12 @@ ProgramImplCore::resident_resources(const SequenceState& sequence) const noexcep
                 if (pages.address_references(logical) > 1) { continue; }
                 if (pages.device_resident(logical)) { ++device_pages; }
                 if (pages.host_resident(logical)) {
-                    if (!host_kv_extents) {
-                        throw std::logic_error("missing Host KV extent store");
-                    }
+                    // Ask the pool that OWNS this replica. The `!host_kv_extents` refusal that
+                    // stood here named ONE pool; the Cold Host tier publishes into its own
+                    // (:5242-5254), so that refusal was false for every tier-evicted page.
                     const HostKVPageReplica& replica = pages.host_replica(logical);
-                    out.host.kv_bytes += host_kv_extents->view(replica.extent).layout().page_stride;
+                    out.host.kv_bytes += host_replica_page_stride(
+                        host_kv_extents.get(), cold_host_tier.get(), replica.extent);
                 }
             }
             if (addresses.active(address)) {
@@ -6687,7 +7639,14 @@ ProgramImplCore::resident_resources(const SequenceState& sequence) const noexcep
             add_kv(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
                    out.device.backend_kv_pages);
         }
-    } catch (...) { return {}; }
+    } catch (const std::exception& degraded) {
+        report_host_kv_reading_degraded("resident_resources(sequence)", degraded.what());
+        return {};
+    } catch (...) {
+        report_host_kv_reading_degraded("resident_resources(sequence)",
+                                        "non-standard exception");
+        return {};
+    }
     return out;
 }
 
@@ -6716,11 +7675,12 @@ ProgramImplCore::resident_resources(const SharedPrefixState& shared) const noexc
                 if (pages.address_references(logical) != 1) { continue; }
                 if (pages.device_resident(logical)) { ++device_pages; }
                 if (pages.host_resident(logical)) {
-                    if (!host_kv_extents) {
-                        throw std::logic_error("missing Host KV extent store");
-                    }
+                    // Ask the pool that OWNS this replica. The `!host_kv_extents` refusal that
+                    // stood here named ONE pool; the Cold Host tier publishes into its own
+                    // (:5242-5254), so that refusal was false for every tier-evicted page.
                     const HostKVPageReplica& replica = pages.host_replica(logical);
-                    out.host.kv_bytes += host_kv_extents->view(replica.extent).layout().page_stride;
+                    out.host.kv_bytes += host_replica_page_stride(
+                        host_kv_extents.get(), cold_host_tier.get(), replica.extent);
                 }
             }
         };
@@ -6732,7 +7692,14 @@ ProgramImplCore::resident_resources(const SharedPrefixState& shared) const noexc
             add_kv(*backend_kv_addresses, *backend_kv_pages, *shared.kv->backend,
                    out.device.backend_kv_pages);
         }
-    } catch (...) { return {}; }
+    } catch (const std::exception& degraded) {
+        report_host_kv_reading_degraded("resident_resources(shared)", degraded.what());
+        return {};
+    } catch (...) {
+        report_host_kv_reading_degraded("resident_resources(shared)",
+                                        "non-standard exception");
+        return {};
+    }
     return out;
 }
 
@@ -6987,7 +7954,12 @@ ProgramImplCore::missing_shared_device_kv_prefix_pages(const KVAddressSpaceStore
 std::size_t ProgramImplCore::host_kv_prefix_bytes(const KVAddressSpaceStore& addresses,
                                                   KVAddressSpaceHandle address,
                                                   std::uint32_t frontier) const noexcept {
-    if (!host_kv_extents) { return 0; }
+    // `host_kv_extents` is the checkpoint/resume pool; the Cold Host tier publishes into its
+    // OWN store (:5242-5254), so returning early just because that ONE pool is absent made
+    // this reader answer 0 for every tier-evicted page without ever looking at one.
+    if (!host_kv_extents && (cold_host_tier == nullptr || !cold_host_tier->enabled())) {
+        return 0;
+    }
     try {
         const LogicalKVPageStore& pages =
             (&addresses == text_kv_addresses.get()) ? *text_kv_pages : *backend_kv_pages;
@@ -7011,13 +7983,20 @@ std::size_t ProgramImplCore::host_kv_prefix_bytes(const KVAddressSpaceStore& add
                 // old Host replica cannot remain part of the active entitlement.
                 continue;
             }
-            const std::size_t stride =
-                host_kv_extents->view(pages.host_replica(logical).extent).layout().page_stride;
+            const std::size_t stride = host_replica_page_stride(
+                host_kv_extents.get(), cold_host_tier.get(), pages.host_replica(logical).extent);
             if (stride > std::numeric_limits<std::size_t>::max() - bytes) { return 0; }
             bytes += stride;
         }
         return bytes;
-    } catch (...) { return 0; }
+    } catch (const std::exception& degraded) {
+        report_host_kv_reading_degraded("host_kv_prefix_bytes", degraded.what());
+        return 0;
+    } catch (...) {
+        report_host_kv_reading_degraded("host_kv_prefix_bytes",
+                                        "non-standard exception");
+        return 0;
+    }
 }
 
 PendingBatch ProgramImplCore::wrap_pending(std::span<const std::uint32_t> lanes,
@@ -9419,7 +10398,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // A retained source may carry cold-pool pages: warm them back into
             // physical pages before any prefix fork touches the membership.
             if (private_source_ready &&
-                (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk)) {
+                (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk ||
+                 cold_policy == ColdPolicy::HostThenDisk)) {
                 SequenceState& source = continuation_states[transaction.source_index];
                 if (source.kv && source.kv->text.valid() &&
                     text_kv_addresses->active(source.kv->text)) {
@@ -9651,7 +10631,15 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             sequence.rewrite_checkpoint = {};
             ordered_reset(sequence);
             sequence.ledger.clear();
+            // w-find2 D-3 station 2/5 (chain CLEAR, Root reuse, :9752).
+            const std::size_t wfd2_chain_before_9752 = sequence.prefix_digests.size();
             sequence.prefix_digests.clear();
+            std::fprintf(stderr,
+                         "[recall][D3] site=9752-root-clear cold=%zu chain=%zu->%zu "
+                         "recorded=%zu live=%zu\n",
+                         sequence.cold_pages.size(), wfd2_chain_before_9752,
+                         sequence.prefix_digests.size(), sequence.recall_recorded.size(),
+                         turn_recall_journal ? turn_recall_journal->live_count() : 0);
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
         } else if (preserving_source) {
@@ -9738,7 +10726,15 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
+            // w-find2 D-3 station 3/5 (chain TRUNCATE, resident append, :9839).
+            const std::size_t wfd2_chain_before_9839 = sequence.prefix_digests.size();
             sequence.prefix_digests.truncate(base);
+            std::fprintf(stderr,
+                         "[recall][D3] site=9839-truncate base=%u cold=%zu chain=%zu->%zu "
+                         "recorded=%zu live=%zu\n",
+                         base, sequence.cold_pages.size(), wfd2_chain_before_9839,
+                         sequence.prefix_digests.size(), sequence.recall_recorded.size(),
+                         turn_recall_journal ? turn_recall_journal->live_count() : 0);
             reserve_state_entitlement(sequence, state_slots);
             refresh_state_views(sequence);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
@@ -9786,7 +10782,15 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                                            request_plan.backend_kv_page_entitlement);
             sequence.tail_hidden_valid = base == prompt_tokens;
             sequence.ledger.resize(base);
+            // w-find2 D-3 station 4/5 (chain TRUNCATE, rewrite-checkpoint reuse, :9887).
+            const std::size_t wfd2_chain_before_9887 = sequence.prefix_digests.size();
             sequence.prefix_digests.truncate(base);
+            std::fprintf(stderr,
+                         "[recall][D3] site=9887-truncate-rewrite base=%u cold=%zu "
+                         "chain=%zu->%zu recorded=%zu live=%zu\n",
+                         base, sequence.cold_pages.size(), wfd2_chain_before_9887,
+                         sequence.prefix_digests.size(), sequence.recall_recorded.size(),
+                         turn_recall_journal ? turn_recall_journal->live_count() : 0);
             reserve_state_entitlement(sequence, state_slots);
             refresh_state_views(sequence);
         } else {
@@ -9803,7 +10807,37 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
             : speculative_backend == SpeculativeBackend::DFlash2 ? 0U
                                                                  : 0U;
-        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        // THE RESIDENT WORKING SET IS MAPPED AT INSTALL, NOT THE WHOLE PROMPT --
+        // the third and last place the whole-sequence assumption lived. Mapping
+        // `prompt_tokens` here requires the pool to hold the ENTIRE prompt before a
+        // single token is processed, so a prompt longer than the pool could not even
+        // be installed: the admission change above would have been sufficient for the
+        // refusal to stop and insufficient for the request to run, which is exactly
+        // the "水位在卸、准入还在拒" family of half-fixes this change is meant to avoid.
+        //
+        // When the unload leg is OFF, `unload_watermark_pages == 0` and this is
+        // `ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized)`,
+        // character for character. When it is ARMED, the bound is the resident
+        // requirement from the ONE source, and advance_prefill() extends the mapping
+        // chunk by chunk as the frontier moves (see the chunk loop) -- which is sound
+        // because ensure_mapped_to_tokens() is incremental and idempotent by name and
+        // by contract, and because a page that leaves for a cold slot gives its
+        // physical page back to the pool.
+        std::uint32_t mapped_main_tokens = prompt_tokens;
+        std::uint32_t mapped_backend_tokens = backend_materialized;
+        if (const std::uint32_t resident_pages = resident_text_kv_pages_required();
+            resident_pages != 0) {
+            const std::uint64_t resident_tokens =
+                static_cast<std::uint64_t>(resident_pages) *
+                static_cast<std::uint64_t>(kPagedKVPageSize);
+            if (resident_tokens < mapped_main_tokens) {
+                mapped_main_tokens = static_cast<std::uint32_t>(resident_tokens);
+            }
+            if (resident_tokens < mapped_backend_tokens) {
+                mapped_backend_tokens = static_cast<std::uint32_t>(resident_tokens);
+            }
+        }
+        ensure_sequence_kv_mapped(sequence, mapped_main_tokens, mapped_backend_tokens);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -9815,7 +10849,20 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);
         sequence.prefix_identity.swap(materialization_identity_);
+        // w-find3 D-3 station 6/6 (chain SWAP, equal-length REPLACEMENT, :9916).
+        // Paired with station 1/5: assign() loads the STAGING chain, swap() publishes it.
+        // swap() never throws and never checks length, so this is the one chain event that
+        // can replace a chain UNDER a live record in complete silence: `chain < base` is not
+        // visible here, only `before -> after` is, and spilled_unfindable does not fire
+        // because the old key is still live (D-1's chain_rewritten is the witness).
+        const std::size_t wfd2_chain_before_9916 = sequence.prefix_digests.size();
         sequence.prefix_digests.swap(materialization_prefix_digests_);
+        std::fprintf(stderr,
+                     "[recall][D3] site=9916-swap cold=%zu chain=%zu->%zu recorded=%zu "
+                     "live=%zu\n",
+                     sequence.cold_pages.size(), wfd2_chain_before_9916,
+                     sequence.prefix_digests.size(), sequence.recall_recorded.size(),
+                     turn_recall_journal ? turn_recall_journal->live_count() : 0);
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
@@ -10078,52 +11125,236 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                 } else {
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
                     std::uint32_t window      = static_cast<std::uint32_t>(next < 0 ? 0 : next);
-                    // Survival/cost criterion (see mtp_window_cut.h): fold this round's accept
-                    // record and cap the next window at the depth whose expected token value
-                    // still pays for the column. Knobs: NINFER_MTP_WINDOW_CUT=0 disables,
-                    // NINFER_MTP_WINDOW_RATIO overrides b/a for calibration.
+                    // Survival/cost criterion (see mtp_window_cut.h). It pays off on the axis it
+                    // models only when the round cost follows the width it chooses, so:
                     //
-                    // Opt-in, and it stays opt-in - it is not "unverified", it was verified and
-                    // it lost. dl/_criterion_ab.txt: -27% against the best fixed k on the code
-                    // prompt (236.84 vs 322.67 tok/s) and on the high-entropy prompt (138.76 vs
-                    // 190.00), a tie on strong repetition. The criterion removes LIVE columns
-                    // while the round cost follows the CAPTURED width (b_mask = 0.103 ms/col vs
-                    // b_width = 0.737 ms/col), so every column it drops costs far more acceptance
-                    // length than it saves time. Consequences for this call site: keep the
-                    // default off so every existing fixed-k experiment keeps meaning "fixed k",
-                    // and do not turn it on from the `auto` front end either - auto resolves to
-                    // DFlash2 for the dflash2 artifact, and otherwise to MTP with k=3, where a
-                    // shrink-only cap can only ever cost tokens.
+                    //  * mtp_ladder NON-EMPTY (adaptive: `--spec auto`, or
+                    //    `--spec mtp --draft-tokens 0`). The criterion owns the CAPTURED width.
+                    //    It folds the finished round every time -- free, the estimator is
+                    //    host-side and the accept record is already in the egress -- re-decides
+                    //    the RUNG at the coarse cadence kMtpWidthRedecisionRounds, and caps the
+                    //    next round's live extent at that rung. The replay then launches the graph
+                    //    captured for that rung, so a column the criterion drops really saves
+                    //    b_width.
+                    //  * mtp_ladder EMPTY (fixed k). The pre-ladder behaviour is preserved
+                    //    verbatim, including the live-extent-only path, which is still opt-in
+                    //    behind NINFER_MTP_WINDOW_CUT and still off by default. It is not
+                    //    "unverified" -- it was verified and it lost (dl/_criterion_ab.txt: -27%
+                    //    against the best fixed k on the code and high-entropy prompts, a tie on
+                    //    strong repetition) because it removed LIVE columns while the round cost
+                    //    followed the CAPTURED width (b_mask = 0.103 ms/col vs
+                    //    b_width = 0.737 ms/col). Enable it only to reproduce that A/B.
+                    //
+                    // Knobs: NINFER_MTP_WINDOW_CUT=1 enables the fixed-k live-extent path,
+                    // NINFER_MTP_WINDOW_RATIO overrides b/a, NINFER_MTP_WINDOW_DENOM=1 restores
+                    // the historical post-add denominator, NINFER_MTP_WINDOW_TRACE=1|2 prints the
+                    // chosen width per re-decision (2 = every round).
                     static const bool kWindowCutEnabled = [] {
                         const char* env     = std::getenv("NINFER_MTP_WINDOW_CUT");
                         const bool enabled  = env != nullptr && std::atoi(env) != 0;
                         if (enabled) {
                             static_cast<void>(std::fprintf(
                                 stderr,
-                                "[mtp-window-cut] enabled: measured net-negative (-27%% on the "
-                                "code and high-entropy prompts against the best fixed k); the "
-                                "cost follows the captured width, not the live column count - "
-                                "read the STATUS note in mtp_window_cut.h first\n"));
+                                "[mtp-window-cut] enabled for a FIXED-k run: this is the "
+                                "live-extent-only actuator that measured -27%% against the best "
+                                "fixed k, because the round cost follows the captured width and "
+                                "not the live column count. An adaptive run does not need it - it "
+                                "selects the captured width instead. Read the STATUS note in "
+                                "mtp_window_cut.h first\n"));
                         }
                         return enabled;
                     }();
-                    static const float kWindowCostRatio = [] {
+                    // NINFER_MTP_WINDOW_RATIO pins b/a (0 = not set, i.e. calibrate at runtime).
+                    static const float kWindowCostRatioEnv = [] {
                         const char* env = std::getenv("NINFER_MTP_WINDOW_RATIO");
-                        return env != nullptr ? static_cast<float>(std::atof(env))
-                                              : qwen3_6::detail::kMtpWindowCostRatio;
+                        return env != nullptr ? static_cast<float>(std::atof(env)) : 0.0F;
                     }();
-                    if (kWindowCutEnabled) {
-                        const std::int32_t accepted = mtp_host_egress->accepted_drafts[row];
-                        const std::uint32_t cut     = qwen3_6::detail::update_mtp_window_cut(
-                            sequence.mtp_window,
-                            static_cast<std::uint32_t>(accepted < 0 ? 0 : accepted),
-                            sequence.mtp_drafted_extent, draft_window, kWindowCostRatio);
-                        if (cut < window) { window = cut; }
+                    // The fallback is only used until the runtime fit has two samples at two
+                    // different widths; after that the criterion is priced with what this
+                    // configuration measures (see MtpCostCalibration).
+                    static const float kWindowCostRatio =
+                        kWindowCostRatioEnv != 0.0F ? kWindowCostRatioEnv
+                                                    : qwen3_6::detail::kMtpWindowCostRatio;
+                    // NINFER_MTP_WINDOW_UNOBSERVED=1 prices a depth no round has reached at the
+                    // prior mean again, which is how a recorded run was measured.
+                    static const bool kWindowPriorUnobserved = [] {
+                        const char* env = std::getenv("NINFER_MTP_WINDOW_UNOBSERVED");
+                        return env != nullptr && std::atoi(env) != 0;
+                    }();
+                    // Reproduce the recorded A/B: the historical post-add denominator C(k) = a+bk
+                    // instead of the exact C(k-1). The derivation is in mtp_window_cut.h; the
+                    // post-add form over-drafts by one column on the code prompt (k=10 against an
+                    // exhaustive optimum of 9).
+                    static const bool kWindowPostAdd = [] {
+                        const char* env = std::getenv("NINFER_MTP_WINDOW_DENOM");
+                        return env != nullptr && std::atoi(env) != 0;
+                    }();
+                    // Per-round window tracing: the instrumentation mtp_window_cut.h's open +-1
+                    // discrepancy asks for. 1 = on a re-decision or a width change, 2 = every
+                    // round. The line carries the chosen rung, the raw cut, the survival, the
+                    // hit rate and the threshold behind the cut.
+                    static const int kWindowTrace = [] {
+                        const char* env = std::getenv("NINFER_MTP_WINDOW_TRACE");
+                        return env != nullptr ? std::atoi(env) : 0;
+                    }();
+                    // NINFER_MTP_WINDOW_SHRINK=0 disables the prior shrinkage and
+                    // NINFER_MTP_WINDOW_MINREACH=<f> sets the optional scan floor; both are part
+                    // of reproducing dl/_criterion_ab.txt (with NINFER_MTP_WINDOW_DENOM=1).
+                    static const bool kWindowShrink = [] {
+                        const char* env = std::getenv("NINFER_MTP_WINDOW_SHRINK");
+                        return env == nullptr || std::atoi(env) != 0;
+                    }();
+                    static const float kWindowMinReach = [] {
+                        const char* env = std::getenv("NINFER_MTP_WINDOW_MINREACH");
+                        return env != nullptr ? static_cast<float>(std::atof(env))
+                                              : qwen3_6::detail::kMtpWindowMinimumReach;
+                    }();
+                    const std::int32_t accepted = mtp_host_egress->accepted_drafts[row];
+                    if (mtp_ladder.empty()) {
+                        if (kWindowCutEnabled) {
+                            const std::uint32_t cut = qwen3_6::detail::update_mtp_window_cut(
+                                                          sequence.mtp_window,
+                                                          static_cast<std::uint32_t>(
+                                                              accepted < 0 ? 0 : accepted),
+                                                          sequence.mtp_drafted_extent, draft_window,
+                                                          kWindowCostRatio, kWindowPostAdd,
+                                                          kWindowMinReach, kWindowShrink)
+                                                          .cut;
+                            if (cut < window) { window = cut; }
+                        }
+                        sequence.mtp_draft_count = window;
+                    } else {
+                        // `bound` is the ladder TOP, never the previous round's window: a decision
+                        // bound by its own last output could only ever shrink.
+                        // RUNTIME COST FIT, fed from this round. The round that just finished
+                        // cost the graph that was installed for it -- mtp_target_width, or the
+                        // staged ladder top while no rung has been chosen yet -- and its wall
+                        // time is tail_seconds. Both are host-side already, so the calibration is
+                        // free; it is what makes the ratio a measurement of THIS configuration
+                        // instead of a constant calibrated on another head at another context.
+                        const std::uint32_t cost_width = sequence.mtp_target_width != 0
+                                                             ? sequence.mtp_target_width
+                                                             : sequence.mtp_drafted_extent;
+                        if (cost_width != 0) {
+                            sequence.mtp_cost.observe(static_cast<float>(cost_width),
+                                                      static_cast<float>(tail_seconds * 1000.0));
+                        }
+                        const float cost_ratio =
+                            kWindowCostRatioEnv != 0.0F
+                                ? kWindowCostRatioEnv
+                                : sequence.mtp_cost.ratio(kWindowCostRatio);
+                        const qwen3_6::detail::MtpWindowDecision decision =
+                            qwen3_6::detail::update_mtp_window_cut(
+                                sequence.mtp_window,
+                                static_cast<std::uint32_t>(accepted < 0 ? 0 : accepted),
+                                sequence.mtp_drafted_extent, kMtpWindowLadderTop, cost_ratio,
+                                kWindowPostAdd, kWindowMinReach, kWindowShrink,
+                                kWindowPriorUnobserved);
+                        ++sequence.mtp_width_rounds;
+                        const bool due =
+                            sequence.mtp_target_width == 0 ||
+                            sequence.mtp_width_rounds % kMtpWidthRedecisionRounds == 0;
+                        // The shortlist (Optimized) proposal head is only safe from
+                        // kMtpShortlistMinimumDrafts up: below it its drafts leak into the
+                        // emitted tokens (88/160 positions at k=3, see startup_features.h). This
+                        // floor is what makes it safe to let an ADAPTIVE run take that head at all
+                        // -- the rung can no longer land in the range the head is not valid for.
+                        const std::uint32_t head_floor =
+                            proposal_head == ProposalHead::Optimized
+                                ? qwen3_6::kMtpShortlistMinimumDrafts
+                                : 1U;
+                        // Snap to the CAPTURED ladder, not to the decision ladder -- see
+                        // mtp_ladder_round. `mtp_ladder` is non-empty on this branch: the empty
+                        // case is the `if (mtp_ladder.empty())` arm above.
+                        const std::uint32_t raw_width = mtp_ladder_round(mtp_ladder, decision.cut);
+                        const std::uint32_t chosen = raw_width > head_floor ? raw_width : head_floor;
+                        // COMPANION (wth5_mtp_ladder_guard.patch): the rung must be a member of the
+                        // ladder that is actually captured. After the snap above the criterion can
+                        // no longer leave it, but `head_floor` can: it is
+                        // kMtpShortlistMinimumDrafts (5) under the Optimized proposal head, and a
+                        // target whose effective ladder does not contain 5 (layouts_impl.h builds
+                        // the ladder as the members <= kMaximumMtpDraftTokens, so kMaximumMtpDraftTokens
+                        // of 3 or 4 gives {2,3}) would take `chosen = 5`, capture nothing for it, and
+                        // stop the engine at select_graph_profile with a message that names CUDA
+                        // Graph coverage, not the ladder. No target has that ladder today, so this
+                        // is an unguarded shape rather than a reachable bug; naming it here, at the
+                        // single write point, costs one branch and one declaration row.
+                        if (std::find(mtp_ladder.begin(), mtp_ladder.end(), chosen) ==
+                            mtp_ladder.end()) {
+                            throw std::logic_error(
+                                "MTP target width is not a rung of the captured ladder");
+                        }
+                        const std::uint32_t previous = sequence.mtp_target_width;
+                        if (due) { sequence.mtp_target_width = chosen; }
+                        // The statistics/trace rung names the ladder this target actually
+                        // captures; kMtpWindowLadderTop is the decision ladder's top and would
+                        // report a width this target cannot run.
+                        const std::uint32_t rung = sequence.mtp_target_width != 0
+                                                       ? sequence.mtp_target_width
+                                                       : mtp_initial_rung(mtp_ladder);
+                        sequence.mtp_width_sum += rung;
+                        request.speculative_stats.mean_window =
+                            static_cast<double>(sequence.mtp_width_sum) /
+                            static_cast<double>(sequence.mtp_width_rounds);
+                        if (kWindowTrace >= 2 || (kWindowTrace >= 1 && (due || rung != previous))) {
+                            static_cast<void>(std::fprintf(
+                                stderr,
+                                "[mtp-window] lane=%u round=%llu frontier=%u accepted=%u "
+                                "drafted_extent=%u device_window=%u cut=%u rung=%u%s S=%.4f "
+                                "p=%.4f thr=%.4f mean_width=%.2f cost_ratio=%.5f\n",
+                                static_cast<unsigned>(lanes[row]),
+                                static_cast<unsigned long long>(sequence.mtp_width_rounds),
+                                static_cast<unsigned>(sequence.execution_frontier),
+                                static_cast<unsigned>(accepted < 0 ? 0 : accepted),
+                                static_cast<unsigned>(sequence.mtp_drafted_extent),
+                                static_cast<unsigned>(window), static_cast<unsigned>(decision.cut),
+                                static_cast<unsigned>(rung), due ? "" : " (held)",
+                                static_cast<double>(decision.survival),
+                                static_cast<double>(decision.hit_rate),
+                                static_cast<double>(decision.threshold),
+                                request.speculative_stats.mean_window,
+                                static_cast<double>(cost_ratio)));
+                        }
+                        // The live extent is the device's next-extent suggestion capped by the
+                        // rung the graph will carry. Never above the rung: the captured graph has
+                        // exactly `rung` AR steps and a verify envelope built for that width.
+                        sequence.mtp_draft_count = std::min(window, rung);
                     }
-                    sequence.mtp_draft_count = window;
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
+                    }
+                    // 落点 ②: the predicate is the round's OWN shape, not the configured
+                    // field alone. A publication with nothing to publish (the ladder shrank
+                    // the extent to 0 on the closing round) used to install a tree layout
+                    // whose nodes no device output backs; the seam on the way in refuses
+                    // exactly that, so refuse to produce it. draft_tree_paths == 0 (every
+                    // chain arm) does not enter.
+                    if (draft_tree_paths > 1 && sequence.mtp_draft_count != 0) {
+                        // --draft-tree L,d (L > 1): the tree the NEXT verify round is going to
+                        // check, published from the lattice this round's proposal loop just
+                        // produced. Without it the next round finds mtp_tree_columns == 0 and is
+                        // refused at program_impl.h:13336 -- exactly the state the receiving half
+                        // shipped in, and the reason the producing half could not run on its own.
+                        //
+                        // It stands AFTER the chain-draft copy above on purpose: the publication
+                        // OWNS SequenceState::mtp_drafts for a tree round. What it writes there is
+                        // the tree's node tokens in verify-column order, not the chain's argmaxes;
+                        // a tree round that kept the argmaxes would verify tokens no node owns.
+                        // The chain round (L <= 1) never enters this branch and keeps the copy
+                        // above byte for byte.
+                        const std::uint32_t tree_nodes = draft_tree_paths * draft_tree_depth;
+                        const qwen3_6::detail::MtpProposalRow proposal_row =
+                            qwen3_6::detail::mtp_proposal_row_from_egress(
+                                mtp_host_egress->next_proposal_ids.data(),
+                                mtp_host_egress->next_drafts.data(),
+                                static_cast<std::uint32_t>(lanes.size()),
+                                static_cast<std::uint32_t>(row), draft_tree_paths,
+                                draft_tree_depth, qwen3_6::kMtpTreeProposalDepthStride,
+                                max_concurrency, TextConfig::token_domain);
+                        sequence.mtp_draft_count = qwen3_6::detail::fill_mtp_tree_round(
+                            proposal_row, tree_nodes, width,
+                            qwen3_6::detail::mtp_tree_publish_slot(sequence));
                     }
                 }
             } else {
@@ -10417,6 +11648,137 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
     }
 }
 
+// ---------------------------------------------------------------------------
+// THE MISSING GUARANTEE OF THE COVERAGE INVARIANT
+//
+// logical_kv_store.h:1572-1586 (ensure_mapped_to_tokens) CHECKS
+//
+//     ceil(tokens / 64) <= entitlement(address) == page_count + reservation
+//
+// and throws "KV coverage exceeds active entitlement" when it does not hold. That
+// check is a real tripwire and it stays one. What was missing is that NOTHING ever
+// RAISED the left-hand side's budget as the frontier moved: the address-space
+// entitlement was set once, at install, to the planned resident requirement
+// (resident_text_kv_pages_required() = 112 pages at the acceptance vector) and then
+// left there while the mapping walked forward one chunk at a time. So the mapping
+// consumed the entitlement whole (112 mapped, 0 reserved -- the numbers in the
+// observed failure), the next chunk boundary asked for 144 pages, and the tripwire
+// fired. The check and the guarantee were the same quantity read from only one side.
+//
+// WHY THE TWO ROLES ARE NOT THE SAME NUMBER, and why this is the fix rather than an
+// arithmetic patch on either of them:
+//
+//   * the ADMISSION reserve (request_plan_impl.h:304-309) asks "how much of the shared
+//     pool must a request of this size HOLD RESIDENT at once" -- that is the 112, and
+//     it must stay 112, because it is what makes a prompt longer than the pool
+//     admissible at all (this is the positive arm, and touching it would move the
+//     negative control's input);
+//   * the ADDRESS-SPACE entitlement asks "how many logical pages may this sequence
+//     cover" -- and that is the whole span, because the block table it indexes has
+//     page_capacity == tables.logical_page_capacity() == page_count(--max-context)
+//     slots (decoder_state.cpp:342,436), i.e. 4096 at the acceptance vector, NOT
+//     page_count(--kv-capacity) == 1024. The geometry already says the two numbers
+//     differ by design: the pool RECYCLES physical pages, the address space covers
+//     the context.
+//
+// WHAT FUNDS THE GROWTH, and why the call site below is the right one: the reservation
+// is the pool's promise of pages for pages not yet materialized, so raising it is a
+// POOL decision and the pool refuses (std::bad_alloc out of resize_reservation, with
+// its own diagnostic line) when the pages are not there. The two mapping sites that
+// matter during a long prefill -- the chunk loop (:13289-13305) and the decode
+// dispatcher (:14133-14150) -- both run unload_watermark_trigger() IMMEDIATELY before
+// the mapping, which is exactly the ordering this needs: a cold transfer returns the
+// page to the pool as a credit ON THE SAME ADDRESS's reservation
+// (paged_kv_cache.cpp:416-427, dematerialize_one ++reservation.pages_), so the retired
+// pages are what let the next chunk be mapped after the pool has run out of free
+// pages. A refusal here therefore means "the pool could not fund the next chunk even
+// after the watermark had its say", and it is re-thrown BY NAME with the numbers,
+// because a bare std::bad_alloc out of a prefill names neither the quantity nor the
+// frontier that needed it.
+void ProgramImplCore::grow_sequence_kv_entitlement_to(SequenceState& sequence,
+                                                      std::uint32_t main_tokens,
+                                                      std::uint32_t backend_tokens) {
+    // -------------------------------------------------------------------------
+    // [M21-ALLOW] THE FUNNEL IS NOT A WATERMARK FEATURE. IT USED TO BE ONE.
+    //
+    // The line that used to stand here was `if (unload_watermark_pages == 0 || ...)`,
+    // justified by "with the leg off the plan's entitlement is the whole span and
+    // already covers every target". That justification was a statement about the
+    // PLAN's span, and the plan's span is a PLAN-TIME CONSTANT:
+    // request_plan_impl.h:277-281 builds it from
+    //     reserved_context_tokens = prompt_tokens + effective_output_tokens - 1
+    // so it covers exactly the sequence the plan knew about. It was sufficient as
+    // long as nothing could make the runtime frontier longer than the plan, which is
+    // what `unload_watermark_pages != 0` happens to be a proxy for in every cell that
+    // existed when it was written: the CONTROL-token path counts its tokens inside
+    // --max-new (options.cpp:191), so it never leaves the plan's span either.
+    //
+    // `append_context_prefill` (runtime.h:803 -> api_impl.h:433 ->
+    // append_forced_tokens, the body this funnel is called from at :9036) is the
+    // FIRST input in this tree that makes the runtime sequence LONGER THAN THE PLAN.
+    // After a 52-token append on a 2470-token prompt the frontier is 2522 while
+    // reserved_context_tokens is 2496, so "the plan's entitlement already covers
+    // every target" is false -- and with the leg off there was no second arm left to
+    // notice, so logical_kv_store.h:1588-1594 fired with
+    //     tokens=2522 required_pages=40 mapped_pages=39 reserved_pages=0 entitlement=39
+    // The ARMED leg never saw this because this line was live there, which is why the
+    // failure looked like "watermark 0 is stricter than watermark 32". It is not the
+    // switch that is stricter; it is that the invariant `entitlement >=
+    // ceil(frontier/64)` was funded in two different places and only the runtime arm
+    // survives a frontier the plan did not predict. One quantity, one source: this.
+    //
+    // WHY REMOVING THE GATE IS EXACTLY A NO-OP FOR EVERY RUN THAT DID NOT APPEND:
+    // the very next thing below is `text_resize = max(text_target, text_pages)` and
+    // then `if (text_resize == text_pages && backend_resize == backend_pages) return;`.
+    // On the default path the plan's entitlement is pages_for_tokens(prompt +
+    // effective_output - 1) and the frontier never passes it (the last generated token
+    // needs no successor slot), so text_target <= text_pages on every call and the
+    // function returns where it always returned -- after two integer divisions, with
+    // no pool call and no resize. When the leg is armed the behaviour is byte-identical
+    // to before, because the gate was already open there.
+    //
+    // WHAT STILL FUNDS A FRONTIER THE PLAN DID NOT PREDICT (unchanged, and deliberately
+    // still elsewhere): resize_reservation() asks the POOL for the pages, so the pool
+    // refuses by name when they are not there and the refusal is re-thrown with the
+    // numbers by the catch block below. That is the same funding path the armed leg has
+    // always used, and it is why this change does not need a second quantity: the
+    // admission reservation (request_plan_impl.h:281-309) is untouched, so the negative
+    // control's input does not move, and the address-space extent is DESC-CAP's ledger
+    // (logical_page_capacity = max(resident pool, tables.logical_page_capacity())), not
+    // this one. This function only ever asks for a POOL reservation; whether the logical
+    // descriptor exists to back it is the other account's business.
+    // -------------------------------------------------------------------------
+    if (!sequence.kv) { return; }
+    const std::uint32_t text_target    = unload_pages_for_tokens(main_tokens);
+    const std::uint32_t backend_target = unload_pages_for_tokens(backend_tokens);
+    const std::uint32_t text_pages     = text_kv_addresses->entitlement(sequence.kv->text);
+    const bool has_backend             = sequence.kv->backend.has_value();
+    const std::uint32_t backend_pages =
+        has_backend ? backend_kv_addresses->entitlement(*sequence.kv->backend) : 0U;
+    // Only ever UP: resize_entitlement() also refuses a value below the mapped count,
+    // and shrinking the entitlement is not this function's business (trim/release own
+    // that, and they keep their own call sites).
+    const std::uint32_t text_resize = text_target > text_pages ? text_target : text_pages;
+    const std::uint32_t backend_resize =
+        has_backend ? (backend_target > backend_pages ? backend_target : backend_pages) : 0U;
+    if (text_resize == text_pages && backend_resize == backend_pages) { return; }
+    try {
+        resize_sequence_kv_entitlement(sequence, text_resize, backend_resize);
+    } catch (const std::exception& error) {
+        const auto& pool = decoder->text_kv.page_pool();
+        throw std::invalid_argument(
+            "KV coverage cannot grow its entitlement to the next frontier: main_tokens=" +
+            std::to_string(main_tokens) + " required_pages=" + std::to_string(text_target) +
+            " entitlement=" + std::to_string(text_pages) +
+            " mapped_pages=" + std::to_string(text_kv_addresses->mapped_pages(sequence.kv->text)) +
+            " prefill_chunk=" + std::to_string(prefill_chunk) +
+            " pool_capacity=" + std::to_string(pool.capacity_pages()) +
+            " pool_allocated=" + std::to_string(pool.allocated_pages()) +
+            " pool_reserved=" + std::to_string(pool.reserved_pages()) +
+            " watermark=" + std::to_string(unload_watermark_pages) + " (" + error.what() + ")");
+    }
+}
+
 void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
     if (!sequence.kv) { throw std::logic_error("KV allocation bundle is unavailable"); }
     const std::int32_t row = static_cast<std::int32_t>(sequence.lane);
@@ -10429,11 +11791,13 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
     try {
         if (!text_active) {
             text_kv_addresses->activate(sequence.kv->text,
-                                        text_kv_addresses->mapped_pages(sequence.kv->text), row);
+                                        text_kv_addresses->mapped_pages(sequence.kv->text), row,
+                                        device.stream);
             if (sequence.kv->backend) {
                 backend_kv_addresses->activate(
                     *sequence.kv->backend,
-                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
+                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row,
+                    device.stream);
             }
         }
         set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
@@ -10475,6 +11839,13 @@ void ProgramImplCore::ensure_sequence_kv_mapped(SequenceState& sequence, std::ui
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
+    // THE COVERAGE INVARIANT IS GUARANTEED AT THE LAST MOMENT BEFORE IT IS CHECKED.
+    // This is the one funnel every frontier-advancing mapping site goes through
+    // (install :10041, the prefill chunk loop :13304, :13074, and the per-round hook
+    // :13550 / :13818 / :14016 / :14279), so the guarantee is stated once, at the same
+    // instant for all of them, instead of being restated per site and drifting. See
+    // grow_sequence_kv_entitlement_to() for the arithmetic and the full note.
+    grow_sequence_kv_entitlement_to(sequence, main_tokens, backend_tokens);
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
@@ -10518,6 +11889,57 @@ void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequenc
     } catch (...) {}
 }
 
+// w-find4 G9: the journal's standing records for a sequence must be tombstoned BEFORE the
+// slots they name are handed back. `release_sequence_kv` returns each cold page's device
+// slot and -- the one that matters -- its PROCESS-GLOBAL spill-file slot, and it used to do
+// so with the log untouched, so a Spill record kept standing for a file region that the very
+// next allocate_cold_disk_file_slot() anywhere in this process can hand to another page. The
+// window is not "eventually": the allocator is a first-fit scan over a bitmap that returns
+// the LOWEST free index (:10823-10831), so the slot just released is the next one handed
+// out. And the log is the durable artifact here, so a process that dies between the release
+// and the next round leaves the lie on disk with nothing left to retract it -- which is why
+// the tombstone belongs at the release and not in some later round's diff.
+//
+// `recall_recorded` is exactly this sequence's STANDING records, ascending by page: the
+// merge loop in record_turn_recall keeps a record only while its page is still cold
+// (`have == now`) and stops keeping it when the page goes hot (`have < now` writes its
+// tombstone and pushes nothing). Iterating it is therefore the same source of truth the
+// engine already trusts, and it needs no digest lookup -- the digest is half the lookup key
+// and cannot be recomputed from a page number, so only the record itself carries it.
+void ProgramImplCore::release_sequence_recall_records(SequenceState& sequence) noexcept {
+    std::vector<spec::turn_recall::RecallRecord>& recorded = sequence.recall_recorded;
+    if (turn_recall_journal != nullptr) {
+        for (const spec::turn_recall::RecallRecord& standing : recorded) {
+            if (static_cast<spec::turn_recall::RecallKind>(standing.kind) !=
+                spec::turn_recall::RecallKind::Spill) {
+                continue; // already retracted: nothing stands for this page any more
+            }
+            // Same key fields as the record being retracted. The digest IS the key, so a
+            // tombstone rebuilt from the page number alone would erase nothing at all.
+            spec::turn_recall::RecallRecord release = standing;
+            release.kind      = static_cast<std::uint8_t>(spec::turn_recall::RecallKind::Release);
+            release.file_slot = -1;
+            release.flags     = 0;
+            // The reason is the point of the field: `file_slot == -1` cannot say WHY the
+            // bytes are unreachable, and "the sequence ended" is the one reason that means
+            // the region is already somebody else's.
+            spec::turn_recall::recall_set_release_reason(
+                release, spec::turn_recall::RecallReleaseReason::SequenceEnd);
+            if (turn_recall_journal->append(release)) {
+                ++turn_recall_counters.tombstones;
+            } else {
+                ++turn_recall_counters.append_failed;
+            }
+        }
+    }
+    // The list is this sequence's own bookkeeping and the sequence is being torn down.
+    // Leaving it behind is how a REUSED lane (`release_continuation_slot` :6660, and the Root
+    // re-admission at :9488) would hand the next request records for pages it never spilled.
+    // Cleared here, in the same breath as the tombstones, so the log and the in-memory view
+    // cannot disagree about what this sequence still owns.
+    recorded.clear();
+}
+
 void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     unbind_sequence_kv(sequence);
@@ -10527,6 +11949,11 @@ void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
     if (text_kv_addresses) { (void)text_kv_addresses->release(sequence.kv->text); }
     sequence.kv.reset();
     for (const auto& cold : sequence.cold_pages) {
+    // w-find4 G9: retract this sequence's standing L0 records BEFORE the slots below go back
+    // to the pool. Both the device cold slot and the process-global spill-file slot are
+    // handed out again from here on, and the file slot is the whole point: a standing record
+    // naming it is what makes a later lookup read a region that is now another page's.
+    release_sequence_recall_records(sequence);
         if (decoder != nullptr) { decoder->text_kv.release_cold_slot(cold.slot); }
         // The file slots are process-global, so they must be returned even when
         // there is no decoder to hand the device slot back to. Nothing used to
@@ -10535,6 +11962,10 @@ void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
     }
     sequence.cold_pages.clear();
     sweep_host_kv_pools();
+    // The L0 journal only speaks when it did something: one line per sequence that
+    // wrote a record, a tombstone, or ran a round, and nothing for the steady state.
+    // Silence therefore means no-op, which is the same contract as the store.
+    report_turn_recall("sequence-end");
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& sequence) const {
@@ -10607,35 +12038,58 @@ void ProgramImplCore::release_cold_disk_file_slot(std::int32_t file_slot) noexce
 // active and at least cold_keep_tokens lie behind the decode frontier. The
 // decode kernels read cold pages straight from the slots, so no restore is
 // needed on the steady-state path.
-void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
-    if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Disk) ||
+// [COLD-FALLBACK CENSUS] the pool stride the ops layer allocates IS the record whose
+// enforced ceiling this census reports: 9632 B -> 259 B per stream -> 4.046875 b/c, i.e.
+// the measured K maximum exactly (dl/ransceil/rans_probe.cu: max 259 B over 512 symbols).
+// A build-time pin, not a comment: if the ops literal moves, or the stream
+// geometry with it, this line stops compiling instead of a run reporting a ceiling nobody
+// allocated. It restates no constant -- every term is read from the tree.
+//
+// It read 2609375 until 2026-09-18. That was 6688 B / 167 B per stream, which the same
+// census's own numerator can now falsify from a real run: at that budget EVERY cold K page
+// falls back (measured 0 of 64 slots), so the line this census prints would report a
+// 100% fallback rate -- which is what it is FOR, and which is why the stride, not the
+// ceiling, had to move. Do not move this number back without moving the ops literal.
+static_assert(ninfer::targets::qwen3_6::cold_fallback::ceiling_x1e6(
+                  static_cast<std::uint32_t>(ninfer::ops::kEntropyNvfp4SlotBytes)) ==
+                  4046875ULL,
+              "the cold rANS record's enforced ceiling is no longer 4.046875 b/c ("
+              "cell(512 * 4.04 / 8) = 259 B per stream): the pool stride, the stream "
+              "geometry and the ceiling that prices the cold tier have come apart (see "
+              "decoder_state.cpp's kColdSlotRansBitsPerCodeX100 and "
+              "cold_fallback_census.h's arithmetic)");
+std::uint32_t ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence,
+                                                       ColdPageAdmission admit,
+                                                       void* admit_context) {
+    if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Disk &&
+         cold_policy != ColdPolicy::HostThenDisk) ||
         !sequence.kv || decoder == nullptr ||
         !sequence.kv->text.valid() || cold_requant_codes == nullptr) {
-        return;
+        return 0;
     }
     KVAddressSpaceStore& store = *text_kv_addresses;
     KVAddressSpaceHandle text  = sequence.kv->text;
     const std::uint32_t total_pages = store.mapped_pages(text);
-    if (total_pages == 0) { return; }
+    if (total_pages == 0) { return 0; }
 
     const std::uint32_t cold_pages =
         sequence.text_kv_valid > cold_keep_tokens
             ? (sequence.text_kv_valid - cold_keep_tokens) / kPagedKVPageSize
             : 0;
     const std::uint32_t limit = cold_pages < total_pages ? cold_pages : total_pages;
-    if (limit == 0) { return; }
+    if (limit == 0) { return 0; }
 
     const std::int32_t kv_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
     const std::uint32_t layers  = decoder->text_kv.layers();
     // Cold slots carry requantized E2M1 planes, ONE CODEC PER LAYER DTYPE: the
     // int8 tier packs raw nibbles (int8 -> E2M1 g64) and the nvfp4 tier
-    // rANS-encodes the native E2M1 (K) / ISO3 (V) nibbles over g64 scales. Both
+    // rANS-encodes the native E2M1 (K) / ISO4E (V) nibbles over g64 scales. Both
     // write the SAME fixed slot, whose stride is resolved per layer by that
     // layer's codec width (decoder_state.cpp cold_slot_stride_for), and readers
     // exist for exactly these two tiers (decode/prefill: the raw i8 slot for
     // DType::I8, the rANS slot for DType::NVFP4), so I8 and NVFP4 are the
-    // cold-capable set. ISO3 is a tier of its own: an iso3 layer's K plane holds
-    // iso3 codes and neither its decode nor its prefill kernel has a cold branch.
+    // cold-capable set. ISO4E is a tier of its own: an iso4e layer's K plane holds
+    // iso4e codes and neither its decode nor its prefill kernel has a cold branch.
     // The page stays hot unless EVERY layer can pack: transfer_to_cold returns the
     // physical page to the shared pool, and the execution table has no layer axis,
     // so one sentinel per (sequence, page) retires the page for all layers at
@@ -10646,45 +12100,172 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
         switch (dtype) {
         case DType::I8: return "the int8 raw slot";
         case DType::NVFP4: return "the nvfp4 rANS slot";
-        case DType::ISO3: return "an iso3 plane (no cold codec)";
-        case DType::E8Kv: return "an e8 lattice plane (no cold codec)";
+        case DType::ISO3: return "an iso4e plane (no cold codec)";
+        // UNLOAD-NORMALQUANT: Rk4v4Kv and BF16 are NOT "no cold codec" any more. Rk4v4Kv packs
+        // through entropy_cold_requant's Rk4v4KvG64 arm (codes copied verbatim, g64 scale
+        // requantized) and BF16 through the Bf16G64 arm; both write the same raw record
+        // the int8 tier does, and the dispatch below has an arm for each of them
+        // (:11645 bf16, :11670 rk4v4). Leaving them spelled as "no cold codec" here is what
+        // made the default 27B stack (6 x rk4v4 + 10 x nvfp4) print a per-layer line saying
+        // its rk4v4 layers cannot pack, in the very run whose pool is packing them -- the
+        // two facts this message exists to keep apart are CODEC and RECORD.
+        case DType::E8Kv: return "the rk4v4 raw slot (verbatim 4-bit codes + requantized g64)";
         case DType::FP8_E4M3FN: return "an fp8 plane (no cold codec)";
+        case DType::BF16: return "the bf16 raw slot (E2M1 g64)";
         default: return "a 16-bit plane (no cold codec)";
         }
     };
+    // THE STACK GATE, and it used to `return` -- aborting the WHOLE cold pass as
+    // soon as ONE layer was not cold-capable. That is a real defect and it is the
+    // second independent reason a default run splills nothing: the shipped stack is
+    // 10xnvfp4 + 6xe8, an rk4v4 layer has NO cold slot at all (kv_tier_formats.h:156,
+    // "E8 lattice; no cold codec at all"), so the old `return` disabled the pass
+    // for the whole stack -- silently, since the warning below is printed once.
+    //
+    // The page is the unit that must be all-or-nothing, not the STACK -- but the
+    // all-or-nothing rule is enforced by the per-page DTYPE DISPATCH below
+    // (:11400-11402), not by this loop. A layer with no cold CODEC still owns a
+    // cold RECORD: plan_decoder_state() adds one cold_slots tensor per layer for
+    // every layer < full_attention_layers whatever its dtype (decoder_state.cpp:888-903,
+    // "their footprint is exactly what it is today"), and
+    // PagedKVCache::batch_layer_view() hands that tensor back unconditionally
+    // (decoder_state.cpp:1065). So the `cold_slots.data == nullptr` skip inside the
+    // per-page loop never fires for an rk4v4/iso4e/fp8/bf16 layer, and the page dies on
+    // its dtype dispatch instead. The wording that used to stand here ("it has no
+    // cold slot and is skipped") asserted the opposite, and that is what kept this
+    // door invisible: "no codec" was read as "no record", and a record is what the
+    // per-page loop tests.
+    //
+    // [SLOT-PACK CENSUS] once per process: the layer table the pass actually sees,
+    // with `codec` (can this dtype be packed at all?) and `cold_record` (does the
+    // layer own a cold slot?) printed as two separate facts so they can never be
+    // conflated again.
+    {
+        static bool census_done = false;
+        if (!census_done) {
+            census_done = true;
+            std::fprintf(stderr, "[cold] slot-pack census: %u layers\n", layers);
+            for (std::uint32_t layer = 0; layer < layers; ++layer) {
+                const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+                const bool dropped                = decoder->text_kv.layer_is_dropped(layer);
+                std::fprintf(stderr,
+                             "[cold]   L%-3u dropped=%d dtype=%u %-46s cold_record=%-3s "
+                             "stride=%d B residual=%d\n",
+                             layer, dropped ? 1 : 0, static_cast<unsigned>(view.dtype),
+                             dropped ? "(empty view: no plane at all)"
+                                     : cold_codec_of(view.dtype),
+                             view.cold_slots.data == nullptr ? "no" : "yes", view.slot_bytes,
+                             view.k_residual_pages.data == nullptr ? 0 : 1);
+            }
+        }
+    }
+    // Counted, not fatal, and once per layer per pass: the warning is per pass so a
+    // long run does not drown its own log, but it is NOT once per process (the
+    // earlier `static bool warned` made the second and every later pass silent,
+    // which is how "the pool is idle" became unobservable), and it is per LAYER
+    // because the first version reported only the first offender -- so a stack with
+    // six of them read exactly like a stack with one.
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
-        const bool packed       = view.dtype == DType::I8 || view.dtype == DType::NVFP4;
+        // L26 instrument: a discarded layer owns no planes and no cold slot, hence
+        // no cold work of its own; without this line the message below reports
+        // "a 16-bit plane (no cold codec)" for a layer that has no plane at all
+        // (its view is the empty one, whose dtype is the struct default).
+        if (decoder->text_kv.layer_is_dropped(layer)) { continue; }
+        // UNLOAD-NORMALQUANT: this predicate is the CLASS-LEVEL twin of the per-page
+        // dtype dispatch below, so it has to list every dtype that dispatch packs. It
+        // listed only I8 and NVFP4, which made it warn "it has no cold CODEC" once per
+        // pass for each of the six rk4v4 layers of the default 27B table -- and for every
+        // bf16 layer of a bf16 stack -- precisely in the runs where those layers DO pack.
+        // A false refusal line is worse than no line: it is indistinguishable from the
+        // real one this loop exists to print.
+        const bool packed       = view.dtype == DType::I8 || view.dtype == DType::NVFP4 ||
+                                  view.dtype == DType::E8Kv || view.dtype == DType::BF16;
         const bool cold_capable = packed && view.k_residual_pages.data == nullptr;
         if (cold_capable) { continue; }
-        // Silent no-op until now: with any layer that has no cold codec the cold pool
-        // still reserves its slots but compresses nothing, so --cold-policy looks
-        // enabled and does nothing. Say so once, loudly.
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            std::fprintf(stderr,
-                         "[cold] policy is set but layer %u is %s (dtype code %u, "
-                         "residual plane %u): cold compression is skipped and the "
-                         "reserved pool stays idle\n",
-                         layer,
-                         packed ? "a plane with a residual the cold restore cannot rebuild"
-                                : cold_codec_of(view.dtype),
-                         static_cast<unsigned>(view.dtype),
-                         view.k_residual_pages.data == nullptr ? 0U : 1U);
-        }
-        return;
+        std::fprintf(stderr,
+                     "[cold] layer %u is %s (dtype code %u, residual plane %u, "
+                     "cold_record=%s): it has no cold CODEC, and a cold record is not a "
+                     "codec -- the per-page dtype dispatch refuses EVERY page it is "
+                     "reached on, so the page stays hot and transfers no byte\n",
+                     layer,
+                     packed ? "a plane with a residual the cold restore cannot rebuild"
+                            : cold_codec_of(view.dtype),
+                     static_cast<unsigned>(view.dtype),
+                     view.k_residual_pages.data == nullptr ? 0U : 1U,
+                     view.cold_slots.data == nullptr ? "absent" : "PRESENT");
     }
     std::vector<std::int32_t> k_flags(static_cast<std::size_t>(kv_heads));
     std::vector<std::int32_t> v_flags(static_cast<std::size_t>(kv_heads));
     std::uint32_t compressed = 0;
 
+    // ---- [SPILL-GATE] read-only probe: the five conjuncts, per pass -------------
+    // No behaviour change: every counter below is tallied from existing accessors and
+    // nothing is written back. `p_orig` re-derives the predicate AS SHIPPED (i.e. with
+    // `writer_references == 0`); `p_can` is the one now in the tree. The difference between
+    // them, per page, IS the answer to "why did no byte ever leave".
+    std::uint32_t p_pages = 0, p_r1 = 0, p_w0 = 0, p_pins0 = 0, p_dev = 0, p_notcold = 0;
+    std::uint32_t p_orig = 0, p_can = 0, p_past = 0;
+    std::uint32_t p_relax_writer = 0, p_relax_refs = 0, p_relax_pins = 0, p_relax_dev = 0;
+    // ----------------------------------------------------------------------------
+
+    // [SILENT-CONTINUE AUDIT] Once per layer per pass. The two `continue`s below used
+    // to be the only places in this function that dropped a page WITHOUT printing
+    // anything, which is precisely why "the predicate admits 553 pages and not one
+    // byte is transferred" stayed unexplained: the pass reported its input (the
+    // [spillgate] counters) and its output (`compressed`), and said nothing at all
+    // about the step in between. A silent drop is a defect in its own right.
+    std::vector<bool> refusal_logged(static_cast<std::size_t>(layers), false);
+    std::vector<bool> validity_logged(static_cast<std::size_t>(layers), false);
+
     for (std::uint32_t page = sequence.cold_frontier; page < limit; ++page) {
-        if (!store.can_cold_transfer(text, page)) { continue; }
+        {
+            const LogicalKVPageHandle probe_page = store.logical_page(text, page);
+            const bool q_r1 = text_kv_pages->address_references(probe_page) == 1;
+            const bool q_w0 = text_kv_pages->writer_references(probe_page) == 0;
+            const bool q_p0 = text_kv_pages->source_pins(probe_page) == 0;
+            const bool q_dr = text_kv_pages->device_resident(probe_page);
+            const bool q_nc = !text_kv_pages->cold_compressed(probe_page);
+            ++p_pages;
+            p_r1 += q_r1 ? 1U : 0U;
+            p_w0 += q_w0 ? 1U : 0U;
+            p_pins0 += q_p0 ? 1U : 0U;
+            p_dev += q_dr ? 1U : 0U;
+            p_notcold += q_nc ? 1U : 0U;
+            if (q_r1 && q_w0 && q_p0 && q_dr && q_nc) { ++p_orig; }
+            if (q_r1 && q_p0 && q_dr && q_nc) { ++p_relax_writer; }
+            if (q_w0 && q_p0 && q_dr && q_nc) { ++p_relax_refs; }
+            if (q_r1 && q_w0 && q_dr && q_nc) { ++p_relax_pins; }
+            if (q_r1 && q_w0 && q_p0 && q_nc) { ++p_relax_dev; }
+        }
+        if (store.can_cold_transfer(text, page)) { ++p_can; } else { continue; }
+        ++p_past;
+        // THE SEMANTIC SEAM. `limit` above is the engine's own floor (nothing newer
+        // than cold_keep_tokens may leave). This filter is the caller's answer to
+        // "may THIS page leave", and for the watermark path it is the semantic
+        // judge's verdict on the page's 64-token block -- not an age, not an LRU
+        // rank. A null filter admits every retirable page, which is the pre-watermark
+        // behaviour of this pass exactly.
+        if (admit != nullptr && !admit(admit_context, page)) { continue; }
         const std::int32_t slot = decoder->text_kv.allocate_cold_slot();
+        // [COLD-FALLBACK CENSUS] THE THIRD PAGE-LOOP TRUNCATION, and the only routine one:
+        // the pool is a capacity, so once it is full every later pass leaves here at its FIRST
+        // page, and every page of that pass then never reaches the codec. Counting it is what
+        // keeps the published page rate honest about the population it was computed over.
+        //
+        // THE CONDITION IS SPELLED TWICE ON PURPOSE. The `break` line below is asserted as an
+        // exact string by tests/test_cold_slot_release_bytes.cpp ("pool exhaustion keeps the rest
+        // hot (no byte is freed)"), so merging the tally into that block would delete a contract
+        // the registered test pins. The two conditions are the same expression, evaluated twice.
+        if (slot < 0) {
+            ninfer::targets::qwen3_6::cold_fallback::note_page_loop_truncated(
+                ninfer::targets::qwen3_6::cold_fallback::TruncationReason::ColdPoolExhausted,
+                static_cast<std::uint64_t>(limit - page));
+        }
         if (slot < 0) { break; }  // cold pool exhausted: keep the rest hot.
 
         bool success = true;
+        std::uint32_t failed_layer = 0;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
             const Tensor cold_slots          = view.cold_slots;
@@ -10707,8 +12288,9 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
             auto* k_slot = static_cast<std::uint8_t*>(cold_slots.data) +
                            static_cast<std::int64_t>(slot) * cold_slots.nb[3];
             auto* v_slot = k_slot + cold_slots.nb[2];
-            auto* k_valid = static_cast<std::int32_t*>(view.cold_slot_valid.data) +
-                            static_cast<std::int64_t>(slot) * view.cold_slot_valid.nb[2];
+            auto* k_valid = reinterpret_cast<std::int32_t*>(
+                static_cast<std::uint8_t*>(view.cold_slot_valid.data) +
+                static_cast<std::int64_t>(slot) * view.cold_slot_valid.nb[2]);
             auto* v_valid = reinterpret_cast<std::int32_t*>(
                 reinterpret_cast<std::uint8_t*>(k_valid) + view.cold_slot_valid.nb[1]);
             // The INT8 requant+pack pair lives ONLY in the I8 branch below: it used to be
@@ -10734,7 +12316,7 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                     static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
                     v_valid, view.slot_bytes, device.stream);
             } else if (view.dtype == DType::NVFP4) {
-                // NVFP4 tier: keep the native E2M1 (K) / ISO3 (V) nibbles,
+                // NVFP4 tier: keep the native E2M1 (K) / ISO4E (V) nibbles,
                 // requantize scales to g64 for a skew that rANS compresses,
                 // and encode into the entropy slot. On incompressible pages
                 // the slot flags stay 0 and the hot plane keeps serving.
@@ -10751,19 +12333,94 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                     static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
                     view.slot_bytes, k_valid, nullptr, kv_heads, device.stream);
                 ops::entropy_cold_requant_raw(
-                    v_codes, v_scales, ops::EntropyColdRequantMode::Iso3VG16, kv_heads, 1,
+                    v_codes, v_scales, ops::EntropyColdRequantMode::Iso4eVG16, kv_heads, 1,
                     static_cast<std::uint8_t*>(cold_requant_codes),
                     static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
                 ops::entropy_nvfp4_slot_encode_raw(
                     static_cast<const std::uint8_t*>(cold_requant_codes),
                     static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
                     view.slot_bytes, v_valid, nullptr, kv_heads, device.stream);
+            } else if (view.dtype == DType::BF16) {
+                // BF16 tier (BF16-COLD-LAND A3): the resident plane is raw bf16 with no
+                // code plane and no scale plane, so the source is the K/V plane itself
+                // and src_scales is unused (nullptr). The requant's output is the SAME
+                // E2M1/g64 pair the int8 arm produces and writes into the SAME raw slot
+                // (fixed 9232 B layout, always valid -- there is no overflow path), so
+                // the slot pack and every reader are shared with the int8 tier. This is
+                // what makes a bf16 stack -- which is what the MTP tree verify requires --
+                // able to retire pages at all.
+                ops::entropy_cold_requant_raw(
+                    k_codes, nullptr, ops::EntropyColdRequantMode::Bf16G64, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::cold_i8_slot_pack_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
+                    k_valid, view.slot_bytes, device.stream);
+                ops::entropy_cold_requant_raw(
+                    v_codes, nullptr, ops::EntropyColdRequantMode::Bf16G64, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::cold_i8_slot_pack_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
+                    v_valid, view.slot_bytes, device.stream);
+            } else if (view.dtype == DType::E8Kv) {
+                // Rk4v4 tier (BF16-COLD-LAND E3): the packed 4-bit lattice codes are the
+                // payload the reader needs back, so this arm copies the code plane
+                // VERBATIM and requantizes only the g64 fp16 scale into the E4M3 g16 tail
+                // (replicated over the four g16 slots of the group). The slot, its
+                // validity plane and its readers are shared with the int8 tier, and the
+                // rk4v4 layer's V plane has the same packed-4-bit + fp16-g64 geometry as its
+                // K plane (the write path packs V with the same gqa_kv_pack_i4), so K and
+                // V take the same arm.
+                ops::entropy_cold_requant_raw(
+                    k_codes, k_scales, ops::EntropyColdRequantMode::Rk4v4KvG64, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::cold_i8_slot_pack_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
+                    k_valid, view.slot_bytes, device.stream);
+                ops::entropy_cold_requant_raw(
+                    v_codes, v_scales, ops::EntropyColdRequantMode::Rk4v4KvG64, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::cold_i8_slot_pack_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
+                    v_valid, view.slot_bytes, device.stream);
             } else {
-                success = false;  // bf16/fp8/iso3/e8: no cold slot codec, page stays hot
+                success      = false;  // fp8/iso4e: no cold slot codec, page stays hot
+                failed_layer = layer;
                 break;
             }
         }
         if (!success) {
+            // [COLD-FALLBACK CENSUS] a SEPARATE event from a fallback: the dtype dispatch
+            // refused this page, so no rANS ran and no stream budget was tested. Counted
+            // here so "stayed hot" can be split into "the codec refused it" and "the codec
+            // overflowed its budget" -- two different fixes.
+            ninfer::targets::qwen3_6::cold_fallback::note_page_refused();
+            // THE FIRST SILENT `continue`. It had NO branch body beyond the release,
+            // so a stack whose layers cannot all pack reported "0 pages retired" and
+            // gave no reason. Named now, once per layer per pass.
+            const PagedKVBatchLayerView refused = decoder->text_kv.batch_layer_view(failed_layer);
+            if (!refusal_logged[failed_layer]) {
+                refusal_logged[failed_layer] = true;
+                std::fprintf(stderr,
+                             "[cold] page %u REFUSED at layer %u (dtype code %u, %s, "
+                             "cold_record=%s, stride=%d B, residual=%d): this layer has no "
+                             "cold codec, and the page is all-or-nothing (transfer_to_cold "
+                             "returns the shared physical page and restore_cold_page rebuilds "
+                             "only the I8/NVFP4 planes), so the page stays hot. This is why "
+                             "`transferred` is 0 on a stack whose predicate admitted pages\n",
+                             page, failed_layer, static_cast<unsigned>(refused.dtype),
+                             cold_codec_of(refused.dtype),
+                             refused.cold_slots.data == nullptr ? "absent" : "PRESENT",
+                             refused.slot_bytes,
+                             refused.k_residual_pages.data == nullptr ? 0 : 1);
+            }
             decoder->text_kv.release_cold_slot(slot);
             continue;
         }
@@ -10775,10 +12432,21 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
         // pointer, so the test was a constant true; the buffer check that matters
         // is element 0.)
         std::int32_t file_slot = -1;
-        if (cold_policy == ColdPolicy::Disk) {
+        if (cold_policy == ColdPolicy::Disk || cold_policy == ColdPolicy::HostThenDisk) {
             if (cold_disk_staging[0] == nullptr) {
                 // Disk policy with no staging buffer: the spill files could not be
                 // prepared, so keep the page resident instead of claiming a spill.
+                //
+                // [COLD-FALLBACK CENSUS] AND THIS IS A TRUNCATION, NOT A PER-PAGE SKIP. `break`
+                // leaves the page loop, so `limit - page` pages -- this one plus every page after
+                // it in this pass -- never reach the codec and never reach ANY counter in the
+                // census, which is what made the published rate a lower bound whose truncation
+                // was unreported. Counted here, reported once at teardown. This is also the one
+                // abandonment path that printed nothing at all: a stack whose spill files could
+                // not be prepared reported "0 pages retired" and gave no reason.
+                ninfer::targets::qwen3_6::cold_fallback::note_page_loop_truncated(
+                    ninfer::targets::qwen3_6::cold_fallback::TruncationReason::NoDiskStaging,
+                    static_cast<std::uint64_t>(limit - page));
                 decoder->text_kv.release_cold_slot(slot);
                 break;
             }
@@ -10790,12 +12458,28 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                 static bool warned_spill_budget = false;
                 if (!warned_spill_budget) {
                     warned_spill_budget = true;
+                    // THE UNIT IS THE PAGE RECORD, NOT ONE LAYER. `cold_disk_slot_bytes`
+                    // is the per-layer STAGING stride (the max over layers, kept for
+                    // cold_disk_staging below) and printing it here understated the
+                    // admitted spill by sum/max -- 16x on the shipped stack, so this line
+                    // read "3634 slots x 73856 B" = 255.9 MiB for a real 4 GiB of pages
+                    // (dl/diskblast/REPORT.md section 3). `turn_recall_page_bytes()` is the
+                    // same authority the file-slot division reads (:1136), so the message
+                    // and the admission cannot drift apart again.
                     std::fprintf(stderr,
-                                 "[cold] spill budget exhausted (%llu file slots x %zu B): "
-                                 "further pages stay resident; raise --cold-disk-bytes\n",
+                                 "[cold] spill budget exhausted (%llu file slots x %llu B per "
+                                 "page): further pages stay resident; raise "
+                                 "--cold-disk-bytes\n",
                                  static_cast<unsigned long long>(cold_disk_file_slots),
-                                 cold_disk_slot_bytes);
+                                 static_cast<unsigned long long>(turn_recall_page_bytes()));
                 }
+                // [COLD-FALLBACK CENSUS] the second disk-policy truncation: no free file slot,
+                // so the loop leaves and every page after this one is invisible to every counter.
+                // The pages that stop contributing are counted; the once-per-process warning
+                // above is untouched.
+                ninfer::targets::qwen3_6::cold_fallback::note_page_loop_truncated(
+                    ninfer::targets::qwen3_6::cold_fallback::TruncationReason::NoDiskFileSlot,
+                    static_cast<std::uint64_t>(limit - page));
                 decoder->text_kv.release_cold_slot(slot);
                 break;
             }
@@ -10842,12 +12526,39 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
         // resolve to the rANS codec.
         // Valid tensor is [kv_heads, 2, pages] col-major: head innermost,
         // page outermost, so slot pages sit at slot * 2*kv_heads.
+        //
+        // [COLD-FALLBACK CENSUS] ONE INTEGER ADD, and it is the denominator of the
+        // fallback rate: a page that reaches this line is a page the codec was asked to
+        // compress. It sits deliberately OUTSIDE the validity_logged guard below -- a tally
+        // inside that guard is counted once per LAYER per pass, which is exactly why this
+        // rate could not be tallied from a log. The increment is orders of magnitude below
+        // the cudaMemcpy D2H pair this loop already pays per layer per page, so it cannot
+        // become the instrument it feeds.
+        ninfer::targets::qwen3_6::cold_fallback::note_page_evaluated(
+            static_cast<std::uint32_t>(kv_heads));
         bool valid = true;
+        std::uint32_t invalid_layer = 0;
         for (std::uint32_t layer = 0; layer < layers && valid; ++layer) {
             const Tensor cold_valid = decoder->text_kv.cold_slot_valid(layer);
             if (cold_valid.data == nullptr) { continue; }
-            auto* k_valid = static_cast<std::int32_t*>(cold_valid.data) +
-                            static_cast<std::int64_t>(slot) * cold_valid.nb[2];
+            // [COLD-FALLBACK CENSUS] THE DENOMINATOR OF THE PUBLISHED OVERFLOW RATE, charged
+            // exactly where the flags are READ: one call per (page, layer) pair, and only for a
+            // layer whose validity tensor is PRESENT -- a null tensor reads no flag, so it is in
+            // neither term of the rate. This is the call that makes the rate a fraction of ONE
+            // population; the two cudaMemcpy D2H calls below are why it is free (the tally rides
+            // an iteration that already pays them).
+            //
+            // WHY NOT note_page_evaluated() ONCE PER PAGE: that call charges 2*kv_heads -- ONE
+            // layer's worth of planes -- to a PAGE, while the codec writes one such flag set per
+            // layer. A rate built on it therefore divides the zeros of the single layer the scan
+            // stopped at (see the fell_back call below) by a page-share that no layer count ever
+            // enters. That is the mixed-population defect this line fixes. The old ratio survives
+            // in the header as head_plane_overflow_ppm(), unpublished but not deleted, because
+            // dl/censusfix/cold_fallback_census_selftest.cpp pins its arithmetic.
+            ninfer::targets::qwen3_6::cold_fallback::note_layer_inspected(static_cast<std::uint32_t>(kv_heads));
+            auto* k_valid = reinterpret_cast<std::int32_t*>(
+                static_cast<std::uint8_t*>(cold_valid.data) +
+                static_cast<std::int64_t>(slot) * cold_valid.nb[2]);
             auto* v_valid = reinterpret_cast<std::int32_t*>(
                 reinterpret_cast<std::uint8_t*>(k_valid) + cold_valid.nb[1]);
             CUDA_CHECK(cudaMemcpy(k_flags.data(), k_valid,
@@ -10858,8 +12569,71 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                                 [](std::int32_t value) { return value != 0; }) &&
                     std::all_of(v_flags.begin(), v_flags.end(),
                                 [](std::int32_t value) { return value != 0; });
+            if (!valid) { invalid_layer = layer; }
         }
         if (!valid) {
+            // [COLD-FALLBACK CENSUS] THE FALLBACK COUNT -- the one measurement the rANS
+            // ceiling owes, and the one the validity_logged guard below cannot produce: this
+            // tally runs once per PAGE, the guarded body below once per layer per pass.
+            // k_flags/v_flags still hold the FAILING layer's flags (the scan below early-exits
+            // on `valid`, so the last cudaMemcpy that ran was that layer's), so the zero
+            // counts are the head-planes that exceeded the record's per-stream byte budget
+            // -- (stride - 320 - 1024) / 32, DERIVED from the record stride and printed by
+            // the line below, never a byte literal that can go stale -- on the layer the
+            // scan stopped at, and head_planes_evaluated makes that a RATE: a page that
+            // did not fall back contributes zero overflowed planes by construction. The guard's
+            // own body is untouched; the flag tally is a read of a vector already in cache.
+            ninfer::targets::qwen3_6::cold_fallback::note_page_fell_back(
+                invalid_layer,
+                static_cast<std::uint64_t>(
+                    std::count(k_flags.begin(), k_flags.end(), std::int32_t{0})),
+                static_cast<std::uint64_t>(
+                    std::count(v_flags.begin(), v_flags.end(), std::int32_t{0})),
+                static_cast<std::uint32_t>(kv_heads));
+            // THE SECOND SILENT `continue`. Same defect as the first: the page is
+            // dropped and nothing is printed. Inside the NVFP4 branch the ONLY thing
+            // that can clear a layer's flag is the rANS stream-budget overflow
+            // (entropy_nvfp4_slot_kernels.cuh:122-131 pass A, :164-172 pass B -- the
+            // same two the comment above names), and the budget is DERIVED from the
+            // record stride, never passed in, so it is reported here as
+            // (stride - header - scales) / streams.
+            // The body below is bounded to once per layer per pass: a 553-page pass
+            // over a 16-layer stack would otherwise print thousands of copies of one
+            // fact. Everything expensive (the layer view, the flag tallies) sits
+            // inside the guard for the same reason.
+            if (!validity_logged[invalid_layer]) {
+                validity_logged[invalid_layer] = true;
+                const PagedKVBatchLayerView bad =
+                    decoder->text_kv.batch_layer_view(invalid_layer);
+                const int k_zero = static_cast<int>(
+                    std::count(k_flags.begin(), k_flags.end(), std::int32_t{0}));
+                const int v_zero = static_cast<int>(
+                    std::count(v_flags.begin(), v_flags.end(), std::int32_t{0}));
+                // The three literals mirror entropy_nvfp4_slot.cuh:41 (header), :45
+                // (scale tail) and :40 (streams); cold_slot_stride_bytes() in
+                // decoder_state.cpp derives the same record from them.
+                constexpr int kSlotHeaderBytes = 320;
+                constexpr int kSlotScaleBytes  = 1024;
+                constexpr int kSlotStreams     = 32;
+                const int data_bytes = bad.slot_bytes - kSlotHeaderBytes - kSlotScaleBytes;
+                std::fprintf(stderr,
+                             "[cold] page %u INVALID at layer %u (dtype code %u, %s): "
+                             "k_flags zero=%d/%zu v_flags zero=%d/%zu | record stride=%d B, "
+                             "data=%d B, budget=%d B per %d-symbol stream "
+                             "(= %.3f bits/symbol at the %.3f bits/code ceiling): the rANS "
+                             "stream budget overflowed, so the codec cleared this layer's "
+                             "valid flag and the page stays hot\n",
+                             page, invalid_layer, static_cast<unsigned>(bad.dtype),
+                             cold_codec_of(bad.dtype), k_zero, k_flags.size(), v_zero,
+                             v_flags.size(), bad.slot_bytes, data_bytes,
+                             data_bytes / kSlotStreams, 512,
+                             8.0 * static_cast<double>(data_bytes / kSlotStreams) / 512.0,
+                             // the ceiling is DERIVED from the record stride, never
+                             // passed in (same expression as the bits/symbol above), so
+                             // this prints the ceiling the codec actually enforced
+                             // instead of the 2.60 literal that only holds at 6688 B.
+                             8.0 * static_cast<double>(data_bytes / kSlotStreams) / 512.0);
+            }
             release_cold_disk_file_slot(file_slot);
             decoder->text_kv.release_cold_slot(slot);
             continue;
@@ -10876,25 +12650,471 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
         store.transfer_to_cold(text, page);
         sequence.cold_pages.push_back(SequenceState::ColdPageEntry{
             .page = page, .slot = slot, .file_slot = file_slot});
+        // [TEXT-CARGO] THE DURABLE PAYLOAD OF THIS BLOCK, AS TEXT. This is the whole
+        // write side of the user's change: the page is being retired, and what is kept for
+        // a later recall is its 64 TOKEN IDS, not its compressed KV.
+        //
+        // WHERE THE TEXT COMES FROM AND WHY THAT IS THE RIGHT SOURCE: `sequence.ledger`
+        // (program.h:456) IS this sequence's token stream -- the same vector
+        // append_forced_tokens appends to (:9039) and the same one prefill_text_chunk is
+        // handed (:9090). Block `page` covers `ledger[64*page, 64*page + 64)`, and the page
+        // is retired only when it is committed (`cold_frontier` walks committed pages), so
+        // the range is final by construction. If it is NOT final the write REFUSES and is
+        // counted -- it does not pad, truncate or substitute: a cargo record that is not
+        // byte-for-byte the tokens the KV was computed from is worse than no record at all.
+        //
+        // THE COORDINATE IS THE BLOCK NUMBER, NOT `file_slot`. They are equal only because
+        // both allocators happen to ascend; the directory's answer must not depend on the
+        // allocator (spec/turn_recall_journal.h, the cargo format note), so the cargo is
+        // addressed by the content's own coordinate and `file_slot` stays where it belongs
+        // -- as the KV mirror's location.
+        if (cold_text_cargo != nullptr) {
+            const std::uint64_t base = static_cast<std::uint64_t>(page) *
+                                       static_cast<std::uint64_t>(kPagedKVPageSize);
+            // ⭐ THE TAIL BLOCK IS STORED, NOT REFUSED -- 「最后一块没存你就补齐了存呗」 at the engine.
+            //
+            // WHAT THIS REPLACES, EXACTLY: the gate was
+            //   `if (base + kPagedKVPageSize <= sequence.ledger.size()) { write } else { ++refused; }`
+            // which is FALSE for the last block of every document whose length is not a multiple of
+            // 64 -- i.e. for every book, and for the last turn of every conversation. The cargo
+            // writer had already been relaxed to accept a short count (spec/turn_recall_journal.h:
+            // 1258-1264 refuses only `count == 0 || count > kRecallCargoBlockTokens`), but NO
+            // caller ever passed one, so the relaxation was inert and the net behaviour was
+            // unchanged -- the inventory's C2 row and Q1(a) both say exactly this. This is the
+            // caller that makes it live.
+            //
+            // THE COUNT IS DERIVED FROM THE LEDGER, NOT ASSUMED. `count` is how many tokens of this
+            // block the sequence has actually COMMITTED; `base >= ledger.size()` is the only
+            // remaining refusal and it is a different statement -- "these tokens do not exist" --
+            // not "this block is not full". The tokens stored are still exactly the tokens the KV
+            // was computed from, at their own positions: nothing is padded up into the payload, and
+            // the writer's zero lanes are a fixed-stride detail that carries no token. What makes
+            // reading back correct is that the REAL length now travels with the block, in the
+            // directory row written immediately below.
+            //
+            // WHY THE ROW IS WRITTEN *HERE*: this is the only point in the engine where a block's
+            // TEXT, its page, its file slot and its codec are all in hand at the moment the block
+            // becomes cold. One row here makes four separate dead things reachable at once -- the
+            // length-aware read (`sum_dir_row_tokens` -> `read_located_block`'s `row_tokens`), the
+            // block->row join (`SumDir::row_for_page`), the byte axis, and the catalogue
+            // (`set_summary` -> `search_summaries` -> the registered `QSummarySubstring`, whose
+            // column had NO writer in any real run).
+            const std::uint32_t count =
+                base < sequence.ledger.size()
+                    ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                          static_cast<std::uint64_t>(kPagedKVPageSize),
+                          static_cast<std::uint64_t>(sequence.ledger.size()) - base))
+                    : 0U;
+            if (count != 0U) {
+                const auto* ids = reinterpret_cast<const std::uint32_t*>(
+                    sequence.ledger.data() + base);
+                if (cold_text_cargo->write_block(page, ids, count)) {
+                    ++cold_text_cargo_blocks;
+                    // The directory row is an OBSERVER of the same event, never a gate on it: a row
+                    // that cannot be written (a codec the directory will not admit) leaves the
+                    // cargo record in place and is COUNTED, because the recall path already refuses
+                    // a page the directory does not describe -- so the failure is a miss, not a
+                    // wrong answer. The rule is the one `product/kv_recall_block.h` states for its
+                    // own sidecar: an observer of the eviction path must not be able to abort it.
+                    if (text_directory != nullptr) {
+                        const spec::sum_dir::SumDirCodec row_codec =
+                            sum_dir_codec_from_recall(turn_recall_codec);
+                        if (spec::sum_dir::sum_dir_codec_admitted(row_codec)) {
+                            const std::size_t row = text_directory->append(
+                                ids, count, static_cast<std::uint32_t>(base),
+                                static_cast<std::uint64_t>(sequence.recall_sequence_tag), row_codec,
+                                file_slot, page);
+                            // The catalogue line, from the ONE renderer in spec/sum_dir.h -- the
+                            // same function the recall provider renders its QUERY with, so the
+                            // producer and the consumer cannot drift about what a line looks like
+                            // (a drift there reads as "the index found nothing", which is the
+                            // misreading this whole patch exists to end).
+                            text_directory->set_summary(
+                                row, spec::sum_dir::sum_dir_render_token_line(ids, count));
+                            ++text_directory_rows;
+                        } else {
+                            ++text_directory_refused;
+                        }
+                    }
+                } else {
+                    ++cold_text_cargo_refused;
+                }
+            } else {
+                ++cold_text_cargo_refused;
+            }
+        }
+        // The KV mirror's own byte count for the SAME retired pages, so the two payloads are
+        // printed as two readings of ONE event instead of as two unrelated measurements.
+        if (file_slot >= 0) { cold_text_kv_bytes += turn_recall_page_bytes(); }
         sequence.cold_frontier = page + 1;
         ++compressed;
     }
+    // ⭐ THE SIDE-BY-SIDE, ON ONE LINE, ONLY WHEN THIS PASS RETIRED SOMETHING: the KV mirror
+    // and the text cargo are two descriptions of the same retired blocks, so the ratio between
+    // them is the entire quantitative argument for the change (1.18 MB/page vs 192-256 B/page)
+    // and it must be a reading, not a constant.
+    // ---------------------------------------------------------------------------
+    // SCOPE OF THE TWO DERIVED FIELDS -- the defect this comment closes
+    // ---------------------------------------------------------------------------
+    // Every number on the line below is CUMULATIVE: `records`, `bytes` and `refused` come from
+    // the cargo object and from members that are never reset, and `kv_mirror_bytes` is a member
+    // accumulator. `compressed` is THIS PASS's page count. Dividing a cumulative numerator by a
+    // per-pass denominator is not a "smaller reading" -- it is a WRONG one, and it is exactly
+    // what this line used to do. Arm Ar's line 1 read bytes_per_record=1181696 for 958 records
+    // while line 2 read bytes_per_record=24766378 for a stride that had not moved: 1006
+    // cumulative pages divided by that pass's 48.
+    // ⇒ ONLY the first `[textcargo]` line of a run was ever quotable.
+    //
+    // THE FIX: the divisor is a cumulative count of the SAME events the numerator accumulates.
+    // `cold_text_kv_bytes` is incremented once per retired page that had a file slot
+    // (`file_slot >= 0`, :11754) -- i.e. PER RETIREMENT EVENT, not per distinct page -- so the
+    // matching denominator is the number of records the cargo actually persisted, which is
+    // `bytes_written() / kRecallCargoBlockBytes`, i.e. exactly the `bytes` field beside it
+    // divided by the `stride`. Both sides therefore count the same events and
+    // `bytes_per_record == kv_mirror_bytes / (bytes / stride)` is checkable by division from the
+    // printed line alone.
+    //
+    // ⚠️ WHY THE DIVISOR IS *NOT* THE PRINTED `records=` FIELD, NAMED WITH A MEASURED INSTANCE:
+    // `TurnRecallTextCargo::write_block` (spec/turn_recall_journal.h:1076-1077) sets
+    // `blocks_written_ = max(blocks_written_, block_index + 1)` and `bytes_written_ += stride`
+    // independently, so `blocks_written()` is a HIGH-WATER MARK of `block_index + 1` (it is also
+    // what the file header publishes as `block_count`), while `bytes_written()` counts writes.
+    // They coincide whenever the write path walks `cold_frontier` upward -- which is the common
+    // case -- and they separate when a page is RE-retired at an index already covered:
+    // `logs/A.log:180` (the KV-read-back arm, where a restored page goes hot and is spilled
+    // again) printed `records=2227 stride=256 B bytes=570368`, and 570368/256 = 2228 ≠ 2227.
+    // Using `records=` there would have moved the ratio by 0.045% for no physical reason. The
+    // `records=` field is left printing exactly what it printed before, so every prior quotation
+    // of it stays valid. (That accessor's semantics are not changed under this task.)
+    //
+    // IT STAYS A READING, NOT A CONSTANT: the ratio is two runtime accumulators at the moment of
+    // the pass, and it moves the moment a retired page has no file slot to mirror into
+    // (`file_slot < 0`, Window policy), or a cargo record is refused
+    // (`cold_text_cargo_refused`, :11746/:11749).
+    if (cold_text_cargo != nullptr && compressed != 0) {
+        const unsigned long long cargo_records =
+            cold_text_cargo->bytes_written() /
+            static_cast<unsigned long long>(spec::turn_recall::kRecallCargoBlockBytes);
+        std::fprintf(stderr,
+                     "[textcargo] path=%s records=%llu stride=%u B bytes=%llu | "
+                     "kv_mirror_bytes=%llu bytes_per_record=%llu ratio=%.2f:1 "
+                     "refused=%llu\n",
+                     cold_text_cargo->path().c_str(),
+                     static_cast<unsigned long long>(cold_text_cargo->blocks_written()),
+                     spec::turn_recall::kRecallCargoBlockBytes,
+                     static_cast<unsigned long long>(cold_text_cargo->bytes_written()),
+                     static_cast<unsigned long long>(cold_text_kv_bytes),
+                     static_cast<unsigned long long>(
+                         cargo_records != 0 ? cold_text_kv_bytes / cargo_records : 0),
+                     cargo_records != 0
+                         ? static_cast<double>(cold_text_kv_bytes / cargo_records) /
+                               static_cast<double>(spec::turn_recall::kRecallCargoBlockBytes)
+                         : 0.0,
+                     static_cast<unsigned long long>(cold_text_cargo_refused));
+    }
+    std::fprintf(stderr,
+                 "[spillgate] limit=%u frontier_after=%u pages=%u | references==1:%u "
+                 "writer==0:%u pins==0:%u device_replica:%u !cold:%u | orig_predicate:%u "
+                 "can_cold_transfer:%u relaxed{writer:%u refs:%u pins:%u dev:%u} | "
+                 "past_predicate:%u transferred:%u\n",
+                 limit, sequence.cold_frontier, p_pages, p_r1, p_w0, p_pins0, p_dev, p_notcold,
+                 p_orig, p_can, p_relax_writer, p_relax_refs, p_relax_pins, p_relax_dev, p_past,
+                 compressed);
     if (compressed != 0) {
         device.synchronize();
         std::fprintf(stderr, "[cold] compressed %u prefix pages (kept %u+)\n", compressed,
                      cold_keep_tokens);
     }
+    return compressed;
 }
 
-// Cold Host tier maintenance (ColdPolicy::Host): retire the READ-FREE prefix of a
-// sequence's text KV into the tier's pinned Host pool and hand the device pages
-// back to the pool. Read-free is what makes this safe without touching a single
-// kernel or block-table entry: a page no layer can read has no reader, so its
-// physical page may be reused immediately, and nothing has to be restored inline.
-// The page comes back only through the materialization path (rewrite, fork,
-// resume, checkpoint restore), which already restores any Host-resident page.
+// ---------------------------------------------------------------------------
+// THE PROACTIVE (WATERMARK) UNLOAD PASS -- the user's design order of 2026-09-15
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS NOT enqueue_cold_compressions(): that pass is PASSIVE. Its gate is
+// `sequence.text_kv_valid > cold_keep_tokens` and its limit is derived from the
+// FRONTIER -- "everything older than the newest cold_keep_tokens is retired" --
+// so it says nothing about how much room is left and it either runs on every
+// round or on none. The user asked for the opposite shape, verbatim:
+//
+//     "达到显存剩下多少的时候主动开始总结压缩而不是等到溢出了"
+//
+// so the trigger here is the FREE POOL, and the question it answers is not "how
+// old is this page" but "does the semantic directory say this block may leave".
+//
+// THE SEMANTIC HALF IS NOT OPTIONAL, and that is the second half of the same
+// order ("卸载根据的是语义"). The judge is spec::sum_dir's per-block verdict -- a
+// fact about the SEQUENCE (does the block's content exist, is it the partial tail
+// page), a fact about the CONTENT (does it carry an injected control token), and
+// the row's own byte axis -- ranked by the FIXED priority in `sum_dir_avl_rank`
+// (sum_dir.h:852). A block the judge KEEPS is never unloaded here, whatever an
+// LRU order would have said about it.
+//
+// WHAT THE JUDGE KEEPS TODAY, NAMED RATHER THAN IMPLIED: of the judge's four keep
+// reasons, only `Resident` (the partial tail page, computable from the sequence
+// length alone -- sum_dir_resident_block, sum_dir.h:999) is derivable from
+// SequenceState as it is built today. `has_control_token`, `pinned_by_anchor` and
+// `inside_system_prefix` are NOT retained in SequenceState (the prompt's token
+// types and the capture frontiers live on the request, not on the sequence), so
+// they arrive false and the keep set exercised here is {Resident} intersect the
+// engine's own cold_keep_tokens floor. That is a LIMIT of this change and not a
+// property of the judge: the two facts the engine would have to retain are named
+// in the REPORT so the gap is checkable.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The seam's type is a plain function pointer (program.h), so the verdicts have to
+// travel as a context object rather than as a closure.
+struct UnloadFilterContext {
+    const std::vector<spec::sum_dir::SumDirAdmissibility>* verdicts = nullptr;
+    // [DESC-CAP] THE STRATEGY SEAM, SECOND HALF. Before this, the pass took BOTH its
+    // count and its filter from the policy-free `sum_dir_is_unloadable`, so
+    // NINFER_SUM_DIR_BYTE_AXIS could not change a single bit. The default here is the
+    // policy this pass was hard-wired to -- PriceWhenAbsent, the OPT-IN value -- and NOT
+    // the enum's own zero value (RefuseWhenAbsent): a construction site that forgets to
+    // pass the policy must not be able to switch the pass to refusing every
+    // AdmissibleTextOnly offer. Today the single construction site passes it explicitly.
+    spec::sum_dir::SumDirByteAxisPolicy policy =
+        spec::sum_dir::SumDirByteAxisPolicy::PriceWhenAbsent;
+};
+
+// A page's block index IS the page number under the engine's own identity: the
+// directory's block is the 64-token Paged-KV page (sum_dir.h:136-138) and a
+// concatenated unload text names its FIRST block (:1824-1833). So "may this page
+// leave" is a direct index into the verdicts, with no second map to drift.
+bool unload_filter_admits(void* raw, std::uint32_t page) {
+    const auto& context = *static_cast<const UnloadFilterContext*>(raw);
+    if (context.verdicts == nullptr || page >= context.verdicts->size()) { return false; }
+    // The offering gate (sum_dir.h:1063-1070). For every policy that declines nothing
+    // this is exactly `sum_dir_is_unloadable`, which is why the default path cannot move.
+    return spec::sum_dir::sum_dir_verdict_is_offered((*context.verdicts)[page], context.policy);
+}
+
+} // namespace
+
+std::uint32_t ProgramImplCore::text_kv_free_pool_pages() const noexcept {
+    if (decoder == nullptr) { return 0; }
+    const auto& pool             = decoder->text_kv.page_pool();
+    const std::uint32_t capacity = pool.capacity_pages();
+    const std::uint64_t used     = static_cast<std::uint64_t>(pool.allocated_pages()) +
+                               static_cast<std::uint64_t>(pool.reserved_pages());
+    // Saturated, never wrapped: an over-subscribed pool is a fact and must read as
+    // "no headroom", not as four billion free pages.
+    return used >= capacity ? 0U : static_cast<std::uint32_t>(capacity - used);
+}
+
+std::uint32_t ProgramImplCore::resident_text_kv_pages_required() const noexcept {
+    // OFF: 0 is the caller's signal to reserve the WHOLE span, i.e. the exact
+    // pre-change behaviour and therefore the negative control.
+    if (unload_watermark_pages == 0) { return 0; }
+    const std::uint32_t floor_pages = unload_pages_for_tokens(cold_keep_tokens);
+    const std::uint32_t chunk_pages = unload_pages_for_tokens(prefill_chunk);
+    const std::uint32_t headroom =
+        unload_watermark_pages > floor_pages ? unload_watermark_pages : floor_pages;
+    return headroom + chunk_pages;
+}
+
+void ProgramImplCore::report_unload_watermark(std::uint32_t free_before,
+                                             std::uint32_t free_after,
+                                             std::uint32_t blocks_total,
+                                             std::uint32_t blocks_unloadable,
+                                             std::uint32_t pages_retired,
+                                             const char* reason,
+                                             const std::uint32_t* verdict_histogram) const {
+    // ONE line per trigger, and the line is the deliverable: a pass that decided
+    // not to unload has to say so, because "the plan was empty and nothing was
+    // printed" is exactly the silence that hid this whole area until now
+    // (ensure_sequence_kv_mapped_for_round's `if (plan.empty()) { return; }`, :11980).
+    // ⭐ [LONGCTX-FIX-D] THE DISTRIBUTION, ON THE SAME LINE AND APPENDED. Nothing before
+    // `reason=` is touched, so a reader that stops there sees exactly the line it saw
+    // before this change.
+    //
+    // WHY A DISTRIBUTION AND NOT ANOTHER SUMMARY: `unloadable` CANNOT discriminate.
+    // `sum_dir_is_unloadable` (sum_dir.h:945-948) is literally
+    // `verdict == Admissible || verdict == AdmissibleTextOnly`, and this pass takes BOTH
+    // its count (the loop in unload_watermark_trigger) and its filter
+    // (unload_filter_admits, below) from that one policy-free predicate. So
+    //     unloadable == #Admissible + #AdmissibleTextOnly
+    // holds BY CONSTRUCTION, and the only thing that could ever lower it are the four
+    // keep verdicts -- which `sum_dir_facts_from_sequence` (sum_dir.h:1023-1033) leaves at
+    // their defaults (has_control_token / pinned_by_anchor / inside_system_prefix are
+    // never written; overlap_frontier mirrors resident_here), so they are false on every
+    // block. The information this leg really carries lives in the SPLIT -- a block whose
+    // bytes are already in a cold slot is `Admissible`, a block that has never been one is
+    // `AdmissibleTextOnly` -- and the sum erases it. Printing the histogram turns the
+    // identity above from a source reading into a reading taken from ONE run:
+    //     dist.admissible + dist.admissible-text-only == unloadable
+    std::uint32_t distribution[7] = {0, 0, 0, 0, 0, 0, 0};
+    if (verdict_histogram != nullptr) {
+        for (std::size_t index = 0; index < 7; ++index) {
+            distribution[index] = verdict_histogram[index];
+        }
+    }
+    // [DESC-CAP] THE BOOKKEEPING THE MEANING CHANGE OWES. `blocks_unloadable` is now the
+    // OFFERED count (see the counting loop), so the identity the previous generation
+    // measured line by line -- admissible + admissible-text-only == unloadable -- holds
+    // only under a policy that refuses nothing. The refused half is DERIVED here from
+    // the two numbers this function already receives: hist[0] + hist[1] is every
+    // unloadable VERDICT, and the difference is what the gate declined. No new argument,
+    // no new call site, and on the two early-exit lines (no histogram) it is 0.
+    const std::uint32_t verdicts_unloadable = distribution[0] + distribution[1];
+    const std::uint32_t refused_by_policy =
+        verdicts_unloadable > blocks_unloadable ? verdicts_unloadable - blocks_unloadable : 0U;
+    std::fprintf(stderr,
+                 "[unload] watermark=%u pages free=%u->%u blocks=%u unloadable=%u retired=%u "
+                 "reason=%s "
+                 "dist.admissible=%u dist.admissible-text-only=%u dist.control-token=%u "
+                 "dist.pinned-by-anchor=%u dist.resident=%u dist.system-prefix=%u dist.empty=%u "
+                 "refused-by-policy=%u\n",
+                 unload_watermark_pages, free_before, free_after, blocks_total, blocks_unloadable,
+                 pages_retired, reason,
+                 distribution[0], distribution[1], distribution[2], distribution[3],
+                 distribution[4], distribution[5], distribution[6], refused_by_policy);
+}
+
+std::uint32_t ProgramImplCore::unload_watermark_trigger(SequenceState& sequence) {
+    // OFF means OFF: with no watermark the Engine behaves exactly as it did before
+    // this knob existed, and it is the passive --cold-policy pass that runs.
+    if (unload_watermark_pages == 0) { return 0; }
+    if (decoder == nullptr || !sequence.kv || !sequence.kv->text.valid()) { return 0; }
+
+    const std::uint32_t free_before = text_kv_free_pool_pages();
+
+    // THE MEDIUM IS STILL THE COLD SLOT TIER. The watermark decides WHEN to
+    // unload; it does not conjure somewhere to put the bytes, so --cold-policy
+    // must still name a slot tier. What the watermark removes is the requirement
+    // that the pool OVERFLOW first -- the passive path's only trigger. Saying so
+    // out loud is the point of this branch: a run with a watermark and no tier is
+    // a configuration that cannot do what it says.
+    const bool slot_tier_live = cold_policy == ColdPolicy::Window ||
+                                cold_policy == ColdPolicy::Disk ||
+                                cold_policy == ColdPolicy::HostThenDisk;
+    if (!slot_tier_live) {
+        report_unload_watermark(free_before, free_before, 0, 0, 0, "no-slot-tier");
+        return 0;
+    }
+    if (cold_requant_codes == nullptr) {
+        report_unload_watermark(free_before, free_before, 0, 0, 0, "no-requant-codes");
+        return 0;
+    }
+    // Above the watermark there is nothing to do and nothing to report: this is the
+    // NEGATIVE side of the knob (and the whole content of acceptance arm B).
+    if (free_before > unload_watermark_pages) { return 0; }
+
+    // (1) THE SEMANTIC JUDGEMENT: one verdict per 64-token block the sequence owns.
+    // [DESC-CAP] STEP 5 OF THE NAMED PLAN, WITH ONE CORRECTION THE PLAN GOT WRONG.
+    //
+    // The plan said "replace the hard-wired PriceWhenAbsent with its real source, e.g.
+    // SumDirKnobs::from_env().byte_axis_policy".  That IS the right source, but reading
+    // it unconditionally would MOVE THE DEFAULT: the knob struct's own default is
+    // `kSumDirByteAxisPolicyDefault == RefuseWhenAbsent` (sum_dir.h:578-579,
+    // commented "DEFAULT. A page with no byte axis is NOT OFFERED"), while this pass has
+    // always run `PriceWhenAbsent` (sum_dir.h:564-570, the OPT-IN value).  Wiring it
+    // naively would therefore make every run with NINFER_SUM_DIR_BYTE_AXIS unset refuse
+    // exactly the AdmissibleTextOnly offers -- i.e. it would collapse `retired` on the
+    // default path, which is the one thing this change is forbidden to do.
+    //
+    // So the environment is read ONLY WHEN IT IS SET, and the spelling is sum_dir.h's own
+    // parser (one place owns the three names).  Unset => the constant that was written
+    // here before, so the default path executes the same policy object it always did.
+    const char* const byte_axis_env = std::getenv("NINFER_SUM_DIR_BYTE_AXIS");
+    bool byte_axis_recognised = false;
+    const spec::sum_dir::SumDirByteAxisPolicy policy =
+        byte_axis_env == nullptr
+            ? spec::sum_dir::SumDirByteAxisPolicy::PriceWhenAbsent
+            : spec::sum_dir::sum_dir_byte_axis_policy_parse(byte_axis_env, byte_axis_recognised);
+    const std::vector<spec::sum_dir::SumDirBlockFactsFromSequence> from_sequence =
+        spec::sum_dir::sum_dir_facts_from_sequence(sequence.text_kv_valid);
+    std::vector<spec::sum_dir::SumDirBlockFacts> facts;
+    facts.reserve(from_sequence.size());
+    for (std::size_t index = 0; index < from_sequence.size(); ++index) {
+        spec::sum_dir::SumDirBlockFacts block = from_sequence[index].facts;
+        // THE BYTE AXIS IS THE ENGINE'S TO STATE, not the sequence's
+        // (sum_dir.h:1021-1022): a block whose page still has a record in
+        // sequence.cold_pages has its bytes on disk and is `Admissible` outright;
+        // every other block is offered as `AdmissibleTextOnly` because the policy
+        // below is PriceWhenAbsent. That distinction is the dead angle being closed:
+        // under the DEFAULT policy (RefuseWhenAbsent) a block that has never been in
+        // a cold slot could never be offered at all (sum_dir.h:563-569), which is the
+        // "没进过冷槽的块永远不可召回" conflict with the user's requirement 5.
+        block.byte_axis_present =
+            std::any_of(sequence.cold_pages.begin(), sequence.cold_pages.end(),
+                        [index](const SequenceState::ColdPageEntry& entry) {
+                            return entry.page == index;
+                        });
+        facts.push_back(block);
+    }
+    const std::vector<spec::sum_dir::SumDirAdmissibility> verdicts =
+        spec::sum_dir::sum_dir_admissibility_report_from(facts);
+    std::uint32_t unloadable = 0;
+    // [LONGCTX-FIX-D] One extra `++` in the SAME loop, over the SAME array, is the whole
+    // instrumentation: the histogram cannot drift from the count because there is no
+    // second pass to drift in. The index is the enum's own value (sum_dir.h:838-846), so
+    // a future renumbering moves the histogram with the verdict rather than silently
+    // re-labelling it.
+    std::uint32_t verdict_histogram[7] = {0, 0, 0, 0, 0, 0, 0};
+    for (const spec::sum_dir::SumDirAdmissibility verdict : verdicts) {
+        ++verdict_histogram[static_cast<std::size_t>(verdict)];
+        // [DESC-CAP] THE COUNT AND THE FILTER MUST SHARE ONE GATE, or `unloadable` would
+        // stop describing what the filter admits. This is the named plan's step 3, and it
+        // changes the MEANING of the printed `unloadable` from "the judge calls it
+        // unloadable" to "the OFFERING GATE offers it" -- under every policy but
+        // RefuseWhenAbsent the two are the same set, and under RefuseWhenAbsent the
+        // difference is exactly the AdmissibleTextOnly blocks, i.e. exactly
+        // `dist.admissible-text-only`. That number is what `refused-by-policy` prints, so
+        // the identity the previous generation measured stays checkable:
+        //     unloadable + refused-by-policy == dist.admissible + dist.admissible-text-only
+        if (spec::sum_dir::sum_dir_verdict_is_offered(verdict, policy)) { ++unloadable; }
+    }
+
+    // (2) THE UNLOAD, through the SAME spill body as the passive path -- device
+    // slot, per-layer codec pack, validity check, sentinel, file slot. The filter is
+    // the only thing the watermark changes about it.
+    UnloadFilterContext context{&verdicts, policy};
+    const std::uint32_t retired =
+        enqueue_cold_compressions(sequence, &unload_filter_admits, &context);
+
+    // THE COUNT IS THE PASS'S OWN, NOT THE POOL'S FREE-PAGE DELTA. A device-slot cold
+    // transfer is footprint-neutral in the pool by construction: transfer_to_cold ->
+    // dematerialize_one hands the physical page back and CREDITS THE SAME ADDRESS's
+    // reservation (paged_kv_cache.cpp:416-427), so `free_after - free_before` is 0 even
+    // when the pass retired nine hundred pages. Measuring it that way made the trigger
+    // report retired=0 on a pass that had just emptied the prefix, which in turn sent
+    // the safety valve below down the passive leg on every single trigger -- a second
+    // full pass and a misleading line. The free counts are still printed, because they
+    // are the pool's truth; they are just not asked to be the retirement count.
+    const std::uint32_t free_after = text_kv_free_pool_pages();
+    report_unload_watermark(free_before, free_after, static_cast<std::uint32_t>(verdicts.size()),
+                            unloadable, retired, "semantic", verdict_histogram);
+
+    if (retired == 0) {
+        // THE SAFETY VALVE, and it is announced rather than silent: a watermark
+        // stricter than the engine's own floor must never be able to fail a request
+        // that the passive rule would have served. So when the judge admits nothing
+        // that the frontier rule had not already retired, the passive pass still runs
+        // and says so. A request can therefore never be broken BY this knob.
+        const std::uint32_t fallback = enqueue_cold_compressions(sequence);
+        const std::uint32_t free_fallback = text_kv_free_pool_pages();
+        report_unload_watermark(free_after, free_fallback,
+                                static_cast<std::uint32_t>(verdicts.size()), unloadable,
+                                fallback, "passive-fallback", verdict_histogram);
+    }
+    return retired;
+}
+
+// Cold Host tier maintenance (ColdPolicy::Host, and rung 1 of
+// ColdPolicy::HostThenDisk): retire the READ-FREE prefix of a sequence's text KV
+// into the tier's pinned Host pool and hand the device pages back to the pool.
+// Read-free is what makes this safe without touching a single kernel or
+// block-table entry: a page no layer can read has no reader, so its physical page
+// may be reused immediately, and nothing has to be restored inline. The page comes
+// back only through the materialization path (rewrite, fork, resume, checkpoint
+// restore), which already restores any Host-resident page.
 void ProgramImplCore::enqueue_cold_host_evictions(SequenceState& sequence) {
-    if (cold_policy != ColdPolicy::Host || cold_host_tier == nullptr || !sequence.kv ||
+    if ((cold_policy != ColdPolicy::Host && cold_policy != ColdPolicy::HostThenDisk) ||
+        cold_host_tier == nullptr || !sequence.kv ||
         decoder == nullptr || !sequence.kv->text.valid()) {
         return;
     }
@@ -10910,6 +13130,41 @@ void ProgramImplCore::enqueue_cold_host_evictions(SequenceState& sequence) {
             std::fprintf(stderr,
                          "[cold] --cold-policy host admits nothing: no layer has a sliding "
                          "window, so no page is ever read-free\n");
+        }
+        return;
+    }
+    // ==== S3 GUARD. ORDERED FIRST, AND NOTHING MAY BE WIRED PAST IT. ====================
+    // A page may leave the device only when EVERY kernel that can still read it applies the
+    // window that released it. The windowed check directly above is a DECODE census; the
+    // prompt kernel that reaches these layers is not in it:
+    //   gqa_attention_prefill_nvfp4.cuh:1097 applies the window only for
+    //   KVDType == DType::NVFP4, and the launcher sends ISO3 into that same template
+    //   (ops/launcher/gqa_attention_prefill.cu:195 -> :201). An ISO3 prefill is FULL
+    //   ATTENTION while an ISO3 decode is window attention, so on ISO3 a page retired on the
+    //   window is read by the next prefill that covers it.
+    // `kv_window_tier_honoured` (product/kv_component_switch.h) is the DECODE census and is
+    // deliberately NOT what this decision uses; `kv_window_tier_release_safe` is the
+    // two-phase census, and this arm is where it is consulted. Without it, wiring a release
+    // site into the prefill path -- or any later prefill over a range this function already
+    // retired on ISO3 -- is the class the tree refuses by name: "a released page would be
+    // read anyway: SILENT CORRUPTION, not a quality loss".
+    // Read-only: it inspects the per-layer tier and returns BEFORE the scan, so no page moves
+    // and no accounting changes. It is a NO-OP for every configuration this project has
+    // measured, because every one of them is nvfp4, and nvfp4 is release-safe.
+    for (std::uint32_t layer = 0; layer < decoder->text_kv.layers(); ++layer) {
+        const DType tier_dtype = decoder->text_kv.batch_layer_view(layer).dtype;
+        if (product::kv_window_tier_release_safe(tier_dtype)) { continue; }
+        if (!cold_host_tier_inert_reported) {
+            // The same one-shot flag as the "admits nothing" arm above and the horizon arm:
+            // one line per process, not one per round.
+            cold_host_tier_inert_reported = true;
+            std::fprintf(stderr,
+                         "[cold] --cold-policy host retires NOTHING on this KV configuration: "
+                         "layer %u is on a tier whose PREFILL kernel does not read "
+                         "sliding_window_tokens (the window is applied only for NVFP4), so a "
+                         "released page would be read by the next prefill that covers it. "
+                         "The Host rung is inert -- SILENT CORRUPTION refused by name.\n",
+                         layer);
         }
         return;
     }
@@ -10937,11 +13192,19 @@ void ProgramImplCore::enqueue_cold_host_evictions(SequenceState& sequence) {
         if (!store.can_cold_host_prepare(text, page)) { continue; }
         const product::ColdTierDecision decision = cold_host_tier->admit();
         if (decision.tier != product::ColdTier::Host) {
-            // Tier 1 is full. Tier 2 (SSD) would catch this page, but no policy
-            // enables both tiers today and the spill tier's file space is still the
-            // device cold-slot pool (see REPORT / the patch's prerequisite note), so
-            // the page simply stays where it is: counted and reported, never thrown.
-            cold_host_tier->note_refused();
+            // Rung 1 is full (or has no room left at all).
+            //
+            // Disk: NOT a refusal -- rung 2 owns the page, and the consumer that
+            // places it is the round's own compression pass, which runs immediately
+            // after this scan (decode_raw). Its age gate is strictly weaker than the
+            // read-free gate that got this page here (a page the sliding windows have
+            // moved past is necessarily older than cold_keep_tokens), so the page
+            // really does land on the spill tier in this same round. Counting it here
+            // would double-count it, so it is left to that pass and its own report.
+            //
+            // StayHot: no second rung is configured, so the page stays where it is --
+            // counted and reported, never thrown.
+            if (decision.tier != product::ColdTier::Disk) { cold_host_tier->note_refused(); }
             break;
         }
         std::array<LogicalKVPageHandle, 1> membership{store.logical_page(text, page)};
@@ -11085,7 +13348,7 @@ bool ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
         const Tensor cold_slots          = view.cold_slots;
         if (cold_slots.data == nullptr) { continue; }
         if (view.dtype == DType::NVFP4) {
-            // NVFP4 tier: rANS-decode the slot back into the native E2M1/ISO3
+            // NVFP4 tier: rANS-decode the slot back into the native E2M1/ISO4E
             // code plane, then scatter the slot's scale tail into the plane.
             auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
             auto* v_slot_base = k_slot_base + cold_slots.nb[2];
@@ -11138,6 +13401,49 @@ bool ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
                                           k_codes_i8, k_scales_h, view.slot_bytes, device.stream);
             ops::cold_i8_slot_restore_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
                                           v_codes_i8, v_scales_h, view.slot_bytes, device.stream);
+        } else if (view.dtype == DType::BF16) {
+            // BF16 tier (BF16-COLD-LAND A5): the resident plane is raw bf16, so there is
+            // no code/scale pair to scatter into -- the slot is decoded straight back
+            // into the bf16 K/V plane. Without this branch a bf16 page that was retired
+            // and then warmed would be left holding whatever the plane held before, while
+            // its sentinel was replaced by a physical page index: a SILENT wrong answer,
+            // which is worse than the refusal it replaces. The decode is lossy (the slot
+            // is the requantized page), which is the contract the int8 tier has always
+            // had; it is new only for bf16, which until now never retired a page.
+            auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
+            auto* v_slot_base = k_slot_base + cold_slots.nb[2];
+            auto* k_plane = static_cast<std::uint8_t*>(view.k_pages.data) +
+                            static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
+            auto* v_plane = static_cast<std::uint8_t*>(view.v_pages.data) +
+                            static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
+            ops::cold_i8_slot_restore_bf16_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                               k_plane, view.slot_bytes, device.stream);
+            ops::cold_i8_slot_restore_bf16_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                               v_plane, view.slot_bytes, device.stream);
+        } else if (view.dtype == DType::E8Kv) {
+            // Rk4v4 tier (BF16-COLD-LAND E5): the codes were stored verbatim, so this is a
+            // verbatim copy back into the packed 4-bit code plane plus a rebuild of the
+            // fp16 g64 scales from the E4M3 g16 tail. Without it a retired rk4v4 page that
+            // went hot again would read whatever its plane held before -- a silent wrong
+            // answer while its sentinel was already replaced by a physical page index.
+            auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
+            auto* v_slot_base = k_slot_base + cold_slots.nb[2];
+            auto* k_codes_rk4v4 = static_cast<std::int8_t*>(view.k_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
+            auto* v_codes_rk4v4 = static_cast<std::int8_t*>(view.v_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
+            auto* k_scales_rk4v4 = static_cast<void*>(
+                static_cast<std::uint8_t*>(view.k_scale_pages.data) +
+                static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3]);
+            auto* v_scales_rk4v4 = static_cast<void*>(
+                static_cast<std::uint8_t*>(view.v_scale_pages.data) +
+                static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3]);
+            ops::cold_i8_slot_restore_rk4v4_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                             k_codes_rk4v4, k_scales_rk4v4, view.slot_bytes,
+                                             device.stream);
+            ops::cold_i8_slot_restore_rk4v4_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                             v_codes_rk4v4, v_scales_rk4v4, view.slot_bytes,
+                                             device.stream);
         }
     }
     // Exactly one device slot is live on every path into here, and it is the
@@ -11162,7 +13468,10 @@ bool ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
 // rewrite needs real physical pages so append/fork can mutate them again.
 void ProgramImplCore::prefetch_cold_pages(SequenceState& sequence, std::uint32_t pages,
                                           std::span<const std::int32_t> file_slots) {
-    if (cold_policy != ColdPolicy::Disk || cold_disk_staging[0] == nullptr) { return; }
+    if ((cold_policy != ColdPolicy::Disk && cold_policy != ColdPolicy::HostThenDisk) ||
+        cold_disk_staging[0] == nullptr) {
+        return;
+    }
     // Pre-read the file regions into pinned staging to warm the OS page
     // cache; the actual H2D happens in restore once a device staging slot is
     // allocated, so the read latency is hidden behind the previous decode.
@@ -11190,7 +13499,8 @@ void ProgramImplCore::prefetch_cold_pages(SequenceState& sequence, std::uint32_t
 }
 
 void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page) {
-    if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Disk) ||
+    if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Disk &&
+         cold_policy != ColdPolicy::HostThenDisk) ||
         !sequence.kv || decoder == nullptr ||
         cold_requant_codes == nullptr || sequence.cold_pages.empty()) {
         return;
@@ -11205,7 +13515,7 @@ void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t en
     // slot, async on the transfer stream) before the decode kernels run, so
     // the H2D legs overlap with the previous decode step.
     std::vector<std::int32_t> prefetch_slots;
-    if (cold_policy == ColdPolicy::Disk) {
+    if (cold_policy == ColdPolicy::Disk || cold_policy == ColdPolicy::HostThenDisk) {
         prefetch_slots.reserve(pages);
         for (std::uint32_t page = 0; page < pages; ++page) {
             if (!store.cold_compressed(text, page)) { continue; }
@@ -11250,6 +13560,1811 @@ void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t en
         device.synchronize();
         std::fprintf(stderr, "[cold] restored %u prefix pages\n", restored);
     }
+}
+
+// ---------------------------------------------------------------------------
+// (6) per-round external recall: P5 the trigger, P6 the page selection, P7 the journal.
+//
+// Design, the measured exchange rates (SSD 2.6-6.1 us/token vs re-prefill 365-690
+// us/token, i.e. 60-260:1) and the codec refusal are in src/spec/turn_recall_journal.h.
+// Every function here REUSES the four legs named in program.h -- no new file I/O, no
+// new key type, no new identity comparison.
+// ---------------------------------------------------------------------------
+
+// The cold codec of the pages this stack can actually spill: the layers that carry a
+// cold slot, classified exactly as restore_cold_page classifies them (:11087 / :11124).
+// A layer with no cold slot contributes nothing, so the factory tier table classifies as
+// `nvfp4` whenever it carries nvfp4 layers at all -- because THIS LOOP HAS NO `else` ARM,
+// its rk4v4 layers set neither flag and are invisible to the answer. That blindness is what
+// [CODECBLIND] counts and names (`turn_recall_codec_blind_layers()`, and the named
+// `[recall] CODEC-BLIND` line at the arming site).
+//
+// CORRECTED 2026-09-22: this comment used to end "Two codecs among the slot-bearing layers
+// is `Mixed`, which admits nothing: one record cannot describe two strides, and guessing one
+// of them would mis-describe every read." `recall_codec_admitted` ADMITS `Mixed` -- since
+// 2026-09-18, on measurement (both cold IO legs are PER LAYER; the record's codec byte has
+// one reader and it is a findability filter, MIXEDPROOF/REPORT.md) -- so that sentence was a
+// claim about the code, written in the code, that the code contradicted. It cannot be used
+// as the definition of anything, which is what src/product/kv_plane_census.h says in its own
+// words. `spec/turn_recall_journal.h`'s `RecallCodec` and `recall_codec_refusal` carry the
+// same correction.
+spec::turn_recall::RecallCodec ProgramImplCore::turn_recall_codec_of_layers() const {
+    if (decoder == nullptr) { return spec::turn_recall::RecallCodec::Rejected; }
+    bool nvfp4 = false;
+    bool i8    = false;
+    const std::uint32_t layers = decoder->text_kv.layers();
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+        if (view.cold_slots.data == nullptr) { continue; }
+        if (view.dtype == DType::NVFP4) { nvfp4 = true; }
+        else if (view.dtype == DType::I8) { i8 = true; }
+    }
+    if (nvfp4 && i8) { return spec::turn_recall::RecallCodec::Mixed; }
+    if (nvfp4) { return spec::turn_recall::RecallCodec::Nvfp4; }
+    if (i8) { return spec::turn_recall::RecallCodec::Int8; }
+    return spec::turn_recall::RecallCodec::Rejected;
+}
+
+// [CODECBLIND] THE COMPLEMENT OF THE FUNCTION ABOVE, AS A NUMBER. The classifier answers
+// "which admitted codec is present"; a loop with no `else` arm has no way to report what it
+// fell through, so the count is taken here -- the SAME views, the SAME skip, the SAME
+// admitted set, walked once more at arming time only.
+//
+// The invariant that the two cannot drift is the pair (classifier, count): the classifier
+// returns `Rejected` exactly when NOTHING admitted is present, and `Rejected` is itself
+// refused -- so a stack whose blind layers are counted here is never one the classifier
+// called admitted *and* clean. The sibling test pins both the arithmetic and the text.
+std::uint32_t ProgramImplCore::turn_recall_codec_blind_layers() const {
+    if (decoder == nullptr) { return 0; }
+    std::uint32_t blind = 0;
+    const std::uint32_t layers = decoder->text_kv.layers();
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+        if (view.cold_slots.data == nullptr) { continue; }
+        if (view.dtype == DType::NVFP4 || view.dtype == DType::I8) { continue; }
+        ++blind;
+    }
+    return blind;
+}
+
+// The NAME of the first codec the classifier could not use, for the line and the refusal.
+// The literals are the tree's own tier tokens (`core/device_capabilities.h`'s `dtype_name`
+// returns the SAME spellings and is deliberately NOT included here: a name a refusal quotes
+// must be stable inside the file that produces the refusal, and the sibling test pins the
+// two spellings equal by TEXT rather than by include). An unknown dtype is named
+// `unclassified`, which is a fact; there is no arm that guesses.
+const char* ProgramImplCore::turn_recall_codec_blind_codec() const {
+    if (decoder == nullptr) { return "none"; }
+    const std::uint32_t layers = decoder->text_kv.layers();
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+        if (view.cold_slots.data == nullptr) { continue; }
+        switch (view.dtype) {
+            case DType::NVFP4: continue;
+            case DType::I8: continue;
+            case DType::E8Kv: return "rk4v4";
+            case DType::E8K3Kv: return "rk3v4";
+            case DType::E8K2Kv: return "rk2v4";
+            case DType::ISO3: return "iso4e";
+            case DType::FP8_E4M3FN: return "fp8-e4m3";
+            case DType::BF16: return "bf16";
+            case DType::FP16: return "fp16";
+            default: return "unclassified";
+        }
+    }
+    return "none";
+}
+
+// One logical page's byte footprint across every layer that carries a cold slot: the
+// same sum the constructor computes as `spill_page_bytes` for --cold-disk-bytes' page
+// arithmetic (:964-970), recomputed from the same views so the two cannot drift. The
+// page -- not a layer, not a head, not a token -- is the unit, because a cold-slot
+// sentinel encodes one slot base that every layer's cold_slots is indexed by
+// (cold_host_tier.h:34-41).
+std::uint64_t ProgramImplCore::turn_recall_page_bytes() const {
+    if (decoder == nullptr) { return 0; }
+    std::uint64_t bytes = 0;
+    const std::uint32_t layers = decoder->text_kv.layers();
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+        if (view.cold_slots.data == nullptr) { continue; }
+        bytes += static_cast<std::uint64_t>(view.cold_slots.nb[3]);
+    }
+    return bytes;
+}
+
+// P7: mirror this round's change to the sequence's spilled-page set into the L0 log.
+//
+// Strictly after the round's spills, and that is verified rather than assumed:
+// decode_raw runs the cold maintenance for every lane (:12727-12733) BEFORE it
+// dispatches to the decode_*_batch ingress loops that reach this function, so a record
+// can only ever be appended for bytes that are already in the spill file. That is the
+// data-before-pointer rule, and it is the whole reason no fsync is needed on the hot
+// path: the log can never point at a region that was never written.
+void ProgramImplCore::record_turn_recall(SequenceState& sequence) {
+    if (turn_recall_journal == nullptr || !sequence.kv) { return; }
+    const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint64_t page_bytes  = turn_recall_page_bytes();
+    const std::uint8_t codec        = static_cast<std::uint8_t>(turn_recall_codec);
+
+    std::vector<spec::turn_recall::RecallRecord>& recorded = sequence.recall_recorded;
+    const std::vector<SequenceState::ColdPageEntry>& cold = sequence.cold_pages;
+
+    std::vector<spec::turn_recall::RecallRecord>& next = recall_scratch_records;
+    next.clear();
+    next.reserve(cold.size());
+    bool changed = false;
+    std::size_t i = 0;  // recorded, ascending
+    std::size_t j = 0;  // cold_pages, ascending
+    while (i < recorded.size() || j < cold.size()) {
+        const std::uint32_t have = i < recorded.size() ? recorded[i].page : 0xFFFFFFFFU;
+        const std::uint32_t now  = j < cold.size() ? cold[j].page : 0xFFFFFFFFU;
+        if (have == now) {
+            next.push_back(recorded[i]);
+            ++i;
+            ++j;
+            continue;
+        }
+        if (have < now) {
+            // The page went hot again (restore_cold_page released its file slot and
+            // erased its cold_pages entry), so the record must stop pointing at that
+            // region: file slots are process-global and ARE reused, and a stale
+            // (page -> file_slot) mapping is exactly the aliasing program.h:783-789
+            // records as a historical bug. The tombstone carries the SAME digest,
+            // because the digest is half of the lookup key.
+            spec::turn_recall::RecallRecord release = recorded[i];
+            release.kind      = static_cast<std::uint8_t>(spec::turn_recall::RecallKind::Release);
+            release.file_slot = -1;
+            release.flags     = 0;
+            if (turn_recall_journal->append(release)) {
+                ++turn_recall_counters.tombstones;
+            } else {
+                ++turn_recall_counters.append_failed;
+            }
+            changed = true;
+            ++i;
+            continue;
+        }
+        // Newly spilled. The digest is the engine's own rolling prefix digest at the
+        // page's end frontier -- the "T[0, frontier) is byte-identical" certificate,
+        // not a similarity score. A page whose frontier has no digest is NOT
+        // recallable: it is counted and skipped, because an uncertified record is worse
+        // than no record -- a later lookup would treat it as a hit.
+        const std::uint32_t page_frontier = (now + 1U) * page_tokens;
+        if (page_frontier > sequence.prefix_digests.size()) {
+            ++turn_recall_counters.digest_unavailable;
+            ++j;
+            continue;
+        }
+        const std::array<std::uint64_t, 2> digest =
+            sequence.prefix_digests.at(page_frontier);
+        spec::turn_recall::RecallRecord record{};
+        record.kind        = static_cast<std::uint8_t>(spec::turn_recall::RecallKind::Spill);
+        record.codec       = codec;
+        record.page        = now;
+        record.layer_bytes = static_cast<std::uint32_t>(page_bytes);
+        record.file_slot   = cold[j].file_slot;
+        record.sequence    = sequence.recall_sequence_tag;
+        record.frontier    = page_frontier;
+        record.digest_lo   = digest[0];
+        record.digest_hi   = digest[1];
+        if (turn_recall_journal->append(record)) {
+            ++turn_recall_counters.records;
+            next.push_back(record);
+            changed = true;
+        } else {
+            // The log refused it: do NOT remember it as recorded, so the next round
+            // retries instead of believing a page is covered when it is not.
+            ++turn_recall_counters.append_failed;
+        }
+        ++j;
+    }
+    if (changed) { recorded.swap(next); }
+    // One batched flush/sync per round at most, and ONLY under the non-default policy:
+    // the log is a mirror, so a lost trailing record costs the recall of one page.
+    if (turn_recall_journal->flush_policy() != spec::turn_recall::JournalFlushPolicy::None) {
+        turn_recall_journal->sync();
+    }
+    ++turn_recall_counters.rounds;
+}
+
+// P6: which pages should this round bring back, and at what cost. A DECISION only --
+// no I/O -- so an empty plan, a refusal and a log line all have no side effects.
+spec::turn_recall::RecallPagePlan ProgramImplCore::plan_round_recall(const SequenceState& sequence) {
+    spec::turn_recall::RecallPagePlan plan;
+    if (turn_recall_journal == nullptr || !sequence.kv) { return plan; }
+    const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t frontier    = sequence.text_kv_valid;
+
+    // "What do I want back?" is the token-space question and it is deliberately NOT
+    // answered here. Two facts set the default:
+    //   * every text layer of this stack is full attention (Variant::is_swa_attention()
+    //     == false, sliding_window == 0 -- see the long note at :11009-11011), so the
+    //     pages a round attends are the whole prefix and "recall the prefix every
+    //     round" is precisely the 18.00 GiB/step / 0.36 tok/s shape TODO.md:5833
+    //     forbids. A steady-state round therefore has nothing bounded to recall.
+    //   * the only sound use of the mirror is a request for a span the caller can name
+    //     (the user's "以对话为单位召回"): at admission/resume, or when the retrieval
+    //     layer has a candidate round.
+    // With no provider injected the answer is an EMPTY plan, and that is a refusal,
+    // not an unimplemented path.
+    // The provider is the retrieval answer, injected. A bounded built-in provider
+    // stands in ONLY when the caller armed NINFER_TURN_RECALL, and then it asks for
+    // ONE page that is BOTH live in the journal AND still cold, so the loop
+    // converges instead of restoring every round. An injected provider always wins.
+    const spec::turn_recall::RecallRequest request = turn_recall_provider
+        ? turn_recall_provider(frontier)
+        : recall_round_request(sequence, frontier);
+    if (request.token_end <= request.token_begin) { return plan; }
+
+    spec::turn_recall::RecallPagePlanRequest plan_request{};
+    plan_request.frontier          = frontier;
+    plan_request.page_tokens       = page_tokens;
+    plan_request.wanted_begin_page = request.token_begin / page_tokens;
+    // Round the wanted end OUTWARD to a whole page: a page is the unit that can be
+    // moved at all (its sentinel is one slot base), so asking for half of one would
+    // either lie or do nothing.
+    plan_request.wanted_end_page = (request.token_end + page_tokens - 1U) / page_tokens;
+    plan_request.page_bytes      = turn_recall_page_bytes();
+    plan_request.byte_budget     = turn_recall_byte_budget;
+    // [PREFILLBUDGET] the same plan, bounded in the second dimension. This is the ONE enforcement
+    // site: everything the token budget can do, it does through `plan_recall_pages` above, and
+    // the refusal it produces is a decision returned to the caller BEFORE
+    // `recall_cold_pages_for_round` is reached. 0 leaves the field unbounded, so an unarmed run
+    // and tonight's baseline produce the same plan object.
+    plan_request.token_budget    = turn_recall_prefill_token_budget;
+
+    // HIT/MISS, the whole criterion: a page is recallable iff (a) its own end frontier
+    // is still inside the sequence's digest chain -- a truncated or cleared chain cannot
+    // certify a prefix, so those pages are misses by construction -- and (b) the journal
+    // still holds a well-formed Spill record for (digest, page) that no later Release
+    // tombstone erased, with an admitted codec. The digest is a SHORTLIST:
+    // prefix_identity.h:37-39 says so explicitly, and the exact reuse decision stays
+    // with the engine's own identity comparison (prefix_matches / reuse_base). This
+    // function never publishes bytes.
+    plan = spec::turn_recall::plan_recall_pages(
+        plan_request, [this, &sequence, page_tokens](std::uint32_t page) {
+            const std::uint32_t page_frontier = (page + 1U) * page_tokens;
+            if (page_frontier > sequence.prefix_digests.size()) { return false; }
+            const std::array<std::uint64_t, 2> digest =
+                sequence.prefix_digests.at(page_frontier);
+            return turn_recall_journal->find_live(digest[0], digest[1], page) != nullptr;
+        });
+    return plan;
+}
+
+// P5's executor: the same two functions warm_cold_prefix() drives, with a page list
+// instead of "the whole prefix". One batched prefetch, one restore per page, ascending
+// -- which is the on-disk order (file_slot * stride), so the reads are monotone. A page
+// that cannot be restored keeps its cold record and its file region and is counted,
+// exactly as warm_cold_prefix does; nothing is approximated.
+void ProgramImplCore::recall_cold_pages_for_round(SequenceState& sequence,
+                                                 const spec::turn_recall::RecallPagePlan& plan) {
+    if (turn_recall_journal == nullptr || plan.empty() || !sequence.kv) { return; }
+    KVAddressSpaceStore& store      = *text_kv_addresses;
+    const KVAddressSpaceHandle text = sequence.kv->text;
+    const auto find_entry = [&sequence](std::uint32_t page) {
+        return std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
+                            [page](const SequenceState::ColdPageEntry& candidate) {
+                                return candidate.page == page;
+                            });
+    };
+
+    // =====================================================================================
+    // [TEXT-CARGO] THE RECALL, AS TEXT -- a RE-PREFILL, not a KV load.
+    // =====================================================================================
+    //
+    // WHAT THIS REPLACES, AND WHY IT IS IN THIS FUNCTION AND NOT IN A SECOND ONE
+    //
+    //   Below this branch is the KV read-back path (P2/P3: prefetch the spill region, decode
+    //   it into the physical page, publish the page index). That is the path the user's order
+    //   of 2026-09-15 replaces, verbatim: "召回 = 把这段文字重新 prefill". There is ONE recall
+    //   entry point in this file -- `ensure_sequence_kv_mapped_for_round` (:12810) calls this
+    //   function and nothing else -- so replacing the BODY here replaces the whole recall path;
+    //   a second function would be the "two paths, one of them dead" shape the coordinator
+    //   forbade.
+    //
+    //   ⚠️ COEXISTENCE, NAMED: the appended segment has NO KV ALLOWANCE. `--kv-capacity`
+    //   funds the pool for the PREFIX; an append grows the sequence past what admission
+    //   reserved, so `ensure_sequence_kv_mapped(sequence, end, ...)` can be refused with
+    //   `KV coverage exceeds active entitlement: tokens=... required_pages=... entitlement=...`.
+    //   That refusal is the property of the ADMISSION side and it belongs to the
+    //   LONGCTX-M21-ALLOW line, NOT to this one: this change does not touch the admission
+    //   predicate, and the arm's own error text is reported verbatim when it fires.
+    //
+    // THE GATE: `NINFER_RECALL_TEXT` set (any value, including "0" -- a presence test, said out
+    // loud because every sibling flag in this tree spells OFF as "0", and reading it as a
+    // ladder here would silently arm a second recall path). Unset, this function is
+    // byte-for-byte the KV read-back path it always was, which is what makes the KV arm a
+    // valid negative control for the SAME binary.
+    // =========================================================================================
+    // [RECALLCHEAP] WHICH LEG RUNS -- DECIDED PER PLAN, at this ONE site.
+    //
+    // The predicate and the measurement behind it are in `turn_recall_journal.h`
+    // (`recall_text_route_wins`). Everything this block ADDS is a READ plus one fprintf: with
+    // `NINFER_RECALL_RESTORE_FIRST` unset, `use_text_route` equals today's `if` condition
+    // exactly, so this change is behaviour-preserving by construction and the byte leg below
+    // is byte-for-byte the path it already was.
+    // =========================================================================================
+    const bool recall_text_armed =
+        (std::getenv("NINFER_RECALL_TEXT") != nullptr && cold_text_cargo != nullptr);
+    const spec::turn_recall::RecallRestoreFirst restore_first_mode =
+        spec::turn_recall::recall_restore_first_parse(
+            std::getenv(spec::turn_recall::kRecallRestoreFirstEnv));
+    std::size_t recall_pages_with_bytes = 0;
+    if (restore_first_mode == spec::turn_recall::RecallRestoreFirst::Bytes) {
+        // The byte leg's own admissibility, asked BEFORE the plan is executed rather than
+        // discovered inside it: the same two conditions the restore loop below applies
+        // (`store.cold_compressed` and a live `cold_pages` entry), counted instead of taken.
+        for (const std::uint32_t page : plan.pages) {
+            if (store.cold_compressed(text, page) && find_entry(page) != sequence.cold_pages.end()) {
+                ++recall_pages_with_bytes;
+            }
+        }
+    }
+    const bool use_text_route = spec::turn_recall::recall_text_route_wins(
+        restore_first_mode, recall_text_armed, plan.pages.size(), recall_pages_with_bytes);
+    if (restore_first_mode != spec::turn_recall::RecallRestoreFirst::Text) {
+        // A line a harness can grep, on the mode that changes behaviour only. `text_route=1`
+        // with `with_bytes==planned` is the state the fallback exists for and must not happen
+        // silently; `with_bytes < planned` is the text route running BY FALLBACK, not by policy.
+        std::fprintf(stderr,
+                     "[recall] RESTORE-FIRST mode=%s planned=%zu with_bytes=%zu text_route=%d "
+                     "armed=%d\n",
+                     spec::turn_recall::recall_restore_first_name(restore_first_mode),
+                     plan.pages.size(), recall_pages_with_bytes, use_text_route ? 1 : 0,
+                     recall_text_armed ? 1 : 0);
+    }
+    if (use_text_route) {
+        // =====================================================================================
+        // [TEXT-REBUILD] THE ORIGINAL-POSITION REBUILD -- RE-PREFILL AT THE RECORD'S OWN ROW.
+        //
+        // This arm is the OTHER leg of the text route. The arm below APPENDS: it puts the recalled
+        // tokens after the frontier and then moves the frontier. This arm does NOT: it writes each
+        // recalled block's K/V back onto the rows that block ALREADY OCCUPIES, at the position the
+        // record itself carries, and leaves `execution_frontier` exactly where it found it.
+        //
+        // THE POSITION IS THE RECORD'S OWN INDEX -- nothing new is persisted. `read_block` was
+        // always HANDED the coordinate (spec/turn_recall_journal.h:883-889, verbatim: "THE INDEX IS
+        // THE PREFIX'S OWN BLOCK NUMBER, i.e. `token_begin / kRecallPageTokens`"); the append arm
+        // THROWS IT AWAY by starting from `sequence.execution_frontier` instead. This arm keeps it.
+        // `recall_cargo_read_run` is the reader that hands it back (turn_recall_journal.h:1215).
+        //
+        // HOW THE POSITION REACHES THE KERNELS: `PrefillContext::text_kv_base` (schedule.h:53) is
+        // BOTH the absolute RoPE position AND the first K/V row, and it is consumed as
+        // `card.prefill_chunk(full_ids, begin, len, ...)` -- one call runs EVERY decoder layer, so
+        // there is no per-layer list here and no layer cap on this path. Setting it to the record's
+        // own position, instead of to the frontier, is the WHOLE difference between the two arms.
+        //
+        // `full_ids` IS INDEXED BY ABSOLUTE POSITION (text_context_impl.h:1604-1614: it validates
+        // `begin < full_ids.size()` and then takes `full_ids.subspan(begin, nominal_length)`), so
+        // the cargo's ids are SCATTERED to their own positions first: `run.ids` is flat and
+        // hole-cut, so its own index is NOT the position, and feeding it directly would rebuild
+        // every block after a hole onto the wrong row.
+        //
+        // SETTLED (SLOT-LAND): this arm re-runs a prefill over tokens the sequence has ALREADY
+        // consumed, and a prefill advances the RECURRENT (GDN / linear-attention) state into
+        // `PrefillContext::state_destination_slot` UNCONDITIONALLY -- `ops::gated_delta_net` takes
+        // no phase (ninfer/ops/gated_delta_net.h:57-60), and `GdnStateAction`
+        // (text_context.h:218-221) has only `UpdateInPlace` / `RecordForReplay`, so there is no
+        // "do not advance" to select. On the append arm that advance is wanted and is committed by
+        // `settle_state_fork` (:10758). On THIS arm it is not wanted, and "the cold tier never
+        // touched the recurrent state" is false: the GDN state is a whole-prefix summary, the
+        // recalled rows all sit BELOW the committed frontier (`recall_pages_for_frontier` clamps
+        // every plan to `committed`), and the gate decays rather than resets -- so re-running them
+        // applies the same transitions a second time to a state that has no position dimension for
+        // the second application to overwrite. That is not "harmless"; it is the committed image
+        // corrupted, irreversibly, in place.
+        //
+        // SO THE DESTINATION IS REDIRECTED, to the sequence's OWN pledged spare
+        // (`SequenceState::reserved_state`, program.h:449). `reserve_state_entitlement` (:10741)
+        // hands a sequence exactly one spare `ReservedDestination` when its plan's entitlement
+        // exceeds its footprint by one. `StateImageStore::allocate` (:642) popped that spare's
+        // device slot off `free_device_slots_` and only `release` puts it back, so for the handle's
+        // whole lifetime the slot is EXCLUSIVELY this sequence's: no other lane can be handed it
+        // and nothing writes it. The redirect needs no new primitive and no new assertion -- the
+        // slot number reaches the kernels as the bare int32 that `TextContext::set_linear_state_slots`
+        // range-checks (`text_context_impl.h:365-371`), and both kernels accept a disjoint in/out
+        // pair (`causal_conv1d_silu.h:9-10` "disjoint or exactly the same storage";
+        // `gated_delta_net.h:53-56`).
+        //
+        // WHY THE SPARE AND NOT A FRESH `reserve_destination()`: the pool is `2 x max_concurrency`
+        // device slots (`program_impl.h:9509` capacity vs `layouts_impl.h:198-202`, `engine.cpp:108`
+        // `device_state_slots = value_or(concurrency)`) and every resident sequence's entitlement is
+        // charged against it, so a round-time allocation is OPPORTUNISTIC -- it can legitimately
+        // find nothing, and its failure mode is `std::bad_alloc` from inside a decode round. The
+        // tree's answer to this is declarative and belongs at ingress: the entitlement is promised
+        // (and charged) up front, and the promise is materialized as `reserved_state`. This arm
+        // therefore uses what was promised and REFUSES when nothing was.
+        //
+        // WHY NOT SNAPSHOT-AND-ROLLBACK: it needs the SAME single slot (there is no other), it
+        // leaves the committed image wrong for the whole loop instead of never, and the throw paths
+        // below (:12908-12911) would leave it wrong permanently. Redirect dominates it; the gate
+        // below turns the no-spare case into a named refusal instead of a silent corruption.
+        //
+        // The fork settlement below (:12926) is KEPT. It is a no-op exactly when there is nothing
+        // to settle (:10759), and load-bearing when the sequence still carries an unsettled
+        // materialization fork -- in which case the committed image is `state.read` and the fork's
+        // destination is the slot the arm used to scribble on. Deleting the line would leave such a
+        // fork unsettled for nothing.
+        if (std::getenv("NINFER_RECALL_TEXT_REBUILD") != nullptr) {
+            // ⭐ THE `page_tokens` ARGUMENT THAT WAS NEVER SUPPLIED. `recall_cargo_read_run` has
+            // taken `page_tokens` since it was written, defaulted to empty, and documented that
+            // "the block's REAL length" is the caller's directory row when it has one and the record
+            // stride otherwise -- and its one caller passed neither, so the default (64) always won
+            // and a short block was read as a full one. Built here from the SAME join the append arm
+            // uses, so the two legs cannot disagree about how many tokens a block holds: that is the
+            // whole reason `recall_cargo_read_run` exists as one function instead of two loops.
+            std::vector<std::uint32_t> rebuild_page_tokens;
+            if (text_directory != nullptr) {
+                rebuild_page_tokens.reserve(plan.pages.size());
+                for (const std::uint32_t page : plan.pages) {
+                    std::size_t row = 0;
+                    if (!text_directory->live_row_for_page(page, row)) { break; }
+                    rebuild_page_tokens.push_back(
+                        spec::sum_dir::sum_dir_row_tokens(text_directory->rows()[row]));
+                }
+                // A short vector means the join stopped early; the reader refuses a length mismatch
+                // rather than pairing the wrong count with a page, so pass it as "no directory".
+                if (rebuild_page_tokens.size() != plan.pages.size()) {
+                    rebuild_page_tokens.clear();
+                }
+            }
+            const spec::turn_recall::RecallCargoLocatedRun run =
+                spec::turn_recall::recall_cargo_read_run(*cold_text_cargo, plan.pages,
+                                                        rebuild_page_tokens);
+            if (run.empty() || run.positions.empty() || !sequence.reserved_state) {
+                // ONE print site, TWO causes. The first is the same condition the append arm
+                // spells `REASON=no-cargo-record-for-planned-pages`, printed under THIS arm's own
+                // tag so a reader can tell which leg ran. The second is this arm's DISCARD GATE
+                // (see the SLOT note above): with no pledged spare StateImage there is no slot the
+                // recurrent advance may be discarded into, and writing it back into the committed
+                // image in place is exactly the corruption this arm exists to avoid -- so the arm
+                // declines and says so, by name, through the same tag and the same `REASON=`
+                // convention rather than through a second literal.
+                std::fprintf(stderr,
+                             "[context-rebuild] lane=%u tokens=%zu source=text-cargo blocks=%zu "
+                             "position=original REASON=%s\n",
+                             sequence.lane, run.ids.size(), run.positions.size(),
+                             run.empty() || run.positions.empty()
+                                 ? "no-cargo-record-for-planned-pages"
+                                 : "no-spare-state-slot-for-discard");
+                return;
+            }
+            // Resolved ONCE for the whole arm: the spare's device slot, through the same door
+            // `prepare_graphs` uses (`physical_slot`, state_image_store.h:230; `capture_state_slot`
+            // at :13208). It is deliberately NOT routed through `state_selectors` -- a bare slot
+            // number is all the kernels take, and the store's role/pin bookkeeping stays untouched.
+            const std::int32_t discard_slot = state_store->physical_slot(*sequence.reserved_state);
+            const auto rebuild_started      = Clock::now();
+            const std::uint32_t last_begin  = run.positions.back();
+            // ⭐ THE SPAN END IS THE LAST BLOCK'S *REAL* END, NOT `last_begin + 64`. The old
+            // expression added a whole stride, which over-claims by `64 - block_tokens` tokens for a
+            // document whose final block is partial -- i.e. it would prefill the writer's zero
+            // padding as if it were text. `block_tokens` is the per-block length the run carries,
+            // parallel to `positions`, and it is what makes this arm agree with the append arm about
+            // where the recalled text stops.
+            const std::size_t span_size =
+                static_cast<std::size_t>(last_begin) +
+                static_cast<std::size_t>(run.block_tokens.back());
+            if (span_size > capacity) {
+                throw std::logic_error("text-cargo rebuild position is outside the sequence bundle");
+            }
+            std::vector<int> located(span_size, 0);
+            // The flat `run.ids` is a concatenation of only the REAL lanes, so its per-block offset
+            // cannot be recovered by `block * 64` once any block is short -- the index below is a
+            // running cursor instead. With every block full this walks the same offsets as the
+            // expression it replaces.
+            std::size_t flat = 0;
+            for (std::size_t block = 0; block < run.positions.size(); ++block) {
+                const std::size_t begin = static_cast<std::size_t>(run.positions[block]);
+                const std::uint32_t tokens = run.block_tokens[block];
+                for (std::uint32_t i = 0; i < tokens; ++i) {
+                    located[begin + i] = static_cast<int>(run.ids[flat + i]);
+                }
+                flat += tokens;
+            }
+            // A partially-filled last block must not be claimed as fully materialized: `span_size`
+            // already stops at the real end, so assert the two readings agree instead of trusting
+            // the arithmetic above.
+            if (flat != run.ids.size()) {
+                throw std::logic_error("text-cargo rebuild run and its flat ids disagree");
+            }
+            const std::uint32_t rebuild_end = static_cast<std::uint32_t>(span_size);
+            // Coverage only, and MONOTONE: a rebuild addresses rows INSIDE the prefix, so this is
+            // normally a no-op. The `max` is load-bearing -- `ensure_sequence_kv_mapped` is the one
+            // frontier-advancing funnel (:11081) and must never be handed a SMALLER extent than the
+            // sequence already holds.
+            ensure_sequence_kv_mapped(sequence, std::max(sequence.text_kv_valid, rebuild_end),
+                                      backend_kv_valid(sequence));
+            // One prefill per CONTIGUOUS group: a plan with a hole must not carry one base across
+            // the gap. The boundary is recomputed here because `position_contiguous()` is a property
+            // of the WHOLE run, not of one group.
+            std::size_t cursor_block = 0;
+            while (cursor_block < run.positions.size()) {
+                std::size_t group_end = cursor_block + 1;
+                while (group_end < run.positions.size() &&
+                       run.positions[group_end] ==
+                           run.positions[group_end - 1U] + run.block_tokens[group_end - 1U]) {
+                    ++group_end;
+                }
+                const std::uint32_t group_begin = run.positions[cursor_block];
+                // The group's limit is the previous block's own end, so a SHORT final block ends the
+                // group at its real end rather than a stride past it.
+                const std::uint32_t group_limit = run.positions[group_end - 1U] +
+                                                  run.block_tokens[group_end - 1U];
+                std::uint32_t cursor = group_begin;
+                while (cursor < group_limit) {
+                    const std::uint32_t count = std::min(prefill_chunk, group_limit - cursor);
+                    const StateImageSelectors selectors = state_selectors(sequence);
+                    schedule::PrefillContext schedule_state{
+                        {device, model, work, state_images->linear(),
+                         replay_records ? &*replay_records : nullptr, io, prefill_hidden,
+                         prefill_chunk, proposal_head},
+                        text_kv_view(sequence),
+                        mtp_kv_view(sequence),
+                        decoder->text_kv,
+                        decoder->mtp_cache(),
+                        dflash ? &*dflash : nullptr,
+                        dflash2 ? &*dflash2 : nullptr,
+                        cursor,
+                        nullptr,
+                        nullptr,
+                        selectors.source,
+                        discard_slot,
+                        0,
+                        dflash_host_ingress,
+                        dflash2_host_ingress};
+                    mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
+                                             ? workspace_plan.mtp_prefill
+                                             : workspace_plan.text_prefill);
+                    if (speculative_backend == SpeculativeBackend::DFlash ||
+                        speculative_backend == SpeculativeBackend::DFlash2) {
+                        mark_workspace_usage(workspace_plan.dflash_context);
+                    }
+                    const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
+                        schedule_state, std::span<const int>(located), count, std::nullopt, false);
+                    if (result.finalized || result.processed_tokens == 0 ||
+                        result.processed_tokens > count) {
+                        throw std::logic_error(
+                            "text-cargo rebuild prefill made invalid progress");
+                    }
+                    cursor += result.processed_tokens;
+                    // MONOTONE, and the frontier is NOT moved: the rebuild restores rows, it does
+                    // not consume new tokens.
+                    sequence.text_kv_valid = std::max(sequence.text_kv_valid, cursor);
+                    if (speculative_backend == SpeculativeBackend::Mtp) {
+                        sequence.mtp_kv_valid =
+                            std::max(sequence.mtp_kv_valid, sequence.text_kv_valid);
+                    } else if (speculative_backend == SpeculativeBackend::DFlash) {
+                        sequence.dflash_context_frontier =
+                            std::max(sequence.dflash_context_frontier, sequence.text_kv_valid);
+                    }
+                    commit_sequence_kv(sequence, sequence.text_kv_valid,
+                                       backend_kv_valid(sequence));
+                    settle_state_fork(sequence);
+                }
+                cursor_block = group_end;
+            }
+            device.synchronize();
+            work.reset();
+            // NO `ledger.insert`, NO `execution_frontier` / `ledger_frontier` move, NO
+            // `advance_rebuild_work`, NO `trim_sequence_kv`, NO `prefix_identity` /
+            // `prefix_digests` append, NO `copy_tail`. Every one of those belongs to the APPEND arm
+            // and would be a lie here: a rebuild consumes no tokens and must leave the frontier
+            // exactly where it found it. `frontier_after` is printed so a reader can CHECK that
+            // claim on the line itself instead of trusting this comment.
+            // [RESTOREUNITS] PAGES, NOT ROUNDS. `run.positions` is parallel to the plan's pages
+            // and holds one entry per block this arm really read back, so its size IS this
+            // round's restored page count -- the same number the line below prints as `blocks=`.
+            // `++` here made this arm disagree with the KV read-back arm about what the counter
+            // means, in the one direction that matters: it under-reported.
+            turn_recall_counters.pages_restored += run.positions.size();
+            std::fprintf(stderr,
+                         "[context-rebuild] lane=%u tokens=%zu source=text-cargo blocks=%zu "
+                         "position=original first_position=%u last_position=%u frontier_after=%u "
+                         "contiguous=%d prefill_ms=%.2f\n",
+                         sequence.lane, run.ids.size(), run.positions.size(),
+                         run.positions.front(), last_begin, sequence.execution_frontier,
+                         run.position_contiguous() ? 1 : 0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - rebuild_started)
+                             .count());
+            return;
+        }
+        // The segment is the planned pages' blocks IN ASCENDING PAGE ORDER, read from the
+        // CARGO (never from the spill file): that order is the on-disk order AND the token
+        // order, so the re-prefill sees the text in the order it was generated in.
+        std::vector<TokenId> segment;
+        segment.reserve(plan.pages.size() *
+                        static_cast<std::size_t>(spec::turn_recall::kRecallCargoBlockTokens));
+        std::uint32_t blocks_read = 0;
+        // ⭐ THE PER-PAGE DIRECTORY-ROW LOOKUP -- the join the file format deliberately left open.
+        //
+        // `read_located_block` has taken a `row_tokens` since it was written, with a comment saying
+        // the count can only come from the directory row (`sum_dir_row_tokens(row) = row.token_end -
+        // row.token_begin`) because the cargo record has a fixed 64-lane stride and no length field
+        // (spec/turn_recall_journal.h, the `row_tokens IS the directory row's own length` note). It
+        // had ZERO direct callers, and `recall_cargo_read_run`'s `page_tokens` argument had no
+        // possible supplier anywhere in the tree -- so the read of a short block was unreachable
+        // even after the writer accepted one. `SumDir::tokens_for_page` is that supplier.
+        //
+        // WHY `live_row_for_page` AND NOT `tokens_for_page`: a directory row for a page whose bytes
+        // are gone (`state == Dead`) must not authorise a read. That is the same gate
+        // `sum_dir_row_bound` applies, applied where the reading happens, so a tombstoned block cuts
+        // the run exactly as a missing record does -- it does not splice in another turn's text.
+        //
+        // THE FALLBACK IS THE PRE-PATCH BEHAVIOUR, BYTE FOR BYTE: with no directory armed (the
+        // cargo may be armed without one), every page is read at the full 64-lane stride, which is
+        // what this loop did before. So the only runs whose recalled token stream can move are runs
+        // that ARMED the directory, and for those the stream is strictly MORE correct.
+        for (const std::uint32_t page : plan.pages) {
+            std::uint32_t row_tokens = spec::turn_recall::kRecallCargoBlockTokens;
+            if (text_directory != nullptr) {
+                std::size_t row = 0;
+                if (!text_directory->live_row_for_page(page, row)) { break; }
+                row_tokens = spec::sum_dir::sum_dir_row_tokens(text_directory->rows()[row]);
+                if (row_tokens == 0U) { break; }
+            }
+            spec::turn_recall::RecallCargoLocatedBlock located;
+            if (text_directory != nullptr) {
+                if (!cold_text_cargo->read_located_block(page, row_tokens, located)) {
+                    // A block with no cargo record CUTS the run, exactly as a hole cuts it in
+                    // plan_recall_pages: the tokens below it are not this prefix's text, and
+                    // filling them with a neighbour's ids would be an approximation.
+                    break;
+                }
+            } else {
+                std::uint32_t ids[spec::turn_recall::kRecallCargoBlockTokens] = {};
+                if (!cold_text_cargo->read_block(page, ids, row_tokens)) { break; }
+                for (std::uint32_t i = 0; i < row_tokens; ++i) { located.ids[i] = ids[i]; }
+                located.token_count = row_tokens;
+            }
+            // ⭐ ONLY the row's real lanes. The writer zero-fills every lane at and beyond the
+            // block's real count, so pushing the whole 64-lane stride here would rebuild the prefix
+            // from padding -- the exact hazard the writer's own comment names.
+            for (std::uint32_t i = 0; i < located.token_count; ++i) {
+                segment.push_back(static_cast<TokenId>(located.ids[i]));
+            }
+            ++blocks_read;
+        }
+        if (segment.empty()) {
+            std::fprintf(stderr,
+                         "[context-append] lane=%u tokens=0 source=text-cargo "
+                         "blocks=0 REASON=no-cargo-record-for-planned-pages\n",
+                         sequence.lane);
+            return;
+        }
+        const std::uint32_t base = sequence.execution_frontier;
+        const std::uint32_t end  = base + static_cast<std::uint32_t>(segment.size());
+        const auto started       = Clock::now();
+        // [RECALLCHEAP] THE ARM'S OWN SPLIT, so "where did the 2.2 s go" is a number on the line
+        // rather than an inference. `kv_map_ms` is the extent/entitlement work the APPEND owes
+        // and the BYTE leg does not; `text_prefill_ms` is the chunk loop that writes K/V.
+        // `prefill_ms` keeps its exact bytes and its exact meaning -- the whole arm.
+        double recall_cheap_kv_map_ms        = 0.0;
+        double recall_cheap_text_prefill_ms  = 0.0;
+        const auto kv_map_started            = Clock::now();
+        // Every step below is the SAME sequence append_forced_tokens performs
+        // (:9036-9140): map the new extent, put the tokens in the ledger, prefill them in
+        // chunks, commit the frontier, and mirror the tail. Nothing here is invented; what
+        // is different is WHERE the tokens came from (the cargo file) and WHY (a recall).
+        ensure_sequence_kv_mapped(sequence, end,
+                                  speculative_backend == SpeculativeBackend::None ? 0U : end);
+        sequence.ledger.insert(sequence.ledger.end(), segment.begin(), segment.end());
+        recall_cheap_kv_map_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - kv_map_started).count();
+        const auto text_prefill_started = Clock::now();
+        std::uint32_t cursor = base;
+        while (cursor < end) {
+            const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
+            const StateImageSelectors selectors = state_selectors(sequence);
+            schedule::PrefillContext schedule_state{
+                {device, model, work, state_images->linear(),
+                 replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+                 proposal_head},
+                text_kv_view(sequence),
+                mtp_kv_view(sequence),
+                decoder->text_kv,
+                decoder->mtp_cache(),
+                dflash ? &*dflash : nullptr,
+                dflash2 ? &*dflash2 : nullptr,
+                cursor,
+                nullptr,
+                nullptr,
+                selectors.source,
+                selectors.destination,
+                0,
+                dflash_host_ingress,
+                dflash2_host_ingress};
+            mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
+                                     ? workspace_plan.mtp_prefill
+                                     : workspace_plan.text_prefill);
+            if (speculative_backend == SpeculativeBackend::DFlash ||
+                speculative_backend == SpeculativeBackend::DFlash2) {
+                mark_workspace_usage(workspace_plan.dflash_context);
+            }
+            const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
+                schedule_state, sequence.ledger, count, std::nullopt, false);
+            if (result.finalized || result.processed_tokens == 0 ||
+                result.processed_tokens > count) {
+                throw std::logic_error("text-cargo recall prefill made invalid progress");
+            }
+            cursor += result.processed_tokens;
+            sequence.text_kv_valid = cursor;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                sequence.mtp_kv_valid = cursor;
+            } else if (speculative_backend == SpeculativeBackend::DFlash) {
+                sequence.dflash_context_frontier = cursor;
+            }
+            commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            settle_state_fork(sequence);
+            copy_tail(sequence,
+                      prefill_hidden.slice(
+                          1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+        }
+        device.synchronize();
+        work.reset();
+        recall_cheap_text_prefill_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - text_prefill_started).count();
+        sequence.prefix_identity.append_generated(segment.size(), sequence.rope_delta);
+        sequence.prefix_digests.append_generated(segment, sequence.rope_delta);
+        advance_rebuild_work(sequence, end, prefill_chunk);
+        sequence.execution_frontier = end;
+        sequence.ledger_frontier    = end + 1U;
+        sequence.mtp_draft_count    = 0;
+        sequence.tail_hidden_valid  = true;
+        trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+        // THE LINE. The tag is the same one LONGCTX-M21's engine-side append prints
+        // (engine_core.h:2006) because the EVENT is the same event -- an in-run append of a
+        // token span that was then pre-filled -- and a reader must be able to grep for one
+        // name. The two trailing counters M21 prints (`decode_rounds_before`,
+        // `generated_before`) are engine-level and are NOT reachable from this layer; the
+        // fields printed INSTEAD are this path's own, and `source=text-cargo` is what tells
+        // the two apart. Naming a line it cannot produce is exactly the kind of claim this
+        // report is supposed to make impossible.
+        std::fprintf(stderr,
+                     "[context-append] lane=%u tokens=%zu source=text-cargo blocks=%u "
+                     "cargo_bytes=%llu prefill_ms=%.2f kv_map_ms=%.2f text_prefill_ms=%.2f\n",
+                     sequence.lane, segment.size(), blocks_read,
+                     static_cast<unsigned long long>(blocks_read) *
+                         spec::turn_recall::kRecallCargoBlockBytes,
+                     std::chrono::duration<double, std::milli>(Clock::now() - started).count(),
+                     recall_cheap_kv_map_ms, recall_cheap_text_prefill_ms);
+        // [RESTOREUNITS] PAGES, NOT ROUNDS -- and the page count is already in hand: the line
+        // above prints it as `blocks=`, and `blocks_read` is incremented once per planned page
+        // whose block was really read from the cargo (an unreadable row, a tombstoned row or a
+        // dead directory row `break`s the loop, which is exactly how a plan of N pages brings
+        // back fewer than N). `++` here is the site that made a run append 8 pages and report 6.
+        turn_recall_counters.pages_restored += blocks_read;
+        return;
+    }
+
+
+    // (P3) one batched prefetch for the whole plan, so the file latency hides behind
+    // the previous round's decode.
+    std::vector<std::int32_t> file_slots;
+    file_slots.reserve(plan.pages.size());
+    for (const std::uint32_t page : plan.pages) {
+        const auto entry = find_entry(page);
+        if (entry == sequence.cold_pages.end()) { continue; }
+        file_slots.push_back(entry->file_slot);
+    }
+    prefetch_cold_pages(sequence, static_cast<std::uint32_t>(file_slots.size()), file_slots);
+
+    std::uint32_t restored = 0;
+    for (const std::uint32_t page : plan.pages) {
+        if (!store.cold_compressed(text, page)) { continue; }
+        const auto entry = find_entry(page);
+        if (entry == sequence.cold_pages.end()) { continue; }
+        const DeviceKVPageHandle physical = store.restore_from_cold(text, page);
+        const std::int32_t physical_index = physical.index();
+        // (P2) restores the bytes AND releases the cold resources; on failure the page
+        // goes back on the cold path so the sentinel keeps naming its own bytes.
+        if (!restore_cold_page(sequence, page, entry->slot, entry->file_slot, physical)) {
+            store.transfer_to_cold(text, page);
+            continue;
+        }
+        decoder->text_kv.execution_tables().publish_indices(
+            store.execution_row(text).handle(), page,
+            std::span<const std::int32_t>(&physical_index, 1), device.stream);
+        ++restored;
+    }
+    if (restored != 0) { device.synchronize(); }
+    // The pages that came back are no longer mirrored pages, so the NEXT round's
+    // record_turn_recall() sees them gone from cold_pages and writes their tombstones.
+    // No extra bookkeeping is needed here, and none is invented.
+    turn_recall_counters.pages_restored += restored;
+}
+
+// ---- TYPE RELOCATED + FORWARD DECLARATIONS (added 2026-09-19) ----------------------------------
+// `IndexPathStamp` and the three `index_path_*` helpers are DEFINED at the end of this runtime
+// region, below this point, while they are USED above those definitions -- in
+// ensure_sequence_kv_mapped_for_round() and report_turn_recall(). A definition that follows its use
+// is not visible to the use in C++, so this header did not compile in any TU that included it.
+// The three FUNCTIONS need only a declaration here, and get one. The TYPE does not: the first use
+// writes a member through the returned reference (`index_path_stamp().round_consulted = false`),
+// and C++ requires the class to be COMPLETE for that, which no declaration can supply. So the
+// struct definition that used to sit below is RELOCATED to this point byte-for-byte, and the three
+// function definitions are left exactly where they were. Nothing else moves or changes.
+struct IndexPathStamp {
+    bool          round_consulted  = false;
+    std::uint32_t frontier         = 0;
+    std::uint32_t query_tokens     = 0;
+    std::uint64_t query_digest     = 0;
+    std::uint32_t status           = 0;  // spec::sum_dir::SumDirReachStatus, as a number
+    std::uint32_t raw_hits         = 0;
+    std::uint32_t admissible       = 0;
+    std::uint32_t candidates       = 0;
+    std::uint32_t best_length      = 0;
+    std::uint32_t best_offset      = 0;
+    std::uint32_t anchor_page      = 0;
+    std::uint32_t first_page       = 0;
+    std::uint32_t last_page        = 0;
+    std::uint32_t need             = 0;
+    std::uint64_t rounds_consulted = 0;  // monotone over the process: the silent-refusal census
+    std::uint64_t rounds_refused   = 0;
+};
+[[nodiscard]] inline IndexPathStamp& index_path_stamp();
+[[nodiscard]] inline std::string index_path_stamp_line();
+[[nodiscard]] inline std::string index_path_join_line(
+    const spec::turn_recall::RecallPagePlan& plan, std::uint64_t pages_restored);
+
+// P5: the hook. Same contract and same position as ensure_sequence_kv_mapped() -- the
+// last statement of each round entry's ingress loop, once per row per round, before
+// submit -- plus the three missing pieces. The four non-round call sites (:8256 /
+// :8818 / :9806 / :11857) keep calling the original, so a prefill or a rewrite cannot
+// trigger a recall by accident.
+void ProgramImplCore::ensure_sequence_kv_mapped_for_round(SequenceState& sequence,
+                                                        std::uint32_t main_tokens,
+                                                        std::uint32_t backend_tokens) {
+    ensure_sequence_kv_mapped(sequence, main_tokens, backend_tokens);
+    if (turn_recall_journal == nullptr) { return; }
+
+    // P5 TIMING. The trigger IS on the steady-state round -- this function is the last
+    // statement of all four decode_*_batch ingress loops -- but an empty plan printed
+    // NOTHING, so the per-round cost the hook adds was invisible. A fixed per-round cost
+    // that cannot be seen is exactly the shape the measured 20.8x paging penalty has
+    // (KVMINE sec.4: insensitive to the paged span, unaffected by recall on/off), so the
+    // number this prints is the one that decides whether arming P5 adds a SECOND constant
+    // on top of the first. It covers the whole hook: record_turn_recall (every round,
+    // including empty-plan ones), the provider install, the plan, and the restore.
+    // Only NINFER_RECALL_TIMING makes an empty-plan round print, so the default contract
+    // (silence means no-op) is unchanged.
+    const bool recall_timing = std::getenv("NINFER_RECALL_TIMING") != nullptr;
+    const auto recall_hook_started = Clock::now();
+
+    // Record first: this round's spills are already in the file (see record_turn_recall
+    // for the ordering evidence), so the log is never ahead of the bytes it describes.
+    record_turn_recall(sequence);
+
+    // ⭐ THE INJECTION. This is the call site `set_turn_recall_provider` had ZERO of, and its absence
+    // is the single structural reason the live retrieval path was content-blind: with no provider
+    // installed, `plan_round_recall` fell through to `recall_round_request`'s positional first-fit
+    // and returned ONE live cold page per pass, chosen by position. Installing the directory-backed
+    // policy here -- once per lane per round, with the query taken from this lane's own newest
+    // committed tokens -- makes the seam live and the retrieval content-addressed. It is a no-op when
+    // no directory is armed (the cargo may be armed alone) and when an external provider was
+    // injected (which always wins).
+    // The stamp is per-round: an arm that is disarmed, or a query that cannot be formed, must
+    // report `consulted=0` for THIS round rather than inherit the previous round's decision.
+    index_path_stamp().round_consulted = false;
+    install_index_recall_provider(sequence);
+
+    const spec::turn_recall::RecallPagePlan plan = plan_round_recall(sequence);
+
+    // ⛔ [INEXACTGATE E] THE SECOND UNNAMED POLICY, and this one is NOT the owner's taste: the
+    // tree has ALREADY stated the rule for this exact named concept ("the budget cannot hold this
+    // run") at the layer above -- `sum_dir_reach.h:257`'s `RefusedBudget = 3, // the strongest
+    // class cannot be held; refusing, not truncating`, implemented at `:773-793` by setting
+    // `result.pages = 0` -- while `plan_recall_pages` (`turn_recall_journal.h`) TRUNCATES from
+    // the low end and drops the anchor the selector rank-1'd, so `sum_dir_reach.h:762-765`'s
+    // `covered_*` claim is FALSE for the run that executes (measured: dl/indexfan,
+    // `anchor in plan = NO`; dl/holegate sec.5.3-5.5). The two policies are wired IN SERIES, and
+    // the layer that decides what text reaches the model is the one that violates the rule.
+    // dl/vectorkey ROW 2 must take its edge rule from `sum_dir_reach.h:773`, NEVER from
+    // `lo += drop`. While the constant is Unnamed, the engine does not build -- because the
+    // alternative is that this disagreement stays silent.
+    static_assert(spec::turn_recall::kRecallBudgetEdgePolicy !=
+                      spec::turn_recall::BudgetEdgePolicy::Unnamed,
+                  "src/spec/turn_recall_journal.h's kRecallBudgetEdgePolicy is Unnamed: the tree's "
+                  "own rule for 'the budget cannot hold this run' is sum_dir_reach.h:257/:773 "
+                  "(`RefusedBudget ... refusing, not truncating`, `result.pages = 0`), and "
+                  "plan_recall_pages truncates the OLDEST instead -- which drops the anchor the "
+                  "selector ranked first and falsifies sum_dir_reach.h:762-765's covered_* claim "
+                  "for the run that executes. Name one at that constant: RefuseNotTruncate (the "
+                  "tree's rule, and the rule dl/vectorkey ROW 2 requires for a new budget), "
+                  "TruncateOldest (today's arithmetic, named on the line), or "
+                  "TruncateNewestKeepAnchor (keeps the anchor; still a truncation).");
+
+    // [INEXACTGATE D] ONE place that records what the round ASKED FOR, on EVERY exit below. A
+    // refused round must not take its wanted count with it: that is precisely how the
+    // sequence-end line's `pages=R/P` became unreadable (its denominator is the ALREADY-CUT
+    // plan, so a holed round prints a perfect ratio -- D1: `pages=5/5` with 3x `INEXACT`).
+    const auto note_plan = [this](const spec::turn_recall::RecallPagePlan& p) {
+        turn_recall_counters.pages_admitted += p.admitted_pages();
+        turn_recall_counters.pages_cut      += p.cut_pages();
+        turn_recall_counters.pages_clamped  += p.dropped_clamped;
+        if (!p.exact()) { ++turn_recall_counters.inexact_rounds; }
+    };
+
+    if (plan.empty()) {
+        // Steady state, or nothing recallable. A silent round must mean "no-op", so
+        // nothing is printed here; report_turn_recall() is the loud path.
+        // ⭐ [INEXACTGATE B] EXCEPT WHEN THE PLAN IS EMPTY BECAUSE IT WAS REFUSED. An empty plan
+        // that CARRIES a cut (dropped_hole / dropped_clamped non-zero: a hole at the first
+        // requested page, or a requested run entirely past the frontier) is not a no-op -- it is
+        // the LOUDEST refusal this path makes, and until now it printed NOTHING while the MILDER
+        // case (short but non-empty) printed `INEXACT`. That is the inversion dl/holegate sec.2.3
+        // measured. Silence still means "no-op"; it now means ONLY that, because the refused case
+        // names itself -- which is what `turn_recall_journal.h:1302-1303` already claimed.
+        if (plan.defect() != spec::turn_recall::RecallPagePlan::Defect::None) {
+            ++turn_recall_counters.refused_empty;
+            // [PREFILLBUDGET] and, when the TOKEN budget is what refused it, by its own name.
+            // The line printed below (recall_refusal_line) carries `refusal=refused-prefill-budget`
+            // and the two token counts; this counter is the census form of the same fact.
+            if (plan.defect() == spec::turn_recall::RecallPagePlan::Defect::PrefillBudget) {
+                ++turn_recall_counters.refused_prefill_tok;
+            }
+            note_plan(plan);
+            std::fprintf(stderr, "%s hook_ms=%.3f\n",
+                         spec::turn_recall::recall_refusal_line(
+                             plan, spec::turn_recall::RecallCost{})
+                             .c_str(),
+                         std::chrono::duration<double, std::milli>(
+                             Clock::now() - recall_hook_started)
+                             .count());
+            return;
+        }
+        if (recall_timing) {
+            std::fprintf(stderr, "[recall] round lane=%u hook_ms=%.3f plan=empty\n",
+                         sequence.lane,
+                         std::chrono::duration<double, std::milli>(
+                             Clock::now() - recall_hook_started)
+                             .count());
+        }
+        return;
+    }
+
+    // The arithmetic gate, from the measured anchors rather than from taste: a plan
+    // whose batched read does not beat re-prefilling the same tokens is refused. (It
+    // always does, by 60-260:1 -- which is exactly why a refusal here would be a
+    // finding, not a tuning knob.)
+    spec::turn_recall::RecallCost cost{};
+    cost.tokens = static_cast<std::uint64_t>(plan.count()) *
+                  static_cast<std::uint64_t>(kPagedKVPageSize);
+    // ⭐ [INEXACTGATE C] THE GATE SAYS WHAT IT DECIDED. `net_positive()` compares two RATES, so
+    // `tokens` cancels and the predicate is TRUE for every plan whenever the two rates are the
+    // shipped defaults -- i.e. `refused_cost=0` has been read as "a check passed" when on this
+    // path it is evidence that NO CHECK RAN (the `return` below cannot be reached; zero captures
+    // in the fleet's census contain `refused_cost=[1-9]`). The counter below and the named
+    // verdict on the line are what let a reader tell the three states apart. The one thing the
+    // header's prose ALSO promises -- "a plan that would stream per token must be refused
+    // outright" -- is NOT implemented anywhere; it is named as a gap at
+    // `turn_recall_journal.h:1278-1300` and is NOT wired here.
+    ++turn_recall_counters.cost_gate_evals;
+    const spec::turn_recall::RecallCost::Verdict cost_verdict = cost.verdict();
+    if (cost_verdict == spec::turn_recall::RecallCost::Verdict::NotPositive) {
+        ++turn_recall_counters.refused_cost;
+        note_plan(plan);
+        std::fprintf(stderr, "[recall] refused: read %.1f ms vs re-prefill %.1f ms\n",
+                     cost.read_ms(), cost.reprefill_ms());
+        return;
+    }
+
+    // ⛔ [INEXACTGATE A] THE OWNER'S POLICY SITE. dl/holegate/REPORT.md sec.4.2 named this spot
+    // and refused to design it: "is an inexact recall a reason to answer-from-the-prompt (a
+    // quality trade) or to answer-anyway (a refusal-discipline violation)" has no answer in the
+    // captures. There is therefore NO DEFAULT HERE, and this assert is why: the tree does not
+    // get to make that choice silently, in either direction.
+    static_assert(spec::turn_recall::kInexactAdmissionPolicy !=
+                      spec::turn_recall::InexactAdmissionPolicy::Unnamed,
+                  "src/spec/turn_recall_journal.h's kInexactAdmissionPolicy is Unnamed: the OWNER "
+                  "has not chosen whether an INEXACT recall may feed a generation. Name ONE of "
+                  "the two policies there (a one-token edit): ReportOnly (the round executes "
+                  "exactly as today and the line names the defect) or RefuseRound (the round does "
+                  "not execute -- no restore, one named REFUSED- line; the record's C1 arm, whose "
+                  "recall was refused and which answered correctly from the resident prompt, is "
+                  "the precedent that this is survivable). Evidence for both, and why the "
+                  "decision is not the tree's: dl/holegate/REPORT.md sec.4.2, sec.6.3.");
+
+    // ⭐ THE THIRD BRANCH -- and it is BEFORE the restore below, not after it. Under
+    // `RefuseRound` this `return` is taken with the plan still unexecuted, so the refusal FIRES
+    // rather than REPORTS; under `ReportOnly` the branch is inert and the round executes exactly
+    // as before, with the defect now named on its own line by `recall_line`.
+    if (spec::turn_recall::recall_plan_refuses_round(
+            plan, spec::turn_recall::kInexactAdmissionPolicy)) {
+        note_plan(plan);
+        std::fprintf(stderr, "%s hook_ms=%.3f\n",
+                     spec::turn_recall::recall_refusal_line(plan, cost).c_str(),
+                     std::chrono::duration<double, std::milli>(
+                         Clock::now() - recall_hook_started)
+                         .count());
+        return;
+    }
+
+    // [RESTOREUNITS] THE UNIT OF `restored` IS TAKEN FROM THE ARMS, NOT ASSUMED HERE. The three
+    // restore arms each add the PAGES they really brought back, so the difference across this
+    // call IS this round's restored page count -- measured. It is deliberately NOT recomputed
+    // from `plan.count()`: that would make the two equal by construction and hide the very
+    // event `recall_restore_delta` exists to expose (and `restored > planned`, should the unit
+    // ever drift again, would be invisible too).
+    const std::uint64_t restored_before = turn_recall_counters.pages_restored;
+    recall_cold_pages_for_round(sequence, plan);
+    const spec::turn_recall::RecallRestoreDelta restore_delta =
+        spec::turn_recall::recall_restore_delta(
+            plan.count(), turn_recall_counters.pages_restored - restored_before);
+    ++turn_recall_counters.plans;
+    turn_recall_counters.pages_planned += plan.count();
+    {
+        const spec::turn_recall::RecallRestoreTally restore_tally =
+            spec::turn_recall::recall_restore_tally_add(
+                {turn_recall_counters.restored_short_rounds,
+                 turn_recall_counters.restored_short_pages},
+                restore_delta);
+        turn_recall_counters.restored_short_rounds = restore_tally.short_rounds;
+        turn_recall_counters.restored_short_pages  = restore_tally.short_pages;
+    }
+    note_plan(plan);
+    // [RESTOREUNITS] AND A SHORT RESTORE IS LOUD, NOT SILENT. `planned=` and `restored=` on the
+    // next line are the same unit now and can be compared -- but a reader who is not looking
+    // would still miss it, and this tree's rule is that a degrade is announced, not inferred.
+    if (restore_delta.short_rounds != 0) {
+        std::fprintf(stderr,
+                     "[recall] SHORT-RESTORE planned=%llu restored=%llu short=%llu "
+                     "plan_pages=[%u,%u] -- the plan executed and fewer pages came back\n",
+                     static_cast<unsigned long long>(plan.count()),
+                     static_cast<unsigned long long>(restore_delta.pages),
+                     static_cast<unsigned long long>(restore_delta.short_pages),
+                     plan.pages.empty() ? 0U : plan.pages.front(),
+                     plan.pages.empty() ? 0U : plan.pages.back());
+    }
+    // THE INDEX PATH'S OWN LINE, ONCE PER RESTORED ROUND, AND APPENDED (nothing above changes):
+    // query -> candidates -> admissible -> pages -> restored, plus `anchor_in_plan=` and, when
+    // the plan was cut, the tree's own INEXACT word. This is the line whose absence let D1's
+    // anchor (page 0) and its answer (page 158) both be true and neither be visible.
+    // [RESTOREUNITS] `restored=` IS THIS ROUND'S PAGE COUNT. It used to be
+    // `pages_restored - plan.count()`: a CUMULATIVE counter minus THIS round's page count, i.e.
+    // two different quantities subtracted, evaluated before the first round had advanced the
+    // counter at all -- which is where the observed `restored=18446744073709551615`
+    // (2^64 - 1 = 0 - 2) came from. The line already carries `planned=`, so the only value a
+    // reader can compare it against is this round's own restored page count.
+    std::fprintf(stderr, "%s\n",
+                 index_path_join_line(plan, restore_delta.pages)
+                     .c_str());
+    std::fprintf(stderr, "%s hook_ms=%.3f\n",
+                 spec::turn_recall::recall_line(plan, cost, restore_delta.pages, 0).c_str(),
+                 std::chrono::duration<double, std::milli>(
+                     Clock::now() - recall_hook_started)
+                     .count());
+}
+
+// One line per run that actually did something, and nothing at all otherwise. Counters
+// are cumulative and are never reset here, so a later line can be compared with an
+// earlier one.
+void ProgramImplCore::report_turn_recall(const char* tag) {
+    const TurnRecallCounters& c = turn_recall_counters;
+    if (turn_recall_journal == nullptr) {
+        // THE REFUSED-ADMISSION SUMMARY. A run that armed NINFER_TURN_RECALL and was
+        // refused used to end here, silently, with a null journal and rc=0: the only
+        // trace was one startup line with no counter and no consequence. This is the
+        // countable form, ONCE per run, so a harness reads it out of the run instead of
+        // scraping a line out of 405. Same policy as the open-failure arm above: the
+        // degrade stands, it is announced.
+        if ((c.refused_codec == 0 && c.refused_medium == 0) || turn_recall_refusal_reported) {
+            return;
+        }
+        turn_recall_refusal_reported = true;
+        std::fprintf(stderr,
+                     "[recall] %s RECALL DISABLED: refused_codec=%llu refused_medium=%llu "
+                     "codec=%s -- NINFER_TURN_RECALL was set and NO recall happened for "
+                     "this run\n",
+                     tag, static_cast<unsigned long long>(c.refused_codec),
+                     static_cast<unsigned long long>(c.refused_medium),
+                     spec::turn_recall::recall_codec_name(turn_recall_codec));
+        return;
+    }
+    if (c.rounds == 0 && c.records == 0 && c.tombstones == 0) { return; }
+    // THE SILENT-REFUSAL CENSUS, at sequence end and ONLY here. The recall round's own gates are
+    // `plan.empty()` (prints nothing by design) and a vacuous cost check, so a run whose every
+    // round was refused used to be indistinguishable from a run whose recall was never armed.
+    // `rounds_refused=` is monotone over the process and is printed by the round line too.
+    std::fprintf(stderr, "%s\n", index_path_stamp_line().c_str());
+    // ⭐ [INEXACTGATE D] `pages=R/P` IS NOT REDEFINED HERE -- changing a printed field's meaning
+    // is the same defect class this patch exists to fix, and every harness in the fleet already
+    // greps `pages=`. What is ADDED is the truth beside it, so the ratio can no longer be read
+    // as completeness. `pages_planned` accumulates `plan.count()`, the ALREADY-CUT plan, so the
+    // more severely a run was cut the cleaner this line reads (dl/holegate sec.3.1: D1 holed,
+    // 3x INEXACT, printed `pages=5/5`; C5 exact, 0 INEXACT, printed `pages=6/20`).
+    //   admitted  Σ pages each round could have held  -> the ratio's missing denominator
+    //   cut       Σ pages that existed and were not held (identity: pages_planned + pages_cut
+    //             == pages_admitted, asserted over a sweep in the sibling test)
+    //   clamped   Σ the part of the ASK the frontier cannot serve (NOT a loss)
+    //   inexact   the countable form of the word `INEXACT`
+    //   refused_empty  refusals that used to print nothing at all
+    //   cost_gate how many times the arithmetic gate was consulted, so `refused_cost=0` can be
+    //             told from "no check ran" (with the shipped rate defaults it cannot fire)
+    std::fprintf(stderr,
+                 "[recall] %s rounds=%llu records=%llu tombstones=%llu plans=%llu "
+                 "pages=%llu/%llu admitted=%llu cut=%llu clamped=%llu inexact=%llu "
+                 "refused_empty=%llu refused_prefill_tok=%llu cost_gate=%llu refused_cost=%llu "
+                 "digest_unavailable=%llu "
+                 "append_failed=%llu refused_codec=%llu refused_medium=%llu live=%zu "
+                 "codec_blind_layers=%llu restored_short=%llu short_pages=%llu\n",
+                 tag, static_cast<unsigned long long>(c.rounds),
+                 static_cast<unsigned long long>(c.records),
+                 static_cast<unsigned long long>(c.tombstones),
+                 static_cast<unsigned long long>(c.plans),
+                 static_cast<unsigned long long>(c.pages_restored),
+                 static_cast<unsigned long long>(c.pages_planned),
+                 static_cast<unsigned long long>(c.pages_admitted),
+                 static_cast<unsigned long long>(c.pages_cut),
+                 static_cast<unsigned long long>(c.pages_clamped),
+                 static_cast<unsigned long long>(c.inexact_rounds),
+                 static_cast<unsigned long long>(c.refused_empty),
+                 static_cast<unsigned long long>(c.refused_prefill_tok),
+                 static_cast<unsigned long long>(c.cost_gate_evals),
+                 static_cast<unsigned long long>(c.refused_cost),
+                 static_cast<unsigned long long>(c.digest_unavailable),
+                 static_cast<unsigned long long>(c.append_failed),
+                 static_cast<unsigned long long>(c.refused_codec),
+                 static_cast<unsigned long long>(c.refused_medium),
+                 turn_recall_journal->live_count(),
+                 static_cast<unsigned long long>(c.codec_blind_layers),
+                 static_cast<unsigned long long>(c.restored_short_rounds),
+                 static_cast<unsigned long long>(c.restored_short_pages));
+}
+
+// The retrieval layer's answer is injected, not re-derived: suffix_lookup (tail-anchored
+// -- R@1 0.73-1.00 only when the quote ends at the newest token) or an n-gram/BM25 index
+// for the medial and reworded shapes (TODO.md:5890-5893) supplies the span, and this
+// header owns only the span -> file_slot -> bytes mapping.
+// The built-in provider: ONE page that is live in the journal AND still cold.
+// It reads state the engine owns (no I/O, no new index) and is the answer only
+// when no retrieval layer was injected. A caller that injects a provider
+// (set_turn_recall_provider) overrides this entirely.
+//
+// ===========================================================================================
+// THE INDEX IS NOW THE DEFAULT ANSWER, AND THE POSITIONAL FALLBACK IS ONLY A FALLBACK
+// ===========================================================================================
+//
+// The paragraph above used to be the whole story and it was the defect: "the retrieval layer's
+// answer is injected" was true as a SEAM and false as a RUN, because `set_turn_recall_provider` had
+// zero injectors anywhere in the tree -- so this function's positional first-fit WAS the live
+// retrieval path, returning exactly one live cold page per pass, chosen by position rather than by
+// content. The measured consequence (inventory Q2): covering a 10 M-token book at one
+// positionally-chosen page per pass needs 156,250 passes; the plan is content-blind, so
+// 「不能丢任何细节」 fails not because detail is dropped in transit but because the wrong 64 tokens
+// are ever offered.
+//
+// What changed, in the order the answers are tried:
+//   1. THE INDEX. When a directory is armed, the query is the sequence's OWN newest tokens --
+//      rendered by `sum_dir_render_token_line`, the same function the producer wrote the catalogue
+//      line with -- and `search_summaries` returns the blocks whose text contains that n-gram. That
+//      is a CONTENT answer to "which page holds this text", and it is the lexical (n-gram) retriever
+//      this tree's registry registers, with a substring scan standing in for the BM25 scores it does
+//      not yet compute (`sum_dir.h`, `search_summaries`).
+//   2. THE POSITIONAL FIRST-FIT, unchanged, for a sequence with no directory (the cargo may be armed
+//      without one) or a prefix too short to form a query. It is kept, not deleted: it is the only
+//      answer available in those two cases, and its convergence property (a restored page leaves
+//      `cold_pages` and gets a tombstone, so the same page is never asked for twice) is what keeps
+//      the fallback from becoming a per-round whole-prefix recall.
+//
+// WHY THE QUERY IS "THE SEQUENCE'S OWN NEWEST TOKENS" AND NOT A STRING FROM SOMEWHERE ELSE: the
+// provider's signature is `RecallRequest(std::uint32_t frontier)` (turn_recall_journal.h:703) -- it
+// is handed the frontier and nothing else, deliberately, so that the retrieval layer cannot do I/O
+// or hold a second copy of the token stream. The only text a provider can therefore form an n-gram
+// from WITHOUT a second index is text the engine already owns, and the newest committed tokens are
+// exactly that. It is also the shape the user's requirement describes: you paste the phrase you are
+// looking for ("在一本书里找信息"), and the pasted phrase IS the newest tokens.
+spec::turn_recall::RecallRequest
+ProgramImplCore::recall_round_request(const SequenceState& sequence,
+                                      std::uint32_t frontier) const {
+    // 1. THE INDEX, when there is one and the query can be formed.
+    std::string term;
+    if (index_query_term(sequence, frontier, term)) {
+        const spec::turn_recall::RecallRequest indexed = index_request_for_term(term, frontier);
+        if (indexed.token_end > indexed.token_begin) { return indexed; }
+    }
+    // 2. THE POSITIONAL FALLBACK -- byte-for-byte the pre-index behaviour.
+    if (turn_recall_journal == nullptr || sequence.cold_pages.empty()) {
+        return spec::turn_recall::RecallRequest{};
+    }
+    const std::vector<std::uint32_t> live = turn_recall_journal->live_pages();
+    if (live.empty()) { return spec::turn_recall::RecallRequest{}; }
+    for (const auto& cold : sequence.cold_pages) {
+        if (!turn_recall_journal->live_page(cold.page)) { continue; }
+        const std::uint32_t page_key = cold.page * spec::turn_recall::kRecallPageTokens;
+        if (page_key >= frontier) { continue; }
+        return spec::turn_recall::RecallRequest{page_key, page_key +
+            spec::turn_recall::kRecallPageTokens};
+    }
+    return spec::turn_recall::RecallRequest{};
+}
+
+// -------------------------------------------------------------------------------------------
+// THE QUERY, THE LOOKUP, AND THE FAN-OUT
+// -------------------------------------------------------------------------------------------
+
+// How many tokens of the prefix a query is formed from, and the shortest window that is still worth
+// asking. The MAXIMUM is 32 because a longer n-gram than that is a quotation rather than a query (and
+// a longer one can straddle a block boundary so often that it finds nothing); the MINIMUM is 4
+// because a 1-3 token "phrase" is a common word, and a common word's hits are not a location. Both
+// are compile-time because neither is a tuning surface: the knob that IS worth turning is how many
+// pages one pass may return, and that one is env-reachable (see `recall_fanout_blocks`).
+inline constexpr std::size_t kIndexQueryMaxTokens = 32U;
+inline constexpr std::size_t kIndexQueryMinTokens = 4U;
+
+bool ProgramImplCore::index_query_term(const SequenceState& sequence, std::uint32_t frontier,
+                                      std::string& term) const {
+    term.clear();
+    if (text_directory == nullptr || text_directory->empty()) { return false; }
+    // The query is taken from COMMITTED tokens only: a query built from tokens the sequence has not
+    // consumed would be asking about text that has not happened.
+    const std::size_t available = std::min<std::size_t>(
+        sequence.ledger.size(), static_cast<std::size_t>(frontier));
+    if (available < kIndexQueryMinTokens) { return false; }
+    const std::size_t window = std::min<std::size_t>(kIndexQueryMaxTokens, available);
+    term = spec::sum_dir::sum_dir_render_token_line(
+        reinterpret_cast<const std::uint32_t*>(sequence.ledger.data() + (available - window)),
+        window);
+    return true;
+}
+
+spec::turn_recall::RecallRequest
+ProgramImplCore::index_request_for_term(const std::string& term, std::uint32_t frontier) const {
+    if (text_directory == nullptr || term.empty()) { return spec::turn_recall::RecallRequest{}; }
+    // ⭐ THE ADAPTER, NOT THE DECISION. The window shortening, the admissibility test, the contiguous
+    // run and the cap all live in `sum_dir_recall_span_for_term` (spec/sum_dir.h), as a pure function
+    // over the directory -- so the acceptance demo exercises THE SAME CODE this line calls, instead
+    // of a second implementation that might disagree with it. That is the property
+    // `sum_dir_unload_plan` did not have (implemented, zero callers) and it is deliberately not
+    // repeated here.
+    const spec::sum_dir::SumDirRecallSpan span = spec::sum_dir::sum_dir_recall_span_for_term(
+        *text_directory, term, frontier, recall_fanout_blocks(),
+        static_cast<std::uint32_t>(kPagedKVPageSize));
+    if (!span.found) { return spec::turn_recall::RecallRequest{}; }
+    std::fprintf(stderr,
+                 "[recall-index] window=%u hits=%zu admissible=%zu pages=%u span=[%u,%u) "
+                 "first_page=%u last_page=%u fanout_cap=%u\n",
+                 span.window, span.hits, span.admissible, span.pages, span.token_begin,
+                 span.token_end, span.first_page, span.last_page, recall_fanout_blocks());
+    return spec::turn_recall::RecallRequest{span.token_begin, span.token_end};
+}
+
+// HOW MANY PAGES ONE PASS MAY RETURN -- and why THIS number.
+//
+// The number is the engine's OWN, not a new one: `SumDirKnobs::max_blocks_per_pass`, whose
+// factory default is `spec::sum_dir::kSumDirDefaultBlocksPerPass` (derived in `sum_dir.h`),
+// env `NINFER_SUM_DIR_BLOCKS`. That field was dead -- its only reader was
+// `sum_dir_idle_eligible`, which has zero callers -- so the ceiling that reports treat as
+// a live constraint lived in code nothing ran. Reviving it as the FAN-OUT CAP is the deliberate
+// choice, for four reasons:
+//
+//   1. A PER-PASS BOUND IS REQUIRED, not optional. A round cannot restore an unbounded span: the
+//      restore path costs `per retired page ~2.17 ms` and a plan is a list of pages to bring back
+//      BEFORE the round runs. "Return every page that matches" is not a policy, it is the
+//      whole-prefix recall that :12863-12872 forbids by name (18.00 GiB/step, 0.36 tok/s).
+//   2. THE CAP IS THE ROUND'S OWN BYTE BUDGET, IN PAGES, AND IT IS STATED ONCE. "One bounded
+//      pass" is already this tree's number -- `turn_recall_byte_budget`, 256 MiB by default
+//      (`NINFER_TURN_RECALL_BYTES`), which `plan_recall_pages` applies to the plan a second
+//      time. The old default of 8 was that number's SMALL-CONTEXT reading (8 x 64 = 512
+//      tokens), and at a 1M prefix it stops being a cost bound and becomes a refusal gate: the
+//      round's byte budget holds 227 such pages, while the measured need was 43 and the
+//      shipped cap was 8, so the answer was RefusedBudget with pages=0
+//      (dl/recallplan/REPORT.md sec.3.3). Two numbers for one bound IS the failure mode the
+//      whole index line exists to remove, so the cap is now the byte budget's own page count
+//      and there is one answer again.
+//   3. "NO DETAIL LOST" DOES NOT MEAN "ONE PASS". The requirement is that a query can find
+//      information in a whole book without losing detail. Recall is PER-ROUND and the journal's
+//      tombstone mechanism guarantees a restored page is never asked for twice (:13313-13316), so
+//      successive rounds walk the matches and the book is covered in fanout-sized steps. What the cap
+//      bounds is the COST OF ONE ROUND, not the reachability of the text.
+//   4. IT IS ENV-REACHABLE, so the demo can MEASURE the fan-out instead of trusting it: the run
+//      below prints `fanout_cap=` on every index hit, and `NINFER_SUM_DIR_BLOCKS=1` turns it back
+//      into one page per pass for a comparison.
+//
+// The default is read from `from_env()`, so `NINFER_SUM_DIR_BLOCKS` and the knob's own default are
+// honoured together -- but `NINFER_SUM_DIR` is deliberately NOT consulted: that variable gates the
+// IDLE summarizer (`sum_dir_idle_eligible`), a different mechanism with a different cost model, and
+// requiring it here would make the index depend on an unrelated flag. A cap of 0 is refused (it
+// would silently disable retrieval) and falls back to the knob's documented default.
+std::uint32_t ProgramImplCore::recall_fanout_blocks() const {
+    const spec::sum_dir::SumDirKnobs knobs = spec::sum_dir::SumDirKnobs::from_env();
+    return knobs.max_blocks_per_pass != 0U ? knobs.max_blocks_per_pass
+                                              : spec::sum_dir::kSumDirDefaultBlocksPerPass;
+}
+
+// THE INJECTOR -- the call site `set_turn_recall_provider` never had.
+//
+// The seam is not changed and not duplicated: this installs through the SAME member
+// `set_turn_recall_provider` writes, and it yields to an external provider (see the flag's note in
+// program.h). What it adds is the thing the seam was for and never got: a retrieval policy that is
+// actually installed, so `plan_round_recall`'s `turn_recall_provider ? provider(frontier) : ...`
+// branch is taken rather than skipped.
+//
+// WHY THE QUERY IS SNAPSHOTTED HERE RATHER THAN RE-READ INSIDE THE LAMBDA: the provider's signature
+// takes only the frontier (:703), so a lambda that wanted the ledger would have to capture the
+// SequenceState -- and a std::function that outlives the round would then hold a reference to a
+// sequence that can be released. Capturing the RENDERED TERM by value makes the installed provider
+// self-contained: no dangling, no second index, and the lookup it performs is the same member
+// function the built-in path calls, so there is one fan-out implementation and not two.
+//
+// It is installed fresh each round (the query moves every round), which is why it is called from the
+// round hook rather than from the constructor.
+// ===========================================================================================
+// P6 -- WHICH PAGES DOES THIS ROUND ACTUALLY NEED: THE COVERING k_min-GRAM FAMILY
+// ===========================================================================================
+//
+// WHAT WAS WRONG (RECALLSPAN's measurement, re-stated in the selector's own header): the span
+// this adapter used to return came from `sum_dir_recall_span_for_term`, which searches PREFIXES
+// union SUFFIXES, accumulates EVERY admissible hit of EVERY window into ONE `pages` vector and
+// takes `pages.front()` -- a min over a union that necessarily contains the LEAST specific
+// evidence. Measured on D1's own catalogue: `k=2 " vault "` hits 256 rows (every row), `k=1`
+// the template tail hits 256, so the union's first page is 0 for essentially any query, and
+// three stated invariants are violated (spec/sum_dir_reach.h:6-27). RECALLFIX reproduced the
+// consequence end to end: for D1 the answer sits at prompt token 10,153 = page 158 while the
+// chosen span was `[0,512)` = pages 0-7, so the recall re-prefilled page 0 and the answer ended
+// exactly where page 0's 64 tokens end (RECALLFIX/REPORT.md sec.0.3).
+//
+// WHAT REPLACES IT: `sum_dir_recall_span_reachable` (spec/sum_dir_reach.h), which
+//   * searches the COVERING family -- every k_min-gram of the query, k_min = 4, the tree's own
+//     `kIndexQueryMinTokens`. PROOF (sum_dir_reach.h:36-40): any fragment of length >= k_min
+//     contains a k_min-gram, so every occurrence of every long-enough fragment is found, at
+//     every offset INCLUDING the interior. It is the MINIMAL covering family of that kind: 29
+//     windows for L=32 against 435 for the literal all-k-grams family, with no loss of reach.
+//   * ranks evidence TOTALLY -- the anchor is maximal under (length DESC, offset ASC, page ASC),
+//     so good evidence cannot be discarded by the mere presence of weak evidence.
+//   * grows the RUN outward in page space, admitting a page only when it EXTENDS the covered
+//     interval, and EXCLUDES the pages this sequence has already recalled (the loop guard),
+//     which it must be HANDED because only the engine owns that state.
+//   * REFUSES rather than clamps: NoCandidate / RefusedEverything / RefusedBudget each carry a
+//     `refusal` string, and there is no silent positional substitution.
+//
+// WHAT IT CANNOT FIND, said here so nobody assumes otherwise: the family is LEXICAL. Token-id
+// equality only -- a paraphrase, a re-tokenisation, or any wording that is not the same ids in
+// the same order is invisible to it BY CONSTRUCTION (sum_dir_reach.h:102-108). It is
+// exact-or-silent, never approximately right, and that is the property that makes it admissible
+// under this project's refusal discipline. A semantic channel (KVMem's Mean-K) is complementary
+// and belongs in the candidate-set UNION, never in place of this arbiter (KVMINE REPORT sec.2).
+//
+// THE BOUND, which is what keeps this from becoming a whole-prefix recall: the span is capped by
+// `recall_fanout_blocks()` and by `budget_blocks = kReachDefaultBudgetBlocks` (2048), and the
+// PAGE budget is then applied a second time by `plan_recall_pages` with `turn_recall_byte_budget`
+// (256 MiB default). One pass therefore cannot restore the whole prefix -- which this file
+// forbids by name where it says "recall the prefix every round" is the 18.00 GiB/step /
+// 0.36 tok/s shape.
+//
+// NINFER_RECALL_REACH: unset (or any value but "0") arms this selector; "0" restores the pre-P6
+// `sum_dir_recall_span_for_term` path BYTE FOR BYTE, so the old selector stays a valid negative
+// control on the SAME binary -- the discipline `NINFER_RECALL_TEXT` already uses.
+[[nodiscard]] inline bool recall_reach_selector_armed() {
+    const char* value = std::getenv("NINFER_RECALL_REACH");
+    const bool armed = value == nullptr || std::string(value) != "0";
+    if (!armed) {
+        // [MECHMUX] THE OFF STATE OF THIS SWITCH IS A KNOWN-WRONG SELECTOR, AND IT IS ARMED FROM AN
+        // ENVIRONMENT VARIABLE. `NINFER_RECALL_REACH=0` restores `sum_dir_recall_span_for_term`,
+        // which this file's own measurement and RECALLFIX both pin: on D1 the answer sits at prompt
+        // token 10,153 = page 158 while the chosen span is `[0,512)` = pages 0-7, so the recall
+        // re-prefills page 0 and the answer ends where page 0's 64 tokens end. It is kept ON PURPOSE
+        // as the negative control for the P6 selector and is NOT refused here -- refusing it would
+        // delete the control -- so it is ANNOUNCED instead, once, by name. If the owner wants it
+        // refused rather than announced, this is the single site to change.
+        static bool pre_p6_selector_reported = false;
+        if (!pre_p6_selector_reported) {
+            pre_p6_selector_reported = true;
+            std::fprintf(stderr,
+                         "[recall] NINFER_RECALL_REACH=0: THE PRE-P6 SPAN SELECTOR IS ARMED. Its span "
+                         "choice is measured to miss (answer at page 158, chosen span pages 0-7, "
+                         "RECALLFIX sec.0.3), so recalls on this run re-prefill the wrong pages. This "
+                         "is the negative control; unset NINFER_RECALL_REACH for the P6 selector.\n");
+        }
+    }
+    return armed;
+}
+
+// THE POSTINGS CACHE, AND WHY IT IS NOT AN OPTIMISATION.
+//
+// MEASURED, at the 1M configuration's own scale (15,782 rows = 1,010,048 tokens, one planted
+// 8-token phrase at page 158 and a query built from it exactly as index_query_term builds one):
+//
+//     OLD sum_dir_recall_span_for_term          123.186 ms/call
+//     NEW reach, postings REBUILT per call      538.202 ms/call   (+415 ms)
+//     NEW reach, postings built ONCE            407.1 ms once, then 0.005 ms/call
+//     cached vs rebuilt: IDENTICAL results (same status, span, pages)
+//
+// `sum_dir_recall_span_reachable`'s convenience overload calls `postings.build(directory)` on
+// every invocation, and the provider is reinstalled once per lane per ROUND -- so the rebuild
+// is a per-ROUND cost. At +415 ms against a paged round of 559 ms it would be a SECOND fixed
+// per-round cost of exactly the shape the measured 20.8x paging penalty has, and the brief's
+// warning is explicit that arming P5 must not add one. Cached, P6 costs 0.005 ms/round and is
+// 123 ms/round CHEAPER than the selector it replaces.
+//
+// The header names the real fix itself -- "the table wants to live on `SumDir` ... as an
+// incrementally-maintained column ... rather than rebuilt per call" -- and `SumDir` is not this
+// line's file. Until it moves there, the cache lives here and is keyed on the directory's own
+// APPEND-ONLY row count, so an append invalidates it by construction and a stale table cannot
+// outlive the rows it indexes.
+//
+// ONE CACHE, NOT ONE PER LANE: `text_directory` is the program's single directory (the idle
+// summarizer is its only writer), so every lane reads the same rows. The round ingress loops run
+// sequentially, so no lock is taken and none is needed; a caller that ever drives two lanes from
+// two threads must move this onto the owner (which is the same change the header asks for).
+struct ReachPostingsCache {
+    const spec::sum_dir::SumDir* directory = nullptr;
+    std::size_t                  rows      = 0;
+    std::uint64_t                builds    = 0;
+    spec::sum_dir::SumDirReachPostings postings;
+
+    [[nodiscard]] bool usable_for(const spec::sum_dir::SumDir& candidate) const noexcept {
+        return directory == &candidate && rows == candidate.size();
+    }
+};
+
+inline ReachPostingsCache& reach_postings_cache() {
+    static ReachPostingsCache cache;
+    return cache;
+}
+
+// Builds the table at most once per (directory, row-count) pair and returns a REFERENCE to it,
+// so the selector's own overload is used and this function never copies the ~1M-entry table.
+[[nodiscard]] inline const spec::sum_dir::SumDirReachPostings&
+reach_postings_for(const spec::sum_dir::SumDir& directory) {
+    ReachPostingsCache& cache = reach_postings_cache();
+    if (!cache.usable_for(directory)) {
+        cache.postings = spec::sum_dir::SumDirReachPostings{};  // drop the old table first
+        cache.postings.k_min = spec::sum_dir::kReachMinWindowTokens;
+        cache.postings.build(directory);
+        cache.directory = &directory;
+        cache.rows      = directory.size();
+        ++cache.builds;
+    }
+    return cache.postings;
+}
+
+// ===========================================================================================
+// MILLIONRUN PREPARED PATCH (NOT LANDED) — THE INDEX PATH'S OWN LINE, AND THE JOIN IT HAD NOT
+// ===========================================================================================
+// WHAT IS MISSING, measured on this tree in the same session as this patch was written:
+//   * `sum_dir_reach_line` (spec/sum_dir_reach.h:868) reports the selector's whole decision --
+//     query windows, hits, admissible, candidates, anchor, run, need, cap, budget -- and
+//     NOTHING about what was planned or restored, and not the word INEXACT;
+//   * `recall_line` (spec/turn_recall_journal.h:1304) reports pages/restored/hole/budget/
+//     clamped and the word INEXACT, and NOTHING about which page the index chose;
+//   * the two halves of the index path's own story are therefore on two lines emitted at two
+//     different times, and NO LINE CARRIES BOTH. The failure that cannot be seen from either
+//     line alone is the recorded one: the anchor was page 0 while the answer sat at page 158
+//     (`dl/COMBO1M` D1 / RECALLFIX), so the restore re-prefilled a page that could not
+//     contain the answer and every counter still looked complete.
+// WHAT THIS PATCH SUPPLIES: one line per consulted round carrying the entire chain the
+// requirement names -- query -> candidates -> admissible -> pages -> restored -- plus the word
+// INEXACT, plus the ANCHOR/PLAN AGREEMENT (`anchor_in_plan=`), which is the property that
+// makes the two halves comparable instead of merely adjacent.
+// IT IS APPEND-ONLY BY CONSTRUCTION: no existing line's bytes change, so every reader that
+// stops before the new prefix sees exactly what it saw before.
+
+[[nodiscard]] inline IndexPathStamp& index_path_stamp() {
+    static IndexPathStamp stamp;
+    return stamp;
+}
+
+[[nodiscard]] inline std::uint64_t index_path_query_digest(const std::string& term) noexcept {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const char ch : term) {
+        hash ^= static_cast<unsigned char>(ch);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+[[nodiscard]] inline std::string index_path_hex16(std::uint64_t value) {
+    static const char* const digits = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int index = 15; index >= 0; --index) {
+        out[static_cast<std::size_t>(index)] = digits[value & 0xFULL];
+        value >>= 4U;
+    }
+    return out;
+}
+
+// The QUERY is named by its rendered token count and a digest of the rendered term, never by
+// its payload: a reader can tell two rounds asked different questions without the log carrying
+// the text, and the producer's own alphabet (`sum_dir_render_token_line`) is what is digested.
+[[nodiscard]] inline std::string index_path_stamp_line() {
+    const IndexPathStamp& stamp = index_path_stamp();
+    std::string out = "[recall-index-path] consulted=";
+    out += stamp.round_consulted ? "1" : "0";
+    out += " rounds_consulted=" + std::to_string(stamp.rounds_consulted);
+    out += " rounds_refused=" + std::to_string(stamp.rounds_refused);
+    if (!stamp.round_consulted) { return out; }
+    out += " frontier=" + std::to_string(stamp.frontier);
+    out += " query_tokens=" + std::to_string(stamp.query_tokens);
+    out += " query_sha16=" + index_path_hex16(stamp.query_digest);
+    out += " status=" + std::to_string(stamp.status);
+    out += " hits=" + std::to_string(stamp.raw_hits);
+    out += " admissible=" + std::to_string(stamp.admissible);
+    out += " candidates=" + std::to_string(stamp.candidates);
+    out += " best=" + std::to_string(stamp.best_length) + "@" + std::to_string(stamp.best_offset);
+    out += " anchor=" + std::to_string(stamp.anchor_page);
+    out += " run=[" + std::to_string(stamp.first_page) + "," + std::to_string(stamp.last_page) +
+           "]";
+    out += " need=" + std::to_string(stamp.need);
+    return out;
+}
+
+// ---- THE JOIN. `plan` and `pages_restored` are the restore half, which exists only here. -----
+[[nodiscard]] inline std::string index_path_join_line(
+    const spec::turn_recall::RecallPagePlan& plan, std::uint64_t pages_restored) {
+    const IndexPathStamp& stamp = index_path_stamp();
+    std::string out = index_path_stamp_line();
+    out += " planned=" + std::to_string(plan.count());
+    out += " plan_pages=[";
+    if (!plan.pages.empty()) {
+        out += std::to_string(plan.pages.front()) + "," + std::to_string(plan.pages.back());
+    }
+    out += "]";
+    out += " restored=" + std::to_string(pages_restored);
+    out += " exact=" + std::to_string(plan.exact() ? 1 : 0);
+    // THE PROPERTY THIS LINE EXISTS FOR, CALCULATED RATHER THAN EYEBALLED: does the plan that
+    // will actually be restored contain the page the query matched? `n/a` when this round did
+    // not consult the index at all (the positional fallback), never silently 1 or 0.
+    if (!stamp.round_consulted) {
+        out += " anchor_in_plan=n/a";
+    } else {
+        bool holds = false;
+        for (const std::uint32_t page : plan.pages) {
+            if (page == stamp.anchor_page) { holds = true; }
+        }
+        out += " anchor_in_plan=" + std::to_string(holds ? 1 : 0);
+    }
+    if (!plan.exact()) { out += " INEXACT(never approximated)"; }
+    return out;
+}
+
+// -------------------------------------------------------------------------------
+// [SIGNKEY] THE SECOND CANDIDATE SOURCE -- ONE WIRING SITE, NO NEW CALL SITE.
+// -------------------------------------------------------------------------------
+//
+// WHAT WAS MISSING, MEASURED BEFORE THIS FILE WAS TOUCHED (`dl/signkey/logs/`):
+// the lexical channel below is EXACT-OR-SILENT by construction -- "a paraphrase, a
+// re-tokenisation, or any wording that is not the same ids in the same order is invisible
+// to it BY CONSTRUCTION" (:14919-14920, verbatim). The complementary channel the tree
+// names at :14922-14923 is the K sign layer. That MATERIAL is on disk as a layout
+// (`e8_lattice_codec.cuh:424-437`) and is NOT on any live path:
+//   * `kv_dtype_for_storage` THROWS for rk3v4/rk2v4   (product/kv_storage_dtype.h:106-120)
+//   * "an rk3v4/rk2v4 layer has no storage profile"   (layouts_impl.h:129-132)
+//   * the reader has NO CALLER on any runtime path    (causal_softmax_attention.cpp:84-95)
+//   * every leg runs `--kv-layer-storage 0-15:nvfp4`
+//     (dl/fusionrefresh/runs/A2_armed_fixed/argv.txt:16-17)
+// So the source is WIRED here and its material is supplied through a NAMED host surface,
+// and the state "armed but unfed" is reported by name instead of being folded into "no
+// candidate" -- those two states are the difference between a named refusal and a silent
+// miss, which is the whole refusal discipline (sum_dir_reach.h:249-251).
+//
+// WHERE IT IS CONSUMED: `install_index_recall_provider` (:15184) derives the source's page
+// set and hands it to THIS function, which is the one point a span is ever built.
+// `install_index_recall_provider` is called from `ensure_sequence_kv_mapped_for_round`
+// (:14446) -- a step INSIDE the round hook, the same discipline the prefill gate follows.
+//
+// WHAT IT MAY NEVER DO: the sign field sits on ROTATED K and this tree has no inverse
+// rotation, so it is a LOCATOR and its pages join the candidate set and never the arbiter
+// (:14868-14872). The substitution forbidden at :15176-15180 is POSITIONAL first-fit; this
+// channel is content-derived, so it is not that -- and it is still a REFUSAL when it has
+// material, never a silent pick of the nearest page.
+[[nodiscard]] inline bool recall_sign_key_armed() {
+    const char* value = std::getenv("NINFER_RECALL_SIGNKEY");
+    return value != nullptr && std::string(value) != "0";
+}
+
+// ONE PROCESS, ONE LOAD -- the discipline the postings cache already uses (:14983), and for
+// the same reason: the provider is re-created every round, so round-scoped state cannot live
+// in its capture, and a per-round file read would be a per-round tax of exactly the shape
+// this file refuses at :15127-15138.
+[[nodiscard]] inline const spec::sum_dir::SignKeySidecar& recall_sign_key_sidecar() {
+    static const spec::sum_dir::SignKeySidecar sidecar = [] {
+        spec::sum_dir::SignKeySidecar out;
+        const char* path = std::getenv("NINFER_RECALL_SIGNKEY_FEED");
+        if (path == nullptr || *path == '\0') { return out; }
+        std::string why;
+        if (!spec::sum_dir::sum_dir_sign_key_sidecar_read_feed(out, path, &why)) {
+            std::fprintf(stderr, "[recall-signkey] REFUSED feed %s: %s\n", path, why.c_str());
+            spec::sum_dir::SignKeySidecar refused;
+            refused.source = "refused";
+            return refused;
+        }
+        return out;
+    }();
+    return sidecar;
+}
+
+[[nodiscard]] inline spec::turn_recall::RecallRequest
+reach_request_for_term(const spec::sum_dir::SumDir& directory, const std::string& term,
+                       std::uint32_t frontier, std::uint32_t fanout_cap,
+                       const std::vector<std::uint32_t>& appended_pages,
+                       const std::vector<std::uint32_t>& sign_key_pages = {}) {
+    const spec::sum_dir::SumDirReachResult reach = spec::sum_dir::sum_dir_recall_span_reachable(
+        directory, reach_postings_for(directory), term, frontier, fanout_cap,
+        std::span<const std::uint32_t>(appended_pages.data(), appended_pages.size()));
+    // THE LINE IS EDGE-TRIGGERED, NOT LEVEL-TRIGGERED, AND THAT IS A COST DECISION.
+    //
+    // MEASURED: this provider is called once per lane per ROUND, and an unconditional
+    // `fprintf` of `sum_dir_reach_line` costs 0.932 ms per call against 0.007 ms for the
+    // lookup itself -- 133x the work it reports, plus one stderr line per round (1001 lines
+    // for 1000 calls in the probe). A steady-state decode runs thousands of rounds, so a
+    // level-triggered line is both a per-round cost of the same forbidden shape and an
+    // unreadable log.
+    //
+    // So: a FOUND prints every time, because a found plan leads to a real recall and that is
+    // the event a reader is looking for. A REFUSAL prints ONCE per distinct status, so the
+    // refusal is loud the first time and cannot become a per-round tax. The status is a
+    // per-process static like the postings cache, for the same reason: the provider is
+    // re-created every round, so round-scoped state cannot live in its capture.
+    static spec::sum_dir::SumDirReachStatus last_refusal_status =
+        spec::sum_dir::SumDirReachStatus::Found;
+    const bool should_print =
+        reach.found || (reach.status != last_refusal_status && !reach.refusal.empty());
+    if (should_print) {
+        std::fprintf(stderr, "%s\n", spec::sum_dir::sum_dir_reach_line(reach).c_str());
+    }
+    if (!reach.found) { last_refusal_status = reach.status; }
+    // ---- THE STAMP, FILLED WHERE THE DECISION IS. `reach` is the index path's whole answer to
+    // "which page holds this query", and until this patch reached no line that also reports what
+    // was planned or restored. Cleaned per round by the caller (ensure_sequence_kv_mapped_for_
+    // round), so a disarmed arm or an unformable query reads as consulted=0 instead of
+    // inheriting the previous round's answer.
+    {
+        IndexPathStamp& stamp  = index_path_stamp();
+        stamp.round_consulted  = true;
+        ++stamp.rounds_consulted;
+        stamp.frontier         = frontier;
+        std::uint32_t rendered = term.empty() ? 0U : 1U;
+        for (const char ch : term) {
+            if (ch == ' ') { ++rendered; }
+        }
+        stamp.query_tokens = rendered;
+        stamp.query_digest = index_path_query_digest(term);
+        stamp.status       = static_cast<std::uint32_t>(reach.status);
+        stamp.raw_hits     = reach.raw_hits;
+        stamp.admissible   = reach.admissible;
+        stamp.candidates   = reach.candidates;
+        stamp.best_length  = reach.window;
+        stamp.best_offset  = reach.best_offset;
+        stamp.anchor_page  = reach.anchor_page;
+        stamp.first_page   = reach.first_page;
+        stamp.last_page    = reach.last_page;
+        stamp.need         = reach.needed_blocks;
+        if (!reach.found) { ++stamp.rounds_refused; }
+    }
+    // ---- [SIGNKEY] THE UNION, AT THE ONE POINT A SPAN IS BUILT ------------------
+    // The second source widens the CANDIDATE SET. It is not a second injector: the bytes
+    // that get re-prefilled still come from `read_located_block` over the cargo
+    // (turn_recall_journal.h:2527), exactly as for the lexical channel.
+    std::uint32_t sign_begin = 0xFFFFFFFFU;
+    std::uint32_t sign_end   = 0U;
+    for (const std::uint32_t page : sign_key_pages) {
+        const std::uint32_t begin = page * spec::turn_recall::kRecallPageTokens;
+        if (begin < sign_begin) { sign_begin = begin; }
+        const std::uint32_t end = begin + spec::turn_recall::kRecallPageTokens;
+        if (end > sign_end) { sign_end = end; }
+    }
+    if (sign_end > sign_begin) {
+        std::uint32_t begin = reach.token_begin;
+        std::uint32_t end   = reach.token_end;
+        const char*   join  = "lexical";
+        if (!reach.found || end <= begin) {
+            begin = sign_begin;
+            end   = sign_end;
+            join  = "sign-only";
+        } else {
+            if (sign_begin < begin) { begin = sign_begin; }
+            if (sign_end > end) { end = sign_end; }
+            join = "lexical+sign";
+        }
+        std::fprintf(stderr,
+                     "[recall-signkey-union] join=%s sign_pages=%zu sign_span=[%u,%u) "
+                     "lexical_span=[%u,%u) union_span=[%u,%u)\n",
+                     join, sign_key_pages.size(), sign_begin, sign_end, reach.token_begin,
+                     reach.token_end, begin, end);
+        return spec::turn_recall::RecallRequest{begin, end};
+    }
+    if (!reach.found || reach.token_end <= reach.token_begin) {
+        // A refusal, not a hole to fill: sum_dir_reach.h:104-108 forbids substituting the
+        // positional first-fit here, because that fallback chooses a page by POSITION, which is
+        // exactly the "plausible-looking wrong anchor" the requirement forbids.
+        return spec::turn_recall::RecallRequest{};
+    }
+    return spec::turn_recall::RecallRequest{reach.token_begin, reach.token_end};
+}
+
+void ProgramImplCore::install_index_recall_provider(const SequenceState& sequence) {
+    if (turn_recall_provider_is_external) { return; }
+    if (text_directory == nullptr || text_directory->empty()) { return; }
+    std::string term;
+    if (!index_query_term(sequence, sequence.text_kv_valid, term)) { return; }
+    if (!recall_reach_selector_armed()) {
+        // [SIGNKEY] NAMED, not silent: the pre-P6 selector (:14932-14946) returns a span from
+        // `sum_dir_recall_span_for_term` and has no candidate-set parameter, so the second
+        // source is INERT on that arm. An unfed source and a source that cannot be consumed
+        // must not read the same.
+        std::fprintf(stderr,
+                     "[recall-signkey] status=inert-pre-p6-selector armed=%d reason="
+                     "NINFER_RECALL_REACH=0 selects a span function with no candidate-set "
+                     "parameter (program_impl.h:14932-14946)\n",
+                     recall_sign_key_armed() ? 1 : 0);
+        turn_recall_provider = [this, term](std::uint32_t frontier) {
+            return index_request_for_term(term, frontier);
+        };
+        return;
+    }
+    // THE LOOP GUARD'S INPUT: every page this sequence has ALREADY recalled -- and that is NOT
+    // `recall_recorded`, which is why this is derived here instead of read off.
+    //
+    // `recall_recorded` is the sequence's STANDING SPILL RECORDS as they stand right now: the merge
+    // loop in record_turn_recall (:13496-13515) keeps a record only while its page is still cold
+    // and writes the tombstone and DROPS it when the page goes hot. Its page column is therefore
+    // { p : p has a row AND p is still cold } -- the pages the guard must ADMIT. Handing that
+    // column to `appended_pages` excluded exactly the pages the selector exists to find and
+    // admitted exactly the pages it exists to suppress, so `found` was reachable only for an
+    // already-restored page. MEASURED, dl/millionrun leg A: `hits=20 admissible=0 ... 1 page(s) by
+    // the already-recalled guard`, `plans=0`, no restore at all.
+    //
+    // The set this needs is the complement: every page the directory has a row for that is no
+    // longer cold, i.e. every page restore_cold_page brought back (its erase of the cold_pages
+    // entry at :13310 is the restore's own record). sum_dir_reach.h's
+    // `sum_dir_reach_already_recalled_pages` states the derivation and is the only place it is
+    // written; this site supplies the two page lists, both of which the engine already owns.
+    std::vector<std::uint32_t> row_pages;
+    row_pages.reserve(text_directory->size());
+    for (const spec::sum_dir::SumDirRow& row : text_directory->rows()) {
+        row_pages.push_back(row.page);
+    }
+    std::vector<std::uint32_t> still_cold;
+    still_cold.reserve(sequence.cold_pages.size());
+    for (const SequenceState::ColdPageEntry& entry : sequence.cold_pages) {
+        still_cold.push_back(entry.page);
+    }
+    std::vector<std::uint32_t> appended =
+        spec::sum_dir::sum_dir_reach_already_recalled_pages(row_pages, still_cold);
+    // ---- [SIGNKEY] THE SECOND SOURCE'S PAGE SET, DERIVED HERE --------------
+    // Edge-triggered like the reach line (:15139-15146) and for the same measured reason:
+    // this runs once per lane per round, so a level-triggered line would be a per-round tax.
+    std::vector<std::uint32_t> sign_key_pages;
+    {
+        const spec::sum_dir::SignKeySidecar& sidecar = recall_sign_key_sidecar();
+        const bool armed = recall_sign_key_armed();
+        std::size_t   matched = 0U;
+        std::uint32_t best_distance = 0U;
+        const char*   blocked = nullptr;
+        if (!armed) {
+            blocked = "NINFER_RECALL_SIGNKEY unset (the source is inert BY ARMED STATE)";
+        } else if (!sidecar.fed) {
+            blocked = "NINFER_RECALL_SIGNKEY_FEED unset (the sign field has no producer on "
+                      "any runtime path: kv_storage_dtype.h:106-120, layouts_impl.h:129-132)";
+        } else {
+            sign_key_pages = spec::sum_dir::sum_dir_sign_key_second_source_pages(
+                sidecar, fanout, &matched, &best_distance);
+        }
+        const std::string line = spec::sum_dir::sum_dir_sign_key_line(
+            armed, sidecar, matched, sign_key_pages.size(), best_distance, blocked);
+        static std::string last_line;
+        if (line != last_line) {
+            last_line = line;
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
+    const std::uint32_t fanout = recall_fanout_blocks();
+    turn_recall_provider = [this, term, appended = std::move(appended),
+                            sign_key_pages = std::move(sign_key_pages), fanout](
+                               std::uint32_t frontier) {
+        return reach_request_for_term(*text_directory, term, frontier, fanout, appended,
+                                      sign_key_pages);
+    };
+}
+
+void ProgramImplCore::set_turn_recall_provider(spec::turn_recall::RecallRequestProvider provider) {
+    turn_recall_provider = std::move(provider);
+    // An injected provider always wins: this flag is what makes the engine's own per-round installer
+    // stand down, so a retrieval layer supplied from outside is never silently replaced.
+    turn_recall_provider_is_external = static_cast<bool>(turn_recall_provider);
 }
 
 void ProgramImplCore::prepare_graphs() {
@@ -11334,7 +15449,12 @@ void ProgramImplCore::prepare_graphs() {
             }
             cache.page_pool().zero_pages(pages, device.stream);
         };
-    const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size) {
+    // `mtp_width` is 0 for every family but the MTP ladder rungs, where it is the width the graph
+    // is being captured for; the representative round then carries that many live columns, so the
+    // captured graph's dummy round matches a real rung round. The buffer strides stay the plan's
+    // draft_window, which is the frame layout.
+    const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
+                                            std::uint32_t mtp_width = 0) {
         if (batch_size == 0 || batch_size > max_concurrency) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
@@ -11402,7 +15522,9 @@ void ProgramImplCore::prepare_graphs() {
         if (io.mtp_decode) {
             *mtp_host_ingress          = {};
             *mtp_host_egress           = {};
-            const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
+            const std::uint32_t rung =
+                mtp_width != 0 && mtp_width < draft_window ? mtp_width : draft_window;
+            const std::uint32_t extent = std::min(rung, capacity - frontier - 1U);
             const std::uint32_t width  = draft_window + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 mtp_host_ingress->anchors[row] = 0;
@@ -11420,6 +15542,13 @@ void ProgramImplCore::prepare_graphs() {
                     mtp_host_ingress->target_rope_positions[row * width + column] =
                         checked_i32(frontier + std::min(column, extent),
                                     "graph representative MTP RoPE position");
+                    // B-line addition: keep the chain-spelling table consistent with the graph
+                    // representative above. A chain order IS the depth order, so this is the same
+                    // value; without it a graph-captured tree round's draft head would read the
+                    // zeroed array. Not exercised by --no-cuda-graph.
+                    mtp_host_ingress->target_chain_rope_positions[row * width + column] =
+                        checked_i32(frontier + std::min(column, extent),
+                                    "graph representative MTP chain RoPE position");
                 }
                 mtp_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
                 mtp_host_ingress->mtp_kv_table_rows[row]       = static_cast<std::int32_t>(row);
@@ -11508,16 +15637,30 @@ void ProgramImplCore::prepare_graphs() {
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
-        validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+        // The capture LADDER: one rung per width (a single rung at `draft_window` for a fixed-k
+        // run, which keeps the pre-ladder behaviour exactly). mtp_graph_ladder_profiles gives each
+        // rung its own topology class, so a per-round width switch installs a DIFFERENT executable
+        // instead of asking cudaGraphExecUpdate to swap a node's kernel function -- which it
+        // refuses, with "executable update failed", the moment one class holds two
+        // implementations. The coverage invariant is therefore checked per rung, not across the
+        // concatenation.
+        const auto planned_profiles = mtp_graph_ladder_profiles(capacity, draft_window, mtp_ladder);
+        const std::vector<std::uint32_t> rungs =
+            mtp_ladder.empty() ? std::vector<std::uint32_t>{draft_window} : mtp_ladder;
+        for (std::uint32_t rung = 0; rung < rungs.size(); ++rung) {
+            validate_graph_profiles(mtp_ladder_rung(planned_profiles, rung), capacity - 1,
+                                    "MTP ladder rung");
+        }
         schedule::MtpBatchContext mtp_state{execution_core(),
                                             decoder->text_kv,
                                             *decoder->mtp_cache(),
                                             *io.mtp_decode,
                                             *mtp_host_ingress,
                                             *mtp_host_egress,
-                                            state_images->continuation_hidden_store()};
+                                            state_images->continuation_hidden_store(),
+                                            draft_tree_paths, draft_tree_depth};
         const GraphExecutionProfile code_warm = planned_profiles.front();
+        // Warm up at the widest rung: it exercises every kernel the narrower rungs use.
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         schedule::mtp_decode_batch(
@@ -11525,9 +15668,37 @@ void ProgramImplCore::prepare_graphs() {
             mtp_causal_attention_envelopes(code_warm.max, draft_window, capacity), nullptr);
         device.synchronize();
 
-        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
+        // Startup capture set. A FIXED-k run captures every segment, exactly as before. An
+        // ADAPTIVE run treats graph_capture_ceiling the way the ordinary family already does:
+        // only the segments whose frontier max is below the ceiling are captured up front, and
+        // decode extends the rung it needs on a growth crossing (extend_mtp_graphs). That is what
+        // keeps the ladder's |ladder|-fold capture cost off a short run's startup path. The
+        // deferral is gated on |ladder| > 1 on purpose: a fixed-k run has to stay byte-identical
+        // to the configuration it was measured in.
+        std::vector<GraphExecutionProfile> startup_profiles = planned_profiles;
+        if (graph_capture_ceiling != 0 && rungs.size() > 1) {
+            startup_profiles.clear();
+            for (std::uint32_t rung = 0; rung < rungs.size(); ++rung) {
+                const auto rung_profiles = mtp_ladder_rung(planned_profiles, rung);
+                bool       covered       = false;
+                for (const GraphExecutionProfile& planned : rung_profiles) {
+                    if (planned.max <= graph_capture_ceiling) {
+                        startup_profiles.push_back(planned);
+                        covered = true;
+                    }
+                }
+                // install_graph_profile only ever UPDATES within a topology class, it never
+                // instantiates a new one at runtime, so every rung needs at least one profile
+                // instantiated here even when no segment of it fits under the ceiling.
+                if (!covered) { startup_profiles.push_back(rung_profiles.front()); }
+            }
+        }
+
+        mtp_graphs.profiles.reserve(startup_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            for (const GraphExecutionProfile planned : planned_profiles) {
+            for (const GraphExecutionProfile planned : startup_profiles) {
+                const std::uint32_t width =
+                    planned.draft_width != 0 ? planned.draft_width : draft_window;
                 mtp_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
                 profile.batch_size             = batch_size;
@@ -11535,9 +15706,10 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
+                profile.draft_width = planned.draft_width;
                 schedule::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_causal_attention_envelopes(planned.max, draft_window, capacity),
+                    mtp_state, static_cast<std::int32_t>(batch_size), width,
+                    mtp_causal_attention_envelopes(planned.max, width, capacity),
                     profile.definition);
             }
         }
@@ -11776,6 +15948,111 @@ void ProgramImplCore::extend_ordinary_graphs(std::uint32_t batch_size,
                  batch_size, missing.size(), frontier);
 }
 
+bool ProgramImplCore::mtp_graph_missing(std::uint32_t batch_size, std::uint32_t frontier,
+                                        std::uint32_t width) const noexcept {
+    return graph_profile_missing(mtp_graphs, batch_size, frontier, width);
+}
+
+// On-demand capture for one rung of the MTP ladder: exactly the ordinary-family machinery (one
+// transient address space on the dedicated never-bound capture row whose private page is repeated
+// across the whole table, so an arbitrary envelope reads and writes valid addresses without
+// disturbing any live request), plus the MTP cache's own transient row, because an MTP round
+// touches the target cache AND the MTP cache. It only ever fills segments of a topology class the
+// startup capture already instantiated -- install_graph_profile updates within a class, it never
+// instantiates a new one at runtime.
+void ProgramImplCore::extend_mtp_graphs(std::uint32_t batch_size, std::uint32_t frontier,
+                                        std::uint32_t width) {
+    // mtplogx: cumulative observation of this on-demand capture. The counter fires on entry and
+    // the elapsed time spans the whole call, including the early returns below: the question the
+    // sampling line could not answer is "did this ever run, and what did it cost in total".
+    const Clock::time_point mtplogx_extension_started = Clock::now();
+    struct MtplogxExtensionObservation {
+        std::uint64_t* calls;
+        std::uint64_t* nanoseconds;
+        Clock::time_point started;
+        ~MtplogxExtensionObservation() noexcept {
+            ++*calls;
+            *nanoseconds += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
+                    .count());
+        }
+    } mtplogx_extension_observation{&mtp_graph_extension_calls_,
+                                    &mtp_graph_extension_nanoseconds_,
+                                    mtplogx_extension_started};
+    const auto rung_entry = std::find(mtp_ladder.begin(), mtp_ladder.end(), width);
+    if (rung_entry == mtp_ladder.end()) { return; }
+    const std::uint32_t rung = static_cast<std::uint32_t>(rung_entry - mtp_ladder.begin());
+    const auto          planned_profiles =
+        mtp_graph_ladder_profiles(capacity, draft_window, mtp_ladder);
+    std::vector<GraphExecutionProfile> missing;
+    for (const GraphExecutionProfile& planned : mtp_ladder_rung(planned_profiles, rung)) {
+        const bool covered = std::any_of(
+            mtp_graphs.profiles.begin(), mtp_graphs.profiles.end(),
+            [&](const DecodeGraphProfile& profile) {
+                return profile.batch_size == batch_size && profile.draft_width == width &&
+                       profile.min_execution_frontier == planned.min &&
+                       profile.max_execution_frontier == planned.max;
+            });
+        if (!covered && planned.min <= frontier) { missing.push_back(planned); }
+    }
+    if (missing.empty()) { return; }
+
+    std::optional<KVAddressSpaceHandle> text_allocation =
+        text_kv_addresses->create_active(1, static_cast<std::int32_t>(max_concurrency));
+    if (!text_allocation) { throw std::bad_alloc(); }
+    text_kv_addresses->ensure_mapped_to_tokens(*text_allocation, 1, device.stream);
+    decoder->text_kv.execution_tables().publish_repeated(
+        text_kv_addresses->execution_row(*text_allocation).handle(),
+        text_kv_addresses->physical_page(*text_allocation, 0),
+        decoder->text_kv.execution_tables().logical_page_capacity(), device.stream);
+    std::optional<KVAddressSpaceHandle> mtp_allocation =
+        backend_kv_addresses->create_active(1, static_cast<std::int32_t>(max_concurrency));
+    if (!mtp_allocation) {
+        text_kv_addresses->deactivate(*text_allocation);
+        (void)text_kv_addresses->release(*text_allocation);
+        throw std::bad_alloc();
+    }
+    backend_kv_addresses->ensure_mapped_to_tokens(*mtp_allocation, 1, device.stream);
+    decoder->mtp_cache()->execution_tables().publish_repeated(
+        backend_kv_addresses->execution_row(*mtp_allocation).handle(),
+        backend_kv_addresses->physical_page(*mtp_allocation, 0),
+        decoder->mtp_cache()->execution_tables().logical_page_capacity(), device.stream);
+    device.synchronize();
+
+    schedule::MtpBatchContext mtp_state{make_execution_core(),
+                                        decoder->text_kv,
+                                        *decoder->mtp_cache(),
+                                        *io.mtp_decode,
+                                        *mtp_host_ingress,
+                                        *mtp_host_egress,
+                                        state_images->continuation_hidden_store(),
+                                        draft_tree_paths, draft_tree_depth};
+    for (const GraphExecutionProfile& planned : missing) {
+        mtp_graphs.profiles.emplace_back();
+        DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
+        profile.batch_size             = batch_size;
+        profile.min_execution_frontier = planned.min;
+        profile.max_execution_frontier = planned.max;
+        profile.topology_class         = planned.topology_class * max_concurrency + (batch_size - 1U);
+        profile.draft_width            = width;
+        schedule::capture_mtp_decode_batch(
+            mtp_state, static_cast<std::int32_t>(batch_size), width,
+            mtp_causal_attention_envelopes(planned.max, width, capacity), profile.definition);
+    }
+    if (backend_kv_addresses->active(*mtp_allocation)) {
+        backend_kv_addresses->deactivate(*mtp_allocation);
+    }
+    (void)backend_kv_addresses->release(*mtp_allocation);
+    if (text_kv_addresses->active(*text_allocation)) {
+        text_kv_addresses->deactivate(*text_allocation);
+    }
+    (void)text_kv_addresses->release(*text_allocation);
+    std::fprintf(stderr,
+                 "[graphs] extended MTP ladder rung k=%u: batch %u +%zu segments through "
+                 "frontier %u\n",
+                 width, batch_size, missing.size(), frontier);
+}
+
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
@@ -11786,6 +16063,9 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        // draft_window above is the ladder TOP for an adaptive run; the CLI prints that next to
+        // the realized mean so an adaptive run cannot be mistaken for a fixed k.
+        .adaptive_window       = !mtp_ladder.empty(),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -11955,7 +16235,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             selectors.destination,
             staged.initial_mtp_extent,
             dflash_host_ingress,
-            dflash2_host_ingress};
+            dflash2_host_ingress,
+            draft_tree_paths,
+            draft_tree_depth};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -12056,6 +16338,35 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
 
+                // THE TWO HALVES OF "A CONVERSATION LONGER THAN THE POOL", at the one
+                // place both are possible: the pages this chunk just produced are
+                // offered to the watermark, and the NEXT chunk's pages are mapped. In
+                // this order, because the watermark has to have given its pages back
+                // before the next chunk asks for more.
+                //
+                // Both are strict no-ops with the unload leg OFF: the trigger returns on
+                // its first line, and the mapping is already complete because the
+                // install path mapped `prompt_tokens` whole. So a short prompt on a
+                // large pool keeps the old code path exactly, and the only runs that
+                // take this branch are the ones that armed the knob.
+                if (unload_watermark_pages != 0) {
+                    (void)unload_watermark_trigger(sequence);
+                    const std::uint32_t next_tokens =
+                        std::min(staged.prompt_tokens, staged.cursor + prefill_chunk);
+                    // The backend bound mirrors the install path's own formula, so the
+                    // two cannot disagree about how far the MTP ladder may reach.
+                    const std::uint32_t next_backend_tokens =
+                        speculative_backend == SpeculativeBackend::Mtp
+                            ? std::min(capacity, next_tokens +
+                                                     (staged.initial_mtp_extent == 0
+                                                          ? 0U
+                                                          : staged.initial_mtp_extent - 1U))
+                        : speculative_backend == SpeculativeBackend::DFlash ? next_tokens
+                        : speculative_backend == SpeculativeBackend::DFlash2 ? 0U
+                                                                            : 0U;
+                    ensure_sequence_kv_mapped(sequence, next_tokens, next_backend_tokens);
+                }
+
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
@@ -12128,10 +16439,18 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
 
         copy_round_token();
         std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> initial_drafts{};
+        // --draft-tree L,d (L > 1): the bridge's own lattice, read out beside its drafts. Only a
+        // tree run copies it; a chain run leaves the whole array untouched.
+        std::array<std::int32_t, qwen3_6::kMtpTreeProposalEntries> initial_lattice{};
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
                                        staged.initial_mtp_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
+            if (draft_tree_paths > 1) {
+                CUDA_CHECK(cudaMemcpyAsync(initial_lattice.data(), io.mtp->lattice_ids.data,
+                                           sizeof(initial_lattice), cudaMemcpyDeviceToHost,
+                                           device.stream));
+            }
         }
         timing.begin_wait();
         device.synchronize();
@@ -12156,6 +16475,27 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             sequence.mtp_draft_count = staged.initial_mtp_extent;
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
+            // 落点 ②: same tightening as the decode-side publication -- the bridge's own
+            // extent is 0 on a round that produced nothing, and a tree layout with no
+            // backing nodes is the state the receiving seam refuses.
+            if (draft_tree_paths > 1 && staged.initial_mtp_extent != 0) {
+                // The FIRST verify round is a tree round too, and the gate reads the FIELD rather
+                // than the extent (program_impl.h:13336), so the bridge's lattice has to be
+                // published here or round 1 is refused. fill_mtp_tree_round() refuses a depth
+                // whose spine is not the chain draft the bridge produced, so a bridge that never
+                // ran the extraction cannot pass as a tree. mtp_draft_count becomes the node
+                // count -- NOT the bridge's own extent -- which is the live extent
+                // mtp_tree_required_extent() states a published tree must carry.
+                const std::uint32_t tree_nodes = draft_tree_paths * draft_tree_depth;
+                const qwen3_6::detail::MtpProposalRow bridge_row =
+                    qwen3_6::detail::mtp_proposal_row_from_prefill(
+                        initial_lattice.data(), initial_drafts.data(), draft_tree_paths,
+                        draft_tree_depth, qwen3_6::kMtpTreeProposalDepthStride,
+                        TextConfig::token_domain);
+                sequence.mtp_draft_count = qwen3_6::detail::fill_mtp_tree_round(
+                    bridge_row, tree_nodes, draft_window + 1U,
+                    qwen3_6::detail::mtp_tree_publish_slot(sequence));
+            }
         } else if (speculative_backend == SpeculativeBackend::DFlash &&
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
@@ -12255,7 +16595,14 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
             executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
-            envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
+            // FIX-A: the third field is the pinned split reference. Without it this rebind
+            // dropped the pin the ordinary family otherwise carries
+            // (program_impl.h:14609 constructs the eager envelope WITH `capacity`), so a
+            // graph launch of the same row partitioned its keys from the live window while
+            // the eager launch of that row partitioned them from the capacity -- the exact
+            // asymmetry the pinned contract exists to remove.
+            envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1,
+                          capacity};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -12273,7 +16620,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
-            ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
+            ensure_sequence_kv_mapped_for_round(sequence, frontier + 1, 0);
         }
 
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
@@ -12380,6 +16727,20 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
+    // The CAPTURED width this launch uses. One graph runs per launch, so a batch pays the widest
+    // lane's rung: batch 1 -- the measured configuration -- is exact, while batch > 1 over-pays
+    // for a lane that chose narrower (a per-lane launch is the alternative and is not attempted
+    // here). 0 means the ladder is off, i.e. the single configured width, and the selection then
+    // ignores the width key entirely -- the pre-ladder behaviour.
+    std::uint32_t launch_width = 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const SequenceState& sequence = active_sequence(lanes[row]);
+        if (sequence.mtp_target_width == 0 && mtp_ladder.empty()) { continue; }
+        const std::uint32_t rung = sequence.mtp_target_width != 0
+                                       ? sequence.mtp_target_width
+                                       : mtp_initial_rung(mtp_ladder);
+        launch_width = std::max(launch_width, rung);
+    }
 
     const auto started = Clock::now();
     try {
@@ -12387,14 +16748,28 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
+        // The round's k. The ladder rung when it is on, else the configured width. Under
+        // --no-cuda-graph the eager body gets the same k, so the adaptive width also costs
+        // b_width without graphs.
+        const std::uint32_t round_width = launch_width != 0 ? launch_width : draft_window;
         schedule::MtpCausalAttentionEnvelopes envelopes =
-            mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
+            mtp_causal_attention_envelopes(maximum_frontier, round_width, capacity);
         if (use_cuda_graph) {
+            // On-demand rung capture, mirroring the ordinary family: the ladder is deferred by
+            // graph_capture_ceiling, so the first round that reaches a frontier this rung has no
+            // segment for extends that rung once per crossing.
+            if (launch_width != 0 && graph_capture_ceiling != 0 &&
+                mtp_graph_missing(static_cast<std::uint32_t>(lanes.size()), maximum_frontier,
+                                  launch_width)) {
+                (void)cudaStreamSynchronize(device.stream);
+                extend_mtp_graphs(static_cast<std::uint32_t>(lanes.size()), maximum_frontier,
+                                  launch_width);
+            }
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "MTP batch");
+                                     maximum_frontier, "MTP batch", launch_width);
             executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
+            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, round_width,
                                                        capacity);
         }
 
@@ -12405,8 +16780,18 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
+            // Clamped by the lane's rung as well as by the frame width: the graph that launched
+            // has exactly `launch_width` AR steps and its verify envelope was built for that
+            // width, so a live extent above the lane's own rung would run columns the graph does
+            // not cover (mtp_draft_count is already capped at it by the decision above; this keeps
+            // it true for every lane of a batch whose graph is the widest rung).
+            const std::uint32_t lane_rung =
+                mtp_ladder.empty()
+                    ? draft_window
+                    : (sequence.mtp_target_width != 0 ? sequence.mtp_target_width
+                                                      : mtp_initial_rung(mtp_ladder));
             const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
+                std::min({sequence.mtp_draft_count, draft_window, lane_rung, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
             // Remember the extent this round actually carries: the post-round window
             // criterion needs it to fold the accept record without a second host read.
@@ -12417,14 +16802,120 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
+            // M1: one ancestor bit set per verify column. Bit i of column j means "column j may
+            // attend column i"; bit 0 is the anchor column and is always set. A chain's column j
+            // is the prefix (1 << (min(j, extent) + 1)) - 1 -- exactly the per-row prefix
+            // target_valid_columns (extent + 1) intersected with the position-causal cut -- so the
+            // chain spelling of this array removes NO key and is bit-identical to the pre-tree
+            // engine. The invalid tail (j > extent) repeats the last live prefix and is already
+            // declared invalid by target_valid_columns = extent + 1.
+            //
+            // L > 1 needs the draft side to publish the tree it is verifying: a real tree's masks
+            // are NOT prefixes (a sibling is never an ancestor) and its depths are not the column
+            // indices, so neither can be derived here from the extent alone. A tree round without
+            // that publication is refused, never guessed: verifying L*d live columns as a chain
+            // would silently report a tree that was never verified.
+            // The mask-driven accept reads the verifier's OWN argmax, which only the greedy route
+            // produces: the sampling and penalty routes define their own commit and would verify a
+            // tree with the masks silently ignored. Refused HERE, on the host, before the round --
+            // not by name in a kernel that cannot throw.
+            if (draft_tree_paths > 1 &&
+                (request.sampling_host.temperature > 0.0f ||
+                 request.sampling_host.presence_penalty != 0.0f ||
+                 request.sampling_host.frequency_penalty != 0.0f)) {
+                throw std::logic_error(
+                    "MTP tree verify (--draft-tree L,d with L > 1) requires the greedy route: the "
+                    "per-column ancestor masks are applied by the argmax accept only, so a tree "
+                    "round under a temperature/penalty request is refused instead of being "
+                    "verified with the masks ignored");
+            }
+            const std::uint32_t tree_columns = sequence.mtp_tree_columns;
+            if (draft_tree_paths > 1 && tree_columns == 0) {
+                throw std::logic_error(
+                    "MTP tree verify (--draft-tree L,d with L > 1) has no draft-side tree "
+                    "producer: the proposal side must publish per-column depths and ancestor "
+                    "masks (ddtree::column_depth / column_ancestors) before this round can be "
+                    "verified");
+            }
+            // 落点 ① (TREE-FIX-LAND): the refusal must key on THIS round's OWN masks, not
+            // merely on whether a publication happened. A published layout whose every column
+            // is the CHAIN spelling (depths[j] == j && masks[j] == (1 << (j + 1)) - 1) verifies
+            // a chain while claiming L > 1 paths -- the silent wrong answer this gate exists
+            // for. The rule is the receiving seam's own (mtp_tree_publish.h:
+            // mtp_tree_layout_defect, "the layout is the CHAIN spelling"), re-evaluated here
+            // on the frame the verify op is about to read. The refusal above is KEPT: this one
+            // only ADDS a case (published, but published the chain's spelling).
+            if (draft_tree_paths > 1) {
+                bool chain_spelling = true;
+                for (std::uint32_t j = 0; j < tree_columns && chain_spelling; ++j) {
+                    chain_spelling = sequence.mtp_tree_depths[j] == j &&
+                                     sequence.mtp_tree_masks[j] ==
+                                         ((std::uint64_t{1} << (j + 1)) - 1);
+                }
+                if (chain_spelling) {
+                    throw std::logic_error(
+                        "MTP tree verify (--draft-tree L,d with L > 1) would verify the CHAIN "
+                        "spelling of the verify frame: the published per-column depths and "
+                        "ancestor masks are exactly the chain's, so no L > 1 node was ever "
+                        "built. Refusing instead of reporting a tree that was never verified");
+                }
+            }
+            if (tree_columns > width) {
+                throw std::logic_error("MTP tree verify published more columns than the frame has");
+            }
+            for (std::uint32_t j = 0; j < width; ++j) {
+                const std::uint32_t live  = std::min(j, extent);
+                const std::uint32_t index = j < tree_columns ? j : (tree_columns - 1);
+                // M1: the ancestor mask. Chain column j = the prefix (1 << (live + 1)) - 1; the
+                // invalid tail repeats the last live column, and target_valid_columns = extent + 1
+                // has already declared that tail invalid.
+                mtp_host_ingress->target_column_masks[row * width + j] =
+                    tree_columns != 0
+                        ? sequence.mtp_tree_masks[index]
+                        : (live + 1 >= 64 ? ~std::uint64_t{0}
+                                          : ((std::uint64_t{1} << (live + 1)) - 1));
+                // M2: the tree node's DEPTH. Chain column j = min(j, extent); the tail repeats the
+                // last live depth, exactly like the old `min(j, extent)` did.
+                mtp_host_ingress->target_column_depths[row * width + j] =
+                    checked_i32(tree_columns != 0 ? sequence.mtp_tree_depths[index] : live,
+                                "MTP tree column depth");
+            }
+            // TREE-FIX-LAND 打印点 A（HOST ONLY，只读；整块删除即回退）。M1/M2 写完之后，
+            // 逐列打出成员那份 dtp/dtd/tree_columns/width/extent/draft_window、发布那份
+            // masks/depths、以及真正落进 ingress 的那份 col_mask。j < width 恒在界内。
+            for (std::uint32_t j = 0; j < width; ++j) {
+                std::fprintf(stderr,
+                             "[treecols] row=%u dtp=%u dtd=%u tree_columns=%u width=%u "
+                             "extent=%u draft_window=%u j=%u mask=%llx depth=%u col_mask=%llx\n",
+                             static_cast<unsigned>(row), draft_tree_paths, draft_tree_depth,
+                             tree_columns, width, extent, draft_window, static_cast<unsigned>(j),
+                             static_cast<unsigned long long>(sequence.mtp_tree_masks[j]),
+                             sequence.mtp_tree_depths[j],
+                             static_cast<unsigned long long>(
+                                 mtp_host_ingress->target_column_masks[row * width + j]));
+            }
             for (std::uint32_t j = 0; j < draft_window; ++j) {
                 mtp_host_ingress->current_drafts[row * draft_window + j] =
                     j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
             }
+            // M2: column j's RoPE position is the DEPTH of the node it carries (anchor + depth),
+            // not its index: siblings at the same depth are alternatives for one position. The
+            // value written here is the same `target_column_depths[j]` the verify op receives, so
+            // the position table and the depth table cannot drift.
             for (std::uint32_t j = 0; j < width; ++j) {
-                const std::uint32_t position = frontier + std::min(j, extent);
+                const std::uint32_t depth     = static_cast<std::uint32_t>(
+                    mtp_host_ingress->target_column_depths[row * width + j]);
+                const std::uint32_t position  = frontier + depth;
                 mtp_host_ingress->target_rope_positions[row * width + j] =
                     checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
+            }
+            // M2b: the same table in the CHAIN spelling -- index j is chain depth j, not column j.
+            // Only the MTP draft head reads it, and only for a tree round (mtp_impl.h), where its
+            // ids and hidden have been re-indexed to depth order. A chain round never reads it.
+            for (std::uint32_t j = 0; j < width; ++j) {
+                const std::uint32_t live = std::min(j, extent);
+                mtp_host_ingress->target_chain_rope_positions[row * width + j] =
+                    checked_i32(frontier + live, "MTP chain RoPE position") + sequence.rope_delta;
             }
             mtp_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
@@ -12435,8 +16926,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
-            ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
-                                      std::min(capacity, frontier + extent + draft_window));
+            ensure_sequence_kv_mapped_for_round(
+                sequence, frontier + extent + 1,
+                std::min(capacity, frontier + extent + draft_window));
         }
 
         schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
@@ -12447,11 +16939,12 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  *io.mtp_decode,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
-                                                 state_images->continuation_hidden_store()};
+                                                 state_images->continuation_hidden_store(),
+                                                 draft_tree_paths, draft_tree_depth};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                   draft_window, envelopes, executable);
+                                   round_width, envelopes, executable);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -12467,6 +16960,15 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             RequestControl& request       = requests[lanes[row]];
             const std::uint32_t base_E    = sequence.execution_frontier;
             const std::uint32_t base_S    = sequence.ledger_frontier;
+            // A tree round's KV history commit refuses to move anything when the published tree
+            // metadata is inconsistent (see ops::kMtpTreeFlagColumnOutOfRange). That refusal used
+            // to be a silent wrong history; it is a hard error here, before the accepted column is
+            // allowed to become the next round's history.
+            const std::int32_t tree_flags = mtp_host_egress->tree_commit_flags[row];
+            if (tree_flags != 0) {
+                throw std::runtime_error("MTP tree KV history commit rejected row metadata: flags=" +
+                                         std::to_string(tree_flags));
+            }
             const std::int32_t count_i    = mtp_host_egress->licensed_counts[row];
             const std::int32_t accepted_i = mtp_host_egress->accepted_drafts[row];
             const std::int32_t next_i     = mtp_host_egress->next_extents[row];
@@ -12504,6 +17006,38 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
+        }
+        // mtplogx: one line per MTP round, opt-in via NINFER_MTP_ROUND_LOG=1. request_log.cpp's
+        // `wait=` is a per-interval MEAN over decode_rounds, so one slow round is diluted into its
+        // neighbours; this line carries the round's own device wait beside the two widths the
+        // round actually used. launch_width is the captured width this launch paid for, rung is its
+        // index in the ladder (-1 when the ladder is off). Off by default so a default run's
+        // stderr is unchanged and the print cannot perturb the round it measures.
+        static const bool mtplogx_round_log_enabled = [] {
+            const char* value = std::getenv("NINFER_MTP_ROUND_LOG");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        if (mtplogx_round_log_enabled) {
+            static std::uint64_t mtplogx_round_index = 0;
+            std::int32_t mtplogx_rung_index          = -1;
+            if (launch_width != 0) {
+                const auto mtplogx_rung_entry =
+                    std::find(mtp_ladder.begin(), mtp_ladder.end(), launch_width);
+                if (mtplogx_rung_entry != mtp_ladder.end()) {
+                    mtplogx_rung_index =
+                        static_cast<std::int32_t>(mtplogx_rung_entry - mtp_ladder.begin());
+                }
+            }
+            // finish() is idempotent (it latches finished_), so the return below still gets the
+            // same value.
+            const runtime::ExecutionTiming mtplogx_round_timing = timing.finish();
+            std::fprintf(stderr,
+                         "[mtpround] idx=%llu batch=%zu frontier=%u width=%u launch_width=%u "
+                         "rung=%d wait_us=%.3f host_us=%.3f\n",
+                         static_cast<unsigned long long>(++mtplogx_round_index), lanes.size(),
+                         maximum_frontier, width, launch_width, mtplogx_rung_index,
+                         static_cast<double>(mtplogx_round_timing.device_wait_ns) / 1000.0,
+                         static_cast<double>(mtplogx_round_timing.host_ns()) / 1000.0);
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
@@ -12623,7 +17157,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
-            ensure_sequence_kv_mapped(sequence, frontier + extent + 1U, frontier);
+            ensure_sequence_kv_mapped_for_round(sequence, frontier + extent + 1U, frontier);
         }
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
@@ -12721,24 +17255,41 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
                             std::span<const runtime::RoundBudget> budgets,
                             runtime::ExecutionTiming* failed_timing) {
-    // Cold-pool maintenance at the round boundary (window policy only).
-    // Every active sequence maintains its own retired prefix; multi-lane
-    // batches compress each lane's pages independently.
-    if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk) {
+    // Cold-pool maintenance at the round boundary. Every active sequence
+    // maintains its own retired prefix; multi-lane batches process each lane's
+    // pages independently.
+    //
+    // Two consumers, and the policy decides which of them run:
+    //   * the slot tiers (Window/Disk, and HostThenDisk's disk rung) compress the
+    //     retired prefix into device cold slots with the spill files behind them;
+    //   * the Host tier (Host, and HostThenDisk's host rung) retires the read-free
+    //     prefix into pinned host memory and gives the device pages back.
+    // Under HostThenDisk BOTH run, host first: rung 1 is the cheapest page to
+    // leave, so it gets first refusal, and a page it cannot take is then picked up
+    // by the slot tier -- the compression pass skips pages the host rung already
+    // owns (`can_cold_transfer` requires a device replica, which a host-rung page
+    // has just given up). Window/Disk/Host keep exactly one consumer, as before.
+    const bool slot_tier_live =
+        cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk ||
+        cold_policy == ColdPolicy::HostThenDisk;
+    const bool host_rung_live =
+        cold_policy == ColdPolicy::Host || cold_policy == ColdPolicy::HostThenDisk;
+    if (slot_tier_live || host_rung_live) {
         for (const std::uint32_t lane : lanes) {
             SequenceState& sequence = active_sequence(lane);
-            if (sequence.kv) {
+            if (!sequence.kv) { continue; }
+            if (host_rung_live) { enqueue_cold_host_evictions(sequence); }
+            if (!slot_tier_live) { continue; }
+            if (unload_watermark_pages == 0) {
+                // No watermark: the passive frontier rule, byte-for-byte as before.
                 enqueue_cold_compressions(sequence);
-            }
-        }
-    } else if (cold_policy == ColdPolicy::Host) {
-        // Same boundary, different medium: retire the read-free prefix into the
-        // pinned Host pool and give the device pages back (cold_host_tier.h). The
-        // window/disk path above is not touched, so the two are independent.
-        for (const std::uint32_t lane : lanes) {
-            SequenceState& sequence = active_sequence(lane);
-            if (sequence.kv) {
-                enqueue_cold_host_evictions(sequence);
+            } else {
+                // Watermark armed: ONE entry point decides, and it is the free pool
+                // that decides -- above the watermark it does nothing at all, at or
+                // below it, the semantic judge picks the pages. The passive rule is
+                // still reachable from inside it as the safety valve, so arming the
+                // knob cannot make the Engine less able to serve a request.
+                (void)unload_watermark_trigger(sequence);
             }
         }
     }
@@ -12869,7 +17420,7 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
             dflash2_host_ingress->state_source_slots[row]      = selectors.source;
             dflash2_host_ingress->state_destination_slots[row] = selectors.destination;
             // DFlash2 owns no backend KV; only the shared text cache materializes.
-            ensure_sequence_kv_mapped(sequence, frontier + extent + 1U, 0);
+            ensure_sequence_kv_mapped_for_round(sequence, frontier + extent + 1U, 0);
         }
 
         schedule::DFlash2BatchContext schedule_state{
@@ -13062,27 +17613,120 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.device      = device.device;
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
-    switch (kv_dtype) {
-    case DType::BF16:
-        out.kv_cache = KvCacheStorage::BFloat16;
-        break;
-    case DType::I8:
-        out.kv_cache = KvCacheStorage::Int8Group64;
-        break;
-    case DType::FP8_E4M3FN:
-        out.kv_cache = KvCacheStorage::Fp8E4M3Row256;
-        break;
-    case DType::NVFP4:
-        out.kv_cache = KvCacheStorage::Nvfp4Group16;
-        break;
-    case DType::ISO3:
-        out.kv_cache = KvCacheStorage::Iso3Group16;
-        break;
-    case DType::E8Kv:
-        out.kv_cache = KvCacheStorage::E8Group64;
-        break;
-    default:
-        out.kv_cache = KvCacheStorage::BFloat16;
+    // w-fit6 T2 disposition. This lambda used to end in
+    //     default: return KvCacheStorage::BFloat16;
+    // which is the same laundering shape as the guard hole in
+    // tests/test_kv_tier_formats.cpp: an unmapped dtype came out as the storage
+    // that MEANS "inherit the global --kv-dtype" (types.h KvCacheStorage::BFloat16
+    // is the per-layer sentinel; layouts_impl.h:1546-1552 fills a target's
+    // registered default table with BFloat16 entries for exactly that reason, and
+    // kv_resolve_slot_dtype() resolves them against the global dtype).
+    //
+    // The default is gone and EVERY DType is named, so this can no longer be a
+    // silent answer. The six KV tiers are the real mapping; the five control
+    // dtypes (FP32/I32/U8/I64/FP16) are named in their own arm as values that
+    // cannot reach either caller -- plan.kv_dtype comes from
+    // target_kv_cache_profile() (layouts_impl.h:1184, image = the six above) and
+    // layer_view.dtype comes from PagedKVCacheLayout::layer_dtypes, which
+    // plan_cache() validates to exactly those six (decoder_state.cpp:324-328,
+    // "Paged KV per-layer dtype is invalid"). Keeping the reachable answer for
+    // them (BFloat16) while removing the default: means a SEVENTH KV dtype added
+    // to DType now trips -Wswitch here instead of being reported as bf16.
+    // (This function is noexcept by contract -- memory_summary() is noexcept -- so
+    // the fix cannot be a throw; making the arm explicit is the available one, and
+    // it is also what closes this site for -Werror=switch-enum.)
+    // ---- w-fit8 T1: this switch is a HARD ERROR on a new DType, in every build.
+    //
+    // The `default:` arm was removed above so that a DType with no KV tier is
+    // reported rather than laundered into KvCacheStorage::BFloat16. MEASURED by
+    // w-fit8 on this exact tree, with a 12th DType added to core/dtype.h and the
+    // REAL carrier TU src/targets/qwen3_6_27b/impl/variant.cpp:
+    //   no warning flag           -> rc=0, and the switch is not mentioned at all
+    //                                (the only default-on diagnostic is -Wreturn-type)
+    //   -Wswitch, -Wall -Wswitch  -> rc=0: a WARNING, never an error
+    //   -Wswitch -Werror=switch   -> rc=1, but that same flag ALSO errors on this
+    //                                tree's other -Wswitch sites, so it is not a
+    //                                CMake gate that can be switched on tree-wide today
+    // With the pragma below and NO flags at all: rc=1. That is the whole point.
+    // So the guarantee "adding a DType fails the build" needs the escalation AT THE
+    // SITE. It costs nothing here and cannot leak: every one of DType's 11
+    // enumerators is named below (13 since the rk4v4 width tiers landed), so this region is
+    // silent on the complete enum.
+    // -Wswitch-enum is escalated as well as -Wswitch: the lambda is exhaustive at
+    // both strengths, and -Wswitch-enum is the stricter one -- it still fires if a
+    // `default:` is ever re-added next to a missing arm.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#pragma GCC diagnostic error "-Wswitch-enum"
+#endif
+    const auto storage_of = [](DType dtype) noexcept {
+        switch (dtype) {
+        case DType::BF16:
+            return KvCacheStorage::BFloat16;
+        case DType::I8:
+            return KvCacheStorage::Int8Group64;
+        case DType::FP8_E4M3FN:
+            return KvCacheStorage::Fp8E4M3Row256;
+        case DType::NVFP4:
+            return KvCacheStorage::Nvfp4Group16;
+        case DType::ISO3:
+            return KvCacheStorage::Iso3Group16;
+        case DType::E8Kv:
+            return KvCacheStorage::E8Group64;
+        // The rk4v4 family's narrower K planes. NAMED, not folded into the
+        // not-a-KV-tier arm below: these are real quantized tiers (K narrowed, V still
+        // i4), so returning BFloat16 here would relabel them as the "inherit the global
+        // --kv-dtype" sentinel. They resolve to their own storage and are REFUSED one
+        // step later by product::kv_dtype_for_storage, which is the decision point that
+        // knows the codec is missing -- see product/kv_e8_width.h.
+        case DType::E8K3Kv:
+            return KvCacheStorage::E8K3Group64;
+        case DType::E8K2Kv:
+            return KvCacheStorage::E8K2Group64;
+        // Not KV tiers and unreachable from both call sites (see above).
+        case DType::FP32:
+        case DType::I32:
+        case DType::U8:
+        case DType::I64:
+        case DType::FP16:
+            return KvCacheStorage::BFloat16;
+        }
+        // NINFER_WARNSURFACE: the switch above names every DType enumerator and the
+        // -Wswitch/-Wswitch-enum escalation at :16788-16790 fails the build if one is
+        // ever added without an arm -- so this point is unreachable in any build that
+        // compiles. It exists because GCC keeps a fall-through edge for a switch with
+        // no `default:` label, which is what -Wreturn-type was reporting: control
+        // reaching it was UNDEFINED BEHAVIOUR. Name the failure instead of laundering
+        // it (no `default:` that returns BFloat16 -- see the comment at :16806-16811).
+        std::terminate();
+    };
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+    out.kv_cache = storage_of(kv_dtype);
+    // The resolved per-layer table, not the global dtype: a target's registered
+    // default table can put different tiers on different layers, and then the global
+    // dtype is only the value a BF16 entry inherits.
+    if (decoder) {
+        // text_kv is a PagedKVCache, not its layout: the count is the layers() METHOD and the
+        // per-layer dtype is published by batch_layer_view(layer).dtype (the same accessor the
+        // cold path reads). Keeping the index under layers() is what makes the call total --
+        // batch_layer_view throws std::out_of_range past the end, and this function is noexcept.
+        const std::size_t resolved_layers =
+            std::min<std::size_t>(decoder->text_kv.layers(), out.kv_layer_storage.size());
+        for (std::size_t i = 0; i < resolved_layers; ++i) {
+            const PagedKVBatchLayerView layer_view =
+                decoder->text_kv.batch_layer_view(static_cast<std::uint32_t>(i));
+            // L26 instrument (D5): a discarded layer has NO storage. Publish that
+            // instead of storage_of(view.dtype), which is the empty view's default
+            // member and would report BFloat16 for a layer with no planes at all.
+            out.kv_layer_storage[i] =
+                decoder->text_kv.layer_is_dropped(static_cast<std::uint32_t>(i))
+                    ? KvCacheStorage::Dropped
+                    : storage_of(layer_view.dtype);
+        }
+        out.kv_full_attention_layers = static_cast<std::uint32_t>(resolved_layers);
     }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};

@@ -230,6 +230,54 @@ public:
         request.remaining_service_work -= work;
     }
 
+    // ---- Service-work reservation vs. a mid-stream prefill-unit shrink ---------------------
+    // A completed prefill unit is charged exactly ONE quantum (EngineCore::
+    // resolve_prefill_progress), so the number of quanta a prompt needs is a function of the
+    // prefill unit that is in force: a SMALLER unit needs MORE quanta for the same tokens. The
+    // plan's projection (RequestRecord::remaining_service_work, written once at materialization
+    // from projected_service_work() at the PLAN's prefill unit, which IS
+    // Program::prefill_chunk_capacity()) is therefore a valid reservation only while the unit does
+    // not move -- and bandwidth_governor_.prefill_chunk_for() is allowed to move it, because a
+    // co-resident decode request should wait for a small unit instead of a full chunk (W6).
+    //
+    // A mid-stream unit shrink is a LEGAL, EXPECTED event. This tree has already ruled on this
+    // exact event once, for the rebuild accounting, in
+    // src/targets/qwen3_6/impl/runtime/rebuild_work.h:18-33:
+    //   "That used to throw std::logic_error(...) and kill the request. A mid-stream unit shrink
+    //    is a legal, expected event, so it must not be an error."
+    // and it repairs its accounting in the same shape this does: recompute the not-yet-charged
+    // span at the unit that is actually in force, because that is the only term recoverable from
+    // the arguments. Over-charging a prefill cost estimate is the conservative direction --
+    // under-charging would make a long prompt look cheaper to serve than it is.
+    //
+    // What is EXACT here: a remaining span with no interior capture / rewrite boundary, which is
+    // the common case (no checkpoint capture, no vision split, no prefix rewrite). Then
+    //   quanta_for(N, base) - u == quanta_for(N - u*base, base)
+    // so subtracting the old span's charge and adding the new one restores the reservation to
+    // exactly quanta_for(remaining_tokens, installed_unit) and the invariant keeps its meaning
+    // instead of being widened. What is NOT exact: an interior boundary adds a term that is itself
+    // unit-dependent, so a top-up can under-count by up to one quantum per interior boundary. That
+    // is accepted deliberately: the alternative -- letting the reservation extend itself whenever a
+    // charge is short -- is the "a flag that changes nothing" failure this tree has already paid
+    // for (see the W6 note in bandwidth_governor.h and the dead-wire history it records).
+    [[nodiscard]] static constexpr std::uint64_t prefill_quanta_for(std::uint64_t tokens,
+                                                                  std::uint32_t unit) noexcept {
+        return tokens == 0 || unit == 0 ? 0ULL : 1ULL + (tokens - 1ULL) / unit;
+    }
+
+    // Top up `request` for the span it has NOT charged yet, from `previous_unit` (the unit this
+    // request's reservation was last reconciled against) to `installed_unit`. Monotone on purpose:
+    // the unit also GROWS back when the governor recovers, and pulling the reservation back down is
+    // not needed to keep the invariant true -- it would only re-open the hole for a second shrink.
+    static void recharge_service_work_for_unit_shrink(Request& request,
+                                                      std::uint64_t remaining_tokens,
+                                                      std::uint32_t previous_unit,
+                                                      std::uint32_t installed_unit) {
+        const std::uint64_t before = prefill_quanta_for(remaining_tokens, previous_unit);
+        const std::uint64_t after  = prefill_quanta_for(remaining_tokens, installed_unit);
+        if (after > before) { request.remaining_service_work += after - before; }
+    }
+
     [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
                                                 bool have_decode, bool previous_unit_was_decode,
                                                 bool context_transaction) const noexcept {

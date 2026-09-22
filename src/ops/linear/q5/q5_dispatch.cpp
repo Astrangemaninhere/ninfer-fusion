@@ -45,6 +45,18 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q5_mma_r64_c128;
         }
         break;
+    case 12288:
+        // k = 12288 is the 4096-wide text stack's MLP intermediate width; n = 4096 is its
+        // hidden width. Every arm reuses a launch this selector already routes to: the SIMT
+        // kernels take k as a runtime argument, and the MMA schedule's k is a runtime value too,
+        // so this geometry adds no kernel body.
+        if (n == 4096) {
+            if (t == 1) { return launch_q5_simt_r8_c4; }
+            if (t <= 4) { return launch_q5_simt_r8_c4; }
+            if (t <= 16) { return launch_q5_simt_r8_c8; }
+            return launch_q5_mma_r64_c128;
+        }
+        break;
     case 1152:
         if (n == 1152 && t >= 4 && t <= 131072 && (t % 4) == 0) {
             if (t <= 76) { return launch_q5_simt_r8_c4; }
@@ -83,6 +95,17 @@ Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
         break;
     }
     throw std::invalid_argument("q5 linear: unsupported policy");
+}
+
+// Non-throwing spelling of the registry lookup, defined in terms of the selector itself so the
+// two can never disagree.
+bool q5_a16_shape_registered(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
+    try {
+        (void)select_q5_a16_launch(n, k, t);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

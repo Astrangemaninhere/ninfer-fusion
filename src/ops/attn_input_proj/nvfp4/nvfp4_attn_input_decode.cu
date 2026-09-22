@@ -17,12 +17,12 @@ struct Nvfp4AttentionInputOutput {
 
     __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t,
                                           float result) const {
-        constexpr std::int32_t kQueryRows  = 6144;
-        constexpr std::int32_t kKeyRows    = 1024;
-        constexpr std::int32_t kGateRows   = 6144;
-        constexpr std::int32_t kKeyBegin   = kQueryRows;
-        constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
-        constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
+        constexpr std::int32_t kQueryRows  = kNvfp4AttnQueryRows;
+        constexpr std::int32_t kKeyRows    = kNvfp4AttnKeyRows;
+        constexpr std::int32_t kGateRows   = kNvfp4AttnGateRows;
+        constexpr std::int32_t kKeyBegin   = kNvfp4AttnKeyBegin;
+        constexpr std::int32_t kGateBegin  = kNvfp4AttnGateBegin;
+        constexpr std::int32_t kValueBegin = kNvfp4AttnValueBegin;
 
         const __nv_bfloat16 result_bf16 = __float2bfloat16_rn(result);
         if (parent_row < kKeyBegin) {
@@ -43,8 +43,8 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
                                     Tensor& k, Tensor& v, cudaStream_t stream) {
     using Geometry = Nvfp4AttnInputGeometry;
     using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
-    static_assert((6144 % 128) == 0);
-    static_assert((1024 % 128) == 0);
+    static_assert((kNvfp4AttnQueryRows % 128) == 0);
+    static_assert((kNvfp4AttnKeyRows % 128) == 0);
 
     const Nvfp4AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data),

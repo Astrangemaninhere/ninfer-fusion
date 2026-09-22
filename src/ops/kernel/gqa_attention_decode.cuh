@@ -16,6 +16,7 @@
 #include <math_constants.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace ninfer::ops {
 
@@ -32,6 +33,104 @@ struct GqaAppendInput {
 struct GqaCachedInput {
     static constexpr bool writes_cache = false;
 };
+
+// ---------------------------------------------------------------------------------------
+// NINFER_VERIFY_EXACT -- the kernel-side half of the split-reduction determinism contract
+// (src/targets/qwen3_6/impl/runtime/program_impl.h:602-605: "the verify columns must reduce
+// exactly like the batch-1 decode of the same row, so their split grid may not depend on the
+// draft window or on how far the sequence has advanced").
+//
+// It is a RUNTIME flag on purpose -- the acceptance matrix has to be a 2x2 over this switch
+// and the host-side NINFER_SPLIT_PARITY, with no rebuild per arm. Device code cannot read the
+// environment, so the value reaches the kernels through a program-wide device symbol:
+// `inline __device__` has EXTERNAL linkage under `-rdc=true`, which is how ninfer_ops is
+// built (src/CMakeLists.txt:11 CUDA_SEPARABLE_COMPILATION ON), so one host write in any TU is
+// seen by every kernel instantiated in the library. A whole-program TU (-rdc=false) -- the
+// header-only host test target -- declares no flag at all and therefore keeps the legacy
+// policy, which is exactly what that test wants to pin.
+//
+// 0 (unset/anything else) = legacy policy, bit-for-bit the previous behaviour.
+// 1                        = exact policy: window-only split counts for every dtype, one
+//                            shared key-range definition, and a reducer that reads the
+//                            column's own visible-key count.
+// ---------------------------------------------------------------------------------------
+inline constexpr int kGqaReduceSlots = 256;
+
+#if defined(__CUDACC_RDC__)
+inline __device__ int g_gqa_verify_exact_flag = 0;
+#endif
+
+#if defined(__CUDACC_RDC__) && !defined(__CUDA_ARCH__)
+// Host side. Idempotent, synchronous, and called from the host pass of
+// gqa_small_t_split_units<Geometry>() -- i.e. from the launcher, before the first kernel of
+// the launch is dispatched -- so no kernel can observe a half-published value.
+inline void gqa_verify_exact_publish() {
+    static const bool once = [] {
+        const char* env = std::getenv("NINFER_VERIFY_EXACT");
+        const int value = (env != nullptr && env[0] == '1' && env[1] == '\0') ? 1 : 0;
+        if (cudaMemcpyToSymbol(g_gqa_verify_exact_flag, &value, sizeof(int)) != cudaSuccess) {
+            (void)cudaGetLastError();
+        }
+        return true;
+    }();
+    (void)once;
+}
+
+#endif
+
+// Device side mirror of the flag. Always 0 in a non-RDC TU.
+__device__ __forceinline__ int gqa_verify_exact_mode() {
+#if defined(__CUDACC_RDC__)
+    return g_gqa_verify_exact_flag;
+#else
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------------------
+// NINFER_GQA_SINGLE_WAVE=1 -- OPT-IN launch policy. It replaces Geometry::DecodeSplits with
+// kGqaDecodeWaveSplitsPerHead<Geometry> as the divisor that turns the pinned split reference
+// into `split_units` (keys per split), and widens the NVFP4 short-window split target in
+// ops/launcher/gqa_attention_decode_split.h from 64 to 128 keys so the split COUNT is the
+// wave's worth instead of launching CTAs that exit immediately.
+//
+// UNSET IS THE LEGACY ARM, and it has to be: this is the arm every acceptance baseline in the
+// tree was taken under, and the split partition is what fixes the fp32 reduction order that
+// decides ULP-level ties. `1` and nothing else enables it, matching the NINFER_VERIFY_EXACT
+// reader below. Changing the partition CAN move a 256-token greedy id stream (measured through
+// the --max-context proxy: 0ba6516eb440110c -> a7f4f404f40ad9e5), so the default path must stay
+// byte-identical and this has to be chosen deliberately, not inherited.
+//
+// HOST-ONLY, and it needs no device mirror. Unlike the verify-exact contract -- where the
+// device recomputes the policy and therefore needs g_gqa_verify_exact_flag published into it --
+// split_units here is a LAUNCH CONSTANT: the launcher computes it and hands it to the kernels
+// as an argument, and nothing on the device re-derives it. So there is no second opinion to
+// keep in sync, and a device pass that never sees this keeps the legacy divisor harmlessly.
+// Every call site is therefore inside `#if defined(__CUDACC_RDC__) && !defined(__CUDA_ARCH__)`,
+// the same guard gqa_verify_exact_publish() above uses. Do not call it from a
+// `__host__ __device__` body without that guard: nvcc warns #20014-D and the device pass would
+// silently take the legacy branch.
+//
+// A non-RDC TU (the header-only host test target) does not define this at all and keeps the
+// legacy policy, which is what that target wants to pin.
+// ---------------------------------------------------------------------------------------
+// NO __CUDA_ARCH__ GUARD HERE, and that is load-bearing rather than an oversight:
+// ops/launcher/gqa_attention_decode_split.h calls this from gqa_small_t_split_count, a plain
+// HOST function, and that header is compiled in the DEVICE pass too -- so a definition that
+// vanished under __CUDA_ARCH__ made the call site `identifier "gqa_single_wave_env" is
+// undefined` (measured, not guessed: the -fsyntax-only preflight of
+// src/ops/launcher/gqa_attention_decode.cu fails on that exact line without this shape).
+// Defining it unconditionally is safe because EVERY call site is a host function. Keep it out
+// of `__host__ __device__` bodies, where nvcc warns #20014-D; put the call site behind
+// `#if defined(__CUDACC_RDC__) && !defined(__CUDA_ARCH__)` there instead, as
+// gqa_small_t_split_units does.
+inline bool gqa_single_wave_env() {
+    static const bool on = [] {
+        const char* env = std::getenv("NINFER_GQA_SINGLE_WAVE");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return on;
+}
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_cache_index(int physical_page, int kv_head, int d,
@@ -79,8 +178,10 @@ __device__ __forceinline__ bool gqa_valid_q_head(int kv_head, int q_head) {
            q_head < (kv_head + 1) * Geometry::GroupSize && q_head < Geometry::QHeads;
 }
 
+// __host__ as well as __device__: gqa_small_t_split_range below is host-callable so the
+// determinism contract can be asserted from a host-only test with no device flag present.
 template <typename Geometry>
-__device__ __forceinline__ int gqa_small_t_default_splits(int window) {
+__host__ __device__ __forceinline__ int gqa_small_t_default_splits(int window) {
     int target_keys_per_split = 480 / Geometry::DecodeSplitScale;
     if (window <= 4096) {
         target_keys_per_split = 64 / Geometry::DecodeSplitScale;
@@ -104,6 +205,15 @@ __device__ __forceinline__ int gqa_small_t_default_splits(int window) {
 // many tokens the enclosing launch carries (batch-1 decode vs k+1 wide verify).
 // The partial kernels and the reducer must be given the same split_units; a launch
 // that passes 0 keeps the legacy window-driven partition.
+//
+// SCOPE: "the enclosing launch" is every launch of THIS family. split_units is derived from
+// GqaExecutionEnvelope::split_reference_keys, so a caller has to pin that field for the claim to
+// hold, and a launch that is not a split-KV small-T launch has no split_units to be given: the
+// prompt body (gqa_attention_prefill_bf16_kernel) partitions keys into kGqaPrefillBc blocks with a
+// sequential online-softmax rescale instead (gqa_attention_prefill_bf16.cuh:140,251,263,394-395),
+// which is a different association tree and cannot be reconciled with this grid from here. The
+// route selector is what keeps a pinned verify inside this family
+// (ops/launcher/gqa_attention_route_contract.h).
 __host__ __device__ __forceinline__ int gqa_small_t_split_active(int window, int split_units,
                                                                int launch_capacity) {
     if (window <= 0 || split_units <= 0 || launch_capacity <= 0) { return 0; }
@@ -115,18 +225,46 @@ __host__ __device__ __forceinline__ int gqa_small_t_split_active(int window, int
 // reference, rounded up to a 32-key boundary so a boundary tile is staged as a whole.
 template <typename Geometry>
 __host__ __device__ __forceinline__ int gqa_small_t_split_units(int split_reference_keys) {
+#if defined(__CUDACC_RDC__) && !defined(__CUDA_ARCH__)
+    // Publish NINFER_VERIFY_EXACT to the device before this launch's kernels are dispatched.
+    // The launcher calls this (gqa_attention_decode_smallt.cu:62, gqa_attention_decode_partial
+    // .cuh:209/:327, gqa_attention_decode_e8.cu:31) ahead of every partial/reduce dispatch, so
+    // the host-side gate never changes what a launcher passes down: only the device policy does.
+    gqa_verify_exact_publish();
+#endif
     const int reference = split_reference_keys > 0 ? split_reference_keys : 1;
-    const int raw       = div_up(reference, static_cast<int>(Geometry::DecodeSplits));
-    const int units     = div_up(raw, 32) * 32;
+    // One wave (NINFER_GQA_SINGLE_WAVE=1) or the tree's two, per Geometry::DecodeSplits. The
+    // call site carries the RDC-host guard because this function is `__host__ __device__`; see
+    // gqa_single_wave_env(). Coverage is NOT uniform -- kGqaDecodeWaveSplitsPerHead lists which
+    // geometries move.
+    int divisor = static_cast<int>(Geometry::DecodeSplits);
+#if defined(__CUDACC_RDC__) && !defined(__CUDA_ARCH__)
+    if (gqa_single_wave_env()) { divisor = static_cast<int>(kGqaDecodeWaveSplitsPerHead<Geometry>); }
+#endif
+    const int raw   = div_up(reference, divisor);
+    const int units = div_up(raw, 32) * 32;
     return units > 0 ? units : 32;
 }
 
+// The split count of one launch. `exact` is gqa_verify_exact_mode(); it is an explicit
+// parameter (and not read here) so the contract can be exercised from a host test that has
+// no device flag at all.
+//
+// exact != 0: gqa_small_t_default_splits<Geometry>(window) -- a function of the column's own
+//   visible-key count and of nothing else. Every `tokens == 5 / tokens == 6` case and the
+//   `if constexpr (Int8)` gate are gone, so the same window gives the same count for a
+//   1-column decode and a 6-column verify chunk, and for every KV dtype (the counted duty of
+//   H39: swapping KV dtype used to move the lossless-region upper bound).
+// exact == 0: the legacy policy, verbatim, including the Int8/window specializations.
 template <typename Geometry, bool Int8>
-__device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_capacity,
-                                                         int tokens) {
+__host__ __device__ __forceinline__ int gqa_small_t_active_splits_exact(int window,
+                                                                        int launch_capacity,
+                                                                        int tokens, int exact) {
     if (window <= 0) { return launch_capacity; }
     int splits = 0;
-    if constexpr (Int8) {
+    if (exact != 0 || !Int8) {
+        splits = gqa_small_t_default_splits<Geometry>(window);
+    } else {
         if (tokens == 5 && window > 128 && window <= 512) {
             splits = div_up(window, 32 / Geometry::DecodeSplitScale);
         } else if (tokens == 6 && window > 128 && window <= 160) {
@@ -140,11 +278,147 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_
         } else {
             splits = gqa_small_t_default_splits<Geometry>(window);
         }
-    } else {
-        splits = gqa_small_t_default_splits<Geometry>(window);
     }
     return splits < launch_capacity ? splits : launch_capacity;
 }
+
+template <typename Geometry, bool Int8>
+__device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_capacity,
+                                                         int tokens) {
+    return gqa_small_t_active_splits_exact<Geometry, Int8>(window, launch_capacity, tokens,
+                                                           gqa_verify_exact_mode());
+}
+
+// One split's key range under the launch's partition: the ONE definition of "which keys does
+// split s own" for the whole family. All five tiers used to spell this block out themselves
+// (bf16/i8/nvfp4/fp8/iso3), which is how the legacy window-driven tiling could have grown a
+// per-tier or per-token-tile variant; it now cannot.
+//
+// `key_block` is the tier's Bc (it only matters in the legacy branch, where the tiling is
+// expressed in whole key tiles).
+struct GqaSmallTSplitRange {
+    int active;
+    int start;
+    int limit;
+};
+
+template <typename Geometry, bool Int8>
+__host__ __device__ __forceinline__ GqaSmallTSplitRange
+gqa_small_t_split_range(int window, int split_count, int split_units, int tokens, int key_block,
+                        int split, int exact) {
+    GqaSmallTSplitRange range{0, 0, 0};
+    if (split_units > 0) {
+        range.active = gqa_small_t_split_active(window, split_units, split_count);
+        range.start  = split * split_units;
+        range.limit  = range.start + split_units;
+    } else {
+        range.active = gqa_small_t_active_splits_exact<Geometry, Int8>(window, split_count,
+                                                                       tokens, exact);
+        const int logical_tiles   = div_up(window, key_block);
+        const bool tile_split     = logical_tiles >= range.active;
+        const int units_per_split = tile_split ? div_up(logical_tiles, range.active)
+                                               : div_up(window, range.active);
+        const int span            = units_per_split * (tile_split ? key_block : 1);
+        range.start               = split * span;
+        range.limit               = range.start + span;
+    }
+    return range;
+}
+
+// The visible-key count the REDUCER uses for a column. It is the column's own count and not
+// the launch's last column, which is what makes the reduction of a verify column identical to
+// the batch-1 decode of the same row: with a pinned split_units the split partition is already
+// a launch constant, so a column may reduce exactly the splits its own prefix needs -- the
+// splits past its last key hold the neutral partials (m = -inf, l = 0) the partial kernel
+// wrote, and skipping them is exact.
+//
+// Only the fixed grid (split_units > 0) qualifies: in the legacy window-driven partition the
+// split a key belongs to is derived from this same window, so it has to stay the launch's.
+// The column's own VISIBLE key count. Site B was that this arithmetic was never applied
+// here: the reducer returned the column's key PREFIX (`own_pos + 1`), which left its count
+// `window_begin` keys too large. Factored out so the contract check below runs on the SAME
+// arithmetic the reducer uses, and made constexpr so the check can be a static_assert.
+__host__ __device__ constexpr int gqa_small_t_visible_keys(int own_pos, int sliding_window) {
+    const int visible = own_pos + 1;
+    if (sliding_window <= 0) { return visible; }
+    const int origin = visible - sliding_window;
+    return origin > 0 ? visible - origin : visible;
+}
+
+__host__ __device__ constexpr int gqa_small_t_reduce_window(int last_pos, int own_pos,
+                                                           int split_units, int exact,
+                                                           int sliding_window) {
+    if (exact != 0 && split_units > 0 && own_pos >= 0) {
+        return gqa_small_t_visible_keys(own_pos, sliding_window);
+    }
+    return last_pos + 1;
+}
+// ===========================================================================
+// winmech LOUD CHECK -- Site B.  The reducer's count, and it FAILS THE BUILD.
+//
+// Site B's defect: the reducer counted a column's keys as `own_pos + 1`, the column's
+// own key PREFIX, where the partial kernels had counted the column's own VISIBLE keys
+// `min(own_pos + 1, sliding_window)`.  The count is what gqa_small_t_split_active()
+// turns into an active-split count, so the prefix made the reducer walk and merge
+// splits the partial kernel never wrote -- and the only thing guarding it was the
+// comment above its own call site, which already said "visible-key count" while the
+// code said prefix.  A comment is not a check.
+//
+// Why a constant-expression check and not assert(): this tree is built with -DNDEBUG,
+// so `assert` is compiled out and would guard nothing.
+// ===========================================================================
+struct GqaSmTWmReduceWitness {
+    int own_pos;
+    int sliding_window;
+    int split_units;
+    int exact;
+};
+constexpr GqaSmTWmReduceWitness kGqaSmTWmReduceWitness[] = {
+    {7679, 7553, 512, 1},    // wm_a   : 7680 keys, sliding window 7553 -> visible 7553
+    {7679, 262144, 512, 1},  // wm_noop: the window is a no-op -> visible 7680
+    {4027, 3901, 512, 1},    // wm_d
+    {4027, 3917, 512, 1},    // wm_e
+    {7463, 7424, 512, 1},    // t_7424
+    {100, 1000, 512, 1},     // already inside the window: no exclusion at all
+    {7679, 7553, 512, 0},    // exact == 0: the LEGACY branch must keep the launch count
+    {7679, 7553, 0, 1},      // split_units == 0: the LEGACY branch again
+    {-1, 7553, 512, 1},      // own_pos < 0: the LEGACY branch again
+};
+constexpr int kGqaSmTWmReduceWitnessCount = 9;
+static_assert(sizeof(kGqaSmTWmReduceWitness) / sizeof(kGqaSmTWmReduceWitness[0]) ==
+                  kGqaSmTWmReduceWitnessCount,
+              "winmech SITE B: the reducer witness table lost a case. These cases ARE the "
+              "check that the reducer's count is the column's VISIBLE key count; deleting "
+              "one to make the build pass removes the check, not the defect "
+              "(dl/winmech/REPORT.md).");
+
+constexpr bool gqa_small_t_reduce_contract_holds() {
+    for (int i = 0; i < kGqaSmTWmReduceWitnessCount; ++i) {
+        const int own_pos = kGqaSmTWmReduceWitness[i].own_pos;
+        const int win     = kGqaSmTWmReduceWitness[i].sliding_window;
+        const int units   = kGqaSmTWmReduceWitness[i].split_units;
+        const int exact   = kGqaSmTWmReduceWitness[i].exact;
+        constexpr int kLaunchLastPos = 999999;  // any launch; own_pos must be what binds
+        const int got = gqa_small_t_reduce_window(kLaunchLastPos, own_pos, units, exact, win);
+        if (exact != 0 && units > 0 && own_pos >= 0) {
+            const int visible = own_pos + 1;
+            const int want    = (win > 0 && visible > win) ? win : visible;
+            if (got != want) { return false; }        // prefix instead of visible count?
+            if (got > visible) { return false; }      // never more than the column owns
+            if (win > 0 && got > win) { return false; }  // never more than declared visible
+        } else {
+            if (got != kLaunchLastPos + 1) { return false; }  // legacy branch untouched
+        }
+    }
+    return true;
+}
+static_assert(gqa_small_t_reduce_contract_holds(),
+              "winmech SITE B: the reducer's per-column key count is not the column's VISIBLE "
+              "count. On the fixed grid it must be min(own_pos + 1, sliding_window); returning "
+              "own_pos + 1 (the column's PREFIX) leaves the count `window_begin` keys too "
+              "large, so the reducer walks splits the partial kernel never wrote "
+              "(dl/winmech/REPORT.md).");
+
 
 __device__ __forceinline__ int gqa_small_t_tc_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -175,7 +449,8 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, std::int32_t split_units, __nv_bfloat16* out) {
+    std::int32_t split_count, std::int32_t split_units, std::int32_t sliding_window,
+    __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -210,7 +485,13 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         partial_l += partial_stat_row;
     }
 
-    const int window = last_pos + 1;
+    const int exact  = gqa_verify_exact_mode();
+    // The column's own visible-key count, not the launch's last one (see
+    // gqa_small_t_reduce_window). `window` used to be last_pos + 1 unconditionally, i.e. it
+    // moved with the token tile: a 6-column verify chunk asked for six columns' worth of
+    // splits and a 1-column decode asked for one.
+    const int window =
+        gqa_small_t_reduce_window(last_pos, positions[token], split_units, exact, sliding_window);
     // split_units > 0 selects the fixed split grid, which the partial kernels also used
     // for this launch. Splits beyond the row's own last key hold the neutral partials the
     // partial kernel wrote (m = -inf, l = 0), so walking them is exact: their l is
@@ -218,19 +499,36 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const int active_split_count =
         split_units > 0
             ? gqa_small_t_split_active(window, split_units, split_count)
-            : gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
+            : gqa_small_t_active_splits_exact<Geometry, Int8>(window, split_count, tokens, exact);
 
-    __shared__ float reduce[256];
-
-    float local_m = -CUDART_INF_F;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
-        local_m = fmaxf(local_m,
-                        partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)]);
-    }
-    reduce[tid] = local_m;
+    // CANONICAL COMBINE. Slot index IS the split index and the tree is a compile-time fixed
+    // 256-slot binary tree, so the fp32 association of the partial mixture is a function of the
+    // partial vector alone -- never of blockDim.x (which the launcher's (TOKENS, WARPS) ladder
+    // picks per verify width) and never of the token tile. Slots at or past
+    // active_split_count hold the monoid identity (-inf for max, 0.0f for the sum), which is
+    // exact: -inf is the max identity and a 0.0f addend is a 0.0f addend.
+    constexpr int kSlots = kGqaReduceSlots;
+    static_assert(kSlots == 256, "the reducer's launch block must equal kGqaReduceSlots");
+    __shared__ float reduce[kSlots];
+    for (int slot = tid; slot < kSlots; slot += blockDim.x) { reduce[slot] = -CUDART_INF_F; }
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    float local_m = -CUDART_INF_F;
+    if (active_split_count <= kSlots) {
+        if (tid < active_split_count) {
+            local_m = partial_m[gqa_partial_stat_index<Geometry>(q_head, token, tid, tokens)];
+        }
+    } else {
+        for (int split = tid; split < active_split_count; split += kSlots) {
+            local_m =
+                fmaxf(local_m,
+                      partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)]);
+        }
+    }
+    if (tid < kSlots) { reduce[tid] = local_m; }
+    __syncthreads();
+
+    for (int stride = kSlots / 2; stride > 0; stride >>= 1) {
         if (tid < stride) { reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]); }
         __syncthreads();
     }
@@ -245,21 +543,40 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         return;
     }
 
-    float local_l = 0.0f;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
-        const float tile_l =
-            partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
-        if (tile_l > 0.0f) {
-            local_l +=
-                tile_l *
-                expf(partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
-                     head_m);
-        }
-    }
-    reduce[tid] = local_l;
+    // Same canonical slot layout and the same compile-time tree shape as the max above;
+    // kSlots is the one declared with the max, so there is a single slot count in this body.
+    for (int slot = tid; slot < kSlots; slot += blockDim.x) { reduce[slot] = 0.0f; }
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    float local_l = 0.0f;
+    if (active_split_count <= kSlots) {
+        if (tid < active_split_count) {
+            const float tile_l =
+                partial_l[gqa_partial_stat_index<Geometry>(q_head, token, tid, tokens)];
+            if (tile_l > 0.0f) {
+                local_l =
+                    tile_l *
+                    expf(partial_m[gqa_partial_stat_index<Geometry>(q_head, token, tid, tokens)] -
+                         head_m);
+            }
+        }
+    } else {
+        for (int split = tid; split < active_split_count; split += kSlots) {
+            const float tile_l =
+                partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
+            if (tile_l > 0.0f) {
+                local_l +=
+                    tile_l *
+                    expf(partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split,
+                                                                    tokens)] -
+                         head_m);
+            }
+        }
+    }
+    if (tid < kSlots) { reduce[tid] = local_l; }
+    __syncthreads();
+
+    for (int stride = kSlots / 2; stride > 0; stride >>= 1) {
         if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
         __syncthreads();
     }

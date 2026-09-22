@@ -1,5 +1,6 @@
 #include "ninfer/ops/linear.h"
 
+#include "ops/generic/rowsplit_generic.h"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -77,6 +78,23 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    // The Q4/Q5/Q6 selectors are exact (N,K) registries. A shape the registry does not carry is
+    // not a user error: it is a geometry this engine simply has no entry for yet, and the target
+    // that owns it still has to run. Fall back to the generic decoder rather than refusing.
+    const std::int32_t t = x.ne[1];
+    if (policy == LinearPolicy::A16Only) {
+        const bool registered =
+            (w.qtype == QType::Q4G64_F16S && detail::q4_a16_shape_registered(w.n, w.k, t)) ||
+            (w.qtype == QType::Q5G64_F16S && detail::q5_a16_shape_registered(w.n, w.k, t)) ||
+            (w.qtype == QType::Q6G64_F16S && detail::q6_a16_shape_registered(w.n, w.k, t));
+        const bool generic = (w.qtype == QType::Q4G64_F16S || w.qtype == QType::Q5G64_F16S ||
+                              w.qtype == QType::Q6G64_F16S) &&
+                             detail::generic_rowsplit_problem_ok(x, w, out);
+        if (generic && !registered) {
+            detail::generic_rowsplit_linear_dispatch(x, w, out, stream);
+            return;
+        }
+    }
     switch (w.qtype) {
     case QType::Q4G64_F16S:
         detail::q4_dispatch(x, w, out, policy, stream);
@@ -118,17 +136,34 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
 
     switch (qtype) {
     case QType::Q4G64_F16S:
-        (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
-        (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
     case QType::Q5G64_F16S:
-        (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
-        (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
+    case QType::Q6G64_F16S: {
+        if (policy == LinearPolicy::AllowA4) {
+            throw std::invalid_argument("linear workspace: unsupported row-split policy");
+        }
+        // The three row-split families need no transient storage on either route: the registered
+        // kernels carry none, and the generic decoder is an in-place block reduction. The
+        // selector calls below exist only to reject a problem that neither route can express.
+        const auto ok = [&](std::int32_t tokens) {
+            if (qtype == QType::Q4G64_F16S) {
+                return detail::q4_a16_shape_registered(output_rows, input_rows, tokens);
+            }
+            if (qtype == QType::Q5G64_F16S) {
+                return detail::q5_a16_shape_registered(output_rows, input_rows, tokens);
+            }
+            return detail::q6_a16_shape_registered(output_rows, input_rows, tokens);
+        };
+        const bool generic_capable = policy == LinearPolicy::A16Only &&
+                                     detail::generic_rowsplit_shape_capable(output_rows,
+                                                                            input_rows);
+        if (!ok(min_tokens) && !generic_capable) {
+            throw std::invalid_argument("linear workspace: unsupported row-split problem");
+        }
+        if (!ok(max_tokens) && !generic_capable) {
+            throw std::invalid_argument("linear workspace: unsupported row-split problem");
+        }
         return 0;
-    case QType::Q6G64_F16S:
-        (void)detail::select_q6_launch(output_rows, input_rows, min_tokens, policy);
-        (void)detail::select_q6_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
+    }
     case QType::W8G32_F16S:
         (void)detail::select_w8_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_w8_launch(output_rows, input_rows, max_tokens, policy);

@@ -329,6 +329,77 @@ MODEL=/path/to/Qwen3.6-27B
 NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
 ```
 
+The default CUDA toolkit is 13.x (`/usr/local/cuda`). CUDA 13 removed offline code generation
+below `sm_75`: its `nvcc --list-gpu-arch` answers `compute_75` upward and nothing lower, and
+`-arch=sm_70` exits 1 with `nvcc fatal : Unsupported gpu architecture 'sm_70'`. A rung at or
+below `sm_70` is therefore never reached by adding its number to a CUDA-13 arch list; it is
+built by a separate chain.
+
+| Rung | Toolkit and entry point |
+|---|---|
+| `75` .. `121` | the default CUDA 13.x `nvcc`, via `cmake -S . -B build-<arch> -DCMAKE_CUDA_ARCHITECTURES=<arch>` |
+| `70` | CUDA 12.8 at `/mnt/g/cuda12/tk` (nvcc V12.8.61), via `NINFER_CUDA_TOOLKIT_70=/mnt/g/cuda12/tk tools/archkit/build_arch.sh 70` |
+
+`tools/archkit/_GPU_MATRIX.md`'s per-rung toolchain column is the authority for which toolkit
+covers which rung. `build_arch.sh` selects the `70` rung's toolchain file through its
+`TOOLCHAIN_FILE_OF` table and then configures with
+`-DCMAKE_TOOLCHAIN_FILE=tools/archkit/cuda128_sm70_toolchain.cmake`,
+`-DCMAKE_CUDA_COMPILER=/mnt/g/cuda12/tk/bin/nvcc`, and `-DCMAKE_CUDA_ARCHITECTURES=70`;
+`NINFER_ARCH_NEEDING_LEGACY_TOOLKIT=70` is a declared name for the same fact and is read by no
+code path. The explicit `-DCMAKE_CUDA_ARCHITECTURES` is not redundant with the toolchain file:
+`CMakeLists.txt:20-21` sets a `120a` default before `project()` reads the toolchain file, and a
+cache entry set without `FORCE` cannot displace it, so without that flag the `70` build
+configures as `120a` and the tree correctly refuses it.
+
+The legacy chain reaches well below `sm_70`, so the lower rungs are not a toolchain boundary.
+`nvcc 12.8 --list-gpu-arch` answers `compute_50 52 53 60 61 62 70 72 75 80 86 87 89 90 100 101
+120`, so Maxwell (`sm_50/52/53`) and Pascal (`sm_60/61/62`) are inside it. What blocks a rung
+below `70` is its kernels, not the toolkit.
+
+CUDA 12.8's nvcc refuses this distro's HOST image in two independent places. Neither is about
+the arch, and no CUDA TU in this tree compiles until both are answered. `crt/host_config.h:143`
+fires `#error -- unsupported GNU version! gcc versions later than 14 are not supported!` because
+the system g++ is 15.2; `-ccbin /usr/bin/g++-13` answers it, and g++-13 (13.4.0) is already
+installed. And CUDA 12.8's `crt/math_functions.h` declares `cospi`/`sinpi`/`rsqrt` and their `f`
+forms without `noexcept`, while this box's glibc 2.43 `bits/mathcalls.h:83/85/206` declares them
+with `noexcept (true)`, so the C++ front end emits six `exception specification is incompatible
+with that of previous function` errors; a glibc 2.35 (Ubuntu 22.04) header set in front of the
+host headers answers it, because that is the glibc CUDA 12.8 was built against.
+
+Both halves of the glibc pin are load-bearing and are separate requirements, and both must be
+`-isystem` rather than `-idirafter`: `-isystem /mnt/g/cuda12/jammy-sysroot/usr/include` and
+`-isystem /mnt/g/cuda12/jammy-sysroot/usr/include/x86_64-linux-gnu`. Measured on one translation
+unit:
+
+| Host flags | Result |
+|---|---|
+| neither pin | `host_config.h:143` `#error -- unsupported GNU version!` |
+| `-ccbin g++-13` only | 6 `exception specification is incompatible` errors |
+| `-ccbin g++-13`, both `-isystem` halves | rc=0, cubin produced |
+| `-ccbin g++-13`, first half only | 8 errors: the 6 above plus `stdio.h` `L_tmpnam` undefined |
+| `-ccbin g++-13`, `-idirafter` both halves | the same 6 errors return |
+
+Those six errors read as a CUDA problem and are not: they are a host-header mismatch, so do not
+question the toolkit, the arch, or the sources first. The pins and the reason for each live in
+`tools/archkit/cuda128_sm70_toolchain.cmake`.
+
+Do not fetch `nvidia/cuda:12.8.0-devel-ubuntu22.04` to close any of this. `sudo -n` fails on this
+box (rc=1) and the image is unnecessary, because both halves are already on disk; `jammy-sysroot`
+has no `usr/bin`, so it is header-only and cannot supply a compiler.
+
+The `70` configure of this tree has been re-run (2026-09-18) at rc=0: every one of its 182
+`.cu` compile entries carries `--generate-code=arch=compute_70,code=[compute_70,sm_70]`
+(185 such occurrences in its `build.ninja`), and two of the tree's own TUs (`core/arena.cu`,
+`core/device_probe.cu`) build under it, with `cuobjdump --list-elf` reporting `sm_70` in both
+objects. The negative control is that same configure WITHOUT `-DCMAKE_CUDA_ARCHITECTURES`: it
+falls back to `120a` and `CMakeLists.txt:280-286` stops it with `arch list '120a' needs CUDA
+13.1 or newer, but the CUDA compiler is 12.8.61`. That rc=1 is the gate working; it is not
+evidence that CUDA 12.8 cannot build this tree.
+
+`CMakeLists.txt:258-267` still says the CUDA 12.x COMPILE half is unmeasured here and names
+`nvidia/cuda:12.8.0-devel-ubuntu22.04` as what would close it. That comment is stale; the
+paragraphs above are current.
+
 ## Commits
 
 Create a commit only when the user requests one. Use Conventional Commit-style subjects, for

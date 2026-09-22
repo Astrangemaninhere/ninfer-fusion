@@ -15,7 +15,7 @@ cross-checked against layer_multipliers):
   row[h] = mixed % per_head_vocab_size[h] + per_head_offset[h]
 
 Usage:
-  python ple_gather_test.py --root C:/Users/User/Documents/ziqinzhang/flashnext_ple
+  python ple_gather_test.py --root <ple_sidecar_root>
   python ple_gather_test.py --root ... --tokens 1234,567,89 --stats
 """
 from __future__ import annotations

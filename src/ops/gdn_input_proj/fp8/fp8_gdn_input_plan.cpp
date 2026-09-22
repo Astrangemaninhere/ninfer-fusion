@@ -14,13 +14,25 @@ enum class Fp8GdnInputRoute : std::uint8_t {
     A8,
 };
 
+// NOTE: FIX-C2. The batch-1 chain-verify width of an MTP round is `--draft-tokens + 1`
+// and the CLI caps `--draft-tokens` at 15, so the verify domain is width in
+// [1, kVerifyWidthCeiling]. Every width in that domain has to reduce like the batch-1
+// decode, which reaches this projection at T = 1 and therefore takes the BF16-activation
+// (A16) route; A8 quantises the ACTIVATIONS to FP8, so it is a different arithmetic and
+// not a re-ordering of the same one. The old predicate was `tokens >= 8 ? A8 : A16`, i.e.
+// the whole upper half of the verify domain (width 8..16, the k >= 7 arms) took A8 while
+// the decode took A16. Its conv sibling (`fp8_gdn_conv_plan.cpp`, FIX-C) and the attention
+// input projection (`fp8_attn_input_plan.cpp`, FIX-C) were already fixed and this one was
+// not, so the family was only patched where it had been measured. This now matches both.
+constexpr std::int32_t kVerifyWidthCeiling = 16;
+
 Fp8GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 gdn_input_proj: T must be positive"); }
     if (policy == LinearPolicy::A16Only) { return Fp8GdnInputRoute::A16; }
     if (policy != LinearPolicy::AllowA8) {
         throw std::invalid_argument("fp8 gdn_input_proj: unsupported policy");
     }
-    return tokens >= 8 ? Fp8GdnInputRoute::A8 : Fp8GdnInputRoute::A16;
+    return tokens > kVerifyWidthCeiling ? Fp8GdnInputRoute::A8 : Fp8GdnInputRoute::A16;
 }
 
 } // namespace
@@ -53,8 +65,11 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor qkv_chunk(qkv_output, DType::BF16, {kQkvRows, active});
         Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
-        // UNIFY-A: one route for the whole small-T family (T=1 included).
-        fp8_gdn_input_small_t_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
+        if (active == 1) {
+            fp8_gdn_input_decode_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
+        } else {
+            fp8_gdn_input_small_t_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
+        }
     }
 }
 

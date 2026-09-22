@@ -18,7 +18,8 @@ namespace ninfer::ops {
  * the stored [2,taps,H] base kernel). `out` is contiguous BF16 [H,T] and is
  * completely overwritten.
  *
- * For token t with in-block position p = t & (block_size-1) and channel h in
+ * For token t with in-block position p = (block_size is a power of two ?
+ * t & (block_size-1) : t % block_size) and channel h in
  * group g = h / group_size,
  *
  *   out[h,t] = hidden[h,t] * (base[0,h] + delta[G*(side*taps)+g,t])
@@ -27,7 +28,8 @@ namespace ninfer::ops {
  *
  * Cross-block reads introduced by t-tap are multiplied by the zero in-block
  * position mask, so rows never leak into a neighbour block. The registered
- * domain is H=5120, T=1..64, taps=2, G=320, group_size=16, block_size=8,
+ * domain is H=5120, T=1..64, taps=2, G=320, group_size=16, block_size=k+1
+ * (the per-request query width, one anchor column plus k mask columns),
  * side in {0,1}. Inputs and base are unchanged and the Op owns no workspace or
  * persistent state. Intermediate arithmetic is FP32 and out is rounded to BF16.
  */

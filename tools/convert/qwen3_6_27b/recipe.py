@@ -26,6 +26,7 @@ from tools.convert.qwen3_6.common.recipe import (
     materialize_recipe,
     preflight_sources as _preflight_recipe_sources,
     source,
+    source_reader,
     source_requirements as _recipe_source_requirements,
     validate_recipe_coverage as _validate_recipe_coverage,
 )
@@ -297,13 +298,18 @@ def _build_vision_recipes() -> tuple[TensorRecipe, ...]:
     return build_vision_recipes(5120)
 
 
-RECIPE_SPECS = (
-    _build_text_recipes()
-    + _build_draft_head_recipes()
-    + _build_mtp_recipes()
-    + _build_vision_recipes()
-)
+TEXT_CORE_RECIPES = _build_text_recipes()
+DRAFT_HEAD_RECIPES = _build_draft_head_recipes()
+MTP_RECIPES = _build_mtp_recipes()
+VISION_RECIPES = _build_vision_recipes()
+
+RECIPE_SPECS = TEXT_CORE_RECIPES + DRAFT_HEAD_RECIPES + MTP_RECIPES + VISION_RECIPES
 RECIPES_BY_NAME = {recipe.object_name: recipe for recipe in RECIPE_SPECS}
+
+#: The text-core subset, by object name.  `text_core.py` selects its closure from
+#: here (and from `inventory.TEXT_CORE_TENSOR_SPECS`) rather than restating any
+#: object: a second description of one object is a fork waiting to disagree.
+TEXT_CORE_RECIPES_BY_NAME = {recipe.object_name: recipe for recipe in TEXT_CORE_RECIPES}
 
 
 def validate_recipe_coverage() -> None:

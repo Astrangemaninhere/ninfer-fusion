@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import mmap
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -377,7 +378,19 @@ class ArtifactWriter:
         self.objects = plan_objects(specs)
         directory = encode_directory(self.identity, self.objects)
         self.payload_offset = align_up(PREFIX_BYTES + len(directory), PAYLOAD_ALIGNMENT)
-        self._file = self.path.open("wb")
+        # Publish by rename, never by writing under the name a caller reads: the
+        # prefix and the directory written below declare EVERY planned object with
+        # its full byte length, so a file created under the final name advertises
+        # completeness in front of a payload that may stop anywhere.  G1/MEASURED
+        # by dl/atomic on this class: three mid-write failure shapes left
+        # 8,192 / 4,196 / 8,192 B under the final name, each rejected by this
+        # module's own reader with "object object/b extends beyond the file".
+        # The name is the tree's own convention (qwen3_8_flash_next/convert.py:387):
+        # a fixed `.partial` next to the target, which no reader looks for.
+        self._temporary = self.path.with_name(self.path.name + ".partial")
+        self._temporary.unlink(missing_ok=True)
+        self._published = False
+        self._file = self._temporary.open("wb")
         self._file.write(PREFIX.pack(MAGIC, len(directory)))
         self._file.write(directory)
         self._file.write(b"\x00" * (self.payload_offset - PREFIX_BYTES - len(directory)))
@@ -416,6 +429,10 @@ class ArtifactWriter:
         self._file.truncate(self.payload_offset + self._cursor)
         self._file.flush()
         self._file.close()
+        # The name a caller reads appears here and nowhere else, once every byte
+        # of every planned object is on disk.
+        os.replace(self._temporary, self.path)
+        self._published = True
         self._finished = True
 
     def close(self) -> None:
@@ -426,14 +443,25 @@ class ArtifactWriter:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        if exc_type is None:
-            try:
-                self.finish()
-            finally:
-                if not self._finished:
-                    self.close()
-        else:
-            self.close()
+        try:
+            if exc_type is None:
+                try:
+                    self.finish()
+                finally:
+                    if not self._finished:
+                        self.close()
+            else:
+                self.close()
+        finally:
+            # Keyed on "did the rename happen", NOT on "did an exception arrive".
+            # Leaving this block with objects still missing raises from INSIDE
+            # finish(), so an exception-keyed test skips the cleanup and the
+            # .partial survives -- G1/MEASURED by dl/atomic, case f3.
+            if not self._published:
+                try:
+                    self._temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def write_artifact(

@@ -48,6 +48,38 @@ __launch_bounds__(256) __global__
     }
 }
 
+// Headwise scalar gate. `x` is [D,H,T] contiguous and `gate` is [H,T] contiguous, so the
+// gate index of element (d,h,t) is h + H*t. Every 8-element pack lies inside one head when
+// D % 8 == 0, so the pack index divided by (D/8) is exactly that gate index: one sigmoid
+// per pack, no per-element gate load.
+__launch_bounds__(256) __global__ void headwise_sigmoid_gate_mul_bf16x8_kernel(
+    const __nv_bfloat16* gate, Bf16x8Pack* x, std::int64_t packs,
+    std::int32_t packs_per_head) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < packs; i += stride) {
+        const float g = sigmoid(__bfloat162float(gate[i / packs_per_head]));
+        Bf16x8Pack value = load_vec<Bf16x8Pack>(x + i);
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            value.pair[pair] = __floats2bfloat162_rn(
+                __low2float(value.pair[pair]) * g, __high2float(value.pair[pair]) * g);
+        }
+        store_vec(x + i, value);
+    }
+}
+
+// Any head_dim: one gate scalar per (head, token) with an exact index divide.
+__launch_bounds__(256) __global__ void headwise_sigmoid_gate_mul_scalar_kernel(
+    const __nv_bfloat16* gate, __nv_bfloat16* x, std::int64_t n, std::int32_t head_dim) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        const float g = sigmoid(__bfloat162float(gate[i / head_dim]));
+        x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) * g);
+    }
+}
+
 __launch_bounds__(256) __global__
     void sigmoid_gate_mul_bf16x2_kernel(const __nv_bfloat16* gate, __nv_bfloat16* x,
                                         std::int64_t n) {

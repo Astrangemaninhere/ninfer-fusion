@@ -38,8 +38,25 @@ inline constexpr int kNvfp4PrefillSmemBytes =
     kNvfp4PrefillBr * kGqaPrefillHeadDim * static_cast<int>(sizeof(__nv_bfloat16)) +
     4 * kNvfp4PrefillBc * kGqaPrefillHeadDim * static_cast<int>(sizeof(__nv_bfloat16)) + 64;
 
+// M1 (MTP tree verify): the per-column ancestor masks of one verify round, one uint64 word per
+// column, laid out [width, batch] exactly as the runtime hands them over. Bit i of word j means
+// "column j may attend column i"; bit 0 is the committed anchor and is always set, so a CHAIN
+// round's word j is the prefix (1 << (min(j, extent) + 1)) - 1 and admits nothing the
+// position-causal cut does not already admit. `nullptr` is every chain round and every plain
+// prefill.
+//
+// It is a RUNTIME pointer and not a template parameter on purpose: these two metadata types are
+// also the metadata of plain prefill and of the chain verify, and both of those paths must keep
+// compiling to the code they compiled to before this field existed. A masked launch is refused by
+// name in gqa_attention_prompt_launch whenever the route cannot honour it, so no launch can carry
+// a non-null mask and then drop it.
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;
+    // Always null here: this is the single-row prompt metadata of gqa_attention_cached and of the
+    // unbatched gqa_attention_prompt_attention_launch, and neither entry has a parameter that
+    // could carry a mask. The member exists so the bf16 prompt body can be a template over both
+    // metadata types and read one name.
+    const std::uint64_t* column_masks = nullptr;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
@@ -52,6 +69,11 @@ struct GqaPrefillBatchMetadata {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
+    // M1: see the note above. Non-null only for the BF16 prompt verify of a tree round, and only
+    // at batch 1: the accessors below reduce this metadata to the SINGLE table row table_rows[0],
+    // so a masked launch at batch > 1 is refused in gqa_attention_prompt_launch rather than made
+    // to index a row the caller never filled.
+    const std::uint64_t* column_masks = nullptr;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
         if constexpr (Masked) {

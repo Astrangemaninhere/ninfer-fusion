@@ -1,6 +1,7 @@
 #include "options.h"
 
 #include <functional>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -90,5 +91,86 @@ int main() {
     failures += check(ninfer::cli::usage_text("ninfer-cli").find("--kv-tier-formats") !=
                           std::string::npos,
                       "CLI help omits --kv-tier-formats");
+    // Cold tier: the layered policy must be selectable from this entry point too,
+    // and every pre-existing token must keep its own meaning.
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--cold-policy",
+                             "host-then-disk"})
+                          .cold_policy == ninfer::ColdPolicy::HostThenDisk,
+                      "--cold-policy host-then-disk did not select the layered policy");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--cold-policy",
+                             "disk"})
+                          .cold_policy == ninfer::ColdPolicy::Disk,
+                      "--cold-policy disk no longer selects the disk policy");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--cold-policy",
+                             "host"})
+                          .cold_policy == ninfer::ColdPolicy::Host,
+                      "--cold-policy host no longer selects the host policy");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").find("host-then-disk") !=
+                          std::string::npos,
+                      "CLI help omits --cold-policy host-then-disk");
+
+    // --cold-host-bytes: usage_text advertises `N[g|m|k]`, and the parser is the thing that has
+    // to accept exactly that grammar. A bare decimal keeps the value it always had, so no
+    // command line that parses today changes meaning; the suffixed spellings the usage promised
+    // are the ones that used to be refused by name (`32m`, `4g`, `256m`).
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--cold-host-bytes", "33554432"})
+                          .cold_host_bytes == (33554432ULL),
+                      "--cold-host-bytes lost its bare decimal meaning");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--cold-host-bytes", "32m"})
+                          .cold_host_bytes == (32ULL << 20),
+                      "--cold-host-bytes 32m was not read as 32 MiB");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--cold-host-bytes", "4g"})
+                          .cold_host_bytes == (4ULL << 30),
+                      "--cold-host-bytes 4g was not read as 4 GiB");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--cold-host-bytes", "256K"})
+                          .cold_host_bytes == (256ULL << 10),
+                      "--cold-host-bytes did not accept an upper-case suffix");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--cold-host-bytes", "32x"});
+                      }),
+                      "the CLI accepted a --cold-host-bytes suffix the usage does not list");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--cold-host-bytes", "m"});
+                      }),
+                      "the CLI accepted a --cold-host-bytes suffix with no digits");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").find("cold-host-bytes N[g|m|k]") !=
+                          std::string::npos,
+                      "CLI help no longer documents the --cold-host-bytes suffix grammar");
+
+    // FreeToken observation switch: off by default, on|off only, help documented,
+    // and an explicit flag committed to the variable the observation reads
+    // (ft::enabled() caches NINFER_FT_STATS on first use, so the parser is the
+    // last place that can set it).
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).ft_stats.has_value(),
+                      "--ft-stats has a non-deferred default");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--ft-stats", "on"})
+                          .ft_stats.value_or(false),
+                      "--ft-stats on was not recorded");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--ft-stats", "off"})
+                           .ft_stats.value_or(true),
+                      "--ft-stats off was not recorded");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--ft-stats", "1"});
+                      }),
+                      "the CLI accepted an unknown ft-stats mode");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").find("--ft-stats") != std::string::npos,
+                      "CLI help omits --ft-stats");
+#if !defined(_WIN32)
+    const char* committed = std::getenv("NINFER_FT_STATS");
+    failures += check(committed != nullptr && std::string(committed) == "0",
+                      "--ft-stats off did not commit NINFER_FT_STATS=0");
+    (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--ft-stats", "on"});
+    committed = std::getenv("NINFER_FT_STATS");
+    failures += check(committed != nullptr && std::string(committed) == "1",
+                      "--ft-stats on did not commit NINFER_FT_STATS=1");
+    unsetenv("NINFER_FT_STATS");
+#endif
     return failures == 0 ? 0 : 1;
 }

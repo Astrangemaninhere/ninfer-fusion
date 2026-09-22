@@ -10,7 +10,14 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1'010'000;
+// The YaRN extension multiplies the native key budget by 4 (include/ninfer/ops/softmax_attention.h:18
+// spells the same bound as kCausalAttentionMaximumVisibleKeysYarn = 4 * 262144), and every decode
+// kernel already sizes its page-id table for exactly it (src/ops/kernel/paged_kv_address.cuh:47
+// static_asserts paged_kv_page_ids(4 * 262144) == 256). The bound below is that same number, so a
+// --yarn context of the full 4x native capacity is admitted instead of being refused here while
+// the kernels can already index it. Raising an upper-bound test only admits the interval
+// (1'010'000, 1'048'576]; every value at or below the old bound decides as it did before.
+inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1'048'576;
 
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
@@ -22,6 +29,21 @@ struct GqaExecutionEnvelope {
     // that follows the live window reassociates the fp32 split reduction and flips
     // ULP-level ties between arms (k=3 vs k=9, plain vs speculative). 0 keeps the legacy
     // window-driven partition.
+    //
+    // SCOPE -- this field alone does not make the sentence above true, and before the route
+    // clause below it did not hold at all for a wide verify. Only the split-KV small-T routes
+    // consume it: gqa_small_t_split_reference -> gqa_small_t_split_units
+    // (src/ops/launcher/gqa_attention_decode_split.h:73-79,
+    // src/ops/kernel/gqa_attention_decode.cuh:114-122). The prompt route never sees it, because
+    // gqa_attention_prompt_launch takes no GqaExecutionEnvelope at all
+    // (src/ops/launcher/gqa_attention.h:69-72); it partitions keys into kGqaPrefillBc blocks with
+    // its own online softmax (src/ops/kernel/gqa_attention_prefill_bf16.cuh:140,251,263,394-395)
+    // and a row's reduction stops being a function of the row's own key prefix. A caller that
+    // pins this field therefore also requires that its (q_heads, width, batch) triple does not
+    // resolve to GqaAttentionRoute::Prompt; gqa_attention_route_for
+    // (src/ops/launcher/gqa_attention_route_contract.h) enforces that by sending a pinned
+    // multi-column verify to the chunked small-T route. Gqa16x4Geometry (16 q-heads / 4 kv-heads)
+    // is the one named exception, and the reason is in that header.
     std::uint32_t split_reference_keys = 0;
 };
 
@@ -76,7 +98,7 @@ gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t q_hea
  *   ideal[:,h,j,b] = sum_x probability[x] * V_cache[b][:,x,kvh].
  *
  * The registered geometries are `[256,24|4,W,B]` group 6, `[256,16|2,W,B]` group 8, and
- * `[256,16|4,W,B]` group 4 (Spark-X2.5; bf16/fp8/iso3 KV tiers).
+ * `[256,16|4,W,B]` group 4 (Spark-X2.5; bf16/fp8/iso4e KV tiers).
  * q/k/v/out are contiguous BF16 in request-major order, positions is contiguous I32 [W,B], and
  * kv_table_rows is contiguous I32 [B]. valid_columns is either contiguous I32 [B], or an empty
  * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
@@ -93,14 +115,32 @@ gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t q_hea
  * position plus one over nonempty rows lies in the declared execution envelope. The envelope is a
  * host launch-resource promise over that batch maximum; it does not alter any row's causal mask.
  *
+ * column_masks is either an empty Tensor (the dense spelling, and the only spelling this Op's
+ * unchanged callers use) or I64 [W,B]: bit i of column_masks[b][j] selects whether verify column j
+ * may attend column i of the SAME round block. Bit 0 is the anchor column and must be set. Keys
+ * whose cache position lies below the block's first position are the shared causal history and stay
+ * unconditionally visible, so a mask equal to the causal prefix (1 << (j+1)) - 1 -- exactly what a
+ * chain's column j means -- removes no key and is identical to passing no mask. An ancestor mask
+ * that is NOT such a prefix (a real tree: a sibling is never an ancestor) hides keys the
+ * position-causal cut would have exposed, which is the whole point of the argument.
+ *
+ * It is consumed by the BF16 decode (small-T) routes and -- at B = 1, which is the only batch size
+ * the prompt route is reachable at -- by the BF16 prompt body, which applies the same cut at the
+ * same place. Every other combination is REFUSED BY NAME rather than silently exempted: this Op
+ * refuses a non-BF16 cache and a round wider than the verify width, and
+ * gqa_attention_prompt_launch refuses a batch above 1, a width above one query block, or a
+ * non-BF16 tier reaching it by another path. Silently dropping a mask would verify a chain and
+ * call it a tree.
+ *
  * q/k/v/positions/valid_columns/kv_table_rows/out, every cache plane/table, and live workspace
  * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but
  * owns no persistent frontier, allocation, request identity, or commit authority.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
-                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                   const Tensor& valid_columns, const Tensor& column_masks,
+                   const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
+                   GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                   cudaStream_t stream);
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is

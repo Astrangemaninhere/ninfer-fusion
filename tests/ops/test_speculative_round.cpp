@@ -138,12 +138,14 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     GuardedDeviceBuffer d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
     GuardedDeviceBuffer d_num(sizeof(std::int32_t));
     GuardedDeviceBuffer d_accepted(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_accepted_columns(sizeof(std::int32_t));
     DeviceBuffer d_extent = to_device<std::int32_t>({k});
     initialize(d_length, std::vector<std::int32_t>{initial_length});
     initialize(d_token, std::vector<std::int32_t>{-1234567});
     d_sampled.fill(0x9d);
     initialize(d_num, std::vector<std::int32_t>{-11});
     initialize(d_accepted, std::vector<std::int32_t>{-13});
+    initialize(d_accepted_columns, std::vector<std::int32_t>{-17});
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {physical_rows, k + 1});
@@ -154,12 +156,14 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     Tensor sampled(d_sampled.data(), DType::I32, {k + 1});
     Tensor num_sampled(d_num.data(), DType::I32, {1});
     Tensor accepted(d_accepted.data(), DType::I32, {1});
+    Tensor accepted_columns(d_accepted_columns.data(), DType::I32, {1});
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::speculative_accept_greedy_drafts(
-        targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p),
+        targets, logits, draft_tensor, extent, /*column_masks=*/Tensor{}, length, token, sampled,
+        num_sampled, accepted, accepted_columns, token_domain,
+        static_cast<const ops::SamplingConfig*>(d_config.p),
         /*draft_ids=*/Tensor{}, /*draft_probs=*/Tensor{}, workspace, nullptr);
     cuda_synchronize();
 
@@ -198,6 +202,8 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     failures += d_sampled.verify_guards((label + " sampled guards").c_str());
     failures += d_num.verify_guards((label + " num guards").c_str());
     failures += d_accepted.verify_guards((label + " accepted guards").c_str());
+    failures +=
+        d_accepted_columns.verify_guards((label + " accepted columns guards").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
@@ -325,6 +331,7 @@ int batched_sampling_workspace_stride_case() {
     DeviceBuffer d_licensed(static_cast<std::size_t>(columns) * batch * sizeof(std::int32_t));
     DeviceBuffer d_counts(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
     DeviceBuffer d_accepted(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer d_accepted_columns(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
 
     ops::SamplingConfig config{};
     config.temperature = 1.0f;
@@ -341,13 +348,15 @@ int batched_sampling_workspace_stride_case() {
     Tensor licensed(d_licensed.p, DType::I32, {columns, batch});
     Tensor counts(d_counts.p, DType::I32, {batch});
     Tensor accepted(d_accepted.p, DType::I32, {batch});
+    Tensor accepted_columns(d_accepted_columns.p, DType::I32, {batch});
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
                                                                        batch);
     WorkspaceArena workspace(workspace_bytes);
     ops::speculative_accept_greedy_drafts(
-        targets, logits_tensor, draft_tensor, extents, lengths, anchors, licensed, counts, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p),
+        targets, logits_tensor, draft_tensor, extents, /*column_masks=*/Tensor{}, lengths, anchors,
+        licensed, counts, accepted, accepted_columns, token_domain,
+        static_cast<const ops::SamplingConfig*>(d_configs.p),
         /*draft_ids=*/Tensor{}, /*draft_probs=*/Tensor{}, workspace, nullptr);
     cuda_synchronize();
 
@@ -436,12 +445,11 @@ int remap_case(int token_count) {
 } // namespace
 
 int main() {
-    if (cuda_unavailable()) {
-        std::cout << "speculative_round: SKIP (CUDA unavailable)\n";
-        return 77;
-    }
-
-    int failures = 0;
+    // ops::speculative_accept_greedy_drafts_workspace_capacity_bytes and
+    // ops::sampling_workspace_capacity_bytes are pure host arithmetic plus std::invalid_argument:
+    // the K+1-sampling-column closure and the draft-interval contract are settled BEFORE the device
+    // gate so that a broken contract cannot be reported as a skip.
+    int host_failures = 0;
     const std::size_t k15 =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 1);
     if (k15 == 0 || k15 != ops::sampling_workspace_capacity_bytes(257, 16, 16) ||
@@ -450,29 +458,45 @@ int main() {
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 2) !=
             2 * k15) {
         std::cerr << "speculative accept workspace did not close over K+1 sampling columns\n";
-        ++failures;
+        ++host_failures;
     }
     try {
         (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
         std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
-        ++failures;
+        ++host_failures;
     } catch (const std::invalid_argument&) {}
-    for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
-    failures += greedy_accept_case(1, 0);
-    failures += greedy_accept_case(5, 2);
-    failures += greedy_accept_case(5, 5);
-    failures += greedy_accept_case(15, 7, 257);
-    failures += greedy_penalty_case(64);
-    failures += greedy_penalty_case(257);
-    failures += deterministic_sampling_case();
-    failures += batched_sampling_workspace_stride_case();
-    failures += select_hidden_case(5120, 6, 0);
-    failures += select_hidden_case(5120, 6, 5);
-    failures += select_hidden_case(2048, 16, 7);
-    failures += remap_case(1);
-    failures += remap_case(15);
-    failures += remap_case(120);
 
+    if (cuda_unavailable()) {
+        if (host_failures != 0) {
+            std::cout << "FAIL speculative_round (host_term=" << host_failures
+                      << " device_term=not-run)\n";
+            return 1;
+        }
+        std::cout << "speculative_round: SKIP (CUDA unavailable)\n";
+        return 77;
+    }
+
+    // The device half is NOT short-circuited by a red host half.
+    int device_failures = 0;
+    for (const int k : {1, 5, 15}) device_failures += prepare_verify_case(k);
+    device_failures += greedy_accept_case(1, 0);
+    device_failures += greedy_accept_case(5, 2);
+    device_failures += greedy_accept_case(5, 5);
+    device_failures += greedy_accept_case(15, 7, 257);
+    device_failures += greedy_penalty_case(64);
+    device_failures += greedy_penalty_case(257);
+    device_failures += deterministic_sampling_case();
+    device_failures += batched_sampling_workspace_stride_case();
+    device_failures += select_hidden_case(5120, 6, 0);
+    device_failures += select_hidden_case(5120, 6, 5);
+    device_failures += select_hidden_case(2048, 16, 7);
+    device_failures += remap_case(1);
+    device_failures += remap_case(15);
+    device_failures += remap_case(120);
+
+    const int failures = host_failures + device_failures;
+    std::cout << "speculative_round host_term=" << host_failures
+              << " device_term=" << device_failures << '\n';
     if (failures != 0) {
         std::cerr << "speculative_round failures=" << failures << '\n';
         return 1;

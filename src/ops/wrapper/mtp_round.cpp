@@ -1,6 +1,8 @@
 #include "ninfer/ops/mtp_round.h"
 #include "ops/launcher/mtp_round.h"
 
+#include "ops/kernel/paged_kv_address.cuh"
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -42,6 +44,30 @@ void require_row_pitched_matrix(const Tensor& t, std::int32_t rows, std::int32_t
 }
 
 } // namespace
+
+void mtp_draft_align_hidden(const Tensor& hidden, const Tensor& chain_sources,
+                            const Tensor& valid_counts, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op    = "mtp_draft_align_hidden";
+    const std::int32_t head_dim = hidden.ne[0];
+    const std::int32_t width    = hidden.ne[1];
+    const std::int32_t batch    = hidden.ne[2];
+    if (hidden.dtype != DType::BF16 || head_dim <= 0 || width < 2 ||
+        width > kMtpTreeMaximumWidth || batch < 1 || hidden.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": invalid hidden tensor");
+    }
+    require_contiguous_nonnull(hidden, op, "hidden");
+    require_matrix(chain_sources, DType::I32, width, batch, op, "chain_sources");
+    require_vector(valid_counts, DType::I32, batch, op, "valid_counts");
+    if (out.dtype != DType::BF16 || out.ne[0] != head_dim || out.ne[1] != width ||
+        out.ne[2] != batch || out.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": invalid out tensor");
+    }
+    require_contiguous_nonnull(out, op, "out");
+    if (out.data == hidden.data) {
+        throw std::invalid_argument(std::string(op) + ": out must not alias hidden");
+    }
+    detail::mtp_draft_align_hidden_launch(hidden, chain_sources, valid_counts, out, stream);
+}
 
 void mtp_svip_entropy_extents(const Tensor& logits, const Tensor& accepted, Tensor& cuts,
                               float threshold, cudaStream_t stream) {
@@ -123,6 +149,68 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
                                           alignment_ids, next_extents, ar_positions,
                                           ar_rope_positions, ar_valid_columns, max_context, stream,
                                           svip_cuts);
+}
+
+void mtp_tree_commit_history(const Tensor& column_masks, const Tensor& column_depths,
+                             const Tensor& accepted_columns, const Tensor& base_frontiers,
+                             const Tensor& table_rows, PagedKVBatchLayerView cache,
+                             Tensor& chain_sources, Tensor& commit_flags, cudaStream_t stream) {
+    constexpr const char* op = "mtp_tree_commit_history";
+    const std::int32_t width = column_masks.ne[0];
+    const std::int32_t batch = column_masks.ne[1];
+    if (width < 2 || width > kMtpTreeMaximumWidth || batch < 1 || batch > 8) {
+        throw std::invalid_argument(std::string(op) + ": unsupported W/B domain");
+    }
+    require_matrix(column_masks, DType::I64, width, batch, op, "column_masks");
+    require_matrix(column_depths, DType::I32, width, batch, op, "column_depths");
+    require_matrix(chain_sources, DType::I32, width, batch, op, "chain_sources");
+    require_vector(accepted_columns, DType::I32, batch, op, "accepted_columns");
+    require_vector(base_frontiers, DType::I32, batch, op, "base_frontiers");
+    require_vector(table_rows, DType::I32, batch, op, "table_rows");
+    require_vector(commit_flags, DType::I32, batch, op, "commit_flags");
+    // The masks are consumed by the bf16 attention routes only -- the small-T decode and, at
+    // B = 1, the prompt body (src/ops/wrapper/gqa_attention.cpp refuses a non-BF16 cache, and
+    // gqa_attention_prompt_launch refuses the route shapes it cannot index) -- so a commit has no
+    // k_scale/v_scale notion to move and this Op takes the same gate: a quantized tier is refused
+    // by NAME here, not committed approximately.
+    if (cache.dtype != DType::BF16) {
+        throw std::invalid_argument(
+            std::string(op) + ": only a BF16 text KV cache can be committed (the tree verify's "
+                              "column masks are implemented for the bf16 small-T route)");
+    }
+    if (cache.k_pages.data == nullptr || cache.v_pages.data == nullptr ||
+        cache.block_tables.data == nullptr || cache.k_pages.dtype != DType::BF16 ||
+        cache.v_pages.dtype != DType::BF16 || cache.block_tables.dtype != DType::I32 ||
+        cache.block_tables.ne[1] < batch || cache.head_dim <= 0 || cache.num_kv_heads <= 0) {
+        throw std::invalid_argument(std::string(op) + ": invalid BF16 batch cache view");
+    }
+    const bool registered_geometry =
+        (cache.head_dim == 256 && (cache.num_kv_heads == 4 || cache.num_kv_heads == 2)) ||
+        (cache.head_dim == 128 && cache.num_kv_heads == 2);
+    if (!registered_geometry) {
+        throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
+    }
+    const std::int64_t capacity =
+        static_cast<std::int64_t>(cache.block_tables.ne[0]) * kPagedKVPageSize;
+
+    detail::MtpTreeCommitInvocation invocation;
+    invocation.column_masks     = static_cast<const std::uint64_t*>(column_masks.data);
+    invocation.column_depths    = static_cast<const std::int32_t*>(column_depths.data);
+    invocation.accepted_columns = static_cast<const std::int32_t*>(accepted_columns.data);
+    invocation.base_frontiers   = static_cast<const std::int32_t*>(base_frontiers.data);
+    invocation.table_rows       = static_cast<const std::int32_t*>(table_rows.data);
+    invocation.block_tables     = static_cast<const std::int32_t*>(cache.block_tables.data);
+    invocation.table_stride     = cache.block_tables.ne[0];
+    invocation.chain_sources    = static_cast<std::int32_t*>(chain_sources.data);
+    invocation.commit_flags     = static_cast<std::int32_t*>(commit_flags.data);
+    invocation.cache_k          = cache.k_pages.data;
+    invocation.cache_v          = cache.v_pages.data;
+    invocation.head_dim         = cache.head_dim;
+    invocation.kv_heads         = cache.num_kv_heads;
+    invocation.width            = width;
+    invocation.batch            = batch;
+    invocation.logical_capacity = static_cast<std::int32_t>(capacity);
+    detail::mtp_tree_commit_history_launch(invocation, stream);
 }
 
 } // namespace ninfer::ops

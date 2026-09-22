@@ -45,11 +45,19 @@ from . import recipe_nvfp4 as recipe
 RECIPE_ID = "qwen3_8_27b_nvfp4-v1"
 OUTPUT_BASENAME = "qwen3_8_27b_nvfp4.ninfer"
 
+# The MLP member of the float-quantized group is the layer set the artifact's
+# own inventory registers as FP8; it is spelled out of `inventory.FP8_MLP_LAYERS`
+# rather than retyped here, so the group the source declaration is checked
+# against and the group the converter writes cannot drift apart.  (This used to
+# be a second, literal copy of the same 56..63 boundary.)
+_FP8_MLP_TARGETS = r"re:.*layers\.(%s)\.mlp\.(gate|up|down)_proj$" % "|".join(
+    str(layer) for layer in inventory.FP8_MLP_LAYERS
+)
 _FP8_TARGETS = [
     r"re:.*self_attn\.(q|k|v|o)_proj$",
     r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$",
     r"re:.*lm_head",
-    r"re:.*layers\.(56|57|58|59|60|61|62|63)\.mlp\.(gate|up|down)_proj$",
+    _FP8_MLP_TARGETS,
 ]
 _NVFP4_TARGETS = [r"re:.*mlp\.(gate|up|down)_proj$"]
 

@@ -53,10 +53,16 @@ namespace ninfer::ops {
  *
  * Compute policy:
  *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4. Row-scaled FP8
- *   admits A16Only and AllowA8. Its two semantic registrations own independent production plans:
- *   [5120,6144] resolves T<22 to A16 and T>=22 to A8, while [5120,17408] resolves T<25 to A16 and
- *   T>=25 to A8. A permissive policy allows the private resolver to select either qualified
- *   arithmetic profile; it does not itself prescribe a kernel.
+ *   admits A16Only and AllowA8. Its two semantic registrations own independent production plans.
+ *   The verify domain is protected: T <= 64 -- the current widest chain-verify round is
+ *   kMtpDecodeMaximumDrafts + 1 = 16, and the widened domain the ngram-draft line introduces
+ *   reaches 63 -- resolves to A16, which is the batch-1 decode's own tier, so a verify round
+ *   reduces exactly like the decode. ABOVE that domain (T >= 65), where only prefill and the
+ *   draft model reach, [5120,6144] resolves to A8 and so does [5120,17408]. The measured
+ *   prefill crossovers of 22 and 25 are therefore retained, not rewritten, and a future
+ *   widening past 64 meets a named constant instead of silently entering A8. A permissive
+ *   policy allows the private resolver to select either qualified arithmetic profile; it does
+ *   not itself prescribe a kernel.
  *
  * Effects:
  *   Updates the full residual tensor in place; x/weight must not alias residual.

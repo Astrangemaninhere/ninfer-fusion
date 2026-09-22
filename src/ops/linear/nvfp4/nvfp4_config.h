@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 
@@ -50,7 +52,8 @@ struct Nvfp4ActivationGeometry {
 };
 
 template <int WarpsPerCta, int RowsPerWarp, int ValuesPerLane, int AccumulatorChains,
-          Nvfp4ScaleAccess ScaleAccess, Nvfp4CodeCache CodeCache, int MinBlocksPerSm>
+          Nvfp4ScaleAccess ScaleAccess, Nvfp4CodeCache CodeCache, int MinBlocksPerSm,
+          int PhaseUnroll = 0>
 struct Nvfp4GemvSchedule {
     static_assert(WarpsPerCta > 0 && WarpsPerCta <= 32);
     static_assert(RowsPerWarp > 0 && RowsPerWarp <= 8);
@@ -58,6 +61,7 @@ struct Nvfp4GemvSchedule {
     static_assert(AccumulatorChains > 0 && (AccumulatorChains & (AccumulatorChains - 1)) == 0);
     static_assert(AccumulatorChains <= ValuesPerLane / 2);
     static_assert(MinBlocksPerSm > 0);
+    static_assert(PhaseUnroll == 0 || PhaseUnroll == 1 || PhaseUnroll == 2 || PhaseUnroll == 4);
 
     static constexpr int kWarpsPerCta       = WarpsPerCta;
     static constexpr int kRowsPerWarp       = RowsPerWarp;
@@ -66,6 +70,10 @@ struct Nvfp4GemvSchedule {
     static constexpr auto kScaleAccess      = ScaleAccess;
     static constexpr auto kCodeCache        = CodeCache;
     static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
+    // 0 keeps `#pragma unroll` (full) exactly as before this patch; 1/2/4 select a partial
+    // unroll of the K-phase loop. The fp8 sibling of this kernel has had that knob all along
+    // (Fp8GemvSchedule::kPhaseUnroll, fp8_config.h:41, measured winner 2).
+    static constexpr int kPhaseUnroll       = PhaseUnroll;
     static constexpr int kThreads           = WarpsPerCta * 32;
     static constexpr int kRowsPerCta        = WarpsPerCta * RowsPerWarp;
     static constexpr int kPairsPerLane      = ValuesPerLane / 2;
@@ -119,6 +127,29 @@ using Nvfp4MuseVocabularyGeometry = Nvfp4GemvGeometry<202112, 6656>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+
+// Row split of the two fused projections. This is the ONLY place the QKV/Z and Q/K/Gate/V
+// row counts are written down: the launchers that stride those outputs, the workspace shapes
+// and the row-routing epilogues all reference these, so a geometry change fails to compile
+// instead of silently mis-striding one producer.
+inline constexpr std::int32_t kNvfp4GdnQkvRows    = 10240;
+inline constexpr std::int32_t kNvfp4GdnZRows      = 6144;
+inline constexpr std::int32_t kNvfp4AttnQueryRows = 6144;
+inline constexpr std::int32_t kNvfp4AttnKeyRows   = 1024;
+inline constexpr std::int32_t kNvfp4AttnGateRows  = 6144;
+inline constexpr std::int32_t kNvfp4AttnKeyBegin  = kNvfp4AttnQueryRows;
+inline constexpr std::int32_t kNvfp4AttnGateBegin = kNvfp4AttnKeyBegin + kNvfp4AttnKeyRows;
+inline constexpr std::int32_t kNvfp4AttnValueBegin = kNvfp4AttnGateBegin + kNvfp4AttnGateRows;
+
+static_assert(kNvfp4GdnQkvRows + kNvfp4GdnZRows == Nvfp4GdnInputGeometry::kOutputRows,
+              "GDN fused projection row split must tile the geometry's output rows");
+static_assert(kNvfp4AttnValueBegin + kNvfp4AttnKeyRows == Nvfp4AttnInputGeometry::kOutputRows,
+              "attention fused projection row split must tile the geometry's output rows");
+static_assert((kNvfp4GdnQkvRows % 128) == 0 && (kNvfp4GdnZRows % 128) == 0,
+              "GDN rows must tile the 128-row block");
+static_assert((kNvfp4AttnQueryRows % 128) == 0 && (kNvfp4AttnKeyRows % 128) == 0 &&
+                  (kNvfp4AttnGateRows % 128) == 0,
+              "attention rows must tile the 128-row block");
 
 enum class Nvfp4Problem : std::uint8_t {
     AttnInput,
@@ -190,14 +221,52 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
 template <class Geometry>
 struct Nvfp4LinearDecodeProductionSchedule {
     using Type =
-        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2, 2>;
 };
 
-// UNIFY-A: the small-T family is defined on T in [kNvfp4FirstSmallT, kNvfp4LastSmallT].
-// T=1 now rides the same kernel family as T in [2,16] instead of the gemv decode kernel,
-// so that plain decode (T=1) and spec verify (T=W) run one arithmetic.
-inline constexpr std::int32_t kNvfp4FirstSmallT = 1;
+inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
 inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
+
+// Length of a whole-family small-T launcher table. Written once: every table below sizes
+// itself with this and every lookup is range-checked against the ceiling that registered it.
+inline constexpr std::int32_t kNvfp4SmallTCount = kNvfp4LastSmallT - kNvfp4FirstSmallT + 1;
+
+// The A16 (W16A16) tier is registered separately from the A4 small-T family above, so each
+// family owns the ceiling its registrar enforces and its launcher table is exactly as long
+// as that ceiling implies.
+inline constexpr std::int32_t kNvfp4LinearSwiGluA16Ceiling = 16;
+inline constexpr std::int32_t kNvfp4GdnConvA16Ceiling      = 16;
+
+// Range-checked index into a per-T launcher table. Tables are indexed by
+// (tokens - kNvfp4FirstSmallT); an out-of-range T used to walk off the end of the table
+// silently, so the contract is enforced here once for every caller.
+[[nodiscard]] inline std::size_t nvfp4_small_t_index(std::int32_t tokens, std::int32_t ceiling,
+                                                     const char* what) {
+    if (tokens < kNvfp4FirstSmallT || tokens > ceiling) {
+        throw std::invalid_argument(std::string(what) +
+                                    ": T outside the registered small-T range");
+    }
+    return static_cast<std::size_t>(tokens - kNvfp4FirstSmallT);
+}
+
+// Compile-time-ceiling spelling of the same lookup. The call sites that already know the
+// ceiling their registrar enforces (nvfp4_linear_add_small_t) name it in the template
+// argument instead of repeating it as a runtime literal; the range check is identical
+// because it is delegated to the 3-argument form above.
+template <std::int32_t Ceiling>
+[[nodiscard]] inline std::size_t nvfp4_small_t_index(std::int32_t tokens, const char* what) {
+    return nvfp4_small_t_index(tokens, Ceiling, what);
+}
+
+// Same contract, plus the table length is tied to the ceiling its registrar enforces.
+template <std::int32_t Ceiling, class Launcher, std::size_t Count>
+[[nodiscard]] inline Launcher nvfp4_small_t_launcher(const std::array<Launcher, Count>& table,
+                                                     std::int32_t tokens, const char* what) {
+    static_assert(Count > 0, "empty small-T launcher table");
+    static_assert(static_cast<std::int32_t>(Count) == Ceiling - kNvfp4FirstSmallT + 1,
+                  "small-T launcher table length must match its registered ceiling");
+    return table[nvfp4_small_t_index(tokens, Ceiling, what)];
+}
 
 // RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads
 // through shared staging; T=5..32 keeps one packed activation tile per warp. The warp-count changes

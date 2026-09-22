@@ -52,7 +52,7 @@ GUI 导入向导 = 唯一入口。本文 = 管线规格 + 现状清单 + 分阶�
 | E5 | n_gdn=0 / 全 softmax 层图 | 纯 softmax 族 | run_layers 二分判定, gdn 数组空则天然跳过, 待验证 |
 | E6 | tied head (lm_head = embed^T) | Gemma | bindings/load 层处理, 待查 |
 | E7 | 逐层 scalar (每层乘系数) | Gemma-4 | semantics 待钉 (拉 modeling_gemma4) |
-| E8 | qk_norm 无参 (无 scale 权重) | Muse qk_norm with_scale=False | load 时 weight=None 即可 |
+| Rk4v4 | qk_norm 无参 (无 scale 权重) | Muse qk_norm with_scale=False | load 时 weight=None 即可 |
 | E9 | 变体目标自动装配 | 所有新模型 | v2 stub 生成器 + CMake 注册 + build_arch.sh |
 
 引擎活全部加 constexpr/特性开关, qwen 现目标行为与性能不变 (回归门:
@@ -65,7 +65,7 @@ ninfer_engine + ninfer_serve + 27b 编译 + logit/机制测试)。
   编译回归。Muse manifest/config.h 重生成核对 E1/E2 常量。
 - 阶段 B: E4 双 norm (FullLayerW 新槽 + attn_mix/mlp_tail 特性分支) +
   E3 window 查证接线。同族 (含 Gemma 如无 scalar) 收进 flavors 词表。
-- 阶段 C: E6/E7/E8 钉死 Gemma (semantics_v5 拉 modeling_gemma4 + 键表核对),
+- 阶段 C: E6/E7/Rk4v4 钉死 Gemma (semantics_v5 拉 modeling_gemma4 + 键表核对),
   Gemma milestone-1 引擎活收尾 (gemma_engine_plan.md 施工单)。
 - 阶段 D: v2 stub 生成器升级 → manifest 一次性产出完整目标目录 (config.h/
   variant/load/package/CMake 注册/build 脚本); adapt.py 改为可直接驱动的

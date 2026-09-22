@@ -1,4 +1,4 @@
-// muse128_repro4.cu — W1 minimal repro: Muse nvfp4(K)+iso3(V) small_t decode.
+// muse128_repro4.cu — W1 minimal repro: Muse nvfp4(K)+iso4e(V) small_t decode.
 // serve crashes on first generation with sticky cudaErrorInvalidValue surfacing
 // at the cudaFuncSetAttribute line. bf16 repro passes, so pin the fault to this
 // cache format path. Eager, no graph, tiny context.
@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
 
     ops::GqaExecutionEnvelope env{1u, 2048u};
 
-    printf("T=%d ctx=%d nvfp4+iso3 launching...\n", T, tokens_ctx);
+    printf("T=%d ctx=%d nvfp4+iso4e launching...\n", T, tokens_ctx);
     fflush(stdout);
     ops::detail::gqa_attention_small_t_launch(
         dq, dk, dv, dpos, Tensor{}, drows, scale, cache, env,

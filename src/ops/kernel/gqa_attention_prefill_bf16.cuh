@@ -96,9 +96,37 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
     }
 }
 
+// M1 (MTP tree verify): is the key whose ROUND-RELATIVE column index is `rel` visible to a query
+// whose ancestor bit set is `mask`? This is the small-T spelling -- rel < 0 is a key below the
+// round, i.e. the shared already committed history, and every key of the round itself is visible
+// only where the mask says so (gqa_attention_decode_bf16.cuh:343-352) -- plus one bound that this
+// route needs and the small-T route does not.
+//
+// The small-T launch clips every key it addresses to the round's own window (split_end <=
+// last_pos + 1), so there rel <= column_begin + tokens - 1 <= 14 and the shift is always in range.
+// This route does not clip: its LAST key tile runs to k0 + Bc - 1, up to Bc - 1 = 63 positions
+// past max_query_abs, so rel reaches 63 + tokens here. A uint64_t shift of 64 or more is
+// undefined, and the exact answer for such a key is "no ancestor bit is set" (a 64-bit word has no
+// bit there) -- and such a key is dropped by the position-causal cut anyway, because that cut
+// requires rel <= qrow while qrow < tokens <= 16. Bounding the shift is therefore both the defined
+// and the exact spelling; copying the small-T expression verbatim into this kernel would have been
+// undefined behaviour. `rel0`/`rel1` below are still spelled exactly as the small-T kernel spells
+// them.
+__device__ __forceinline__ bool gqa_prefill_round_visible(std::uint64_t mask, int rel) {
+    return rel < 0 || (rel < 64 && ((mask >> static_cast<unsigned>(rel)) & std::uint64_t{1}) != 0);
+}
+
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
+//
+// M1 (MTP tree verify): when metadata.column_masks is non-null the visible set is a BIT SET
+// instead of the causal prefix. The cut above is kept -- it still drops the unwritten tail and
+// every key above the query's own column -- and each surviving key additionally needs its ancestor
+// bit. The mask row is selected per QUERY ROW, and the bit index is the key's round-relative
+// column index, because the runtime lays a verify round out as consecutive cache positions:
+// column j's slot is frontier + j (speculative_round.cuh:34, positions[j] = base_positions[row] +
+// min(j, extent), and extent == width - 1 for a tree so the min() never bites).
 template <typename Geometry, typename Metadata>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
@@ -141,6 +169,13 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     }
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
+    // M1: the round-relative cut, spelled exactly as the small-T kernel spells it
+    // (gqa_attention_decode_bf16.cuh:343, `rel0 = column_begin + key0 - first_pos`). This route is
+    // a SINGLE launch over the whole round and its position table is consecutive from positions[0],
+    // so its column 0 sits at column_begin 0 and the round's first cache position IS first_pos.
+    const std::uint64_t* const column_masks = metadata.column_masks;
+    const int column_begin                  = 0;
+    const int first_pos                     = base_pos;
 
     const int gid = lane >> 2;
     const int lid = lane & 3;
@@ -288,7 +323,27 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const int qrow1            = q0 + row1;
         const int qabs0            = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1            = (qrow1 < tokens) ? base_pos + qrow1 : -1;
-        const bool full_score_tile = (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
+        // M1: the full-tile fast path scores every key of the tile without consulting a per-key
+        // predicate, so it must not be taken while a mask is in play. It cannot be taken anyway --
+        // a masked launch has tokens <= kMaximumVerifyTokens (16) < Br, so `q0 + Br <= tokens` is
+        // false -- but it is spelled out rather than left as an inference, because a later width
+        // bound above Br would otherwise start silently ignoring the mask.
+        const bool full_score_tile = (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0)) &&
+                                     (column_masks == nullptr);
+
+        // M1: the two query rows' ancestor masks, selected exactly as the small-T kernel selects
+        // them (gqa_attention_decode_bf16.cuh:310-319) with column_begin == 0 and batch == 0: rows
+        // past `tokens` take column 0's word so the load stays in bounds, and their scores are
+        // dropped by the `qrow < tokens` guards below. With no mask both words are all ones and
+        // `round_masked` is false, which leaves every `vis` below true and the predication exactly
+        // the scalar causal cut it was.
+        const bool round_masked = column_masks != nullptr;
+        const std::uint64_t mask0 =
+            round_masked ? column_masks[column_begin + (qrow0 < tokens ? qrow0 : 0)]
+                         : ~std::uint64_t{0};
+        const std::uint64_t mask1 =
+            round_masked ? column_masks[column_begin + (qrow1 < tokens ? qrow1 : 0)]
+                         : ~std::uint64_t{0};
 
         // block row-max on raw (unscaled) scores; scale is folded into exp2 below
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
@@ -303,10 +358,28 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0]   = (qrow0 < tokens && key0 <= qabs0) ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1]   = (qrow0 < tokens && key1 <= qabs0) ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1) ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1) ? score[nt][3] : -CUDART_INF_F;
+                // M1: the round-relative cut plus each query's ancestor bit set for the keys of
+                // this tile. `rel` is the key's column index within the ROUND's whole row (the
+                // round's column 0 sits at cache position first_pos), so rel < 0 is a key below the
+                // round -- the shared, already committed history -- and is always visible, while
+                // every key of the round is visible only where the mask says so. For a chain the
+                // mask is the prefix (1 << (j+1)) - 1, so every column that rel < 0 used to admit
+                // is admitted by the mask too: bit-for-bit unchanged. `!round_masked` short-circuits
+                // the whole term, so the unmasked path evaluates the same predicate it always did.
+                const int rel0    = column_begin + key0 - first_pos;
+                const int rel1    = column_begin + key1 - first_pos;
+                const bool vis0k0 = !round_masked || gqa_prefill_round_visible(mask0, rel0);
+                const bool vis0k1 = !round_masked || gqa_prefill_round_visible(mask0, rel1);
+                const bool vis1k0 = !round_masked || gqa_prefill_round_visible(mask1, rel0);
+                const bool vis1k1 = !round_masked || gqa_prefill_round_visible(mask1, rel1);
+                score[nt][0] =
+                    (qrow0 < tokens && key0 <= qabs0 && vis0k0) ? score[nt][0] : -CUDART_INF_F;
+                score[nt][1] =
+                    (qrow0 < tokens && key1 <= qabs0 && vis0k1) ? score[nt][1] : -CUDART_INF_F;
+                score[nt][2] =
+                    (qrow1 < tokens && key0 <= qabs1 && vis1k0) ? score[nt][2] : -CUDART_INF_F;
+                score[nt][3] =
+                    (qrow1 < tokens && key1 <= qabs1 && vis1k1) ? score[nt][3] : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }

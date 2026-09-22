@@ -1,0 +1,144 @@
+{
+ "model_id": "spark-x2.5-4b",
+ "family": "auto",
+ "hf": {
+  "model_type": "spark2_5",
+  "architectures": [
+   "Spark2_5ForCausalLM"
+  ]
+ },
+ "geometry": {
+  "hidden": 2560,
+  "layers": 36,
+  "query_heads": 16,
+  "kv_heads": 4,
+  "head_dim": 256,
+  "vocab": 131072,
+  "max_ctx": 1048576,
+  "intermediate": 10240,
+  "rms_eps": 1e-06
+ },
+ "notes": "derived from config.json",
+ "layer_types": [
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention"
+ ],
+ "attention": {
+  "attention_bias": false,
+  "rope_parameters": {
+   "full_attention": {
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 5000000
+   },
+   "sliding_attention": {
+    "partial_rotary_factor": 1.0,
+    "rope_theta": 10000
+   }
+  },
+  "headwise_attn_output_gate": true,
+  "gate_attn_act_mode": "sigmoid",
+  "qk_norm": null,
+  "sliding_window": 512
+ },
+ "knobs": {
+  "sliding_window": 512,
+  "attention_bias": false,
+  "tie_word_embeddings": true,
+  "headwise_attn_output_gate": true,
+  "gate_attn_act_mode": "sigmoid",
+  "hidden_act": "gelu"
+ },
+ "layer_kind_order": [
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention"
+ ],
+ "multimodal": false,
+ "rope": {
+  "full_attention": {
+   "partial_rotary_factor": 0.25,
+   "rope_theta": 5000000
+  },
+  "sliding_attention": {
+   "partial_rotary_factor": 1.0,
+   "rope_theta": 10000
+  }
+ },
+ "head_dim": 256,
+ "rope_by_kind": {
+  "full_attention": 5000000,
+  "sliding_attention": 10000
+ },
+ "partial_rotary_by_kind": {
+  "full_attention": 0.25,
+  "sliding_attention": 1.0
+ },
+ "hidden_act": "gelu"
+}

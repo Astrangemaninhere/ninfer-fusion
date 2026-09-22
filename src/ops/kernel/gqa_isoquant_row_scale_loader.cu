@@ -4,6 +4,7 @@
 // table, because a silently-ignored sidecar is indistinguishable from success.
 #include "ops/kernel/gqa_isoquant_row_scale_loader.h"
 #include "ops/kernel/gqa_isoquant_row_scale.cuh"
+#include "ops/kernel/gqa_isoquant_rot.cuh"
 
 #include <cuda_runtime.h>
 
@@ -116,6 +117,36 @@ bool kv_rowscale_sidecar_apply_spec(const std::string& spec,
                  static_cast<unsigned>(sc.words.size()), kKvRowScalePoolCapacity,
                  (sc.flags & kKvRowScaleFlagIdentity) ? 1u : 0u, sc.crc,
                  static_cast<unsigned long long>(sc.model_hash), sc.tag.c_str());
+    return true;
+}
+
+// N3 runtime loop: the row scale lives in the SO(4)-ROTATED domain, so the
+// host-side bake has to reproduce the rotation the kernels apply. These two
+// readbacks are the only way to see it from the host: the gate is one word and
+// the matrix is 1024 floats, both in constant memory next to the kernels that
+// use them. Reading them back (instead of copying the literal into the bake)
+// means the bake cannot feed a table computed for a different basis, and it
+// cannot feed one at all when the rotation state is unavailable.
+bool kv_rowscale_device_rotation_enabled() {
+    int gate[4] = {1, 0, 0, 0};
+    const cudaError_t error =
+        cudaMemcpyFromSymbol(gate, kGqaIsoquantRotGeom, sizeof gate);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("KVRS rot gate read: ") +
+                                 cudaGetErrorString(error));
+    }
+    return gate[0] != 0;
+}
+
+bool kv_rowscale_device_rotation_matrix(float* out_row_major_64x4x4) {
+    if (out_row_major_64x4x4 == nullptr) { return false; }
+    const cudaError_t error =
+        cudaMemcpyFromSymbol(out_row_major_64x4x4, kGqaIsoquantRotDev,
+                             sizeof(float) * 64 * 4 * 4);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("KVRS rot matrix read: ") +
+                                 cudaGetErrorString(error));
+    }
     return true;
 }
 

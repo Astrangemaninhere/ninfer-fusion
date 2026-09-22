@@ -23,6 +23,8 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 #include "targets/qwen3_6/impl/runtime/mtp_window_cut.h"
+#include "spec/turn_recall_journal.h"
+#include "spec/sum_dir.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -414,10 +416,16 @@ struct SequenceKVBundle {
 };
 
 struct DecodeGraphProfile {
-    std::uint32_t batch_size             = 1;
+    std::uint32_t batch_size = 1;
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
-    std::uint32_t topology_class         = 0;
+    std::uint32_t topology_class = 0;
+    // Captured MTP draft width of this profile, i.e. the ladder rung it belongs to. 0 = not a
+    // rung (the ordinary/DFlash families, and every profile of a fixed-k MTP run), in which
+    // case the replay's width filter is a no-op and behaviour is the pre-ladder one. Selecting
+    // by width is what makes the marginal draft column cost b_width: the graph that runs IS the
+    // width the criterion chose.
+    std::uint32_t draft_width = 0;
     DecodeGraphDefinition definition;
 };
 
@@ -455,11 +463,34 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // The DRAFT TREE the next verify round is going to check (--draft-tree L,d with L > 1),
+    // published by the proposal side in verify-column order: column j (1-based: column 0 is the
+    // anchor) carries the node at depth mtp_tree_depths[j] whose ancestor set is mtp_tree_masks[j]
+    // (ddtree::column_depth / ddtree::column_ancestors, include/ninfer/ops/dflash2_ddtree.h:314-345).
+    // 0 columns = no tree: the round is a chain and every tree path below is a no-op. This is the
+    // ONLY place a tree can enter the runtime, which is why an L > 1 tree round without it is
+    // refused instead of being verified as a chain.
+    std::uint32_t mtp_tree_columns = 0;
+    std::array<std::uint32_t, qwen3_6::kMtpDecodeMaximumWidth> mtp_tree_depths{};
+    std::array<std::uint64_t, qwen3_6::kMtpDecodeMaximumWidth> mtp_tree_masks{};
     // Adaptive draft-window control (survival/cost criterion, see mtp_window_cut.h):
     // the per-sequence depth-conditional accept statistics and the extent the round in
     // flight actually carried (needed to fold the finished round correctly).
     qwen3_6::detail::MtpWindowState mtp_window{};
     std::uint32_t mtp_drafted_extent = 0;
+    // Adaptive capture width: the ladder rung the criterion last selected. 0 means "no decision
+    // yet" and the round starts on the ladder TOP (the same staged-wide start the fixed-k path
+    // had with its initial extent), so a fresh request never begins at the narrow end.
+    std::uint32_t mtp_target_width = 0;
+    // Coarse-cadence counter and the realized-width accumulator behind
+    // SpeculativeStats::mean_window. Both count only rounds that actually drafted.
+    std::uint64_t mtp_width_rounds = 0;
+    std::uint64_t mtp_width_sum = 0;
+    // Runtime (a, b) fit behind the criterion's cost ratio. The ratio is the ONE calibration the
+    // criterion cannot derive from its own estimator (that is why it sat in this header as a
+    // constant, calibrated on a different head): it is measured from the round wall times and the
+    // widths they were run at, so the threshold is priced for the configuration actually running.
+    qwen3_6::detail::MtpCostCalibration mtp_cost{};
     bool tail_hidden_valid        = false;
     bool state_source_retained    = false;
     bool endpoint_valid           = false;
@@ -501,6 +532,18 @@ struct SequenceState {
     // record of the eviction itself (and of its restore: the descriptor loses it
     // when a device replica comes back).
     std::uint32_t host_cold_frontier = 0;
+
+    // (6) per-round external recall (P5/P6/P7). `recall_recorded` is this sequence's
+    // live L0 records in ascending page order -- the journal's own view of what it has
+    // been told about this sequence, so a round can diff it against `cold_pages` (which
+    // is ascending by construction: the compressor walks cold_frontier forward and a
+    // restore erases from the middle) with no log I/O and no lookup.
+    // `recall_sequence_tag` rides every record, so a page number reused by a later
+    // session cannot collide with this one's. The journal is a MIRROR of the spill
+    // files, never the only replica of an attended page: losing all of this costs a
+    // re-read, never an answer.
+    std::vector<spec::turn_recall::RecallRecord> recall_recorded;
+    std::uint32_t recall_sequence_tag = 0;
 };
 
 struct SharedPrefixState {
@@ -689,6 +732,16 @@ public:
     const std::uint32_t prefill_chunk_capacity;
     std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    // Capture-width ladder rungs (empty for a fixed-k run). See SequencePlanningInputs: when
+    // non-empty the MTP replay selects its graph by the criterion's chosen rung, and
+    // draft_window is the ladder top, i.e. the frame/buffer width.
+    const std::vector<std::uint32_t> mtp_ladder;
+    // --draft-tree L,d (MTP). L*d == draft_window when it is a tree round, because the node
+    // budget is the live verify width and the frame has one column per draft. {0,0} = chain.
+    // Read by the round's ingress fill (program_impl.h), which refuses a tree round with no
+    // published tree instead of verifying a chain and calling it a tree.
+    const std::uint32_t draft_tree_paths;
+    const std::uint32_t draft_tree_depth;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
@@ -766,7 +819,14 @@ public:
     // Cold-pool maintenance (rev 2b): staging + per-step compress pass.
     ColdPolicy cold_policy      = ColdPolicy::None;
     std::uint32_t cold_keep_tokens = 128;
-    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    // THE UNLOAD WATERMARK, resolved from the plan (see
+    // EngineOptions::unload_watermark_pages). 0 = off, which is byte-for-byte
+    // the pre-watermark behaviour: the ONLY other consumer of the free pool,
+    // enqueue_cold_compressions(), still runs exactly when --cold-policy says so.
+    // A sentinel at construction time means "derive from prefill_chunk_capacity",
+    // so the member is never left holding kUnloadWatermarkDerive at run time.
+    std::uint32_t unload_watermark_pages = 0;
+    std::uint64_t cold_host_bytes  = 7ULL << 30;
     void* cold_requant_codes       = nullptr;
     void* cold_requant_scales      = nullptr;
     std::uint32_t cold_requant_heads = 0;
@@ -788,11 +848,114 @@ public:
     // set, so returning one can never move a page's bytes on disk.
     std::uint64_t cold_disk_file_slots = 0;
     std::vector<std::uint8_t> cold_disk_file_used;
+    // [TEXT-CARGO] THE COLD PAYLOAD, AS TEXT. The user's order of 2026-09-15 is that the
+    // retired block's DURABLE payload is its 64 token ids and a recall re-prefills them
+    // instead of loading KV back ("召回 = 把这段文字重新 prefill"), so this is the cargo the
+    // cold path writes beside the per-layer KV spill files. It lives at
+    // `<--cold-disk-path>/ninfer_text.cargo`, addressed by BLOCK NUMBER (never by file
+    // slot), one fixed 256-byte record per block, format owned by
+    // spec/turn_recall_journal.h. `cold_text_kv_bytes` is the KV mirror's own byte count for
+    // the SAME retired pages, kept ONLY so the two payloads can be printed side by side: the
+    // whole point of the change is that they differ by four orders of magnitude, and a number
+    // that is only asserted in a comment is not a measurement.
+    std::unique_ptr<spec::turn_recall::TurnRecallTextCargo> cold_text_cargo;
+    std::uint64_t cold_text_kv_bytes      = 0;
+    std::uint64_t cold_text_cargo_blocks  = 0;
+    std::uint64_t cold_text_cargo_refused = 0;
+    // [TEXT-CARGO] THE INDEX BESIDE THE CARGO. The cargo holds the TEXT of every retired block; this
+    // is the DIRECTORY that makes the text FINDABLE -- one `SumDirRow` per stored block, carrying the
+    // block's content identity, its page, its real length and (from `set_summary`) its catalogue
+    // line. It is armed and disarmed with the cargo because it is the cargo's index and nothing else:
+    // a page the directory names is read back from the cargo file, and a directory with no cargo
+    // behind it could only produce misses.
+    //
+    // WHY IT LIVES HERE AND NOT IN A SERVING LOOP: because the WRITE has to happen where the block
+    // becomes cold. `SumDir::set_summary`'s only callers were two test files before this landing --
+    // the catalogue column had no producer in any real run, so `search_summaries` and the registered
+    // query `QSummarySubstring` could only ever answer "nothing". The producer is the retire path in
+    // program_impl.h, and this member is what it writes into.
+    std::unique_ptr<spec::sum_dir::SumDir> text_directory;
+    std::uint64_t text_directory_rows     = 0; // rows written (1 per stored block)
+    std::uint64_t text_directory_refused  = 0; // blocks stored whose codec the directory will not admit
     [[nodiscard]] std::int32_t allocate_cold_disk_file_slot() noexcept;
     void release_cold_disk_file_slot(std::int32_t file_slot) noexcept;
     void prefetch_cold_pages(SequenceState& sequence, std::uint32_t pages,
                              std::span<const std::int32_t> file_slots);
-    void enqueue_cold_compressions(SequenceState& sequence);
+    // The page-admission filter, i.e. the ONE seam through which a caller says
+    // WHICH of the retirable pages this pass may actually retire. It exists so the
+    // passive path (--cold-policy: "everything older than the newest
+    // cold_keep_tokens") and the proactive path (the watermark: "the blocks the
+    // semantic judge calls unloadable") can share the spill body -- the device
+    // slot, the per-layer codec pack, the validity check, the sentinel, the file
+    // slot -- instead of duplicating it. `nullptr` admits every retirable page and
+    // is therefore byte-for-byte the pre-watermark pass.
+    using ColdPageAdmission = bool (*)(void* context, std::uint32_t page);
+    // Returns the number of pages THIS pass actually moved into a cold slot (0 when it
+    // moved none). The watermark's own line needs that count and cannot infer it: a
+    // device-slot cold transfer is FOOTPRINT-NEUTRAL in the pool (transfer_to_cold ->
+    // dematerialize_one credits the page back to the SAME address's reservation), so
+    // the free-page delta across this pass is 0 even when it retired nine hundred
+    // pages -- which is exactly the reading that used to look like "the judge refused
+    // everything" and sent the safety valve down the passive leg for no reason.
+    std::uint32_t enqueue_cold_compressions(SequenceState& sequence,
+                                           ColdPageAdmission admit = nullptr,
+                                           void* admit_context = nullptr);
+    // THE PROACTIVE (WATERMARK) TRIGGER, and the user's design order of
+    // 2026-09-15: "达到显存剩下多少的时候主动开始总结压缩而不是等到溢出了".
+    //
+    // It is a SEPARATE entry point from enqueue_cold_compressions() on purpose:
+    // that one is the PASSIVE path (--cold-policy says which pages are retired
+    // relative to the frontier), and this one is the PROACTIVE path (the free
+    // pool has fallen to the watermark, so the Engine asks its semantic
+    // directory which blocks may be unloaded at all). The two share the spill
+    // legs -- store.transfer_to_cold + cold_pages + file slots -- and share
+    // nothing else. Returns the number of pages it retired.
+    //
+    // It never runs when unload_watermark_pages == 0, so OFF is the pre-watermark
+    // behaviour exactly.
+    std::uint32_t unload_watermark_trigger(SequenceState& sequence);
+    // Free text-KV pool pages, i.e. capacity - allocated - reserved. Saturates at
+    // 0 rather than wrapping: a pool that is over-subscribed is a fact, and the
+    // watermark must read it as "no headroom" and not as 4 billion pages.
+    [[nodiscard]] std::uint32_t text_kv_free_pool_pages() const noexcept;
+    // THE ONE SOURCE of "how many text-KV pages a sequence must have RESIDENT",
+    // and the reason it is one function and not two statements: the admission
+    // reserve (request_plan_impl.h, root_demand) and the watermark's free-pool
+    // target are the SAME quantity read from opposite sides -- "never reserve more
+    // than must stay resident" and "never let the free pool fall below what must
+    // stay resident". Two independent computations of it would drift, and the drift
+    // would show up as the worst possible shape: the watermark unloading while the
+    // admission still refuses.
+    //
+    //   newest cold_keep_tokens  -- the engine's own floor: the decode cold-read path
+    //                               requires the newest cold_keep_tokens to be hot
+    //                               (:11050-11055), so they are resident by rule;
+    //   one prefill chunk        -- a chunk's KV cannot be written half-way, so this
+    //                               is the largest unit that must be placeable without
+    //                               freeing anything first;
+    //   the watermark itself     -- when the operator sets a larger reserve than the
+    //                               floor, the reserve IS that value (it is the target
+    //                               the free pool is kept at, and the admission must
+    //                               not reserve what the watermark is trying to keep
+    //                               free).
+    // Returns 0 when the watermark is OFF, which is how the caller knows to keep the
+    // full-span reservation and therefore how the negative control still refuses.
+    [[nodiscard]] std::uint32_t resident_text_kv_pages_required() const noexcept;
+    // One evidence line per trigger, and NOTHING when nothing triggered -- the
+    // --cold-policy path prints through its own ["[cold] compressed N"] line.
+    // "没有这行就等于没实现" is the reason it exists: a silent plan.empty() is
+    // exactly the failure mode this report is about.
+    // [LONGCTX-FIX-D] THE DISTRIBUTION IS AN OPTIONAL ARGUMENT ON PURPOSE. The five
+    // fields above keep their exact meaning, their order and their call sites; the two
+    // early-exit lines (no-slot-tier / no-requant-codes) deliberately pass no histogram
+    // and still compile unchanged. When it IS passed it must be an array of exactly 7
+    // counts indexed by `SumDirAdmissibility`'s own enum order (sum_dir.h:838-846):
+    // 0 admissible, 1 admissible-text-only, 2 control-token, 3 pinned-by-anchor,
+    // 4 resident, 5 system-prefix, 6 empty.
+    void report_unload_watermark(std::uint32_t free_before, std::uint32_t free_after,
+                                 std::uint32_t blocks_total, std::uint32_t blocks_unloadable,
+                                 std::uint32_t pages_retired, const char* reason,
+                                 const std::uint32_t* verdict_histogram = nullptr) const;
     void warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page);
     // Restores one cold page into `physical` and releases the cold resources the
     // page no longer needs once it is hot again. Returns false only when no
@@ -809,9 +972,201 @@ public:
     void sweep_cold_host_tier() noexcept;
     void report_cold_host_tier(const char* tag);
 
+    // ---- (6) per-round external recall: P5 trigger, P6 selection, P7 journal ----
+    //
+    // The four legs already exist and are REUSED, never re-implemented:
+    //   P1 spill     enqueue_cold_compressions  (:10610, file_slot + cold_pages)
+    //   P2 read-back restore_cold_page          (:11023)
+    //   P3 prefetch  prefetch_cold_pages        (:11163)
+    //   P4 key type  PrefixShortlistDigests::at (prefix_identity.h:42-57)
+    // What is missing -- and what these functions add -- is the once-per-round trigger,
+    // the page-selection rule, and a log that survives the process.
+    //
+    // The token-space half ("which span do I want back?") is NOT here: suffix_lookup or
+    // an n-gram/BM25 index answers it and the engine injects the answer
+    // (set_turn_recall_provider), so no second token index and no second identity
+    // comparison is created.
+    //
+    // Enabled only by NINFER_TURN_RECALL=1 on a ColdPolicy::Disk run whose slot-bearing
+    // codec is nvfp4/int8, so the default run is bit-identical to today: with the
+    // journal closed, ensure_sequence_kv_mapped_for_round() is the old function.
+    spec::turn_recall::RecallCodec turn_recall_codec_of_layers() const;
+    [[nodiscard]] std::uint64_t turn_recall_page_bytes() const;
+    // [CODECBLIND] The COMPLEMENT of `turn_recall_codec_of_layers()`: how many
+    // cold-slot-bearing layers its two `if` arms could not reach, and the name of the first
+    // such codec. Two walks rather than one shared walk on purpose -- rewriting the
+    // classifier would change the bytes of the function every existing recall capture was
+    // produced by, and a report-only change must not move them. Both are read ONCE, at
+    // arming time; neither is on the per-round path.
+    [[nodiscard]] std::uint32_t turn_recall_codec_blind_layers() const;
+    [[nodiscard]] const char* turn_recall_codec_blind_codec() const;
+    void record_turn_recall(SequenceState& sequence);
+    [[nodiscard]] spec::turn_recall::RecallPagePlan plan_round_recall(const SequenceState& sequence);
+    void recall_cold_pages_for_round(SequenceState& sequence,
+                                     const spec::turn_recall::RecallPagePlan& plan);
+    // The request the engine answers when no retrieval layer was injected: ONE page
+    // that is both live in the journal and still cold, or nothing. Bounded by
+    // construction -- a restored page leaves cold_pages and gets a tombstone, so the
+    // same page is never asked for twice, and this can never become the per-round
+    // whole-prefix recall the design forbids.
+    [[nodiscard]] spec::turn_recall::RecallRequest recall_round_request(const SequenceState&, std::uint32_t frontier) const;
+    // -----------------------------------------------------------------------
+    // THE RETRIEVAL INDEX'S OWN ENTRY POINTS
+    // -----------------------------------------------------------------------
+    // Two entry points, ONE lookup. "What do I want back?" is answered by finding a recently-seen
+    // token n-gram in the directory's catalogue column -- a content answer, not a positional one --
+    // and both the injected provider and the built-in request funnel into `index_request_for_term`
+    // so there is exactly one place the fan-out is decided.
+    //
+    // `index_query_term` is the QUERY BUILDER: it renders the newest tokens of the sequence's own
+    // committed prefix into the byte alphabet `search_summaries` searches (via the ONE renderer,
+    // `sum_dir::sum_dir_render_token_line`), so a query is expressed in the same alphabet the
+    // producer wrote. It returns false when there is nothing to ask with (no directory, too short a
+    // prefix), in which case the caller must fall back rather than ask an empty question.
+    [[nodiscard]] bool index_query_term(const SequenceState&, std::uint32_t frontier,
+                                       std::string& term) const;
+    // The lookup + fan-out. `frontier` is the sequence's committed-token count: a page at or above it
+    // is not yet legal to recall, and the blocks the query itself occupies are skipped so the search
+    // cannot find the question instead of the answer.
+    [[nodiscard]] spec::turn_recall::RecallRequest
+    index_request_for_term(const std::string& term, std::uint32_t frontier) const;
+    // How many pages ONE pass may return. Read from the engine's own knob
+    // (`SumDirKnobs::max_blocks_per_pass`, env `NINFER_SUM_DIR_BLOCKS`, factory default
+    // `kSumDirDefaultBlocksPerPass`) -- see the
+    // definition in program_impl.h for why that number and not another.
+    [[nodiscard]] std::uint32_t recall_fanout_blocks() const;
+    // THE INJECTOR. Installs the directory-backed retrieval policy through the ONE seam that already
+    // exists (`set_turn_recall_provider`, :993), with a snapshot of the query taken from this lane's
+    // own committed prefix. It REFUSES to run when `turn_recall_provider_is_external` is set, so an
+    // externally injected provider keeps winning exactly as that seam's contract says.
+    void install_index_recall_provider(const SequenceState& sequence);
+    void ensure_sequence_kv_mapped_for_round(SequenceState& sequence,
+                                            std::uint32_t main_tokens,
+                                            std::uint32_t backend_tokens = 0);
+    void report_turn_recall(const char* tag);
+    void set_turn_recall_provider(spec::turn_recall::RecallRequestProvider provider);
+
+    std::unique_ptr<spec::turn_recall::TurnRecallJournal> turn_recall_journal;
+    spec::turn_recall::RecallCodec turn_recall_codec = spec::turn_recall::RecallCodec::Rejected;
+    std::uint64_t turn_recall_byte_budget = 256ULL << 20;
+    // [PREFILLBUDGET] the BOUNDED PREFILL budget, in TOKENS of re-prefill per recall round.
+    // Read once, from `NINFER_RECALL_PREFILL_TOKENS` (the flag `--recall-prefill-tokens` is
+    // committed to that variable at parse time -- the same "the flag wins" shape `--ft-stats`
+    // uses, options.cpp `set_process_env`), next to the byte budget it complements, and handed to
+    // `plan_recall_pages` on EVERY plan. 0 == unset == today's behaviour, bit for bit.
+    std::uint64_t turn_recall_prefill_token_budget = 0;
+    spec::turn_recall::RecallRequestProvider turn_recall_provider;
+    // Set ONLY by `set_turn_recall_provider`, i.e. only by a caller from outside this class. It is
+    // what lets the engine install its own default retrieval policy per round (see
+    // `install_index_recall_provider`) WITHOUT clobbering a retrieval layer that was injected: the
+    // seam's contract is "an injected provider always wins", and a flag is the only way to honour
+    // that contract while also having a working default. It is a separate flag rather than a null
+    // check because the engine's own installer writes the same member.
+    bool turn_recall_provider_is_external = false;
+    // Reused across rounds so the steady state (nothing spilled, nothing restored)
+    // allocates nothing and only walks the two ascending vectors once.
+    std::vector<spec::turn_recall::RecallRecord> recall_scratch_records;
+    struct TurnRecallCounters {
+        std::uint64_t rounds             = 0;  // hooks run
+        std::uint64_t records            = 0;  // Spill records appended
+        std::uint64_t tombstones         = 0;  // Release records appended
+        std::uint64_t append_failed      = 0;  // the log refused a record (retried next round)
+        std::uint64_t digest_unavailable = 0;  // page spilled but its frontier has no digest
+        std::uint64_t plans              = 0;  // non-empty plans
+        std::uint64_t pages_restored     = 0;
+        std::uint64_t pages_planned      = 0;
+        // ---- [RESTOREUNITS] THE UNIT OF `pages_restored`, FIXED, AND THE SHORTFALL NAMED ------
+        // `pages_restored` is a PAGE count now: it was a ROUND count on two of its three
+        // increment sites (see spec/turn_recall_journal.h, `recall_restore_delta`). Fixing that
+        // alone leaves the ratio readable in only one direction -- a run that planned 8 pages
+        // and brought back 6 would print `pages=6/8` exactly as the OLD, WRONG numerator did --
+        // so the fact the ratio cannot carry gets its own two fields, and BOTH are printed on
+        // the sequence-end line beside the ratio:
+        //   restored_short_rounds  rounds whose restored page count != their own plan's count
+        //   restored_short_pages   the deficit over those rounds; 0 on a complete run
+        std::uint64_t restored_short_rounds = 0;
+        std::uint64_t restored_short_pages  = 0;
+        std::uint64_t refused_cost       = 0;  // plans whose read did not beat re-prefill
+        // ---- [INEXACTGATE D] THE TRUTH BESIDE `pages=R/P` ---------------------------------
+        // `pages_planned` accumulates `plan.count()` -- the ALREADY-CUT plan -- so `pages=R/P`
+        // reads HIGHER the more severely the run was cut: D1 (holed, 3x INEXACT) printed
+        // `pages=5/5` while C5 (exact, 0 INEXACT) printed `pages=6/20` (dl/holegate sec.3.1).
+        // `pages=R/P` is NOT redefined here; these four fields are added beside it so the truth
+        // is on the same line, and each one names a different fact:
+        //   pages_admitted  Σ of the pages each round COULD have held (the request's run, after
+        //                 the frontier clamp) -- the denominator a reader believes `pages=R/P`
+        //                 already has. It is NOT `pages_planned` and it is NOT the raw ask: the
+        //                 part of the ask that the frontier cannot serve is `pages_clamped`.
+        //   pages_cut     Σ of (dropped_hole + dropped_budget): pages that EXISTED and were not
+        //                 held. Identity, asserted over a sweep in the sibling test:
+        //                 pages_planned + pages_cut == pages_admitted.
+        //   pages_clamped Σ dropped_clamped: the part of the ASK the frontier cannot serve.
+        //                 Nothing that exists was dropped for it, so it is a separate axis and
+        //                 must not be read as a loss. Second identity:
+        //                 pages_admitted + pages_clamped == Σ wanted_pages().
+        //   inexact_rounds  rounds whose plan was non-exact -- the countable form of the word
+        //                 `INEXACT`, which until now existed only as a per-round suffix
+        //   refused_empty   rounds REFUSED by an empty-but-non-exact plan, i.e. the refusals
+        //                 that used to print NOTHING AT ALL (dl/holegate sec.2.3)
+        //   cost_gate_evals how many times the arithmetic gate was CONSULTED. Without it,
+        //                 `refused_cost=0` cannot be told from "no check ran" -- and with the
+        //                 shipped rate defaults no check CAN fire (dl/holegate sec.2.5).
+        std::uint64_t pages_admitted     = 0;
+        std::uint64_t pages_cut          = 0;
+        std::uint64_t pages_clamped      = 0;
+        std::uint64_t inexact_rounds     = 0;
+        std::uint64_t refused_empty      = 0;
+        std::uint64_t cost_gate_evals    = 0;
+        // THE TWO REFUSALS, NAMED. Both are the case "the user set
+        // NINFER_TURN_RECALL=1 and NO recall happened", and until they existed that case
+        // was reported by ONE stderr line whose text did not say recall was off, with no
+        // counter, no summary-line trace and rc=0 -- so "no error" read as "it worked".
+        //   refused_codec  -- the stack-level classifier refused the stack's codec
+        //                     (program_impl.h:~1071); it refuses EVERY spilled page of
+        //                     that stack, not only the two-codec ones.
+        //   refused_medium -- --cold-policy cannot spill at all, so the whole recall
+        //                     block never ran; this case used to print NOTHING at all.
+        std::uint64_t refused_codec      = 0;
+        std::uint64_t refused_medium     = 0;
+        //   refused_prefill_tok -- [PREFILLBUDGET] rounds refused by the TOKEN budget
+        //                     (`refused-prefill-budget`). It is a SUBSET of `refused_empty`
+        //                     (both are counted: the empty-but-non-exact refusal is the parent
+        //                     fact, this is the cause), and it exists for the same reason
+        //                     `cost_gate_evals` does -- so that "the budget never fired" can be
+        //                     told apart from "the budget was never consulted". Without it, a run
+        //                     with `refused_prefill_tok=0` cannot say which of those two it is.
+        std::uint64_t refused_prefill_tok = 0;
+        //   codec_blind_layers -- [CODECBLIND] cold-slot-bearing layers whose dtype the
+        //                     stack-level classifier cannot name. It is an ASSIGNMENT, not an
+        //                     increment: the arming block runs once per run and the fact is a
+        //                     property of the RESOLVED per-layer table, not an event. Before
+        //                     this field the case left NO trace at all whenever an admitted
+        //                     codec was present beside the blind layers -- the run looked
+        //                     clean, the chain fired, and the record's stride spanned two
+        //                     codecs while the log named one.
+        std::uint64_t codec_blind_layers = 0;
+    } turn_recall_counters;
+    // Set when the refused-admission summary has been emitted, so the line appears once
+    // per run instead of once per report_turn_recall() call site.
+    bool turn_recall_refusal_reported = false;
+
     // On-demand graph capture state (see DecodeGraphFamily comment).
     std::uint32_t graph_capture_ceiling = 16;
     void extend_ordinary_graphs(std::uint32_t batch_size, std::uint32_t frontier);
+    // On-demand capture for one rung of the MTP ladder: exactly the ordinary machinery, plus the
+    // MTP cache's own transient address row, because an MTP round touches both caches. Only ever
+    // fills segments of a topology class that the startup capture already instantiated.
+    void extend_mtp_graphs(std::uint32_t batch_size, std::uint32_t frontier, std::uint32_t width);
+    // mtplogx: the two cumulative quantities behind the routine above. Read-only; a consumer
+    // differences two snapshots.
+    [[nodiscard]] std::uint64_t mtp_graph_extension_calls() const noexcept {
+        return mtp_graph_extension_calls_;
+    }
+    [[nodiscard]] std::uint64_t mtp_graph_extension_nanoseconds() const noexcept {
+        return mtp_graph_extension_nanoseconds_;
+    }
+    [[nodiscard]] bool mtp_graph_missing(std::uint32_t batch_size, std::uint32_t frontier,
+                                         std::uint32_t width) const noexcept;
     schedule::ExecutionCore make_execution_core();
     std::size_t vision_handoff_peak_bytes    = 0;
 
@@ -820,6 +1175,10 @@ private:
         if (++resource_revision_ == 0) { ++resource_revision_; }
     }
 
+    // mtplogx: the counters exposed by mtp_graph_extension_calls() and
+    // mtp_graph_extension_nanoseconds() above.
+    std::uint64_t mtp_graph_extension_calls_       = 0;
+    std::uint64_t mtp_graph_extension_nanoseconds_ = 0;
     std::uint64_t resource_revision_            = 1;
     std::uint32_t pressure_planning_generation_ = 0;
     bool pressure_planning_active_              = false;
@@ -1329,6 +1688,29 @@ private:
                          runtime::ExecutionTiming* failed_timing);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
+    // THE MISSING GUARANTEE of the coverage invariant that
+    // KVAddressSpaceStore::ensure_mapped_to_tokens() only ever CHECKS
+    // (logical_kv_store.h:1572-1586): "the entitlement still covers the frontier this
+    // call is about to reach". The check exists and is a real tripwire; nothing used to
+    // raise the entitlement as the frontier moved, so the mapping walked into the wall
+    // one chunk after install and threw. This raises it, and only ever UP.
+    //
+    // It is called from ensure_sequence_kv_mapped() -- the ONE funnel every
+    // frontier-advancing mapping site goes through (install :10041, the prefill chunk
+    // loop :13304, the per-round hook :13550 / :13818 / :14016 / :14279, :13074) -- so
+    // the guarantee holds at the same instant at every site instead of being restated
+    // per site and drifting between them.
+    //
+    // [M21-ALLOW] A NO-OP whenever the plan's whole span already covers the target --
+    // which is every call on the default (watermark OFF) path EXCEPT one that follows a
+    // runtime context append. The old note said the default path "cannot be reached by
+    // this function at all", and that was only true while nothing could push the runtime
+    // frontier past the plan-time span: the plan's span is
+    // pages_for_tokens(prompt_tokens + effective_output_tokens - 1), and
+    // append_context_prefill() is the input that leaves it. See the body for the
+    // reading and for why the arithmetic below is unchanged.
+    void grow_sequence_kv_entitlement_to(SequenceState& sequence, std::uint32_t main_tokens,
+                                         std::uint32_t backend_tokens);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
@@ -1337,6 +1719,10 @@ private:
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
     void release_sequence_kv(SequenceState& sequence) noexcept;
+    // w-find4 G9: retract this sequence's standing L0 records (one Release per live one,
+    // reason = SequenceEnd) and forget them. MUST run before release_sequence_kv() hands the
+    // device cold slot and the process-global spill-file slot back to their pools.
+    void release_sequence_recall_records(SequenceState& sequence) noexcept;
     void commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                             std::uint32_t backend_tokens = 0);
     [[nodiscard]] qwen3_6::PagedKVCache* backend_kv_cache() noexcept;

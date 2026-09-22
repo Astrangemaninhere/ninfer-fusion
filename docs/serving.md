@@ -894,3 +894,87 @@ decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+## MTP draft trees are not expressible over HTTP
+
+`--draft-tree L,d` is accepted by `ninfer` (the one-request CLI) and by no other front end. The
+server's option surface does not carry it, so **an MTP tree verify shape cannot be requested over
+HTTP today**: there is no flag, no request-body field, and no route that reaches it. This is a
+statement about the option surface, not about the engine — the engine path exists (see
+[MTP draft-tree verify shape](maintainer/mtp-draft-tree.md)), so the missing piece is the serving
+plumbing, not a missing implementation.
+
+Two options run the other way and are **serve-only**:
+
+| Option | Meaning | `ninfer` |
+|---|---|---|
+| `--ft-vram-axis` | select the VRAM axis used by the FreeToken auto-relayout pass (`NINFER_FT_VRAM_AXIS` is the environment spelling) | not accepted |
+| `--kv-residual-layers SPEC` | residual-plane layer selection | not accepted |
+
+`ninfer-perplexity` accepts a much smaller surface than either: `--device`, `--kv-dtype`,
+`--kv-layer-storage`, `--prefill-chunk`, `--prefill-chunk-mode`, and its corpus/output options. Every
+KV-budget option (`--kv-bits`, `--kv-k-bits`, `--kv-v-bits`, `--kv-bits-mode`,
+`--kv-quality-weight`, `--kv-score-table`, `--kv-tier-scores`, `--kv-bit-budget`), every cold-tier
+option (`--cold-policy`, `--max-cold-pages`, `--cold-keep-tokens`, `--cold-disk-path`,
+`--cold-disk-bytes`, `--cold-host-bytes`), and every weight-offload option is **absent** there. Use
+`--kv-dtype` and `--kv-layer-storage` for a fixed tier on the perplexity front end.
+
+## KV strategy on the server
+
+`ninfer-serve` accepts the KV strategy family described in
+[KV strategy and cold tier](cli.md#kv-strategy-and-cold-tier), with the same contradiction rules and
+the same environment spellings. The authority for a request's tier is the server's startup option
+set, not the request body: there is no per-request KV-tier field in any of the four protocol
+surfaces. The resolved tier is reported back per request in the JSONL request log as `kv_cache`,
+using the canonical token for the storage (`bf16`, `int8-g64`, `fp8-e4m3-r256`, `nvfp4-g16`,
+`fp8-g16`, `iso4e-g16`, `rk4v4-g64`, `dropped`).
+
+Two server-only KV controls:
+
+| Option | Meaning |
+|---|---|
+| `--kv-auto-relayout` | run the automatic KV relayout pass at startup |
+| `--host-kv-mib N` | Host KV backing in MiB |
+
+The auto-relayout pass reads its own environment knobs: `NINFER_FT_VRAM_AXIS`,
+`NINFER_FT_RELOAD_SECS`, `NINFER_FT_FULL_ATTN_LAYERS`, `NINFER_FT_DEEP_FRAC`,
+`NINFER_FT_COLD_MODE`, `NINFER_FT_COLD_PAGES`.
+
+`--prefill-chunk-mode dynamic|manual` selects whether the prefill unit is owned by the bandwidth
+governor (`dynamic`) or is `--prefill-chunk` verbatim with the governor constructed disabled
+(`manual`). The mode is resolved with "CLI > environment > default" precedence in both front ends.
+
+## Routes
+
+| Route | Method | Auth |
+|---|---|---|
+| `/health` | `GET` | **exempt** — always reachable, including while a model is loading. Used by liveness probes |
+| `/v1/models` | `GET` | required |
+| `/v1/chat/completions` | `POST` | required |
+| `/v1/responses` | `POST` | required |
+| `/v1/responses/input_tokens` | `POST` | required |
+| `/v1/responses/compact` | `POST` | required |
+| `/v1/messages` | `POST` | required (Anthropic Messages surface) |
+| `/v1/messages/count_tokens` | `POST` | required |
+
+`/health` is the only auth-exempt route; `OPTIONS` requests are also exempt so a browser preflight
+is not rejected by `--api-key`. Any path under `/v1/` that is not `/v1/messages*` is treated as an
+OpenAI-family path. A `404` received from a path under `/v1/messages` is translated for the Anthropic
+surface rather than returned as an OpenAI error shape.
+
+## Request log and the KV tier field
+
+The JSONL request log written by `--request-log-jsonl` carries one line per completed request. Its
+`kv_cache` field is the canonical token of the tier the request actually ran at. Before the canonical
+table existed this field named only three of eight storages, so a server started with
+`--kv-dtype nvfp4` wrote `"kv_cache":"unknown"` for every request — a persistent record claiming a
+tier the engine does not have. The three tokens that already shipped (`bf16`, `int8-g64`,
+`fp8-e4m3-r256`) are unchanged, so existing log consumers keep parsing.
+
+## Building the server with the switch-coverage gate
+
+`-DNINFER_WARN_SHADOW_SWITCH=report` (or `error`) is a CXX-only gate and does not change any CUDA
+compilation unit. `report` is measured safe on this tree. `error` with the default
+`NINFER_WARN_ERROR_CHECKS=switch` is a hard gate; do not add `switch-enum` to that list — this tree
+has 767 `-Wswitch-enum` warnings over 19 files, most of them deliberate partial switches. See
+[KV storage names and the switch-coverage gate](maintainer/kv-storage-names-and-switch-gates.md).

@@ -3,11 +3,12 @@
 // Cold-KV tier budgets and admission (the CONSUMER-side semantics of
 // --cold-host-bytes / --cold-disk-bytes).
 //
-// Both byte budgets are carried all the way into the engine and never read
-// again (program_impl.h:772-774 copies them into the cold-pool state and
-// ProgramImplCore never consults them: `cold_host_bytes` has no other
-// reference in src/, and `cold_disk_bytes` neither). So today neither cap
-// restricts anything. This header owns the missing meaning:
+// Both byte budgets are carried all the way into the engine AND read there:
+// program_impl.h:790-791 copies them into the cold-pool state, :927 sizes the
+// file-slot space from `cold_disk_bytes`, and :1011 folds both into this
+// header's own admission ladder (product::cold_tier_budget_from), which
+// runtime/cold_host_tier.h consumes under --cold-policy host / host-then-disk.
+// So neither cap is inert; what this header owns is the ladder's arithmetic:
 //
 //   * what a cap counts (whole pages of a fixed stride -- so page accounting
 //     and byte accounting are the same accounting and the cap can never be
@@ -78,6 +79,10 @@ struct ColdTierBudget {
     // Resolved policy flags. ColdPolicy::Window has no byte budget at all: its
     // cold pool is device-resident and capped in pages, so both flags stay
     // false and every page that asks for a tier stays hot (tier 3).
+    // ColdPolicy::HostThenDisk is the one policy that sets BOTH: that is the whole
+    // point of it -- each rung's cap bounds its own medium, and the ladder is what
+    // turns "host memory full" into "spill the excess to SSD" instead of "stay
+    // hot". Every other value keeps exactly the flag it had.
     bool host_tier_enabled = false;
     bool disk_tier_enabled = false;
 };
@@ -90,8 +95,10 @@ cold_tier_budget_from(ColdPolicy policy, std::uint64_t cold_host_bytes,
     ColdTierBudget budget;
     budget.host_bytes        = cold_host_bytes;
     budget.disk_bytes        = cold_disk_bytes;
-    budget.host_tier_enabled = policy == ColdPolicy::Host;
-    budget.disk_tier_enabled = policy == ColdPolicy::Disk;
+    budget.host_tier_enabled =
+        policy == ColdPolicy::Host || policy == ColdPolicy::HostThenDisk;
+    budget.disk_tier_enabled =
+        policy == ColdPolicy::Disk || policy == ColdPolicy::HostThenDisk;
     return budget;
 }
 
@@ -229,7 +236,11 @@ struct ColdTierCounters {
 // Everything that depends on the runtime strides (a page larger than the whole
 // cap) is left to the consumer, which reports it instead of throwing.
 inline void validate_cold_tier_budget(const ColdTierBudget& budget) {
-    if (budget.host_tier_enabled && budget.host_bytes == 0) {
+    // A zero host cap is only a contradiction when the host rung IS the tier: under
+    // HostThenDisk the ladder falls through to the disk rung, so
+    // --cold-host-bytes 0 legitimately means "spill everything" rather than
+    // "admit nothing".
+    if (budget.host_tier_enabled && budget.host_bytes == 0 && !budget.disk_tier_enabled) {
         throw std::invalid_argument(
             "--cold-policy host with --cold-host-bytes 0 can never admit a cold page; "
             "set a positive host budget or drop the policy");

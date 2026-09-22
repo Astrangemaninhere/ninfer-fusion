@@ -174,9 +174,40 @@ struct RequestRecord {
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
+    // M21 context append (EngineCore::append_context_tokens). The caller arms the token run and
+    // `context_append_pending`; the worker services it at the first round boundary that observes it,
+    // AHEAD of the decode membership for that boundary, then clears `pending` and sets `done`. Since
+    // the service point precedes the first decode round, an append armed right after submit() is
+    // ordered before this request's first sampled token; `context_append_rounds` records how many
+    // decode rounds had already run when it was serviced, so a lost race is visible, not silent.
+    // Read and written under `mutex`, which this record already owns.
+    std::vector<TokenId> context_append_tokens;
+    bool context_append_pending = false;
+    bool context_append_done    = false;
+    std::uint64_t context_append_rounds = 0;
+    std::exception_ptr context_append_error;
 
     std::optional<BasePlan> base_plan;
     std::uint64_t remaining_service_work = 0;
+    // W6 accounting for the service-work reservation above. A prefill unit is charged one quantum,
+    // so the number of quanta a prompt needs depends on the prefill unit in force; the plan's
+    // projection is made at the plan's unit (Program::prefill_chunk_capacity()) while
+    // bandwidth_governor_.prefill_chunk_for() may shrink the unit mid-stream. Keeping both numbers
+    // on the request is what lets the engine re-charge the not-yet-charged span at the unit that is
+    // actually in force instead of turning a legal event into a whole-engine stop. See
+    // Scheduling::recharge_service_work_for_unit_shrink.
+    //   prefill_tokens_done -- prompt tokens this request has already charged a prefill unit for.
+    //   service_work_unit   -- the prefill unit the reservation was last reconciled against;
+    //                          0 means "not reconciled yet", i.e. still the plan's own unit.
+    std::uint64_t prefill_tokens_done = 0;
+    std::uint32_t service_work_unit   = 0;
+    // The plan's own prompt span -- `N` in projected_service_work() at
+    // src/targets/qwen3_6/impl/runtime/request_plan_impl.h:101 -- seeded where the
+    // reservation is seeded. It CANNOT be read back from base_plan at prefill time:
+    // release_planning_state() resets base_plan at the admission transition
+    // (engine_core.h:1694) and ensure_base_plan() only runs for pending requests, so a
+    // request that is already prefilling has no base_plan at all.
+    std::uint32_t planned_prefill_tokens = 0;
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;
     GenerationTimings generation_timings;

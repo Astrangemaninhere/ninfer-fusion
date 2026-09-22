@@ -9,12 +9,15 @@ Compares src vs out artifact:
 """
 import argparse
 import hashlib
+from pathlib import Path
 import sys
 
 import numpy as np
 import torch
 
-sys.path.insert(0, r"C:\Users\User\Documents\ziqinzhang\ninfer-fusion-repo")
+# Import the package from this checkout (tools/convert/qwen3_8_27b -> repo root)
+# instead of a hardcoded absolute path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from tools.artifact.container import Artifact  # noqa: E402
 
 

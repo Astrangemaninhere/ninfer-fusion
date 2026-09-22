@@ -2,9 +2,12 @@
 #include "ops/launcher/speculative_round.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -108,8 +111,9 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
 
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
-                                      Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
-                                      Tensor& licensed_counts, Tensor& accepted,
+                                      const Tensor& column_masks, Tensor& lengths, Tensor& anchors,
+                                      Tensor& licensed_tokens, Tensor& licensed_counts,
+                                      Tensor& accepted, Tensor& accepted_columns,
                                       std::int32_t token_domain, const SamplingConfig* configs,
                                       const Tensor& draft_ids, const Tensor& draft_probs,
                                       WorkspaceArena& workspace, cudaStream_t stream) {
@@ -137,6 +141,73 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     require_matrix(licensed_tokens, DType::I32, k + 1, batch, op, "licensed_tokens");
     require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
     require_vector(accepted, DType::I32, batch, op, "accepted");
+    // ACCMASK-ONE-SHOT diagnostic (HOST ONLY, read-only; deleting this whole block is the
+    // complete revert). WHAT IT MEASURES: the `column_masks` THIS op was actually handed --
+    // i.e. the very argument the accept path branches on. launcher/speculative_round.cu:59-61
+    // turns `column_masks.data == nullptr` into the kernel's `masks_ptr == nullptr`, and
+    // kernel/speculative_round.cuh:142 branches exactly on that. The upstream [treebind] probe
+    // (mtp_impl.h:194) prints the SLICE's own `.data`, which is non-null whenever the frame is
+    // bound at all, so it is not a binding witness. Two things are printed here:
+    //   (a) the pointer and the nullptr-test result -- the world-(A)/(B) discriminator;
+    //   (b) the VALUES the device holds at that pointer at this point in the stream, read back
+    //       by an ordered D2H on the SAME stream, which is what the kernel's `row_masks[]` reads.
+    // No numeric path is touched: nothing here writes device memory, nothing printed is fed back
+    // into any tensor, and the only added side effect is an extra stream sync (timing, not values).
+    // NOTE: the ordered D2H is incompatible with CUDA graph capture -- run with --no-cuda-graph.
+    {
+        static int accmask_round = 0;
+        const int accmask_bound = column_masks.data != nullptr ? 1 : 0;
+        std::fprintf(stderr,
+                     "[accmask] round=%d bound=%d masks=%p k=%d batch=%d ne=%d,%d,%d,%d "
+                     "nb=%lld,%lld,%lld,%lld\n",
+                     accmask_round, accmask_bound, static_cast<const void*>(column_masks.data),
+                     static_cast<int>(k), static_cast<int>(batch), column_masks.ne[0],
+                     column_masks.ne[1], column_masks.ne[2], column_masks.ne[3],
+                     static_cast<long long>(column_masks.nb[0]),
+                     static_cast<long long>(column_masks.nb[1]),
+                     static_cast<long long>(column_masks.nb[2]),
+                     static_cast<long long>(column_masks.nb[3]));
+        if (accmask_bound != 0) {
+            const std::int32_t accmask_cols = k + 1;
+            std::vector<std::uint64_t> accmask_host(
+                static_cast<std::size_t>(accmask_cols) * static_cast<std::size_t>(batch),
+                std::uint64_t{0});
+            const int accmask_sync_rc = static_cast<int>(cudaStreamSynchronize(stream));
+            const int accmask_copy_rc = static_cast<int>(cudaMemcpyAsync(
+                accmask_host.data(), column_masks.data,
+                accmask_host.size() * sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
+            const int accmask_drain_rc = static_cast<int>(cudaStreamSynchronize(stream));
+            std::fprintf(stderr,
+                         "[accmask] round=%d sync_rc=%d copy_rc=%d drain_rc=%d\n", accmask_round,
+                         accmask_sync_rc, accmask_copy_rc, accmask_drain_rc);
+            for (std::int32_t accmask_r = 0; accmask_r < batch; ++accmask_r) {
+                std::fprintf(stderr, "[accmask] round=%d row=%d masks:", accmask_round,
+                             static_cast<int>(accmask_r));
+                for (std::int32_t accmask_c = 0; accmask_c < accmask_cols; ++accmask_c) {
+                    std::fprintf(stderr, " %llu",
+                                 static_cast<unsigned long long>(
+                                     accmask_host[static_cast<std::size_t>(accmask_r) *
+                                                      accmask_cols +
+                                                  static_cast<std::size_t>(accmask_c)]));
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        ++accmask_round;
+    }
+    if (column_masks.data != nullptr) {
+        require_matrix(column_masks, DType::I64, k + 1, batch, op, "column_masks");
+        // accepted_columns is the round's published COLUMN: every reader of it is tree-gated
+        // (speculative_target_impl.h selects the continuation hidden from it under the same
+        // `column_masks` test, and ops::mtp_tree_commit_history is reached only from the MTP tree
+        // round). A chain round publishes no column, so it may leave the output unbound --
+        // dflash/dflash2 build their TargetVerifyFrameView without it and the struct's field
+        // defaults to the empty Tensor. Demanding it unconditionally is what rejected every
+        // dflash2 arm with "invalid dtype for accepted_columns" before its first decode.
+        // The requirement stays INSIDE the mask gate on purpose: a tree round, the only round whose
+        // consumer reads the value, still fails loudly if it forgets to bind the output.
+        require_vector(accepted_columns, DType::I32, batch, op, "accepted_columns");
+    }
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
     }
@@ -155,8 +226,9 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
         speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
-        target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, draft_ids, draft_probs, scratch, stream);
+        target_tokens, logits, drafts, current_extents, column_masks, lengths, anchors,
+        licensed_tokens, licensed_counts, accepted, accepted_columns, token_domain, configs,
+        draft_ids, draft_probs, scratch, stream);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

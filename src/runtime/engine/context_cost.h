@@ -101,6 +101,20 @@ struct ResolvedContextMachineCost {
 [[nodiscard]] std::vector<ContextCostMachinePreset>
 parse_context_cost_presets(std::string_view json, std::string_view source_name);
 
+// The prefill identities the compiled defaults declare for a hardware class, rendered in
+// declaration order as `model_id/weights_id`, or `(none declared)` when that machine declares none.
+[[nodiscard]] std::string context_prefill_identities(std::string_view hardware_class);
+
+// Empty when the compiled defaults declare a prefill preset for this identity. Otherwise a
+// refusal-style note naming the identity and every identity the same hardware class declares.
+//
+// Why this exists: `resolve_context_machine_cost` starts from `generic_context_prefill_cost()` and
+// only overrides it when a prefill row matches, so an identity whose prefill was never measured is
+// charged a generic number with nothing said about it. The loader prints this note so that
+// degradation is visible. Only the compiled table is inspected, so the note states what the binary
+// declares, not what the final resolution found.
+[[nodiscard]] std::string context_prefill_preset_miss_note(const ContextCostIdentity& identity);
+
 // Transfer and prefill are resolved independently. Generic numerical defaults always exist;
 // compiled hardware/model values and then matching external values override them.
 [[nodiscard]] ResolvedContextMachineCost

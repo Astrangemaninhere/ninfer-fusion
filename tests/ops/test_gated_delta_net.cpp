@@ -427,12 +427,10 @@ int contract_rejection_cases() {
 } // namespace
 
 int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    int failures = 0;
+    // ops::gated_delta_net_workspace_capacity_bytes is pure host arithmetic plus
+    // std::invalid_argument: the chunk-boundary, token-interval and head-map contracts are settled
+    // BEFORE the device gate so that a broken contract cannot be reported as a skip.
+    int host_failures = 0;
 
     for (const bool normalize_qk : {false, true}) {
         const std::size_t interval =
@@ -441,43 +439,61 @@ int main() {
             ops::gated_delta_net_workspace_capacity_bytes(16, 48, normalize_qk, 65, 65);
         if (interval != witness) {
             std::cerr << "gated_delta_net interval capacity missed the chunk boundary\n";
-            ++failures;
+            ++host_failures;
         }
     }
     try {
         (void)ops::gated_delta_net_workspace_capacity_bytes(16, 48, true, 0, 65);
         std::cerr << "gated_delta_net accepted an invalid token interval\n";
-        ++failures;
+        ++host_failures;
     } catch (const std::invalid_argument&) {}
     try {
         (void)ops::gated_delta_net_workspace_capacity_bytes(4, 6, true, 1, 65);
         std::cerr << "gated_delta_net workspace accepted a non-divisible head map\n";
-        ++failures;
+        ++host_failures;
     } catch (const std::invalid_argument&) {}
-    failures += contract_rejection_cases();
+
+    if (cuda_unavailable()) {
+        if (host_failures != 0) {
+            std::cout << "FAIL gated_delta_net correctness (host_term=" << host_failures
+                      << " device_term=not-run)\n";
+            return 1;
+        }
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+
+    // contract_rejection_cases() allocates DeviceBuffers and is the first device caller: it stays
+    // after the gate. The device half is NOT short-circuited by a red host half.
+    int device_failures = 0;
+    device_failures += contract_rejection_cases();
 
     // Registered 27B/35B-A3B geometries, public state forms, and the recurrent/chunk/tail route
     // boundary are all qualified directly against the same complete FP64 recurrence.
-    failures += inplace_case({"27b decode fused-qk-norm", 16, 48, 1, true}, 12001u);
-    failures += distinct_state_case({"27b raw-qk small-T", 16, 48, 7, false}, 12007u);
-    failures += distinct_state_case({"35b pre-chunk fused-qk-norm", 16, 32, 63, true}, 12063u);
-    failures += distinct_state_case({"27b exact chunk fused-qk-norm", 16, 48, 64, true}, 12064u);
-    failures += distinct_state_case({"27b exact chunk raw-qk", 16, 48, 64, false}, 12164u);
-    failures += inplace_case({"35b chunk-tail fused-qk-norm", 16, 32, 65, true}, 12065u);
-    failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
-    failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
-    failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
+    device_failures += inplace_case({"27b decode fused-qk-norm", 16, 48, 1, true}, 12001u);
+    device_failures += distinct_state_case({"27b raw-qk small-T", 16, 48, 7, false}, 12007u);
+    device_failures += distinct_state_case({"35b pre-chunk fused-qk-norm", 16, 32, 63, true}, 12063u);
+    device_failures += distinct_state_case({"27b exact chunk fused-qk-norm", 16, 48, 64, true}, 12064u);
+    device_failures += distinct_state_case({"27b exact chunk raw-qk", 16, 48, 64, false}, 12164u);
+    device_failures += inplace_case({"35b chunk-tail fused-qk-norm", 16, 32, 65, true}, 12065u);
+    device_failures +=
+        distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
+    device_failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
+    device_failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
 
     // The production decode path updates selected state-pool slots in place at width one.
-    failures += batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8,
-                                  12101u);
-    failures += batch_update_case({"35b selected-slot near-zero", 16, 32, 1, true, true}, {6}, {6},
-                                  8, 12201u);
-    failures += batch_update_case({"35b ordinary", 16, 32, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
-                                  {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
-    failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
-                                  {1, 3, 5, 7}, 8, 13101u);
+    device_failures += batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7},
+                                         {7}, 8, 12101u);
+    device_failures += batch_update_case({"35b selected-slot near-zero", 16, 32, 1, true, true}, {6},
+                                         {6}, 8, 12201u);
+    device_failures += batch_update_case({"35b ordinary", 16, 32, 1, true},
+                                         {8, 9, 10, 11, 12, 13, 14, 15},
+                                         {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
+    device_failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true},
+                                         {0, 2, 4, 6}, {1, 3, 5, 7}, 8, 13101u);
 
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
+    const int failures = host_failures + device_failures;
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness"
+              << " host_term=" << host_failures << " device_term=" << device_failures << '\n';
     return failures == 0 ? 0 : 1;
 }

@@ -44,6 +44,16 @@ DFlash2PersistentState& dflash2_state(DFlash2BatchContext& state) { return state
 
 DFlash2PersistentState& dflash2_state(DFlash2AppendContext& state) { return state.dflash2; }
 
+// Debug sinks in this file are opt-in through a *pair* of environment variables: the tap
+// switch (NINFER_DF2FEAT / NINFER_DF2SCORES) and the directory the raw files land in
+// (NINFER_DF2FEAT_DIR / NINFER_DF2SCORES_DIR) - the same convention as
+// NINFER_HS_DUMP_DIR and NINFER_KVDUMP_DIR. The tree carries no machine-specific path:
+// without a directory the tap still prints its stderr diagnostics and writes no file.
+const char* df2_dump_dir(const char* env_name) {
+    const char* dir = std::getenv(env_name);
+    return (dir != nullptr && *dir != '\0') ? dir : nullptr;
+}
+
 Weight conv_side_weight(const Weight& base, std::int32_t side, std::int32_t taps) {
     Weight out      = base;
     out.qdata       = static_cast<const std::byte*>(base.qdata) +
@@ -140,16 +150,16 @@ void append_context_impl(DFlash2AppendContext& state, const Tensor& features,
         if (df2feat_calls < 8) {
             ++df2feat_calls;
             Tensor fv = features.view({Config::feature_rows, columns});
-            const cudaStream_t s = state.execution.device.stream;
+            const cudaStream_t s       = state.execution.device.stream;
+            const char* const dump_dir = df2_dump_dir("NINFER_DF2FEAT_DIR");
             auto dump_one = [&](const char* tag, const Tensor& view) {
-                if (view.data == nullptr || view.numel() == 0) { return; }
+                if (dump_dir == nullptr || view.data == nullptr || view.numel() == 0) { return; }
                 std::vector<std::byte> host(view.bytes());
                 CUDA_CHECK(cudaMemcpyAsync(host.data(), view.data, host.size(),
                                            cudaMemcpyDeviceToHost, s));
                 CUDA_CHECK(cudaStreamSynchronize(s));
                 char path[256];
-                std::snprintf(path, sizeof(path),
-                              "/mnt/c/Users/User/Documents/ziqinzhang/dl/feat_%s_%d.bin", tag,
+                std::snprintf(path, sizeof(path), "%s/feat_%s_%d.bin", dump_dir, tag,
                               df2feat_calls);
                 if (std::FILE* fh = std::fopen(path, "wb")) {
                     std::fwrite(host.data(), 1, host.size(), fh);
@@ -413,16 +423,16 @@ void propose_batch_impl(DFlash2BatchContext& state, qwen3_6::DFlashDecodeState& 
         if (df2scores_calls < 12) {
             ++df2scores_calls;
             const cudaStream_t dump_stream = state.execution.device.stream;
+            const char* const dump_dir     = df2_dump_dir("NINFER_DF2SCORES_DIR");
             auto dump_one = [&](const char* tag, const Tensor& view) {
-                if (view.data == nullptr || view.numel() == 0) { return; }
+                if (dump_dir == nullptr || view.data == nullptr || view.numel() == 0) { return; }
                 std::vector<std::byte> host(view.bytes());
                 CUDA_CHECK(cudaMemcpyAsync(host.data(), view.data, host.size(),
                                            cudaMemcpyDeviceToHost, dump_stream));
                 CUDA_CHECK(cudaStreamSynchronize(dump_stream));
                 char path[256];
-                std::snprintf(path, sizeof(path),
-                              "/mnt/c/Users/User/Documents/ziqinzhang/dl/df2scores_%s_%d.bin",
-                              tag, df2scores_calls);
+                std::snprintf(path, sizeof(path), "%s/df2scores_%s_%d.bin", dump_dir, tag,
+                              df2scores_calls);
                 if (std::FILE* fh = std::fopen(path, "wb")) {
                     std::fwrite(host.data(), 1, host.size(), fh);
                     std::fclose(fh);
@@ -578,6 +588,9 @@ void dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size, s
                           DecodeGraphExecutable* executable) {
     auto body = dflash2_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     run_prepared(state, executable, body);
+    // GRAPH ROUND: the body ran at capture time, so the round's acceptlog block is published from
+    // the photograph of this round's width (k + 1 columns). Inert unless NINFER_ACCEPTLOG is set.
+    if (executable != nullptr) { acceptlog_replay_dump(static_cast<int>(k) + 1); }
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

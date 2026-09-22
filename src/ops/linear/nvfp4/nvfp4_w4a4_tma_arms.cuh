@@ -14,6 +14,7 @@
 
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
+#include "core/arch_caps.h"
 #include "core/device.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -82,12 +83,14 @@ namespace {
 using TmaM256N128   = Nvfp4W4a4TmaSchedule<256, 3, 1>;
 using TmaM256N128S2 = Nvfp4W4a4TmaSchedule<256, 2, 1>;
 
-constexpr std::int32_t kQueryRows  = 6144;
-constexpr std::int32_t kKeyRows    = 1024;
-constexpr std::int32_t kGateRows   = 6144;
-constexpr std::int32_t kKeyBegin   = kQueryRows;
-constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
-constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
+// The attention row split is shared with the W4A4 launcher and the planners: it is
+// declared once in nvfp4_config.h and referenced here.
+constexpr std::int32_t kQueryRows  = kNvfp4AttnQueryRows;
+constexpr std::int32_t kKeyRows    = kNvfp4AttnKeyRows;
+constexpr std::int32_t kGateRows   = kNvfp4AttnGateRows;
+constexpr std::int32_t kKeyBegin   = kNvfp4AttnKeyBegin;
+constexpr std::int32_t kGateBegin  = kNvfp4AttnGateBegin;
+constexpr std::int32_t kValueBegin = kNvfp4AttnValueBegin;
 
 struct AttentionOutput {
     __nv_bfloat16* query;
@@ -124,6 +127,19 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
                 const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
                 std::int32_t tokens, float alpha, Epilogue epilogue, Output output,
                 cudaStream_t stream) {
+    // THE HOST HALF OF THE ARCH DECISION, and it is a RUNTIME fact on purpose: the guard
+    // that compiles the device body out is keyed on __CUDA_ARCH__, which is not defined on the
+    // host pass, so a compile-time test here would be answered about the wrong thing. The
+    // predicate is the SAME fact the device guard encodes -- "this card has the
+    // kind::mxf4nvf4 channel the pipeline's inner mma needs" -- asked of the card in hand off
+    // the measured capability table (src/core/arch_caps.h), not off a number.
+    //
+    // Cached and single-sourced: see nvfp4_tma_rung_has_the_mxf4_channel() in
+    // nvfp4_w4a4_tma.cuh, where the device half of this same decision lives.
+    if (!nvfp4_tma_rung_has_the_mxf4_channel()) {
+        throw std::runtime_error(nvfp4_tma_below_floor_refusal());
+    }
+
     const Nvfp4W4a4TmaDescriptors descriptors =
         make_nvfp4_w4a4_tma_descriptors<Geometry, Schedule::kBlockM>(
             activation_codes, activation_scales, weight_codes, weight_scales, tokens);

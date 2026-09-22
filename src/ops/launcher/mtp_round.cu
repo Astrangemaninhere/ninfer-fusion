@@ -6,8 +6,63 @@
 #include "ops/kernel/mtp_round.cuh"
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
+
+namespace {
+
+// The registered GQA geometries whose KV cache a tree verify can reach (the wrapper rejects every
+// other pair by name before this point): 24 q-heads/4 KV, 16/2, 16/4 and 32/2 -- see
+// src/ops/wrapper/gqa_attention.cpp registered_kv_heads().
+template <int HeadDim, int KVHeads>
+void mtp_tree_commit_geometry(const MtpTreeCommitInvocation& inv, cudaStream_t stream) {
+    constexpr int kBlock = 128;
+    mtp_tree_commit_history_kernel<HeadDim, KVHeads><<<inv.batch, kBlock, 0, stream>>>(
+        inv.column_masks, inv.column_depths, inv.accepted_columns, inv.base_frontiers,
+        inv.table_rows, inv.block_tables, inv.table_stride, inv.chain_sources, inv.commit_flags,
+        static_cast<__nv_bfloat16*>(inv.cache_k), static_cast<__nv_bfloat16*>(inv.cache_v),
+        inv.width, inv.batch, inv.logical_capacity);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void mtp_tree_commit_history_launch(const MtpTreeCommitInvocation& invocation, cudaStream_t stream) {
+    if (invocation.head_dim == 256 && invocation.kv_heads == 4) {
+        mtp_tree_commit_geometry<256, 4>(invocation, stream);
+        return;
+    }
+    if (invocation.head_dim == 256 && invocation.kv_heads == 2) {
+        mtp_tree_commit_geometry<256, 2>(invocation, stream);
+        return;
+    }
+    if (invocation.head_dim == 128 && invocation.kv_heads == 2) {
+        mtp_tree_commit_geometry<128, 2>(invocation, stream);
+        return;
+    }
+    // Unreachable through the wrapper; refuse to guess rather than index a cache this launcher has
+    // no page layout for.
+    throw std::invalid_argument(
+        "mtp_tree_commit_history: unsupported Q/KV head geometry for a tree KV commit");
+}
+
+void mtp_draft_align_hidden_launch(const Tensor& hidden, const Tensor& chain_sources,
+                                   const Tensor& valid_counts, Tensor& out, cudaStream_t stream) {
+    const std::int32_t head_dim = hidden.ne[0];
+    const std::int32_t width    = hidden.ne[1];
+    const std::int32_t batch    = hidden.ne[2];
+    // One block per (batch row, depth) column; the D elements of a column are contiguous.
+    constexpr int kBlock = 256;
+    const dim3 grid(static_cast<unsigned int>(batch), static_cast<unsigned int>(width));
+    mtp_draft_align_hidden_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const std::uint16_t*>(hidden.data),
+        static_cast<const std::int32_t*>(chain_sources.data),
+        static_cast<const std::int32_t*>(valid_counts.data),
+        static_cast<std::uint16_t*>(out.data), width, batch, head_dim);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void mtp_svip_entropy_extents_launch(const Tensor& logits, const Tensor& accepted,
                                        Tensor& cuts, float threshold, cudaStream_t stream) {

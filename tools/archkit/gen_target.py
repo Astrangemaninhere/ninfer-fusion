@@ -3,8 +3,13 @@
 """gen_target.py — ARCHKIT 生成器 v1。
 
 输入 arch-spec.json, 输出:
-  1. <out>/config.h         — TextConfig constexpr (自包含, 可直接 g++ 语法检查)
-  2. <out>/arch_manifest.json — 机器可读接入清单 (GUI 白名单/registry/转换器输入)
+  1. <out>/config.h       — TextConfig constexpr (自包含, 可直接 g++ 语法检查)
+  2. <out>/manifest.json  — 机器可读接入清单 (GUI 白名单/registry/转换器输入)
+
+清单文件名与读者一致: tools/gui/model_import.find_manifest 找的就是 manifest.json
+(本生成器原来写 arch_manifest.json, 于是缺口报告永远找不到它写的清单)。
+本生成器没有算子目录, 所以清单里写 `"gaps": null` + `"gaps_measured": false` ——
+"未测量", 不是"没有缺口"; 报真实缺口的是 adapt.py。
 
 v1 只做"确定性翻译" (spec -> 常量头 + 清单), 不生成需要对齐 runtime 精确
 API 的 bindings/package/recipe 代码 —— 那部分等接入首个目标时对着真实
@@ -22,6 +27,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import arch_spec  # noqa: E402
+
+#: The file name the reader looks for. One constant, because the writer/reader pair
+#: drifting apart is exactly what hid this generator's manifest from the gap report.
+MANIFEST_NAME = "manifest.json"
 
 
 def fmt_int(v) -> str:
@@ -131,7 +140,22 @@ def gen_config_h(spec: dict) -> str:
 
 
 def gen_manifest(spec: dict) -> dict:
-    """机器可读清单: GUI 导入向导白名单 + 转换器/registry 输入。"""
+    """机器可读清单: GUI 导入向导白名单 + 转换器/registry 输入。
+
+    `gaps` 故意写成 None。本生成器没有算子目录, 报不出这个家族在引擎侧缺什么;
+    而"干脆不写这个字段"与"什么也不缺"在读者眼里读起来是一样的。缺口报告
+    (tools/gui/model_import.manifest_gap_state / import_gap_report) 现在把
+    "缺字段 / 显式 null / 非列表 / 自己声明 gaps_measured:false" 一律读成
+    UNMEASURED, 写 `"gaps": null` + `gaps_measured: False` 是把这件事说明白,
+    而不是靠读者去猜。报真实缺口的是 tools/archkit/adapt.py。
+
+    `gui_hint` 里不再有 `"supported": True`。它以前是一句关于"引擎能跑这个家族"
+    的断言, 而树里**没有任何读取方**, 也没有任何检查 —— 断言错了也不会响。
+    现在替换成 `spec_extracted` / `engine_supported` 两个字段, 由
+    tools/gui/model_import.gui_hint_claims() 读出来放进 UNKNOWN 报告里, 且
+    `engine_supported` 的值是 None(未验证) 而不是 True: 本生成器从来没检查过
+    引擎能不能吃这个家族, 所以它没有资格说能。
+    """
     return {
         "model_id": spec["model_id"],
         "family": spec.get("family", ""),
@@ -142,9 +166,17 @@ def gen_manifest(spec: dict) -> dict:
         "has_ple": "ple" in spec,
         "has_mtp": "mtp" in spec,
         "layer_types": [norm_layer_kind(t) for t in spec.get("layer_types", [])],
+        "gaps": None,
+        "gaps_measured": False,
+        "gaps_source": ("none: gen_target.py v1 has no operator catalogue "
+                        "(tools/archkit/adapt.py reports real gaps)"),
+        "verified_against_engine": False,
         "gui_hint": {
-            "supported": True,
-            "import_note": ("支持该家族转换 (按 ARCHKIT 流程接入后启用)" ),
+            "spec_extracted": True,
+            "engine_supported": None,
+            "import_note": ("该家族可被本生成器翻译 (确定性映射); "
+                            "引擎是否支持该家族**未验证** —— 见 tools/archkit/adapt.py "
+                            "的缺口报告"),
         },
     }
 
@@ -160,12 +192,16 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     (out_dir / "config.h").write_text(gen_config_h(spec), encoding="utf-8")
-    with open(out_dir / "arch_manifest.json", "w", encoding="utf-8") as f:
+    # MANIFEST_NAME is the name the reader (tools/gui/model_import.find_manifest)
+    # looks for. This generator used to write arch_manifest.json, which no reader
+    # looked at (it is still accepted as a legacy name), so the gap report could
+    # never find the manifest it had written.
+    with open(out_dir / MANIFEST_NAME, "w", encoding="utf-8") as f:
         json.dump(gen_manifest(spec), f, ensure_ascii=False, indent=2)
         f.write("\n")
     print("generated into %s:" % out_dir)
-    print("  config.h          (TextConfig/MoE/GDN/PLE/MTP constexpr)")
-    print("  arch_manifest.json (GUI 白名单 + registry/转换器输入)")
+    print("  config.h       (TextConfig/MoE/GDN/PLE/MTP constexpr)")
+    print("  %s (GUI 白名单 + registry/转换器输入; gaps 未测量)" % MANIFEST_NAME)
     return 0
 
 

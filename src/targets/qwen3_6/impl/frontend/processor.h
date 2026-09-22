@@ -101,6 +101,24 @@ struct ProcessorOptions {
 struct ProcessedInput {
     std::vector<int> input_ids;
     std::vector<std::uint8_t> token_types;
+    // NOTE ON LINE NUMBERS: the `file:line` references in this block are PRE-LANDING (HEAD
+    // 3944a53); each is also given by SYMBOL. Current values: processor.h
+    // ProcessedInput::token_classes:121  EncodedChat::token_classes:141;
+    // processor.cpp assign_positions:642  encode_rendered_chat:761  exact-frontier throw:814.
+    //
+    // THE FRAME AXIS. One class byte per token, in lockstep with `input_ids`:
+    //   0 = Literal (bytes the CALLER supplied), 1 = Template, 2 = TemplateControl
+    //   (`ninfer::spec::frame_axis::TokenClass`).
+    //
+    // THIS IS NOT `token_types`, and it must never be merged into it. `token_types` has a LIVE
+    // consumer that treats non-zero as "a Vision chunk is owed" and THROWS when the chunk is missing
+    // (text_prefill_impl.h:349-363; the reuse path tests `type != 0` at program_impl.h:4443-4447).
+    // `product/kv_recall_block.h:352-360` pins that verbatim and concludes that a recall marker must
+    // not be written there. Same shape, different column, different meaning -- hence a new field.
+    //
+    // EMPTY means "not classified", which is a different statement from "all Literal"; the
+    // distinction is `size() == 0` vs `size() == input_ids.size()`.
+    std::vector<std::uint8_t> token_classes;
     // Axis-major [3, input_ids.size()] in temporal, height, width order.
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;
@@ -118,6 +136,15 @@ struct ProcessedInput {
 
 struct EncodedChat {
     std::vector<int> input_ids;
+    // THE FRAME AXIS, carried out of the tokenizer. See `ProcessedInput::token_classes` and
+    // `Tokenizer::encode_with_frame_classes`; empty means "not classified".
+    std::vector<std::uint8_t> token_classes;
+    // How many literal spans the tokenizer could pin to EXACT token boundaries, and how many it
+    // could not. An unresolved span leaves its tokens on the TEMPLATE side (the conservative
+    // direction) and is REPORTED here rather than swallowed -- a silent coarsening of the axis is
+    // exactly the failure mode this whole landing exists to remove.
+    std::uint32_t literal_spans_resolved   = 0;
+    std::uint32_t literal_spans_unresolved = 0;
 
     struct MediaTokenRun {
         TokenSpan tokens;

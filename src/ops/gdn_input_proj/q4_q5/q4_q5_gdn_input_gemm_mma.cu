@@ -6,6 +6,7 @@
 #include "ops/common/token_slices.h"
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -35,12 +36,20 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
 
 void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                   Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    constexpr std::int32_t kValueRows = 6144;
-    using Schedule                    = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+    using Schedule = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+    // The value/z split is the operands' own geometry: the value_z weight's first half lands in
+    // qkv after the qk rows, its second half lands in z. Reading it from the tensors is what lets
+    // one kernel body serve a second (value_rows, z_rows) geometry with no new instantiation --
+    // and a mismatch is refused here rather than silently mis-tiled.
+    const std::int32_t value_rows = z.ne[0];
+    if (value_z_weight.n != 2 * value_rows || qkv.ne[0] != qk_weight.n + value_rows) {
+        throw std::invalid_argument("GDN Q4/Q5 grouped MMA: value/z row split does not match");
+    }
     const RowSplitGroupedMmaJob qk    = make_job(qk_weight, 0, qk_weight.n, qkv, 0);
-    const RowSplitGroupedMmaJob value = make_job(value_z_weight, 0, kValueRows, qkv, qk_weight.n);
+    const RowSplitGroupedMmaJob value =
+        make_job(value_z_weight, 0, value_rows, qkv, qk_weight.n);
     const RowSplitGroupedMmaJob output_gate =
-        make_job(value_z_weight, kValueRows, kValueRows, z, 0);
+        make_job(value_z_weight, value_rows, value_rows, z, 0);
     RowSplitGroupedMmaJob empty{};
     const int tiles = div_up(qk.n, Schedule::BM) + div_up(value.n, Schedule::BM) +
                       div_up(output_gate.n, Schedule::BM);

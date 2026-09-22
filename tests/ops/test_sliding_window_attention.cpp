@@ -334,12 +334,10 @@ int run_batch_case() {
 } // namespace
 
 int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: CUDA device unavailable\n";
-        return 77;
-    }
-
-    int failures = 0;
+    // ops::sliding_window_attention_workspace_capacity_bytes is pure host arithmetic plus
+    // std::invalid_argument: the monotonic-endpoint and token-interval contracts are settled BEFORE
+    // the device gate so that a broken contract cannot be reported as a skip.
+    int host_failures = 0;
     constexpr ops::SlidingWindowAttentionExecutionEnvelope capacity_envelope{0, 8194};
     const std::size_t interval = ops::sliding_window_attention_workspace_capacity_bytes(
         kGeometry, kWindow, capacity_envelope, 1, 16, 1);
@@ -348,25 +346,41 @@ int main() {
     if (interval != endpoint) {
         std::cerr << "sliding_window_attention interval capacity did not resolve to its monotonic "
                      "endpoint\n";
-        ++failures;
+        ++host_failures;
     }
     try {
         (void)ops::sliding_window_attention_workspace_capacity_bytes(kGeometry, kWindow,
                                                                      capacity_envelope, 0, 16, 1);
         std::cerr << "sliding_window_attention accepted an invalid token interval\n";
-        ++failures;
+        ++host_failures;
     } catch (const std::invalid_argument&) {}
-    failures += run_case(1, 0);
-    failures += run_case(16, 1);
-    failures += run_case(8, 96, InputProfile::Random, 4096);
-    failures += run_case(16, 4096);
-    failures += run_case(2, 4096, InputProfile::WindowBoundary);
-    failures += run_case(2, 8194);
-    failures += run_case(8, 65, InputProfile::Random, 96);
-    failures += run_case(8, 65, InputProfile::Random, 96, 0);
-    failures += run_case(8, 4096, InputProfile::Random, 4096, 0);
-    failures += run_batch_case();
 
+    if (cuda_unavailable()) {
+        if (host_failures != 0) {
+            std::cerr << "sliding_window_attention host_term=" << host_failures
+                      << " device_term=not-run\n";
+            return 1;
+        }
+        std::cout << "SKIP: CUDA device unavailable\n";
+        return 77;
+    }
+
+    // The device half is NOT short-circuited by a red host half.
+    int device_failures = 0;
+    device_failures += run_case(1, 0);
+    device_failures += run_case(16, 1);
+    device_failures += run_case(8, 96, InputProfile::Random, 4096);
+    device_failures += run_case(16, 4096);
+    device_failures += run_case(2, 4096, InputProfile::WindowBoundary);
+    device_failures += run_case(2, 8194);
+    device_failures += run_case(8, 65, InputProfile::Random, 96);
+    device_failures += run_case(8, 65, InputProfile::Random, 96, 0);
+    device_failures += run_case(8, 4096, InputProfile::Random, 4096, 0);
+    device_failures += run_batch_case();
+
+    const int failures = host_failures + device_failures;
+    std::cout << "sliding_window_attention host_term=" << host_failures
+              << " device_term=" << device_failures << '\n';
     if (failures != 0) {
         std::cerr << "sliding_window_attention failures=" << failures << '\n';
         return 1;

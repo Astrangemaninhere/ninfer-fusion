@@ -59,6 +59,21 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
                           {1152, 4304, 181U, Comparison::Sampled, false, kN1152K4304});
 
+    // The 4096-wide GDN-hybrid text stack. (4096, 12288) is its MLP down projection, which the
+    // MTP block runs too; (4096, 4096) is a hidden-width projection that writes the residual.
+    // Between them they are the whole of this stack's plain-Q5 linear surface.
+    constexpr std::array kN4096K4096{
+        a16(1), a16(2), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
+                          {4096, 4096, 199U, Comparison::Sampled, false, kN4096K4096});
+
+    constexpr std::array kN4096K12288{
+        a16(1), a16(2), a16(4), a16(5), a16(16), a16(17), a16(128),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
+                          {4096, 12288, 211U, Comparison::Sampled, false, kN4096K12288});
+
     return failures;
 }
 

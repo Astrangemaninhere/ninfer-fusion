@@ -1,4 +1,5 @@
 #include "serve/request_log.h"
+#include "product/kv_summary_format.h"
 #include "product/speculative_options.h"
 #include "serve/console_log.h"
 
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -15,7 +17,13 @@
 #include <system_error>
 #include <utility>
 
+// The only POSIX dependency in this file. MSVC has no <unistd.h> at all (MEASURED: C1083)
+// and does not declare ::getpid, so the Windows arm takes the UCRT's own spelling.
+#if defined(_WIN32)
+#    include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::serve {
 namespace {
@@ -36,8 +44,15 @@ std::uint64_t unix_time_ms() {
 std::string new_server_instance_id() {
     const auto now    = std::chrono::system_clock::now().time_since_epoch();
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+#if defined(_WIN32)
+    // MEASURED in this line's record dir: ::_getpid() == GetCurrentProcessId() on this SDK, and
+    // the value fits the long long below.
+    return "serve-" + std::to_string(static_cast<long long>(::_getpid())) + '-' +
+           std::to_string(micros);
+#else
     return "serve-" + std::to_string(static_cast<long long>(::getpid())) + '-' +
            std::to_string(micros);
+#endif
 }
 
 std::filesystem::path normalized_absolute_path(const std::string& value) {
@@ -120,6 +135,27 @@ requested_reasoning_effort_text(const std::optional<RequestedReasoningEffort>& r
     return requested ? std::string(requested_reasoning_effort_name(*requested)) : "default";
 }
 
+// Every KvCacheStorage enumerator is named; the fallback is kept for a byte no
+// enumerator names (KvCacheStorage is a std::uint8_t, so a cast or an untrusted
+// input can produce one). It used to name 3 of 8, and that is observable: this
+// string goes into the request-log line ({"kv_cache",
+// kv_cache_name(engine_options.kv_cache)} below) while engine_options.kv_cache is
+// filled by serve_options.cpp parse_kv_dtype / apps/cli/options.cpp
+// parse_kv_cache, both of which map nvfp4/iso3/e8 onto their real enumerators. So
+// `--kv-dtype nvfp4` produced a request log saying "kv_cache":"unknown" -- the
+// service's persistent record claiming a tier the engine does not have, with no
+// warning anywhere. Names follow core/device_capabilities.h kv_storage_name; the
+// three that already shipped are byte-identical so existing log consumers keep
+// parsing.
+//
+// RENAME (dl/isoname): the iso4e tier's own token moved "iso3-g16" -> "iso4e-g16",
+// matching product/kv_storage_dtype.h kKvStorageNames (which has read "iso4e-g16"
+// since before this table existed) and core/device_capabilities.h kv_storage_name.
+// This string is PERSISTED: it is the value of {"kv_cache", ...} in every request-log
+// record. Nothing in this tree parses a request log back, so no compatibility READ is
+// needed -- but records written before this change carry "iso3-g16" forever, and a
+// consumer that keys on the string must accept both spellings. That is a NOTE, not a
+// decoder, and it is the only persisted name this rename touches.
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     switch (storage) {
     case ninfer::KvCacheStorage::BFloat16:
@@ -128,6 +164,20 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
+    case ninfer::KvCacheStorage::Nvfp4Group16:
+        return "nvfp4-g16";
+    case ninfer::KvCacheStorage::Fp8Group16:
+        return "fp8-g16";
+    case ninfer::KvCacheStorage::Iso3Group16:
+        return "iso4e-g16";
+    case ninfer::KvCacheStorage::E8Group64:
+        return "rk4v4-g64";
+    case ninfer::KvCacheStorage::E8K3Group64:
+        return "e8k3-g64";
+    case ninfer::KvCacheStorage::E8K2Group64:
+        return "e8k2-g64";
+    case ninfer::KvCacheStorage::Dropped:
+        return "dropped";
     }
     return "unknown";
 }
@@ -506,6 +556,13 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.sampling                           = prepared.sampling;
     context.acquisition_seconds                = prepared.acquisition_seconds;
     context.preparation                        = prepared.preparation;
+    // mtplogx: the ids come off the engine's prepared prompt; the serve layer has no second
+    // tokenizer and must not grow one. Opt-in, because an id list is unbounded and a default run
+    // must not change size.
+    if (const char* mtplogx_ids = std::getenv("NINFER_SERVE_TOKEN_IDS");
+        mtplogx_ids != nullptr && mtplogx_ids[0] != '\0' && mtplogx_ids[0] != '0') {
+        context.prompt_token_ids = prepared.prompt_token_ids;
+    }
     return context;
 }
 
@@ -616,8 +673,17 @@ std::string format_request_done(const RequestLogContext& context,
     if (outcome.thinking.configured_budget) {
         out << " thinking_budget=" << *outcome.thinking.configured_budget
             << " model_thinking=" << outcome.thinking.model_thinking_tokens
-            << " control_tokens=" << outcome.thinking.injected_tokens
-            << " control=" << (outcome.thinking.applied ? "applied" : "unused");
+            << " control_tokens=" << outcome.thinking.injected_tokens;
+        // mtplogx: the committed ids, on the same console record as the counters they explain.
+        if (const char* mtplogx_ids = std::getenv("NINFER_SERVE_TOKEN_IDS");
+            mtplogx_ids != nullptr && mtplogx_ids[0] != '\0' && mtplogx_ids[0] != '0') {
+            out << " generated_ids=";
+            for (std::size_t index = 0; index < outcome.generated_token_ids.size(); ++index) {
+                if (index != 0) { out << ','; }
+                out << outcome.generated_token_ids[index];
+            }
+        }
+        out << " control=" << (outcome.thinking.applied ? "applied" : "unused");
     }
     return out.str();
 }
@@ -669,6 +735,17 @@ std::string format_throughput(const ThroughputReport& report) {
                    static_cast<double>(report.decode_rounds)
             << "us/round";
     }
+    // mtplogx: appended, never interleaved. `prefill=` and `decode=` above keep interval_seconds
+    // as their denominator -- that reading is NOT redefined -- and the two *_active fields are the
+    // per-class windows already accumulated in host_work, so a reader that wants a class-local rate
+    // can divide by them instead.
+    out << " interval_index=" << report.interval_index << " decode_active=" << std::setprecision(3)
+        << nanoseconds_to_seconds(host.decode_host_ns + host.decode_device_wait_ns)
+        << "s prefill_active="
+        << nanoseconds_to_seconds(host.prefill_host_ns + host.prefill_device_wait_ns)
+        << "s mtp_extend_calls=" << report.current.mtp_graph_extension_calls
+        << " mtp_extend_ms=" << std::setprecision(3)
+        << nanoseconds_to_seconds(report.current.mtp_graph_extension_nanoseconds) * 1000.0;
     out << " boundary=" << std::setprecision(2)
         << nanoseconds_to_seconds(host.engine_boundary_ns) * 1000.0
         << "ms maintenance=" << nanoseconds_to_seconds(host.engine_maintenance_ns) * 1000.0 << "ms";
@@ -732,7 +809,18 @@ std::string format_server_start_json(
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
+             // def3: TWO keys, because they are two different facts. `kv_cache` is
+             // the GLOBAL --kv-dtype (EngineOptions::kv_cache, types.h:391) -- and with a
+             // ceiling it is read by NOTHING (--kv-dtype and --kv-bit-budget/--kv-bits are
+             // mutually exclusive, layouts_impl.h:366-375). `kv_layer_storage` is the table
+             // the page pool was actually built from, straight from the engine's own
+             // reflection (MemorySummary::kv_layer_storage, types.h:1172) through the one
+             // shared formatter the CLI prints as "kv cache dtype". Before this key the
+             // record said bf16 while all 16 layers ran nvfp4, with no warning anywhere.
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"kv_cache_explicit", engine_options.kv_cache_explicit},
+             {"kv_layer_storage", product::format_kv_layer_store(memory)},
+             {"kv_full_attention_layers", memory.kv_full_attention_layers},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
@@ -841,6 +929,13 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
     record["speculative"]     = speculative_json(outcome.metrics);
+    // mtplogx: the two id vectors the request record could not previously answer for. Present
+    // only when asked for, so a default campaign file keeps the size and the field set it had.
+    if (const char* mtplogx_ids = std::getenv("NINFER_SERVE_TOKEN_IDS");
+        mtplogx_ids != nullptr && mtplogx_ids[0] != '\0' && mtplogx_ids[0] != '0') {
+        record["token_ids"] = Json{{"prompt", context.prompt_token_ids},
+                                   {"generated", outcome.generated_token_ids}};
+    }
     record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();
 }
@@ -1041,6 +1136,21 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    record["interval_index"] = report.interval_index;
+    // mtplogx: the same two per-class windows as the console line, plus the cumulative rung-capture
+    // pair and its interval delta.
+    record["active_windows_seconds"] =
+        Json{{"decode", nanoseconds_to_seconds(host.decode_host_ns + host.decode_device_wait_ns)},
+             {"prefill",
+              nanoseconds_to_seconds(host.prefill_host_ns + host.prefill_device_wait_ns)}};
+    record["mtp_graph_extension"] =
+        Json{{"calls", current.mtp_graph_extension_calls},
+             {"nanoseconds", current.mtp_graph_extension_nanoseconds},
+             {"interval_calls",
+              monotonic_delta(previous.mtp_graph_extension_calls, current.mtp_graph_extension_calls)},
+             {"interval_nanoseconds",
+              monotonic_delta(previous.mtp_graph_extension_nanoseconds,
+                              current.mtp_graph_extension_nanoseconds)}};
     return record.dump();
 }
 

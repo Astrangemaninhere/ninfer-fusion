@@ -38,8 +38,8 @@ struct DecoderStateSpec {
     // SWA layers' attention window in tokens, indexed like layer_kv_dtypes.
     // 0 = no window (full attention) -- the value every consumer guards on.
     std::array<std::uint32_t, 64> layer_sliding_windows{};
-    // SEPARATION: codec of the V plane on the NVFP4 tier. Iso3 keeps the engine
-    // default (V stored as ISO3 sign-magnitude INT3); E2M1 is the ablation.
+    // SEPARATION: codec of the V plane on the NVFP4 tier. Iso4e keeps the engine
+    // default (V stored as ISO4E sign-magnitude INT3); E2M1 is the ablation.
     // Both share one plane geometry, so this only changes what the producers
     // encode and the consumers decode.
     KvVCodec kv_v_codec                     = KvVCodec::Iso3;
@@ -55,6 +55,18 @@ struct DecoderStateSpec {
     std::uint32_t mtp_physical_page_groups  = 0;
     // Entropy-coded cold pool capacity in pages; 0 disables the pool.
     std::uint32_t max_cold_pages            = 0;
+    // WHICH layers the per-layer spec actually WROTE (see
+    // EngineOptions::kv_layer_storage_set), for layer_kv_dtypes above.
+    // layer_kv_dtypes_set[L] true makes layer_kv_dtypes[L] authoritative even when
+    // it is DType::BF16 -- that is the only way to ask for a REAL BF16 layer under
+    // a quantized kv_dtype. All-false (the default) is the pre-mask rule: a BF16
+    // entry inherits kv_dtype. Read by plan_cache() and by the three switch/gate
+    // predicates that must resolve a layer the same way it does.
+    // LAST MEMBER ON PURPOSE: this header is an export (embedders and the target
+    // TUs compile against it), so a field appended at the end cannot move any
+    // existing field's offset and an object built before this change still reads
+    // everything it knows where it expects it.
+    std::array<bool, 64> layer_kv_dtypes_set{};
 };
 
 struct PagedKVCacheLayout {
@@ -74,9 +86,10 @@ struct PagedKVCacheLayout {
     std::array<TensorRegion, 64> cold_slot_valid{};
     // Cold-slot record stride PER LAYER, in bytes; one record is one
     // (page, kv_head, K|V) plane set. Each layer's record is exactly as wide as
-    // the codec its resolved dtype feeds -- 9232 B for the int8 raw slot, 9536 B
-    // for the nvfp4 rANS slot -- so a mixed stack is not charged the widest codec
-    // on every layer. Indexed like layer_dtypes; all-zero when the pool is off
+    // the codec its resolved dtype feeds -- 9232 B for the int8 raw slot, 6688 B
+    // for the nvfp4 rANS slot at the 2.60 bits/code ceiling (9536 B at the 4-bit
+    // no-expansion bound) -- so a mixed stack is not charged the widest codec on
+    // every layer. Indexed like layer_dtypes; all-zero when the pool is off
     // (decoder_state.cpp derives it from the attention geometry).
     std::array<std::int32_t, 64> layer_slot_bytes{};
     // Widest record in the pool (the codec default). Diagnostics and upper
@@ -84,9 +97,23 @@ struct PagedKVCacheLayout {
     std::int32_t slot_bytes = 0;
     std::uint32_t max_cold_pages = 0;
     // Resolved per-layer storage (one entry per full-attention layer).
+    // THE FOUR TABLES BELOW ARE ALWAYS FULLY POPULATED, AND THEY ARE AUTHORITATIVE.
+    // plan_cache() resolves the pool-wide dtype inheritance itself before storing
+    // (kv_resolve_slot_dtype), writes every layer of every one of the four, and throws on
+    // a table shorter than the layer count; the only producer of a PagedKVCacheLayout is
+    // plan_cache(). There is therefore NO "table absent" state, and
+    // `layer_dtypes_.empty()`, `layer_plane_base_.empty()`, `layer_residual_.empty()` and
+    // `layer_sliding_windows_.empty()` are all CONSTANT FALSE (std::array<T,N>::empty()
+    // returns false -- it is a size constant, not a query). A fallback guarded by one of
+    // them is unreachable, and would silently IGNORE the per-layer resolution the layout
+    // already performed. layer_view()/batch_layer_view() read these unconditionally for
+    // that reason and pin `layer < layers_` (the one bound that is real) separately.
     std::array<DType, 64> layer_dtypes{};
-    // Layers that keep an NVFP4 residual plane (base + 4) in the page
-    // geometry; empty disables residual planes.
+    // Layers that keep an NVFP4 residual plane (base + 4) in the page geometry. This
+    // table is 64 wide and every full-attention layer is written, so there is no
+    // "table absent" state: a layer with no residual plane stores FALSE. (It used to say
+    // "empty disables residual planes", which a std::array cannot express and which was
+    // never how the pool worked.)
     std::array<bool, 64> layer_residual{};
     // Resolved per-layer SWA window in tokens (0 = full attention).
     std::array<std::uint32_t, 64> layer_sliding_windows{};
@@ -94,6 +121,14 @@ struct PagedKVCacheLayout {
     // per-layer plane counts; mixed BF16/quantized tables have unequal
     // strides).
     std::array<std::uint32_t, 64> layer_plane_base{};
+    // L26 instrument: full-attention indices whose planes were DISCARDED by
+    // NINFER_KV_DROP_LAYERS. Carried on the LAYOUT, not read from the
+    // environment at each use, so the text cache can own the table while the MTP
+    // cache -- planned with an empty spec -- keeps every one of its layers (D3).
+    std::array<bool, 64> layer_dropped{};
+    // Number of set entries in layer_dropped (carried so a reader does not have to
+    // popcount the table back out).
+    std::uint32_t layer_dropped_count = 0;
     // SEPARATION: V codec of the NVFP4 tier (see DecoderStateSpec::kv_v_codec).
     // Carried on the layout so PagedKVCache can publish it as v_dtype without
     // re-deriving it from a global option.
@@ -160,6 +195,15 @@ public:
 
     [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
 
+    // L26 instrument: TRUE when this cache holds NO planes for `layer` (its
+    // storage was discarded). Per-INSTANCE state, so a cache planned with an
+    // empty drop spec -- the MTP cache -- answers false for every layer, which
+    // is what makes dropping text layer 0 legal again (D3).
+    [[nodiscard]] bool layer_is_dropped(std::uint32_t layer) const noexcept {
+        return layer < layers_ && layer < layer_dropped_.size() && layer_dropped_[layer];
+    }
+    [[nodiscard]] std::uint32_t dropped_layer_count() const noexcept { return dropped_layers_; }
+
     [[nodiscard]] DeviceKVPagePool& page_pool() noexcept { return pages_; }
 
     [[nodiscard]] const DeviceKVPagePool& page_pool() const noexcept { return pages_; }
@@ -189,12 +233,20 @@ private:
     std::int32_t kv_heads_     = 0;
 
     std::int32_t head_dim_     = 0;
+    // Pool-wide defaults carried from the layout: the values plan_cache() RESOLVES FROM,
+    // not an alternative source of truth. Since the sixteen dead
+    // `layer_dtypes_.empty()`-style ternaries were removed from decoder_state.cpp there is
+    // no reader left in this class, and a future reader that wants a layer's dtype must
+    // use layer_dtypes_[layer], never this.
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
     std::array<DType, 64> layer_dtypes_{};
     std::array<bool, 64> layer_residual_{};
     std::array<std::uint32_t, 64> layer_sliding_windows_{};
     std::array<std::uint32_t, 64> layer_plane_base_{};
+    // L26 instrument: PagedKVCacheLayout::layer_dropped, plus its popcount.
+    std::array<bool, 64> layer_dropped_{};
+    std::uint32_t dropped_layers_ = 0;
     // SEPARATION: V codec of the NVFP4 tier (PagedKVCacheLayout::kv_v_codec).
     KvVCodec kv_v_codec_ = KvVCodec::Iso3;
     std::array<Tensor, 64> cold_slots_;

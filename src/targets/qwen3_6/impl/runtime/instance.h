@@ -7,6 +7,7 @@
 #    error "NINFER_QWEN36_RUNTIME_NS must be a unique identifier for this instantiation"
 #endif
 
+#include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -66,8 +67,42 @@ inline std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t 
 }
 
 inline std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
-                                                             std::uint32_t draft_window) {
-    return Variant::mtp_graph_profiles(capacity, draft_window);
+                                                             std::uint32_t draft_window,
+                                                             bool ladder_capture = false) {
+    return Variant::mtp_graph_profiles(capacity, draft_window, ladder_capture);
+}
+
+// Composes the MTP capture-width ladder: one rung per width in `ladder`, each rung its own
+// topology class (so a per-round width switch installs a DIFFERENT executable instead of asking
+// cudaGraphExecUpdate to change a node's kernel function, which it refuses) and its own
+// frontier-segment partition (so the contiguity invariant holds within a rung, not across the
+// concatenation). `ladder` empty means a fixed-k run: one rung at `draft_window` with topology
+// class 0 and draft_width 0, i.e. byte-identical to the pre-ladder behaviour.
+inline std::vector<GraphExecutionProfile> mtp_graph_ladder_profiles(
+    std::uint32_t capacity, std::uint32_t draft_window,
+    const std::vector<std::uint32_t>& ladder) {
+    if (ladder.empty()) { return mtp_graph_profiles(capacity, draft_window, false); }
+    std::vector<GraphExecutionProfile> out;
+    for (std::size_t rung = 0; rung < ladder.size(); ++rung) {
+        const std::uint32_t width = ladder[rung];
+        for (GraphExecutionProfile profile : mtp_graph_profiles(capacity, width, true)) {
+            profile.topology_class = static_cast<std::uint32_t>(rung);
+            profile.draft_width    = width;
+            out.push_back(profile);
+        }
+    }
+    return out;
+}
+
+// The rung a profile belongs to: the sub-partition that must satisfy its own coverage
+// invariant (validate_graph_profiles).
+inline std::vector<GraphExecutionProfile> mtp_ladder_rung(
+    const std::vector<GraphExecutionProfile>& profiles, std::uint32_t rung) {
+    std::vector<GraphExecutionProfile> out;
+    for (const GraphExecutionProfile& profile : profiles) {
+        if (profile.topology_class == rung) { out.push_back(profile); }
+    }
+    return out;
 }
 
 inline std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,

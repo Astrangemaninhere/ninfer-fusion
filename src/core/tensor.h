@@ -37,6 +37,11 @@ enum class QType : std::uint16_t {
     I32_CTRL             = 6,
     NVFP4                = 7,
     FP8_E4M3FN_ROW_BF16S = 8,
+    // F32-scale FP8 rows.  The donor tree (igorls/ninfer @ 5e4a66d) carries BOTH spellings and
+    // they are NOT aliases: row_scale_geometry() emits a 2-byte scale word for ..._BF16S and a
+    // 4-byte one for this member, so collapsing them would halve the scale plane and read the
+    // wrong scale words.  Appended after the existing enumerators, so no existing value moves.
+    FP8_E4M3FN_ROW_F32S  = 9,
 };
 
 enum class QuantLayout : std::uint16_t {

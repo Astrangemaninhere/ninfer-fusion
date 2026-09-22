@@ -25,8 +25,16 @@ void launch_split2(const Tensor& x, const Weight& w, Tensor& residual_out, cudaS
 
 template <int Cols>
 void dispatch_shape(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    if (w.k == 6144) {
+    // The split2 exact kernel takes k as compile-time geometry (kFullSlabs = k/1024 full
+    // 1024-value slabs, kStride = k the x token stride), so this branch IS the instantiation set
+    // for the op's admitted k values.  A new k is registered by adding its row to
+    // q5_linear_add_plan.cpp's kSupports AND its instantiation here; nothing else moves.
+    if (w.k == 4096) {
+        launch_split2<Cols, 4, 4096>(x, w, residual_out, stream);
+    } else if (w.k == 6144) {
         launch_split2<Cols, 6, 6144>(x, w, residual_out, stream);
+    } else if (w.k == 12288) {
+        launch_split2<Cols, 12, 12288>(x, w, residual_out, stream);
     } else if (w.k == 17408) {
         launch_split2<Cols, 17, 17408>(x, w, residual_out, stream);
     } else {

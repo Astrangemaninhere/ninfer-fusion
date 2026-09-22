@@ -4,12 +4,12 @@
 Protocol (§38/§61): big planted-needle context + long generation + retrieval
 questions, run against a live ninfer-serve. Pass = all needles retrieved
 verbatim at the target context. This is the acceptance gate for layered
-KV storage (e8/nvfp4 mixes) after a reload or cold start.
+KV storage (rk4v4/nvfp4 mixes) after a reload or cold start.
 
 Usage:
   python longtest_57k.py --port 8321 --context 57344 [--needles 8] [--model muse-glimmer-30b]
-  python longtest_57k.py --port 8321 --context 57344 --reload "0-11:e8,12-15:nvfp4"
-                         [--reloads "all:bf16" "0-11:e8,12-15:nvfp4"]   # sequential configs
+  python longtest_57k.py --port 8321 --context 57344 --reload "0-11:rk4v4,12-15:nvfp4"
+                         [--reloads "all:bf16" "0-11:rk4v4,12-15:nvfp4"]   # sequential configs
 Exit 0 iff every tested config passes.
 """
 from __future__ import annotations

@@ -55,6 +55,11 @@ struct GenerationOutcome {
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
+    // mtplogx: the tokens the model committed, in order. GenerationResult already carries them
+    // (engine_core.h complete_success writes result.generated_token_ids); before this the serve
+    // layer read that vector for its size only and dropped it, which is why no generated-id trace
+    // existed to compare two non-greedy runs against.
+    std::vector<ninfer::TokenId> generated_token_ids;
 };
 
 struct StreamSink {
@@ -87,6 +92,9 @@ struct PreparedRequest {
     std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
     bool preserve_thinking = false;
     std::shared_ptr<RequestLifetime> lifetime;
+    // mtplogx: the prompt ids this request was prepared from, read straight out of the engine's
+    // own prepared prompt.
+    std::vector<ninfer::TokenId> prompt_token_ids;
 };
 
 class GenerationService {

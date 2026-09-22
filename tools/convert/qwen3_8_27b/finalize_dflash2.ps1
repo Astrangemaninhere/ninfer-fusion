@@ -8,11 +8,21 @@
 $ErrorActionPreference = "Stop"
 param(
     [string]$Ckpt = "",
+    [string]$DataRoot = "",
     [switch]$SkipWsl
 )
 $py = "C:\Program Files\Python312\python.exe"
-$base = "C:\Users\User\Documents\ziqinzhang"
-$tool = Join-Path $base "ninfer-fusion-repo\tools\convert\qwen3_8_27b"
+# The converter is part of the tree this script lives in: resolve it from the
+# script's own directory.  It used to point at a sibling `ninfer-fusion-repo`
+# checkout, i.e. at a *stale mirror* - a run there patched the artifact with
+# whatever inventory that copy happened to hold, not with the one under test.
+$tool = $PSScriptRoot
+# Data root: `models\` and `data\` sit beside the repository working copy
+# (= four directories above tools\convert\qwen3_8_27b).
+if (-not $DataRoot) {
+    $DataRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)))
+}
+$base = $DataRoot
 $srcArt = Join-Path $base "models\Qwen3.8-27B-Huihui-Abliterated-NInfer-DFlash2\qwen3_8_27b_nvfp4_dflash2.ninfer"
 
 if (-not $Ckpt) {

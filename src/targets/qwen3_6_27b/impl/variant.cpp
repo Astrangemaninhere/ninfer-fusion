@@ -21,16 +21,39 @@
 namespace ninfer::targets::qwen3_6_27b::detail {
 
 std::array<DType, 64> Variant::default_layer_kv_dtypes(WeightsProfile) {
-    // Default: 10 layers of E8-lattice K (H64 rotation + E8 projection,
-    // 4-bit packed) + 6 layers of NVFP4 (E2M1 K + ISO3 V). Measured on 13.3k zh
-    // perplexity at ctx 4096: ppl 1.020 (best of all mixes; all-E8 1.112,
+    // Default: E8-lattice K (H64 rotation + Rk4v4 projection, 4-bit packed) on the
+    // low full-attention layers, NVFP4 (E2M1 K + ISO4E V) above them. Measured on
+    // 13.3k zh perplexity at ctx 4096: ppl 1.020 (best of all mixes; all-Rk4v4 1.112,
     // all-NVFP4 1.706, all-I8 1.522). Generation-verified (MTP accept 44%,
-    // decode ~111 tok/s on 5090). E8 supplies the K lattice gain; NVFP4
-    // layers supply the ISO3 V which fits the value distribution better
+    // decode ~111 tok/s on 5090). Rk4v4 supplies the K lattice gain; NVFP4
+    // layers supply the ISO4E V which fits the value distribution better
     // than i4.
+    //
+    // LAYER BOUND -- CAP THE Rk4v4 LAYERS AT FULL-ATTENTION INDEX 7. The ctx-4096
+    // perplexity win above is not the whole story: at long context, Rk4v4 on a HIGH
+    // layer number silently corrupts retrieval. Measured
+    // (docs/maintainer/kv-strategy-matrix.md section 2 rule 2 and section 6.1):
+    //   0-7:rk4v4 -> 8/8 needles | 8-15:rk4v4 -> 0/8 | 14-15:rk4v4 -> 4/8 |
+    //   this table, with rk4v4 also on 8,9,13,14 -> 6/8, while every pure tier
+    //   (bf16/int8/nvfp4/iso4e) is 8/8. compute-sanitizer is clean on the failure
+    //   (_TODO.md 96), so it is a logic/aliasing defect, not an out-of-bounds
+    // one, and it is still open. Keep the default table inside the verified
+    // range until it is fixed; --kv-layer-storage remains the explicit escape.
+    //
+    // [RK4V4-CONTROL 2026-09-18 vs PATCHSET/RK4V4-CONTROL/REPORT.md] THE NUMBERS ABOVE ARE PARTLY
+    // REFUTED; THE DECISION IS NOT. A controlled re-measurement could not reproduce the layer
+    // rule: "27" was never a needle count (it is the prefix of ONE 27-CHARACTER needle),
+    // {0..12}:rk4v4 gave 9/27 while {0..13}:rk4v4 -- one layer MORE -- gave 27/27, and rk4v4 on layer 15
+    // passed 27/27 in two different sets. So the failure is neither monotone in the count nor
+    // explained by the highest index, the "8,9,13,14 -> 6/8" membership is unconfirmed, and the
+    // per-arm row cited above (0-7:rk4v4 = 8/8) re-measured as 1/8 on the tree's own 8-needle probe.
+    // What DOES hold, and is why this cap stays: all-16-layers rk4v4 answers 0/27 twice, sigma=0,
+    // with `kv cache dtype rk4v4-group64` proving the tier ran, and it fails under --spec none too
+    // -- so it is a KV-fidelity failure, not a speculative-decoding artifact. Treat the 0-7 cap
+    // as a conservative floor pending a clean probe, NOT as a measured boundary.
     std::array<DType, 64> table{};
     table.fill(DType::NVFP4);
-    for (const int layer : {0, 1, 3, 4, 6, 7, 8, 9, 13, 14}) {
+    for (const int layer : {0, 1, 3, 4, 6, 7}) {
         table[static_cast<std::size_t>(layer)] = DType::E8Kv;
     }
 
@@ -171,7 +194,8 @@ std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_
 }
 
 std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
-                                                               std::uint32_t draft_window) {
+                                                               std::uint32_t draft_window,
+                                                               bool ladder_capture) {
     if (draft_window == 0 || capacity == 0) { return {}; }
     // Bound the final AR window E+2K at split-policy transitions until the grid reaches its cap.
     std::vector<std::uint32_t> ends;
@@ -181,9 +205,24 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
         add_shifted(visible_end, 2 * draft_window);
     }
-    // Target verify and MTP batch both have T=K+1 and W=E+K+1. Preserve one concrete INT8
-    // implementation per range at the T=4/5/6 launch boundaries.
-    if (draft_window == 3) {
+    // Target verify and MTP batch both have T=K+1 and W=E+K+1. The small-T target-verify split
+    // forks at the visible ends 128 / 160 / 512 / 1029 / 2054 / 8198 -- measured for T=4 at
+    // 1029, T=5 at 128/512/1029 and T=6 at 128/160/2054/8198 -- and each range must hold exactly
+    // one concrete INT8 implementation, because a range that straddles a fork would need a
+    // node's kernel function to change and cudaGraphExecUpdate refuses that.
+    //
+    // A fixed-k run therefore keeps the exact measured boundary set for its own T (a larger T is
+    // single-implementation and needs no addition). A LADDER capture applies the UNION of the
+    // measured forks to every width rung: an extra boundary only splits a range (it costs one
+    // more profile, not one more executable, because the topology class is per width), while a
+    // missing one is a hard install failure. The union is a conservative superset of the
+    // measured forks; if some width's fork is not at one of these visible ends the install still
+    // fails loudly and adding that end here is the fix -- a measurement, not a guess.
+    if (ladder_capture) {
+        for (const std::uint32_t visible_end : {128U, 160U, 512U, 1029U, 2054U, 8198U}) {
+            add_shifted(visible_end, draft_window + 1);
+        }
+    } else if (draft_window == 3) {
         add_shifted(1029, draft_window + 1);
     } else if (draft_window == 4) {
         for (const std::uint32_t visible_end : {128U, 512U, 1029U}) {
@@ -436,6 +475,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, kFp8TextPolicy, first, last);
     }
@@ -459,6 +499,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::query_size,
                                                         kFp8TextPolicy, first, last);
@@ -482,6 +523,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
     }
@@ -508,6 +550,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
@@ -536,6 +579,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
@@ -562,6 +606,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::value_dim,
                                                         kFp8TextPolicy, first, last);
@@ -591,6 +636,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     case WeightsProfile::Qwen38Nvfp4Dspark:
     case WeightsProfile::Qwen38Nvfp4DFlash2:
     case WeightsProfile::Qwen38Nvfp4DFlash2Bf16Head:
+    case WeightsProfile::Qwen38Nvfp4ModelOpt:
         const std::size_t nvfp4 =
             post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);
         const std::size_t fp8 = post_mixer_workspace_bytes(

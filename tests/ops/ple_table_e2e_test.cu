@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -67,11 +68,33 @@ bool read_rows_host(const ninfer::ops::ple::PleTable& table,
 
 int main(int argc, char** argv) {
     using namespace ninfer::ops::ple;
-    if (argc < 2) {
-        std::printf("usage: %s <sidecar_root>\n", argv[0]);
-        return 2;
+    // The 95 GiB SSD sidecar is an opt-in resource like every other real-artifact test:
+    // take the root from argv[1] or NINFER_PLE_SIDECAR_ROOT. THREE states, and ctest must
+    // not read them the same way -- the same split tests/targets/qwen3_6/test_frontend.cpp,
+    // tests/targets/qwen3_6_27b/test_load_plan.cpp and
+    // tests/targets/qwen3_6_35b_a3b/test_dflash_load_plan.cpp were fixed for:
+    //   * unset/empty                        -> never provisioned      -> SKIP (exit 77)
+    //   * set, and the dir is a real sidecar  -> run the end-to-end    -> exit 0 or 1
+    //   * set, but the dir holds no manifest  -> MISPECONFIGURATION    -> exit 1, never 77
+    // The third state used to print the same "skip:" line and return 77 as the first, and
+    // this target is registered through ninfer_add_op_test(), which attaches
+    // SKIP_RETURN_CODE 77 (tests/CMakeLists.txt). So NINFER_PLE_SIDECAR_ROOT=/typo was
+    // reported by ctest as "***Skipped" with "100% tests passed" -- an operator error
+    // printed as a pass. tests/CMakeLists.txt registers this test without arguments, so a
+    // missing argument is a skip, never a usage failure.
+    const char* const sidecar = argc >= 2 ? argv[1] : std::getenv("NINFER_PLE_SIDECAR_ROOT");
+    if (sidecar == nullptr || *sidecar == '\0') {
+        std::printf("skip: pass <sidecar_root> or set NINFER_PLE_SIDECAR_ROOT\n");
+        return 77;
     }
-    const std::filesystem::path root = argv[1];
+    const std::filesystem::path root = sidecar;
+    if (!std::filesystem::is_regular_file(root / "ple-manifest.json")) {
+        std::printf("FAIL: %s was set to \"%s\" but that directory holds no "
+                    "ple-manifest.json; refusing to report a skip for an explicitly "
+                    "configured sidecar root\n",
+                    argc >= 2 ? "argv[1]" : "NINFER_PLE_SIDECAR_ROOT", root.string().c_str());
+        return 1;
+    }
     int failures = 0;
 
     // Tiny budget on purpose: first gather must evict to fit the second.

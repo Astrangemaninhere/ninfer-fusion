@@ -23,12 +23,12 @@ struct Nvfp4AttentionInputSmallTOutput {
 
     __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
                                           float result) const {
-        constexpr std::int32_t kQueryRows  = 6144;
-        constexpr std::int32_t kKeyRows    = 1024;
-        constexpr std::int32_t kGateRows   = 6144;
-        constexpr std::int32_t kKeyBegin   = kQueryRows;
-        constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
-        constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
+        constexpr std::int32_t kQueryRows  = kNvfp4AttnQueryRows;
+        constexpr std::int32_t kKeyRows    = kNvfp4AttnKeyRows;
+        constexpr std::int32_t kGateRows   = kNvfp4AttnGateRows;
+        constexpr std::int32_t kKeyBegin   = kNvfp4AttnKeyBegin;
+        constexpr std::int32_t kGateBegin  = kNvfp4AttnGateBegin;
+        constexpr std::int32_t kValueBegin = kNvfp4AttnValueBegin;
         const __nv_bfloat16 result_bf16    = __float2bfloat16_rn(result);
 
         if (parent_row < kKeyBegin) {
@@ -93,13 +93,15 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 }
 
 constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+    make_launchers(std::make_index_sequence<kNvfp4SmallTCount>{});
 
 } // namespace
 
 void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+    nvfp4_small_t_launcher<kNvfp4LastSmallT>(kLaunchers, x.ne[1],
+                                           "nvfp4 attn input small_t")(
+        x, weight, q, gate, k, v, stream);
 }
 
 } // namespace ninfer::ops::detail

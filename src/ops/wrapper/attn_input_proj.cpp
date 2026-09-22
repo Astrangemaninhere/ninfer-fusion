@@ -1,5 +1,6 @@
 #include "ninfer/ops/attn_input_proj.h"
 
+#include "ops/generic/rowsplit_generic.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
@@ -225,6 +226,36 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
     const std::int32_t cols        = x.ne[1];
+    const std::int32_t q_rows      = q.ne[0];
+    const std::int32_t kv_rows     = k.ne[0];
+
+    // The registered Q4/Q5 attention-input problem is a single model's geometry. Any other
+    // geometry -- a different hidden width, a different q/kv split -- has no registry entry, and
+    // the honest answer is to run the same computation the registered kernel's epilogue performs:
+    // split each parent weight at the declared boundary and project each part. The generic
+    // decoder is shape-agnostic, so this route covers every well-formed split.
+    const bool other_geometry = !(q_rows == kQRows && kv_rows == kKvRows && x.ne[0] == kHidden);
+    if (other_geometry && cols > 0 && q_rows > 0 && kv_rows > 0 && gate.ne[0] == q_rows &&
+        v.ne[0] == kv_rows && detail::generic_fallback_enabled() &&
+        query_key_weight.qtype == QType::Q4G64_F16S &&
+        gate_value_weight.qtype == QType::Q5G64_F16S &&
+        detail::generic_rowsplit_weight_ok(query_key_weight) &&
+        detail::generic_rowsplit_weight_ok(gate_value_weight) &&
+        query_key_weight.n == q_rows + kv_rows && gate_value_weight.n == q_rows + kv_rows &&
+        query_key_weight.k == x.ne[0] && gate_value_weight.k == x.ne[0]) {
+        const Weight q_parent  = detail::generic_rowsplit_row_view(query_key_weight, 0, q_rows);
+        const Weight k_parent  = detail::generic_rowsplit_row_view(query_key_weight, q_rows,
+                                                                   kv_rows);
+        const Weight g_parent  = detail::generic_rowsplit_row_view(gate_value_weight, 0, q_rows);
+        const Weight v_parent  = detail::generic_rowsplit_row_view(gate_value_weight, q_rows,
+                                                                   kv_rows);
+        detail::generic_rowsplit_linear_dispatch(x, q_parent, q, stream);
+        detail::generic_rowsplit_linear_dispatch(x, k_parent, k, stream);
+        detail::generic_rowsplit_linear_dispatch(x, g_parent, gate, stream);
+        detail::generic_rowsplit_linear_dispatch(x, v_parent, v, stream);
+        return;
+    }
+
     require_matrix(x, kHidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
     require_matrix(gate, kQRows, cols, "gate");

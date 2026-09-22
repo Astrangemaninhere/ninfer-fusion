@@ -615,34 +615,49 @@ int increment_counts_contract() {
 } // namespace
 
 int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    int failures            = 0;
+    // ops::sampling_workspace_capacity_bytes is pure host arithmetic plus std::invalid_argument:
+    // the route-boundary and lane-interval contracts are settled BEFORE the device gate so that a
+    // broken contract cannot be reported as a skip. The *_contract() runners below all reach
+    // run_homogeneous_batch() -> run_batch(), which uses to_device / GuardedDeviceBuffer /
+    // ops::sample / cuda_synchronize, so they stay after the gate.
+    int host_failures       = 0;
     const std::size_t at_16 = ops::sampling_workspace_capacity_bytes(257, 16, 16);
     if (ops::sampling_workspace_capacity_bytes(256, 1, 16) != 0 || at_16 == 0 ||
         ops::sampling_workspace_capacity_bytes(257, 17, 17) != 0 ||
         ops::sampling_workspace_capacity_bytes(257, 1, 17) != at_16) {
         std::cerr << "sampling workspace route boundary contract failed\n";
-        ++failures;
+        ++host_failures;
     }
     try {
         (void)ops::sampling_workspace_capacity_bytes(257, 0, 16);
         std::cerr << "sampling workspace accepted an invalid lane interval\n";
-        ++failures;
+        ++host_failures;
     } catch (const std::invalid_argument&) {}
-    failures += greedy_contract();
-    failures += deterministic_stochastic_contract();
-    failures += heterogeneous_batch_contract();
-    failures += filtered_distribution_contract();
-    failures += capped_distribution_contract();
-    failures += real_shape_distribution_contract();
-    failures += rng_key_contract();
-    failures += workspace_route_boundary_contract();
-    failures += increment_counts_contract();
 
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
+    if (cuda_unavailable()) {
+        if (host_failures != 0) {
+            std::cout << "FAIL sample public contract (host_term=" << host_failures
+                      << " device_term=not-run)\n";
+            return 1;
+        }
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+
+    // The device half is NOT short-circuited by a red host half.
+    int device_failures = 0;
+    device_failures += greedy_contract();
+    device_failures += deterministic_stochastic_contract();
+    device_failures += heterogeneous_batch_contract();
+    device_failures += filtered_distribution_contract();
+    device_failures += capped_distribution_contract();
+    device_failures += real_shape_distribution_contract();
+    device_failures += rng_key_contract();
+    device_failures += workspace_route_boundary_contract();
+    device_failures += increment_counts_contract();
+
+    const int failures = host_failures + device_failures;
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract"
+              << " host_term=" << host_failures << " device_term=" << device_failures << '\n';
     return failures == 0 ? 0 : 1;
 }

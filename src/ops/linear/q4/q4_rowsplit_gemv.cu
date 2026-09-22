@@ -39,4 +39,12 @@ void launch_q4_gemv_r1_w8_direct(const Tensor& x, const Weight& w, Tensor& out,
     launch_gemv<Q4GemvR1W8DirectSchedule>(x, w, out, stream);
 }
 
+// The k-agnostic sibling. Anything whose k is not 5120 must come here: the static schedule walks
+// the codes and scales at 80 groups per row, which is a 2560 B / 160 B row stride and does not
+// match a payload laid out at k/64 groups per row.
+void launch_q4_gemv_r1_w8_runtime(const Tensor& x, const Weight& w, Tensor& out,
+                                  cudaStream_t stream) {
+    launch_gemv<Q4GemvR1W8RuntimeSchedule>(x, w, out, stream);
+}
+
 } // namespace ninfer::ops::detail

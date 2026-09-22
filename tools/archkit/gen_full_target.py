@@ -20,6 +20,7 @@ from pathlib import Path
 
 KIND_FULL = 0
 KIND_SWA = 1
+KIND_GDN = 2
 
 
 def cpp_float(v):
@@ -30,27 +31,143 @@ def cpp_int(v):
     return str(int(v))
 
 
+def rotary_dim_of(spec: dict, knobs: dict, head_dim: int) -> int:
+    """rotary_dim is a declared fraction of head_dim, not always head_dim itself.
+
+    `attention.partial_rotary_factor` is declared by shipped specs
+    (specs/qwen4_exp_spec.json:72 -> 0.25 of head_dim 256,
+    specs/gemma4-31b_spec.json:86) and was consumed by nothing, so the emitted
+    TextConfig claimed a full-width rope.  Nothing here invents a number: a factor
+    is either declared or the width stays head_dim.
+    """
+    def scaled(factor, where):
+        f = float(factor)
+        if f == 1.0:
+            return head_dim
+        dim = f * head_dim
+        if dim != int(dim):
+            raise ValueError(
+                '%s: partial_rotary_factor %s * head_dim %d is not integral (%s)'
+                % (spec.get('model_id'), f, head_dim, where))
+        return int(dim)
+
+    # Per-kind factors (rope_parameters.<kind>.partial_rotary_factor).  The engine
+    # has exactly one rotary_dim slot (TextConfig, see
+    # src/targets/muse_glimmer_30b/impl/config.h:34), so a per-kind declaration the
+    # single slot cannot represent must not be silently collapsed.  Two shapes of
+    # that: kinds that disagree, and a kind-keyed dict where only some kinds carry
+    # the key (Gemma-4's sliding_attention entry names the key's siblings but not
+    # the factor, specs/gemma4-31b_spec.json:84-93 - the absent one is the HF
+    # default 1.0, i.e. full-width rope on 50 of 60 layers).
+    per_kind = {}
+    kinds_named = 0
+    # Two places spell per-kind rope parameters out: a flat spec.rope mapping
+    # (what adapt.py stores as spec['rope'], adapt.py:55) and the shipped
+    # gemma4-31b spec, which keeps them under spec['attention']['rope_parameters']
+    # (specs/gemma4-31b_spec.json:82-95).  Read both, so neither memory of the
+    # schema silently drops the declaration.
+    for source in (spec.get('rope'), (spec.get('attention') or {}).get('rope_parameters')):
+        if not isinstance(source, dict):
+            continue
+        for kind, value in source.items():
+            if not isinstance(value, dict):
+                continue
+            kinds_named += 1
+            if value.get('partial_rotary_factor') is not None:
+                per_kind[str(kind)] = float(value['partial_rotary_factor'])
+    if len(set(per_kind.values())) > 1 or (kinds_named and len(per_kind) < kinds_named):
+        raise ValueError(
+            '%s: partial_rotary_factor is declared per layer kind (%s of %d named kind(s)) but '
+            'TextConfig has a single rotary_dim; a per-layer rotary table is needed before this '
+            'family can be emitted.' % (spec.get('model_id'), per_kind, kinds_named))
+
+    scalar = knobs.get('partial_rotary_factor')
+    if scalar is None:
+        scalar = (spec.get('attention') or {}).get('partial_rotary_factor')
+    if scalar is None and len(per_kind) == 1:
+        scalar = next(iter(per_kind.values()))
+    if scalar is not None:
+        return scaled(scalar, 'partial_rotary_factor')
+    return int(knobs.get('rotary_dim', head_dim))
+
+
 def gen_text_config(spec: dict, knobs: dict) -> str:
     g = spec["geometry"]
     kinds_raw = [t for t in (spec.get("layer_types") or spec.get("layer_kind_order") or [])]
     layers = int(g["layers"])
     assert len(kinds_raw) == layers, 'layer_types length %d != layers %d' % (len(kinds_raw), layers)
-    kinds = [KIND_SWA if "sliding" in t else KIND_FULL for t in kinds_raw]
+    # Three-way kind mapping.  The previous form was
+    # `KIND_SWA if "sliding" in t else KIND_FULL`, so every third kind
+    # (linear_attention / gdn / conv) was labelled a *full attention* layer: 24 of
+    # Ornith-1.5-9B's 33 layers carry "linear_attention"
+    # (tools/archkit/specs/ornith-1.5-9b-q4-k-m_spec.json:19-53).  The kind names
+    # below are the ones the other two emitters already use (gen_target.py:38-46
+    # norm_layer_kind, adapt.py:113-119 emit_config_header).
+    def kind_of(t):
+        t = (t or "").lower()
+        if "sliding" in t:
+            return KIND_SWA
+        if "full" in t:
+            return KIND_FULL
+        return KIND_GDN
+
+    kinds = [kind_of(t) for t in kinds_raw]
+    non_softmax = sorted({t for t, k in zip(kinds_raw, kinds) if k == KIND_GDN})
+    if non_softmax:
+        # This emitter's TextConfig hard-codes gdn_* = 0 and gdn_layers() == 0
+        # (see the emitted struct below), i.e. it only describes the pure-softmax
+        # family.  For Ornith the run used to abort further down on the Muse-only
+        # per-layer-theta assert ("layer_rope_theta length 0 != layers 33"), which
+        # names the wrong cause: the model has no per-layer theta table at all, and
+        # what actually blocks it is 24 linear layers.  Name the real blocker,
+        # first - the same idiom as the 'intermediate' guard further down.
+        raise ValueError(
+            "%s: layer_types carry non-softmax layers %s; this emitter describes only the "
+            "pure-softmax family (its TextConfig pins gdn_* = 0 and gdn_layers() == 0).  A "
+            "linear/conv/SSM layer needs the shared runtime's linear-attention path wired for "
+            "this variant first." % (spec.get("model_id"), non_softmax))
     n_full = sum(1 for k in kinds if k == KIND_FULL)
     n_swa = layers - n_full
 
-    theta_raw = knobs.get("layer_rope_theta") or []
-    assert len(theta_raw) == layers, 'layer_rope_theta length %d != layers %d' % (
-        len(theta_raw), layers)
-    # 引用推导语义一致性: full 层 == theta 0 (NoPE), swa 层 theta>0.
-    for i, (k, th) in enumerate(zip(kinds, theta_raw)):
-        if k == KIND_FULL:
-            assert th == 0.0, 'layer %d full but theta=%s (contradicts NoPE rule)' % (i, th)
-        else:
-            assert th > 0.0, 'layer %d swa but theta=%s' % (i, th)
+    declared_theta = [float(t) for t in (knobs.get("layer_rope_theta") or [])]
+    if declared_theta:
+        theta_raw = declared_theta
+        assert len(theta_raw) == layers, 'layer_rope_theta length %d != layers %d' % (
+            len(theta_raw), layers)
+        # NoPE is a *declared* per-layer property, not a universal rule: it holds
+        # for specs that spell layer_rope_theta out
+        # (specs/muse-glimmer-30b_spec.json:88-140 - 13 zero entries, exactly the
+        # full-attention layers).  Gemma-4 keeps rope on its full layers with a
+        # different theta and a 0.25 rotary fraction
+        # (specs/gemma4-31b_spec.json:84-93), so the rule is enforced only where
+        # the spec declares it.
+        for i, (k, th) in enumerate(zip(kinds, theta_raw)):
+            if k == KIND_FULL:
+                assert th == 0.0, 'layer %d full but theta=%s (contradicts NoPE rule)' % (i, th)
+            else:
+                assert th > 0.0, 'layer %d swa but theta=%s' % (i, th)
+    else:
+        # No per-layer table: every layer gets the model's declared theta, which is
+        # what a single-theta family means.  This derives from a declared value
+        # (never invents one) and keeps the per-layer accessor surface complete.
+        theta_raw = [float(knobs.get("rope_theta") or
+                           (spec.get("rope") or {}).get("rope_theta") or 1e7)] * layers
 
     hidden = int(g["hidden"])
-    intermediate = int(g.get("intermediate", 0))
+    # A spec whose geometry carries no `intermediate` is a MoE-only model: its FFN
+    # width is `moe.moe_intermediate_size`, which is a different quantity with
+    # different consumers.  Defaulting the key to 0 (or stringifying it) handed the
+    # engine a TextConfig that silently claims a zero-wide dense FFN -
+    # `static constexpr int intermediate = None;` in
+    # src/targets/qwen4_exp/impl/config.h is the same defect spelled by an emitter
+    # that rendered the missing key instead of naming it.  Name it.
+    if "intermediate" not in g:
+        raise ValueError(
+            "%s: geometry has no 'intermediate' (dense FFN width).  A MoE-only spec "
+            "must say so on purpose - emit -1 (no dense path, the MoE work package "
+            "supplies the width) or read moe.moe_intermediate_size; a missing key is "
+            "not a width." % spec.get("model_id"))
+    intermediate = int(g["intermediate"])
     vocab = int(g.get("vocab", 0))
     max_ctx = int(g.get("max_ctx", 0))
     qh = int(g["query_heads"])
@@ -60,7 +177,7 @@ def gen_text_config(spec: dict, knobs: dict) -> str:
     post_eps = float(knobs.get("post_norm_eps", rms_eps))
     rope_theta = float(knobs.get("rope_theta") or
                        (spec.get("rope") or {}).get("rope_theta") or 1e7)
-    rotary_dim = int(knobs.get("rotary_dim", hd))
+    rotary_dim = rotary_dim_of(spec, knobs, hd)
     window = int(knobs.get("sliding_window", 0))
     qk_scale = float(knobs.get("qk_scale_factor", 1.0))
     mult = float(knobs.get("output_multiplier", 1.0))
@@ -188,14 +305,17 @@ def gen_text_config(spec: dict, knobs: dict) -> str:
     A('    }')
     A('    return true;')
     A('}());')
-    A('// NoPE 语义门: full 层 theta==0, swa 层 theta>0 (参考代码推导).')
-    A('static_assert([] {')
-    A('    for (int l = 0; l < TextConfig::layers; ++l) {')
-    A('        const bool no_pe = TextConfig::rope_theta_at(l) == 0.0F;')
-    A('        if (no_pe != TextConfig::is_full_attention(l)) { return false; }')
-    A('    }')
-    A('    return true;')
-    A('}());')
+    if declared_theta:
+        A('// NoPE 语义门: full 层 theta==0, swa 层 theta>0 (参考代码推导).')
+        A('static_assert([] {')
+        A('    for (int l = 0; l < TextConfig::layers; ++l) {')
+        A('        const bool no_pe = TextConfig::rope_theta_at(l) == 0.0F;')
+        A('        if (no_pe != TextConfig::is_full_attention(l)) { return false; }')
+        A('    }')
+        A('    return true;')
+        A('}());')
+    else:
+        A('// NoPE 语义门不适用: 本 spec 未声明逐层 theta (全层同 theta, 由 rope_theta 展开).')
     A('')
     A('inline constexpr float kAttentionScale = %sF;' % cpp_float(qk_scale * (1.0 / (hd ** 0.5))))
     A('inline constexpr std::uint32_t kNativeContext = %s;' % cpp_int(max_ctx))

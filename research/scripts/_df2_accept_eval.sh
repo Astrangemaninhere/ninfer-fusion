@@ -14,16 +14,50 @@
 #   => build the beam-L DDTree; otherwise the tree is not worth its nodes.
 #
 # Usage (GPU window; training must be paused): bash _df2_accept_eval.sh [ckpt] [anchors]
+#
+# The checkpoint may be given as a path relative to $J ("data\dflash2_ckpts\x.pt"),
+# as an absolute WSL path under /mnt/..., or as a Windows path. Whatever it is, it
+# has to survive the trip to a Windows torch process -- so it is normalised ONCE,
+# below, and the guard checks exactly the string that gets passed on.
 set -u
 J=/mnt/c/Users/User/Documents/ziqinzhang
 LOG="$J/data/df2_accept_eval.log"
 OUT="$J/_collab/M_accept_eval.md"
 CKPT=${1:-data\dflash2_ckpts\step_006000.pt}
 ANCHORS=${2:-1200}
-WIN_CKPT="${CKPT//\//\\}"
+
+# The ONE place the path is converted. (The old version converted twice in
+# opposite directions: it checked "${WIN_CKPT//\\//}" -- the WSL form of the
+# *Windows* string -- and then handed the Windows string to the .bat. An absolute
+# WSL path therefore passed the check and torch died on '\mnt\c\...'.)
+to_windows_path() {
+  case "$1" in
+    /mnt/[A-Za-z]/*) wslpath -w "$1" ;;   # a real Windows path, drive letter and all
+    /*) return 1 ;;                       # a WSL-only absolute path has no Windows form
+    *) printf '%s' "${1//\//\\}" ;;       # relative stays relative, in backslashes
+  esac
+}
 
 cd "$J" || exit 2
-[ -f "${WIN_CKPT//\\//}" ] || { echo "FATAL: checkpoint missing: $CKPT"; exit 2; }
+if ! WIN_CKPT="$(to_windows_path "$CKPT")"; then
+  echo "FATAL: checkpoint '$CKPT' is a WSL-only absolute path, so it has no Windows form." >&2
+  echo "       eval_ddtree.py runs under the WINDOWS torch (via _df2_accept_eval.bat) and" >&2
+  echo "       could never open it. Pass a path under /mnt/<drive>/... (it is translated)," >&2
+  echo "       or a path relative to $J (e.g. data\\dflash2_ckpts\\step_006000.pt)." >&2
+  exit 2
+fi
+
+# Validate the exact string we are about to hand to cmd.exe: wslpath -u is the
+# inverse of what produced it ('C:\a\b' -> /mnt/c/a/b, 'a\b' -> a/b).
+CKPT_CHECK="$(wslpath -u "$WIN_CKPT" 2>/dev/null || printf '%s' "${WIN_CKPT//\\//}")"
+if [ ! -f "$CKPT_CHECK" ]; then
+  echo "FATAL: checkpoint not found." >&2
+  echo "       as given          : $CKPT" >&2
+  echo "       passed on to torch: $WIN_CKPT" >&2
+  echo "       checked at        : $CKPT_CHECK   (cwd $PWD)" >&2
+  exit 2
+fi
+echo "checkpoint ok: $CKPT -> torch sees $WIN_CKPT (present at $CKPT_CHECK)"
 if pgrep -af 'train_dflash2' | grep -v $$ > /dev/null; then
   echo "ABORT: training is alive — the GPU must be free (kill it deliberately first)"; exit 3
 fi

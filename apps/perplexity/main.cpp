@@ -3,6 +3,8 @@
 
 #include "ninfer/engine.h"
 #include "product/kv_options.h"
+#include "product/kv_summary_format.h"
+#include "runtime/engine/bandwidth_governor.h"
 
 #include <nlohmann/json.hpp>
 
@@ -44,14 +46,38 @@ struct Options {
     std::uint32_t context     = 4096;
     std::uint32_t stride      = 2048;
     int device                = 0;
+    // Unset means "whatever the engine defaults to" (ninfer/types.h:214), so the
+    // report below can only be faithful if it reads the value back from the Engine
+    // instead of repeating a literal. This knob exists so that the reported number
+    // is demonstrably a function of the run and not of the reporting code.
+    std::optional<std::uint32_t> prefill_chunk;
+    // --prefill-chunk-mode. Only `manual` is accepted here, and that is a FACT about this path, not
+    // a preference: a CausalScoreCore owns no Scheduler and no governor (engine.cpp
+    // normalize_engine_options), so the score tile cannot adapt. `dynamic` is refused by the engine
+    // by name rather than accepted and ignored -- and the field still exists so that the flag's
+    // absence here is a decision recorded in the code instead of an omission.
+    std::optional<ninfer::PrefillChunkMode> prefill_chunk_mode;
     ninfer::KvCacheStorage kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
     std::array<ninfer::KvCacheStorage, ninfer::kKvLayerStorageSlots> kv_layer_storage{};
+    // Which slots --kv-layer-storage actually wrote; see
+    // EngineOptions::kv_layer_storage_set and product/kv_options.h KvLayerStorageSpec.
+    std::array<bool, ninfer::kKvLayerStorageSlots> kv_layer_storage_set{};
     bool kv_layer_storage_explicit = false;
     // --kv-dtype is an explicit global tier: without this bit, layouts_impl.h
     // always takes either the pinned per-layer table or the target's registered
     // default table, so --kv-dtype is a dead label here (measured: a bf16 run and
     // an fp8 run came out bit-identical). Same field as include/ninfer/types.h.
     bool kv_cache_explicit = false;
+    // --kv-residual-layers SPEC: the per-layer NVFP4 second-stage residual planes
+    // (include/ninfer/types.h EngineOptions::kv_residual_layers). This is the ONLY handle
+    // in the tree that names a real plane SUBSET -- an NVFP4 layer goes from 4 planes to 8
+    // -- and until this field existed the flag was reachable from ninfer-serve alone, so
+    // the independent-plane layer could not be scanned from a scoring run at all. The
+    // table is parsed here (not carried raw) because this front end has no second reader
+    // of the spelling; the grammar is the shared product parser's, so all three front
+    // ends accept one grammar and emit one set of errors.
+    std::array<bool, ninfer::kKvLayerStorageSlots> kv_residual_layers{};
+    bool kv_residual_layers_explicit = false;
     bool quick                = false;
 };
 
@@ -59,8 +85,10 @@ struct Options {
     throw std::invalid_argument(std::string(message) +
                                 "\nusage: ninfer-perplexity <model.ninfer> "
                                 "(--corpus <manifest.json> [--quick] | --text <utf8-file>) "
-                                "[--context N] [--stride N] [--device N] "
-                                "[--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--output <directory>]");
+                                "[--context N] [--stride N] [--device N] [--prefill-chunk N] "
+                                "[--prefill-chunk-mode manual] "
+                                "[--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] "
+                                "[--kv-residual-layers SPEC] [--output <directory>]");
 }
 
 template <class Integer>
@@ -77,8 +105,11 @@ Options parse_options(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "usage: ninfer-perplexity <model.ninfer> "
                      "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-                     "       [--context N] [--stride N] [--device N]\n"
-                     "       [--kv-dtype bf16|int8|fp8] [--output <directory>]\n";
+                     "       [--context N] [--stride N] [--device N] [--prefill-chunk N]\n"
+                     "       [--prefill-chunk-mode manual]\n"
+                     "       [--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC]\n"
+                     "       [--kv-residual-layers SPEC]\n"
+                     "       [--output <directory>]\n";
         std::exit(0);
     }
     if (argc < 2 || std::string_view(argv[1]).starts_with("--")) {
@@ -104,6 +135,16 @@ Options parse_options(int argc, char** argv) {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
+        } else if (option == "--prefill-chunk") {
+            out.prefill_chunk =
+                parse_integer<std::uint32_t>(value("--prefill-chunk"), "prefill chunk");
+        } else if (option == "--prefill-chunk-mode") {
+            // The same two spellings the other two front ends take, from the same place. `dynamic`
+            // is accepted HERE and refused by the engine, so the reason it cannot run on this path
+            // is stated once, next to the code that knows why, instead of being re-argued by every
+            // front end that would otherwise have to re-derive it.
+            out.prefill_chunk_mode =
+                ninfer::runtime::BandwidthGovernor::parse_mode(value("--prefill-chunk-mode"));
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             out.kv_cache_explicit         = true;
@@ -119,9 +160,23 @@ Options parse_options(int argc, char** argv) {
                 usage_error("--kv-dtype must be bf16, int8, fp8, or nvfp4");
             }
         } else if (option == "--kv-layer-storage") {
-            const auto table = ninfer::product::parse_kv_layer_storage(value("--kv-layer-storage"));
-            out.kv_layer_storage = table;
+            // Table AND mask (see apps/cli/main.cpp): a spec that spells `bf16` on a
+            // layer means BF16 on that layer, not "inherit --kv-dtype".
+            const auto parsed =
+                ninfer::product::parse_kv_layer_storage_spec(value("--kv-layer-storage"));
+            out.kv_layer_storage          = parsed.table;
+            out.kv_layer_storage_set      = parsed.set;
             out.kv_layer_storage_explicit = true;
+        } else if (option == "--kv-residual-layers") {
+            // The per-layer NVFP4 residual planes (4 -> 8 planes on a layer). Table plus an
+            // explicit bit, because the planner reads the table ONLY when the bit is set
+            // (layouts_impl.h make_sequence_planner_impl): an all-false table handed over
+            // unconditionally would read as "explicitly no residuals" on every other run.
+            // Shared grammar and shared error text with the other two front ends.
+            const auto parsed = ninfer::product::parse_kv_residual_layers_spec(
+                value("--kv-residual-layers"));
+            out.kv_residual_layers          = parsed.table;
+            out.kv_residual_layers_explicit = true;
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
         } else {
@@ -138,6 +193,16 @@ Options parse_options(int argc, char** argv) {
     return out;
 }
 
+// Every KvCacheStorage enumerator is named here, and the throw sits AFTER the
+// switch. That is deliberate: this function feeds the report's "kv_dtype" field
+// AND the output directory name, so a tier that reaches it unnamed does not lose
+// a label, it loses the whole run. It used to name 4 of 8 and throw for nvfp4,
+// which is one of the four spellings --kv-dtype ITSELF accepts (parse_options,
+// below): `--kv-dtype nvfp4` parsed, loaded the artifact, scored the corpus and
+// then died at the first kv_name call (prepare_output_directory). A name table
+// shorter than its enum is a runtime failure with a compile-time warning next to
+// it, and the warning is the only thing that was ever going to catch it, so it
+// must be silent. Names follow core/device_capabilities.h kv_storage_name.
 std::string kv_name(ninfer::KvCacheStorage value) {
     switch (value) {
     case ninfer::KvCacheStorage::BFloat16:
@@ -146,6 +211,17 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "int8-g64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-r256";
+    case ninfer::KvCacheStorage::Nvfp4Group16:
+        return "nvfp4-g16";
+    case ninfer::KvCacheStorage::Fp8Group16:
+        return "fp8-g16";
+    case ninfer::KvCacheStorage::Iso3Group16:
+        return "iso4e-g16";
+    case ninfer::KvCacheStorage::E8Group64:
+        return "rk4v4-g64";
+    case ninfer::KvCacheStorage::Dropped:
+        // L26 instrument: a layer with no KV planes (see KvCacheStorage::Dropped).
+        return "dropped";
     }
     throw std::logic_error("unknown KV dtype");
 }
@@ -218,7 +294,14 @@ int run(const Options& options) {
     engine_options.kv_cache               = options.kv;
     engine_options.kv_cache_explicit      = options.kv_cache_explicit;
     engine_options.kv_layer_storage      = options.kv_layer_storage;
+    engine_options.kv_layer_storage_set  = options.kv_layer_storage_set;
     engine_options.kv_layer_storage_explicit = options.kv_layer_storage_explicit;
+    engine_options.kv_residual_layers        = options.kv_residual_layers;
+    engine_options.kv_residual_explicit      = options.kv_residual_layers_explicit;
+    if (options.prefill_chunk.has_value()) { engine_options.prefill_chunk = *options.prefill_chunk; }
+    // Unset stays unset: the engine resolves the mode (and refuses `dynamic` on this path, which
+    // has no governor). Copying a value here would only move the refusal to this file.
+    engine_options.prefill_chunk_mode = options.prefill_chunk_mode;
     engine_options.load_progress.callback = [&](std::string_view phase, std::uint64_t done,
                                                 std::uint64_t total) {
         const std::uint64_t bucket =
@@ -235,6 +318,42 @@ int run(const Options& options) {
     const ninfer::LoadSummary load = engine.load_summary();
     std::cerr << "[ppl] artifact ready in " << std::fixed << std::setprecision(2)
               << load.load_seconds << "s\n";
+
+    // The `summary` block, printed BEFORE any scoring so that a run which dies mid-corpus
+    // still leaves the instrument reading behind. Until this existed the scoring front end
+    // emitted NO byte column at all (`grep -c summary` on a ppl stderr was 0 while the
+    // generation front end's was 40), so any "perplexity x payload" table had to fall back
+    // to the device-total peak -- +/-5 MiB of noise, against a quantity whose interesting
+    // steps are 34 MiB. Same vocabulary, same writer and same column widths as
+    // apps/cli/main.cpp, through product/kv_summary_format.h, so ONE regex reads either app.
+    //
+    // Every value here is the ENGINE's own reflection of the plan it built (MemorySummary),
+    // not a re-derivation from argv: --kv-dtype / --kv-layer-storage / --kv-bit-budget /
+    // --kv-bits all resolve into one per-layer table inside the planner, and only the engine
+    // knows which spelling won. `kv drop layers` is read off that table (a discarded layer
+    // is reflected as KvCacheStorage::Dropped) and never off NINFER_KV_DROP_LAYERS, whose
+    // parser has already been caught reading "0-15" as layer 0 and "abc" as layer 0.
+    const ninfer::MemorySummary memory = engine.memory_summary();
+    ninfer::product::print_summary_metric(std::cerr, "max context",
+                                         std::to_string(memory.max_context));
+    ninfer::product::print_summary_metric(std::cerr, "KV capacity",
+                                         std::to_string(memory.kv_capacity));
+    ninfer::product::print_summary_metric(
+        std::cerr, "full attention layers",
+        std::to_string(memory.kv_full_attention_layers));
+    ninfer::product::print_summary_metric(
+        std::cerr, "kv cache dtype", ninfer::product::format_kv_layer_store(memory));
+    ninfer::product::print_summary_metric(
+        std::cerr, "kv cache payload",
+        ninfer::product::format_kv_bytes(memory.kv_payload_bytes));
+    ninfer::product::print_summary_metric(
+        std::cerr, "kv drop layers", ninfer::product::format_kv_dropped_layers(memory));
+    ninfer::product::print_summary_metric(
+        std::cerr, "kv residual layers",
+        options.kv_residual_layers_explicit
+            ? ninfer::product::format_layer_set(options.kv_residual_layers,
+                                               memory.kv_full_attention_layers)
+            : std::string("-"));
 
     const Clock::time_point preflight_started = Clock::now();
     std::cerr << "[ppl] corpus preflight started\n";
@@ -358,6 +477,26 @@ int run(const Options& options) {
         domain_reports.push_back(std::move(item));
     }
 
+    // The provenance block used to carry two literals, 1024 for both fields, while the engine
+    // scored with 3072 (ninfer/types.h:214 through engine.cpp normalize_engine_options), so every
+    // report.json on disk named a prefill unit that no run ever used. Reading the number back from
+    // the Engine fixed the literal half; it was still half a fix, because the memory ladder in
+    // targets/registry.cpp ("ninfer: reduced prefill chunk to N" on stderr) lowers the chunk that
+    // the plan is finalized at, and that decision used to be invisible from here -- so a report
+    // written after a reduction still named the requested chunk. The engine now adopts the settled
+    // value into its own options (Engine::Impl's constructor) before any caller can read them, so
+    // what is read here is the value the plan and the prefill loop were built at.
+    // min(prefill_chunk, max_context) is the same quantity layouts_impl.h:1381 derives the plan's
+    // chunk from.
+    //
+    // The MODE this number was reached in is manual by construction on this path
+    // (engine.options().prefill_chunk_mode, which normalize_engine_options pins to Manual because a
+    // CausalScoreCore has no Scheduler and no governor -- and which refuses `dynamic` by name). So
+    // the number above is the score tile itself and not a ceiling some governor may still move: on
+    // this path "manual" is the truthful description of the run, not an option the caller picked.
+    const std::uint32_t effective_score_tile =
+        std::min(engine.options().prefill_chunk, engine.options().max_context);
+
     json report{
         {"schema_version", 1},
         {"metric",
@@ -377,8 +516,27 @@ int run(const Options& options) {
           {"device", options.device},
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
-          {"prefill_chunk_tokens", 1024},
-          {"score_tile_tokens", 1024},
+          // The KV store the run really used, from the engine's own plan. `kv_dtype` below
+          // records the FLAG; these record the TABLE. Without them a report.json on disk
+          // named a flag and left the deployed per-layer table, the discarded layer set, the
+          // residual set and the payload reachable only by scraping stderr with a regex --
+          // and a discarded layer used to be indistinguishable from "the flag defaulted".
+          {"kv_layer_store", ninfer::product::format_kv_layer_store(memory)},
+          {"kv_payload_bytes", memory.kv_payload_bytes},
+          {"kv_full_attention_layers", memory.kv_full_attention_layers},
+          {"kv_capacity_tokens", memory.kv_capacity},
+          {"kv_drop_layers", ninfer::product::format_kv_dropped_layers(memory)},
+          {"kv_drop_layers_requested_env", std::getenv("NINFER_KV_DROP_LAYERS") == nullptr
+                                               ? ""
+                                               : std::getenv("NINFER_KV_DROP_LAYERS")},
+          {"kv_residual_layers",
+           options.kv_residual_layers_explicit
+               ? ninfer::product::format_layer_set(options.kv_residual_layers,
+                                                   memory.kv_full_attention_layers)
+               : std::string("-")},
+          {"kv_residual_explicit", options.kv_residual_layers_explicit},
+          {"prefill_chunk_tokens", effective_score_tile},
+          {"score_tile_tokens", effective_score_tile},
           {"kv_dtype", kv_name(options.kv)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},

@@ -69,7 +69,9 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
 
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
-                                     float* __restrict__ scores) {
+                                     float* __restrict__ scores,
+                                     const char* __restrict__ shared_down_codes,
+                                     unsigned long long shared_down_bytes) {
     __shared__ float partial[kD1Warps];
     const int row   = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
@@ -81,6 +83,15 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
         float value = lane < kD1Warps ? partial[lane] : 0.0f;
         value       = warp_reduce_sum<kD1Warps>(value);
         if (lane == 0) { scores[row] = value; }
+    }
+    if (shared_down_codes != nullptr) {
+        // Warm L2 for the shared-expert down codes that D4's shared warp
+        // (the block's long pole) will stream at t~14.3us. Pure cache hint.
+        const unsigned long long offset =
+            (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 128ull;
+        if (offset < shared_down_bytes) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(shared_down_codes + offset));
+        }
     }
 }
 
@@ -153,7 +164,7 @@ struct W8Codec {
     }
 };
 
-template <class Codec, int K>
+template <class Codec, int K, int QuadsInFlight = 2>
 __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const std::uint8_t* high,
                                              const std::uint8_t* scales, int row0, int row1,
                                              const __nv_bfloat16* x, int k_begin, int k_end,
@@ -168,32 +179,64 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
         // Four adjacent Q4 groups form one 128-byte warp transaction. Each lane owns eight
         // consecutive K values, so one mantissa decode feeds eight FP32 FMAs instead of issuing
         // four scalar code-pair/decode iterations.
+        //
+        // QuadsInFlight quads are in flight at a time. All of their code words and scales are
+        // issued before any is decoded, so the decode and the FMA chain of one quad cover the
+        // memory latency of the next. One quad in flight leaves the load unit idle for the whole
+        // decode, which pays off where the path is latency-bound rather than bandwidth-bound: at
+        // the operator bench's trace-like point it demands 55% of the measured DRAM read ceiling.
+        //
+        // The two callers want different depths and get them. The T >= 2 path-tiled kernel takes
+        // the default 2; sparse_moe_d3_nine_warp_kernel, the T = 1 decode path, keeps 1, because
+        // at one token per launch it has a fifth of the occupancy and pairing costs it 6% in the
+        // round and 10% on the operator bench.
+        //
+        // The groups are still visited in ascending order at either depth, so the order of
+        // additions into acc0 and acc1 is unchanged and the output is bit-identical.
+        constexpr int kQuadsInFlight = QuadsInFlight;
+        // What the pairing needs is that the span this loop walks, (k_end - k_begin) /
+        // Codec::kGroupK, is a multiple of 4 * kQuadsInFlight. That is a property of the
+        // arguments and cannot be asserted here; every caller passes k_begin = 0 and
+        // k_end = K, which reduces it to the compile-time condition below.
+        static_assert(kGroups % (4 * kQuadsInFlight) == 0);
         const int lane_group    = lane >> 3;
         const int lane_in_group = lane & 7;
-        for (int group_base = first_group; group_base < last_group; group_base += 4) {
-            const int group           = group_base + lane_group;
-            const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
-            const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
-            const std::uint32_t packed0 =
-                *reinterpret_cast<const std::uint32_t*>(codes + index0 * 32 + lane_in_group * 4);
-            const std::uint32_t packed1 =
-                *reinterpret_cast<const std::uint32_t*>(codes + index1 * 32 + lane_in_group * 4);
-            const auto scale0 = *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2);
-            const auto scale1 = *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2);
-            float weights0[8];
-            float weights1[8];
-            Q4SimtDecodeAtom::decode_eight(packed0, scale0, weights0);
-            Q4SimtDecodeAtom::decode_eight(packed1, scale1, weights1);
-            const uint4 input     = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
-            const float2 x0       = bf16x2_bits_to_float2(input.x);
-            const float2 x1       = bf16x2_bits_to_float2(input.y);
-            const float2 x2       = bf16x2_bits_to_float2(input.z);
-            const float2 x3       = bf16x2_bits_to_float2(input.w);
-            const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+        for (int group_base = first_group; group_base < last_group;
+             group_base += 4 * kQuadsInFlight) {
+            std::uint32_t packed0[kQuadsInFlight];
+            std::uint32_t packed1[kQuadsInFlight];
+            std::uint16_t scale0[kQuadsInFlight];
+            std::uint16_t scale1[kQuadsInFlight];
 #pragma unroll
-            for (int item = 0; item < 8; ++item) {
-                acc0 = fmaf(weights0[item], values[item], acc0);
-                acc1 = fmaf(weights1[item], values[item], acc1);
+            for (int quad = 0; quad < kQuadsInFlight; ++quad) {
+                const int group           = group_base + quad * 4 + lane_group;
+                const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
+                const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
+                packed0[quad] = *reinterpret_cast<const std::uint32_t*>(codes + index0 * 32 +
+                                                                        lane_in_group * 4);
+                packed1[quad] = *reinterpret_cast<const std::uint32_t*>(codes + index1 * 32 +
+                                                                        lane_in_group * 4);
+                scale0[quad]  = *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2);
+                scale1[quad]  = *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2);
+            }
+#pragma unroll
+            for (int quad = 0; quad < kQuadsInFlight; ++quad) {
+                const int group = group_base + quad * 4 + lane_group;
+                float weights0[8];
+                float weights1[8];
+                Q4SimtDecodeAtom::decode_eight(packed0[quad], scale0[quad], weights0);
+                Q4SimtDecodeAtom::decode_eight(packed1[quad], scale1[quad], weights1);
+                const uint4 input = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
+                const float2 x0   = bf16x2_bits_to_float2(input.x);
+                const float2 x1   = bf16x2_bits_to_float2(input.y);
+                const float2 x2   = bf16x2_bits_to_float2(input.z);
+                const float2 x3   = bf16x2_bits_to_float2(input.w);
+                const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+                for (int item = 0; item < 8; ++item) {
+                    acc0 = fmaf(weights0[item], values[item], acc0);
+                    acc1 = fmaf(weights1[item], values[item], acc1);
+                }
             }
         }
     } else if constexpr (Codec::kD3SingleValuePerLane) {
@@ -246,9 +289,9 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
         pdl::wait_for_dependencies();
         const int expert   = ids[warp];
         const int row_base = expert * 1024;
-        dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales, row_base + j,
-                                           row_base + kIntermediate + j, x_shared, 0, kHidden, gate,
-                                           up);
+        dot_two_rows<RoutedCodec, kHidden, 1>(routed_codes, routed_high, routed_scales,
+                                              row_base + j, row_base + kIntermediate + j, x_shared,
+                                              0, kHidden, gate, up);
     } else {
         dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
                                        x_shared, 0, kHidden, gate, up);
@@ -480,12 +523,14 @@ __global__ void sparse_moe_d4_token_kernel(
     }
 }
 
-void launch_d1(const Tensor& x, const Weight& router_shared_gate,
+void launch_d1(const Tensor& x, const SparseMoeWeights& weights,
                const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
     sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const __nv_bfloat16*>(router_shared_gate.qdata),
-        static_cast<float*>(workspace.scratch.data));
+        static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
+        static_cast<float*>(workspace.scratch.data),
+        static_cast<const char*>(weights.shared_down.qdata),
+        static_cast<unsigned long long>(kHidden) * kIntermediate);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -719,7 +764,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
 
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
-    launch_d1(x, weights.router_shared_gate, workspace, stream);
+    launch_d1(x, weights, workspace, stream);
     launch_d2_d3(x, weights, workspace, stream);
     launch_d4_dependent(weights, destination, workspace, stream);
 }

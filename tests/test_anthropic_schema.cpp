@@ -35,6 +35,10 @@ Json base_request() {
 RequestLimits limits() {
     RequestLimits value;
     value.default_max_tokens = 8192;
+    // mtplogfix: NAME the ceiling -- the same number the front ends carry from
+    // ServeOptions::max_context -- because validate_output_budget() now refuses a budget
+    // presented against an unnamed (0) ceiling by name instead of passing it.
+    value.max_context        = 8192;
     return value;
 }
 

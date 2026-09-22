@@ -20,6 +20,7 @@
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
+#include "ninfer/ops/mtp_proposal_topk.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
@@ -59,12 +60,27 @@ inline bool head_debug_enabled() {
     return enabled;
 }
 
-inline void debug_head_probe(cudaStream_t stream, const Tensor& tensor, const char* label) {
+// ⚠️ PATCH A2 (diagnostic, scratch/PATCHSET/A2_headdbg_columns.diff).
+// `column` selects WHICH column of a [.., columns] tensor is sampled. It MUST be
+// applied with the tensor's own byte stride `nb[1]`, never as `column * ne[0] * 2`:
+// `x` is an arena sub-view, so the byte distance between two columns is a property
+// of the view and only `nb[1]` carries it.
+//
+// WHY THIS CHANGES BEHAVIOUR: the pre-patch probe read the FIRST 8 BF16 values
+// contiguously, which is COLUMN 0 ONLY of a [hidden, columns] tensor. The measured
+// argmax flip is in column 1 and later columns (round 0 column 1: 19670->436;
+// round 2 column 3: 387->279), so the old probe was BLIND to the very phenomenon
+// it was being used to explain.
+inline void debug_head_probe(cudaStream_t stream, const Tensor& tensor, const char* label,
+                             std::int32_t column = 0) {
     if (!head_debug_enabled() || tensor.data == nullptr || tensor.dtype != DType::BF16) { return; }
+    if (column < 0 || tensor.ne[1] <= column || tensor.nb[1] <= 0) { return; }
     const std::size_t count = std::min<std::size_t>(8, tensor.bytes() / sizeof(__nv_bfloat16));
     if (count == 0) { return; }
+    const char* source = static_cast<const char*>(tensor.data) +
+                         static_cast<std::int64_t>(column) * tensor.nb[1];
     __nv_bfloat16 host[8] = {};
-    if (cudaMemcpyAsync(host, tensor.data, count * sizeof(__nv_bfloat16),
+    if (cudaMemcpyAsync(host, source, count * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
         (void)cudaGetLastError();
         return;
@@ -73,7 +89,8 @@ inline void debug_head_probe(cudaStream_t stream, const Tensor& tensor, const ch
         (void)cudaGetLastError();
         return;
     }
-    std::fprintf(stderr, "[headdbg] %-14s", label);
+    // Widened from %-14s: the label now carries layer/stage/phase/width/batch/column/pos.
+    std::fprintf(stderr, "[headdbg] %-34s", label);
     bool any_nan = false;
     for (std::size_t i = 0; i < count; ++i) {
         const float value = __bfloat162float(host[i]);
@@ -135,6 +152,162 @@ inline void kvcalib_capture(std::uint32_t full_layer, const Tensor& k,
     std::lock_guard<std::mutex> lock(mutex);
     capture->capture(full_layer, k, v, positions, stream);
 }
+
+// =====================================================================================
+// layerrec probe -- GDN-branch intermediate-tensor dump (READ-ONLY).
+//
+// WHY IT EXISTS: the attention branch of `attn_mix` has `mix_probe` and the GDN branch of
+// `gdn_mix` has NO probe at all.  That asymmetry is why "the artifact side is already
+// consistent / the engine side still disagrees" could not be split on the GDN path
+// (registered by dl/gdntrace/REPORT.md section 7 item 2).
+//
+// GATES (each one a cached getenv, so an unset environment costs one branch):
+//   NINFER_GDNDUMP_DIR=<dir>          destination directory; unset == probe completely off
+//   NINFER_GDNDUMP_LAYERS=<i,j|all>   full-layer filter; default all
+//   NINFER_GDNDUMP_MAX_CALLS=<n>      stop after n gdn_mix calls; default 0 == no cap
+//   NINFER_GDNDUMP_MAX_ELEMS=<n>      per-tensor element cap; default 2097152
+//
+// READ-ONLY, by construction: the probe only ever (a) reads member fields and the integer
+// position selectors, and (b) issues an ORDERED async D2H copy on the producing stream and
+// writes those bytes to a file.  It never writes a Tensor, never launches a kernel, and
+// never throws: every failure mode (absent data, non-contiguous view, D2H error, fopen
+// error, over the element cap) becomes a `note` line in the meta file and the run goes on.
+// The paired arms `a1_red_nograph` (gates off) and `a2_red_dump` (gates on) are the same
+// binary under the same flags, so their token streams must be identical.
+//
+// It must be run with `--no-cuda-graph`: the copy is issued from inside the decoded layer
+// loop, and an illegal D2H during stream capture is why the tree's own offline
+// instruments (NINFER_KVDUMP_DIR / NINFER_KV_CALIB_DIR) document that flag.
+// =====================================================================================
+inline const char* gdndump_dir() {
+    static const char* dir = std::getenv("NINFER_GDNDUMP_DIR");
+    return (dir != nullptr && *dir != '\0') ? dir : nullptr;
+}
+
+inline bool gdndump_layer_enabled(int full_layer) {
+    static const char* spec = std::getenv("NINFER_GDNDUMP_LAYERS");
+    if (spec == nullptr || *spec == '\0' || std::strcmp(spec, "all") == 0) { return true; }
+    const std::string list(spec);
+    std::size_t pos = 0;
+    while (pos <= list.size()) {
+        const std::size_t comma = list.find(',', pos);
+        const std::string token =
+            list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (!token.empty() && std::atoi(token.c_str()) == full_layer) { return true; }
+        if (comma == std::string::npos) { break; }
+        pos = comma + 1;
+    }
+    return false;
+}
+
+// Writes raw little-endian bytes: the meta line carries ne/nb/dtype so the reader never
+// has to guess.  Never throws -- see the READ-ONLY note above.
+inline void gdndump_one(cudaStream_t stream, const Tensor& tensor, const std::string& path,
+                        std::FILE* meta, const char* name) {
+    if (meta == nullptr) { return; }
+    if (tensor.data == nullptr || tensor.numel() <= 0) {
+        std::fprintf(meta, "note %s absent\n", name);
+        return;
+    }
+    static const char* cap_env = std::getenv("NINFER_GDNDUMP_MAX_ELEMS");
+    static const std::size_t cap =
+        (cap_env != nullptr && *cap_env != '\0')
+            ? static_cast<std::size_t>(std::strtoull(cap_env, nullptr, 10))
+            : static_cast<std::size_t>(2097152);
+    const std::size_t elems = static_cast<std::size_t>(tensor.numel());
+    if (elems > cap) {
+        std::fprintf(meta, "note %s over cap elems=%zu cap=%zu\n", name, elems, cap);
+        return;
+    }
+    if (!tensor.is_contiguous()) {
+        std::fprintf(meta, "note %s not contiguous\n", name);
+        return;
+    }
+    const std::size_t bytes = static_cast<std::size_t>(tensor.bytes());
+    std::fprintf(meta,
+                 "tensor %s file=%s ne=%d,%d,%d,%d nb=%lld,%lld,%lld,%lld dtype=%d bytes=%zu\n",
+                 name, path.c_str(), tensor.ne[0], tensor.ne[1], tensor.ne[2], tensor.ne[3],
+                 static_cast<long long>(tensor.nb[0]), static_cast<long long>(tensor.nb[1]),
+                 static_cast<long long>(tensor.nb[2]), static_cast<long long>(tensor.nb[3]),
+                 static_cast<int>(tensor.dtype), bytes);
+    std::fflush(meta);
+    std::vector<std::byte> host(bytes);
+    if (cudaMemcpyAsync(host.data(), tensor.data, bytes, cudaMemcpyDeviceToHost, stream) !=
+        cudaSuccess) {
+        (void)cudaGetLastError();
+        std::fprintf(meta, "note %s d2h failed\n", name);
+        std::fflush(meta);
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        std::fprintf(meta, "note %s sync failed\n", name);
+        std::fflush(meta);
+        return;
+    }
+    std::FILE* out = std::fopen(path.c_str(), "wb");
+    if (out == nullptr) {
+        std::fprintf(meta, "note %s fopen failed\n", name);
+        std::fflush(meta);
+        return;
+    }
+    std::fwrite(host.data(), 1, bytes, out);
+    std::fclose(out);
+}
+
+// One instance per gdn_mix call.  The full-layer index is recovered with the same
+// predicate `run_layers` uses (ModelConfig::is_full / gdn_idx), so a probe row can be
+// joined to the layer numbers in every other report on this box.
+struct GdnDump {
+    std::FILE* meta       = nullptr;
+    std::uint32_t call    = 0;
+    int layer             = -1;
+    int gidx              = -1;
+    cudaStream_t stream   = nullptr;
+
+    GdnDump(int gdn_index, bool verify_phase, cudaStream_t s) : gidx(gdn_index), stream(s) {
+        if (!verify_phase || gdndump_dir() == nullptr) { return; }
+        for (int L = 0; L < kCfg.n_layers; ++L) {
+            if (!ModelConfig::is_full(L) && ModelConfig::gdn_idx(L) == gdn_index) {
+                layer = L;
+                break;
+            }
+        }
+        if (layer < 0 || !gdndump_layer_enabled(layer)) { return; }
+        static std::atomic<std::uint32_t> counter{0};
+        static const char* max_env = std::getenv("NINFER_GDNDUMP_MAX_CALLS");
+        static const std::uint32_t max_calls =
+            (max_env != nullptr && *max_env != '\0')
+                ? static_cast<std::uint32_t>(std::strtoul(max_env, nullptr, 10))
+                : 0u;
+        call = counter.fetch_add(1);
+        if (max_calls != 0 && call >= max_calls) { return; }
+        meta = std::fopen((std::string(gdndump_dir()) + "/gdn_c" + std::to_string(call) + "_L" +
+                           std::to_string(layer) + "_meta.txt")
+                              .c_str(),
+                          "w");
+        if (meta != nullptr) {
+            std::fprintf(meta, "call=%u full_layer=%d gidx=%d phase=verify threads=%d\n", call,
+                         layer, gidx, 1);
+            std::fflush(meta);
+        }
+    }
+
+    ~GdnDump() {
+        if (meta != nullptr) { std::fclose(meta); }
+    }
+
+    GdnDump(const GdnDump&)            = delete;
+    GdnDump& operator=(const GdnDump&) = delete;
+
+    void dump(const char* stage, const Tensor& tensor) {
+        if (meta == nullptr) { return; }
+        gdndump_one(stream, tensor,
+                    std::string(gdndump_dir()) + "/gdn_c" + std::to_string(call) + "_L" +
+                        std::to_string(layer) + "_" + stage + ".bin",
+                    meta, stage);
+    }
+};
 
 inline void kvdump_write_file(const std::string& path, const void* data, std::size_t bytes) {
     std::FILE* file = std::fopen(path.c_str(), "wb");
@@ -521,11 +694,11 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::gqa_attention(
-            q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
+            q_batch, k_batch, v_batch, position_batch, *active_valid_columns_, Tensor{},
             *active_backend_kv_table_rows_, kAttnScale,
             batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
     } else {
-        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
+        ops::gqa_attention(qn, kn, v, positions, Tensor{}, Tensor{}, io_.backend_kv_table_row,
                                       kAttnScale,
                                       batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
@@ -707,6 +880,31 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     }
 }
 
+// --draft-tree L,d (L > 1): the per-depth top-L candidate rows of the proposal row, published
+// beside the draft token that SAME row's argmax produced (proposal_argmax() just above). The two
+// are one device source read two ways, and the host reader re-runs the check
+// (detail::mtp_proposal_ready_steps compares lattice_ids[depth * kMtpTreeProposalDepthStride]
+// against next_drafts[depth]) so a depth this function never wrote is refused instead of
+// publishing a lattice no device output backs.
+//
+// It mirrors the decode loop's extraction exactly (mtp_impl.h, mtp_decode_batch_body): same op,
+// same `rows` (kCfg.token_domain -- the very window proposal_argmax()'s argmax reads), same
+// one-lane spelling (`tokens == 1`, because one prefill proposal proposes for one lane), same
+// `top_l`, same per-depth block stride. `logits` is the contiguous [kCfg.vocab, 1] window
+// matrix_window() handed the proposal, so rank i of the written block and the draft token both
+// come out of one and the same logits row.
+void TextContext::extract_mtp_proposal_lattice(Tensor& logits, std::uint32_t depth) {
+    if (mtp_tree_paths_ <= 1 || depth >= mtp_tree_depth_ || !io_.mtp.has_value()) { return; }
+    if (io_.mtp->lattice_ids.data == nullptr) {
+        throw std::logic_error("MTP prefill lattice is not bound");
+    }
+    ops::mtp_proposal_topk(logits.data, kCfg.token_domain, 1,
+                           static_cast<std::int32_t>(mtp_tree_paths_),
+                           static_cast<std::int32_t*>(io_.mtp->lattice_ids.data) +
+                               static_cast<std::size_t>(depth) * kMtpTreeProposalDepthStride,
+                           ctx_.stream);
+}
+
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& positions,
                                     ops::GqaExecutionEnvelope envelope,
@@ -827,7 +1025,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
 template <class Tap>
 void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                            const Tensor& rope_positions,
-                                           const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                           const Tensor& valid_columns, const Tensor& column_masks,
+                                           const Tensor& kv_table_rows,
                                            const Tensor& linear_state_source_slots,
                                            ops::GqaExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
@@ -845,6 +1044,10 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_tensor_shape(rope_positions, DType::I32, {width, batch},
                          "target verify batch RoPE positions");
     require_tensor_shape(valid_columns, DType::I32, {batch}, "target verify batch valid columns");
+    if (column_masks.data != nullptr) {
+        require_tensor_shape(column_masks, DType::I64, {width, batch},
+                             "target verify batch column masks");
+    }
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "target verify batch KV rows");
     require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
                          "target verify batch Linear Attention slots");
@@ -864,6 +1067,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<const Tensor*> state_binding(active_linear_state_source_slots_,
                                                  &linear_state_source_slots);
         ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
+        ScopedValue<const Tensor*> mask_binding(active_column_masks_, &column_masks);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
 
@@ -893,24 +1097,26 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                                       const Tensor& rope_positions, const Tensor& valid_columns,
-                                      const Tensor& kv_table_rows,
+                                      const Tensor& column_masks, const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
                                       ops::GqaExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
     NullTap tap;
-    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, column_masks,
+                             kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
                              tap);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                                       const Tensor& rope_positions, const Tensor& valid_columns,
-                                      const Tensor& kv_table_rows,
+                                      const Tensor& column_masks, const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
                                       ops::GqaExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
-    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, column_masks,
+                             kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
                              sink);
 }
@@ -1063,12 +1269,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid,
+        // M1: the per-column ancestor masks of a tree verify round (empty for a chain round).
+        const Tensor masks = active_column_masks_ != nullptr ? *active_column_masks_ : Tensor{};
+        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, masks,
                                       kv_table_rows, 
                                       kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                                       *active_causal_attention_envelope_, work_, a_batch, s);
     } else {
-        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, Tensor{}, kv_table_rows,
                                       kAttnScale,
                                       batch_text_kv_->batch_layer_view(fidx),
                                       *active_causal_attention_envelope_, work_, a, s);
@@ -1084,12 +1292,24 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
+    // layerrec probe session (READ-ONLY; see the gdndump_* block above for the gates and
+    // the reason this cannot change a number).  `gidx` is the GDN index; GdnDump recovers
+    // the full layer index the same way `run_layers` does.
+    GdnDump gdn_probe(gidx, ph == Phase::Verify, s);
+    const auto gdn_dump = [&](const char* stage, const Tensor& t) { gdn_probe.dump(stage, t); };
+    // The layer's INPUT residual, before the control projection touches anything.
+    gdn_dump("in_x", x);
+
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
     Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
                                          work_, s);
+    // Control-projection outputs: `h` is the projection input, `g`/`beta` the GDN gate.
+    gdn_dump("h", h);
+    gdn_dump("g", g);
+    gdn_dump("beta", beta);
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -1140,6 +1360,19 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         ops::causal_conv1d_silu_split(qkv, *w.conv1d, conv_state_in, conv_state_out, qc, kc, vc, s);
     }
 
+    // The four projection outputs the GDN recurrence consumes, exactly as written by
+    // whichever registered route the dispatch picked (snapshot / record / materialized).
+    gdn_dump("qc", qc);
+    gdn_dump("kc", kc);
+    gdn_dump("vc", vc);
+    gdn_dump("z", z);
+    if (ph == Phase::Verify && active_linear_state_source_slots_ != nullptr) {
+        // The width-three convolution history the snapshot op reads, plus the selector
+        // that says WHICH slot of it: without both, qc/kc/vc cannot be recomputed.
+        gdn_dump("conv_pool", state_.layer_view(static_cast<std::uint32_t>(gidx)).conv);
+        gdn_dump("src_slots", *active_linear_state_source_slots_);
+    }
+
     Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
     Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
 
@@ -1185,7 +1418,13 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
+    // The recurrence output and the gated normalisation, before the output projection.
+    gdn_dump("o", o);
+    gdn_dump("on", on);
+
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    // The layer's OUTPUT residual (x after the mixer), for the next layer's `in_x` join.
+    gdn_dump("out_x", x);
 }
 
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
@@ -1197,18 +1436,79 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
+
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    // ⚠️ PATCH A2 cap: never dump more than this many columns per (layer, stage). Keeps a
+    // prefill chunk (thousands of columns) from turning one probe into thousands of lines.
+    static constexpr std::int32_t kHeadDebugProbeColumns = 16;
     // NINFER_HEADDBG=1: per-stage probe on every layer so the first NaN inside the decode stack
     // is visible (see _TODO.md 102/103).
+    // NINFER_HEADDBG=1: per-stage probe over the FIRST kHeadDebugProbeColumns columns of
+    // `x`, one LINE per column, labelled (layer, stage, phase, width, batch, column, pos)
+    // so hd_diff.py can JOIN BY THAT TUPLE instead of by output line index.
+    //
+    // WHERE w / b / c COME FROM: `active_sequence_width_` and `active_sequence_batch_` are
+    // MEMBERS of TextContext, so a member function already reads them here
+    // (target_verify_batch_impl:899-900 and ordinary_decode_batch:837 bind them; prefill
+    // binds neither, so both stay 0 and the fallback 1/1 reproduces the old single-column
+    // dump for prefill). `cache_positions[0]` is read from `active_cache_positions_` D2H.
+    //
+    // ⚠️ `column_begin` IS NOT IN THIS SCOPE AND IS NOT INVENTED HERE. It is the attention
+    // invocation's chunk offset (ops/launcher/gqa_attention.h:39). On this path it is
+    // PROVABLY 0 for the round under study: ops/wrapper/gqa_attention.cpp:597-598 passes a
+    // literal 0, and the only non-zero value on the chunked route is a multiple of
+    // kSmallTChunkTokens (6) from launch_chunked_small_t (:414-424), where chunk 2 writes
+    // only columns >= 6. To move this window, thread a `std::int32_t column_begin` through
+    // text_context.h:376/378 and the three run_layers call sites -- NOT done here, to keep
+    // A2 inside ONE translation unit.
     const auto probe = [&](int layer, const char* stage) {
         if (!head_debug_enabled()) { return; }
-        char label[32];
-        std::snprintf(label, sizeof(label), "L%02d_%s", layer, stage);
-        debug_head_probe(ctx_.stream, x, label);
+        const std::int32_t width = active_sequence_width_ != 0 ? active_sequence_width_ : 1;
+        const std::int32_t batch = active_sequence_batch_ != 0 ? active_sequence_batch_ : 1;
+        const std::int32_t columns = width * batch;
+        const std::int32_t dump =
+            columns < kHeadDebugProbeColumns ? columns : kHeadDebugProbeColumns;
+        std::int32_t cache_pos = -1;
+        if (active_cache_positions_ != nullptr && active_cache_positions_->data != nullptr &&
+            active_cache_positions_->dtype == DType::I32 &&
+            active_cache_positions_->bytes() >= sizeof(std::int32_t)) {
+            if (cudaMemcpyAsync(&cache_pos, active_cache_positions_->data, sizeof(std::int32_t),
+                                cudaMemcpyDeviceToHost, ctx_.stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+                cache_pos = -1;
+            } else if (cudaStreamSynchronize(ctx_.stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+                cache_pos = -1;
+            }
+        }
+        for (std::int32_t j = 0; j < dump; ++j) {
+            char label[64];
+            std::snprintf(label, sizeof(label), "L%02d_%s_%s_w%d_b%d_c%d_p%d", layer, stage,
+                          prefill ? "prefill" : "verify", static_cast<int>(width),
+                          static_cast<int>(batch), static_cast<int>(j),
+                          static_cast<int>(cache_pos));
+            debug_head_probe(ctx_.stream, x, label, j);
+        }
     };
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        // W13: the residency hook, at the layer boundary. The H2D for layer
+        // L + arena_layers - 1 is issued here while layer L is being computed, so
+        // the arena slot a live layer occupies is never the one being refilled.
+        //
+        // PREFILL ONLY, deliberately. Prefill is not CUDA-graph captured and its
+        // transfer is amortized over a whole chunk of tokens, which is the regime
+        // where a weight offload is net-positive; decode captures these nodes into
+        // a graph, where a host-side fetch would be replayed with stale data.
+        // Landing W13 on decode needs the H2D lifted into the graph on a second
+        // stream -- specified in scratch/w13a/DESIGN.md section 5, NOT done.
+        if (ph == Phase::Prefill) {
+            if (product::WeightResidencyRuntime* w13 = weights_.backing.weight_residency();
+                w13 != nullptr) {
+                w13->note_layer(static_cast<std::uint32_t>(layer));
+            }
+        }
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1220,7 +1520,14 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                attn_mix(full, x, fidx, ph);
+                // L26 prototype: a dropped layer has no KV planes at all, so its
+                // attention is never enqueued -- no KV append, no QK/PV. The layer
+                // keeps only its MLP tail, which is exactly the discard semantics
+                // this instrument measures. fidx is the full-attention index, the
+                // same index plan_cache() uses for the plane geometry.
+                if (!batch_text_kv_->layer_is_dropped(static_cast<std::uint32_t>(fidx))) {
+                    attn_mix(full, x, fidx, ph);
+                }
             }
             probe(layer, "attn");
             {
@@ -1384,7 +1691,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
             const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
-            const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
+            // FIX-A: the third field is the pinned split reference. Left out, this two-field
+            // aggregate value-initialises split_reference_keys to 0, so the MTP bridge and the
+            // MTP prompt chunks reduced their keys on a 32-key grid derived from the LIVE window
+            // (`[splitdbg] ... pin=0 split_reference=47 ... split_units=32`) while the batch-1
+            // decode of the same row used the capacity-pinned grid. The pin is the compile-time
+            // maximum visible-key count, a constant of the produced graph, which is what the
+            // contract asks for; the planner's own capacity is not in scope here.
+            const ops::GqaExecutionEnvelope chunk_envelope{
+                visible, visible, ops::kGqaAttentionMaximumVisibleKeys};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
@@ -1478,6 +1793,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
                                       rope_positions, chunk_envelope, true, &io_.mtp->ar_hidden,
                                       &logits, &draft0);
+                    // --draft-tree L,d (L > 1): the FIRST verify round is a tree round and the
+                    // round-1 gate reads the published tree FIELD, so the depth-0 lattice has to be
+                    // produced by the proposal that just ran. THIS block -- not
+                    // mtp_bridge_and_propose() -- is the proposal loop an ordinary fresh prompt
+                    // takes, and a fresh prompt is the common case; leaving only the bridge wired
+                    // publishes no lattice for it at all and the round is refused at depth 0.
+                    extract_mtp_proposal_lattice(logits, 0);
 
                     Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
                     ops::set_i32_scalar(ar_position, base_i + T, s);
@@ -1486,10 +1808,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         Tensor next_token     = io_.mtp->draft_tokens.slice(0, i, 1);
                         Tensor next_hidden    = work_.alloc(DType::BF16, {kCfg.hidden, 1});
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
-                        const ops::GqaExecutionEnvelope ar_envelope{ar_visible,
-                                                                                ar_visible};
+                        // FIX-A: same pin, same reason. This is the prompt-time MTP AR step:
+                        // k-1 of them per run, one per proposal token, and each used to
+                        // partition its keys from the live window.
+                        const ops::GqaExecutionEnvelope ar_envelope{
+                            ar_visible, ar_visible, ops::kGqaAttentionMaximumVisibleKeys};
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
                                             ar_envelope, next_hidden, logits, next_token);
+                        extract_mtp_proposal_lattice(logits, static_cast<std::uint32_t>(i));
                         CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,
                                                    io_.mtp->ar_hidden.bytes(),
                                                    cudaMemcpyDeviceToDevice, s));

@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -431,6 +432,98 @@ private:
         bool release        = false;
     };
 
+    // `valid()` below is a conjunction, so a refusal that names one of its terms sends the reader
+    // to the wrong explanation in the middle of a failure. These two helpers name the term that
+    // actually failed AND print every value that was compared. The term that fires most often --
+    // `owner_ == this` -- is not staleness at all: the Cold Host tier publishes into its own
+    // store, so a capability published there is rejected here by the ownership term alone.
+    [[nodiscard]] static const char* extent_state_name(ExtentState state) noexcept {
+        switch (state) {
+        case ExtentState::Free:
+            return "Free";
+        case ExtentState::Reserved:
+            return "Reserved";
+        case ExtentState::Published:
+            return "Published";
+        }
+        return "unknown";
+    }
+
+    [[nodiscard]] std::string describe_unusable_capability(
+        HostKVExtentCapability capability) const {
+        const Extent* descriptor = nullptr;
+        if (capability.index_ < extents_.size()) { descriptor = &extents_[capability.index_]; }
+        const char* owner = "another store";
+        if (capability.owner_ == this) {
+            owner = "this store";
+        } else if (capability.owner_ == nullptr) {
+            owner = "none";
+        }
+        std::string state      = "out-of-range";
+        std::string generation = "n/a";
+        if (descriptor != nullptr) {
+            state      = extent_state_name(descriptor->state);
+            generation = std::to_string(descriptor->generation);
+        }
+        std::string reason;
+        if (capability.owner_ != this) {
+            reason = capability.owner_ == nullptr
+                         ? "the capability names no store, so nothing ever published it"
+                         : "the capability belongs to another Host KV extent store";
+        } else if (descriptor == nullptr) {
+            reason = "the capability index is outside this store's descriptor range";
+        } else if (descriptor->state != ExtentState::Published) {
+            reason = "the named descriptor is not currently published";
+        } else {
+            reason = "the capability is stale: the descriptor was recycled since publication";
+        }
+        return "Host KV extent capability is unusable: " + reason + " (owner=" + owner +
+               ", index=" + std::to_string(capability.index_) + " of capacity " +
+               std::to_string(extents_.size()) + ", state=" + state + ", capability generation=" +
+               std::to_string(capability.generation_) + ", live generation=" + generation + ")";
+    }
+
+    [[nodiscard]] std::string describe_unusable_reservation(
+        const HostKVExtentReservation& reservation) const {
+        const Extent* descriptor = nullptr;
+        if (reservation.descriptor_ < extents_.size()) {
+            descriptor = &extents_[reservation.descriptor_];
+        }
+        const char* owner = "another store";
+        if (reservation.owner_ == this) {
+            owner = "this store";
+        } else if (reservation.owner_ == nullptr) {
+            owner = "none";
+        }
+        std::string state      = "out-of-range";
+        std::string generation = "n/a";
+        if (descriptor != nullptr) {
+            state      = extent_state_name(descriptor->state);
+            generation = std::to_string(descriptor->generation);
+        }
+        std::string reason;
+        if (reservation.owner_ != this) {
+            reason = reservation.owner_ == nullptr
+                         ? "the reservation names no store, so it was never prepared"
+                         : "the reservation belongs to another Host KV extent store";
+        } else if (descriptor == nullptr) {
+            reason = "the reservation's descriptor index is outside this store's range";
+        } else if (reservation.page_store_ == nullptr) {
+            reason = "the reservation names no page store";
+        } else if (descriptor->state != ExtentState::Reserved) {
+            reason = "the reservation's descriptor is no longer Reserved";
+        } else if (descriptor->generation != reservation.generation_) {
+            reason = "the reservation is stale: the descriptor was recycled after preparation";
+        } else {
+            reason = "the reservation is incomplete: a Reserved descriptor must hold an "
+                     "allocation, a non-empty page list and both ends";
+        }
+        return "Host KV extent reservation is unusable: " + reason + " (owner=" + owner +
+               ", index=" + std::to_string(reservation.descriptor_) + " of capacity " +
+               std::to_string(extents_.size()) + ", state=" + state + ", reservation generation=" +
+               std::to_string(reservation.generation_) + ", live generation=" + generation + ")";
+    }
+
     [[nodiscard]] bool valid(const HostKVExtentReservation& reservation) const noexcept {
         if (reservation.owner_ != this || reservation.descriptor_ >= extents_.size() ||
             reservation.page_store_ == nullptr) {
@@ -445,16 +538,22 @@ private:
     }
 
     void validate(const HostKVExtentReservation& reservation) const {
-        if (!valid(reservation)) { throw std::logic_error("Host KV extent reservation is stale"); }
+        if (!valid(reservation)) {
+            throw std::logic_error(describe_unusable_reservation(reservation));
+        }
     }
 
     [[nodiscard]] Extent& require(HostKVExtentCapability capability) {
-        if (!valid(capability)) { throw std::invalid_argument("Host KV extent is stale"); }
+        if (!valid(capability)) {
+            throw std::invalid_argument(describe_unusable_capability(capability));
+        }
         return extents_[capability.index_];
     }
 
     [[nodiscard]] const Extent& require(HostKVExtentCapability capability) const {
-        if (!valid(capability)) { throw std::invalid_argument("Host KV extent is stale"); }
+        if (!valid(capability)) {
+            throw std::invalid_argument(describe_unusable_capability(capability));
+        }
         return extents_[capability.index_];
     }
 
@@ -517,6 +616,58 @@ private:
         }
     }
 
+    // `partition_extent` is a corruption detector: every refusal in it fires only when this store's
+    // own bookkeeping is inconsistent, so its message is the whole diagnosis a reader gets before
+    // the extent store is abandoned. Both refusals in the membership walk below are conjunctions
+    // that name a single symptom, so each one sends the reader to the wrong explanation for one of
+    // its two causes. These helpers name the cause that fired, in the order the checks run, and
+    // print the values that were compared.
+    [[nodiscard]] std::string describe_truncated_membership(std::uint32_t offset,
+                                                            std::uint32_t node,
+                                                            std::uint32_t head,
+                                                            std::uint32_t page_count) const {
+        const bool ended_early = node == kInvalidIndex;
+        const std::string reason =
+            ended_early
+                ? "the membership chain ended before the descriptor's page count was reached, so a "
+                  "membership's `next` link (or the descriptor's head) is kInvalidIndex"
+                : "the membership chain left the membership table, so a node index is at or past "
+                  "memberships_.size()";
+        return "Host KV extent membership is truncated: " + reason + " (walk offset=" +
+               std::to_string(offset) + " of page_count=" + std::to_string(page_count) +
+               ", node=" + (ended_early ? std::string("kInvalidIndex") : std::to_string(node)) +
+               ", head=" +
+               (head == kInvalidIndex ? std::string("kInvalidIndex") : std::to_string(head)) +
+               ", memberships_.size()=" + std::to_string(memberships_.size()) + ")";
+    }
+
+    // The second walk refusal is also a two-term conjunction, and the cheaper term to observe --
+    // `pages->valid(page)` -- is not the one that actually fires in a healthy store: a page whose
+    // handle is fine but which simply has no Host replica is reported as "stale", though nothing
+    // about it is stale.
+    [[nodiscard]] std::string describe_unusable_membership(const LogicalKVPageStore& pages,
+                                                           LogicalKVPageHandle page,
+                                                           std::uint32_t extent_index,
+                                                           std::uint32_t offset,
+                                                           std::uint32_t node) const {
+        const bool handle_usable = pages.valid(page);
+        const char* owner        = "another page store";
+        if (page.owner_ == &pages) {
+            owner = "this page store";
+        } else if (page.owner_ == nullptr) {
+            owner = "none";
+        }
+        const std::string reason =
+            handle_usable ? "the page handle is valid but the page has no Host replica, so the "
+                            "membership cannot be released"
+                          : "the page handle is unusable, so the membership cannot be resolved";
+        return "Host KV extent membership is unusable: " + reason + " (extent index=" +
+               std::to_string(extent_index) + ", walk offset=" + std::to_string(offset) +
+               ", node=" + std::to_string(node) + ", page owner=" + owner +
+               ", page index=" + std::to_string(page.index_) + " of page capacity " +
+               std::to_string(pages.capacity()) + ", page generation=" +
+               std::to_string(page.generation_) + ")";
+    }
     template <typename Predicate>
     [[nodiscard]] std::size_t partition_extent(std::uint32_t index, Predicate&& should_release) {
         if (index >= extents_.size()) {
@@ -538,11 +689,13 @@ private:
         std::uint32_t released_pages = 0;
         for (std::uint32_t offset = 0; offset < original.page_count; ++offset) {
             if (node == kInvalidIndex || node >= memberships_.size()) {
-                throw std::logic_error("Host KV extent membership is truncated");
+                throw std::logic_error(describe_truncated_membership(
+                    offset, node, original.head, original.page_count));
             }
             const Membership& entry = memberships_[node];
             if (!pages->valid(entry.page) || !pages->host_resident(entry.page)) {
-                throw std::logic_error("Host KV extent membership is stale");
+                throw std::logic_error(
+                    describe_unusable_membership(*pages, entry.page, index, offset, node));
             }
             const HostKVPageReplica replica = pages->host_replica(entry.page);
             if (entry.extent != index || entry.offset != offset || replica.extent != old ||

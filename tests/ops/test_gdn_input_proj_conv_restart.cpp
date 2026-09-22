@@ -326,6 +326,14 @@ int run_record_restart_case(DevicePackedWeight& parent, std::int32_t tokens) {
 } // namespace
 
 int main() {
+    // No device: report the repository's skip code. DevicePackedWeight's first act is a device
+    // allocation and this file had neither a gate nor a handler, so on a box with no device the
+    // exception left main() and std::terminate ran. The gate text is the one its two registered
+    // siblings (test_gdn_input_proj_conv_snapshot.cpp:1083, ..._record.cpp) already use.
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 727U));
     int failures = 0;

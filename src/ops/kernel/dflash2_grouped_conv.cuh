@@ -26,7 +26,16 @@ __launch_bounds__(Block) __global__ void dflash2_grouped_conv_kernel(
             delta_n + static_cast<std::int64_t>(2) * taps * groups * t;
         float value = __bfloat162float(hidden[hidden_offset]) *
                       (__bfloat162float(base[h]) + __bfloat162float(delta[delta_offset]));
-        const int position = t & (block_size - 1);
+        // In-block column index. `t & (block_size - 1)` is only the column
+        // index when block_size is a power of two; vLLM
+        // (qwen3_dflash2._grouped_conv) uses `% block_size` for every other
+        // width and the z-lab reference needs no gate at all. The runtime
+        // passes block_size = k + 1 (dflash2_impl.h:214), which is not a
+        // power of two for k in {2,4,5,6,...}.
+        const int conv_block = block_size > 0 ? block_size : 1;
+        const int position   = (conv_block & (conv_block - 1)) == 0
+                                   ? (t & (conv_block - 1))
+                                   : (t % conv_block);
         for (int tap = 1; tap < taps; ++tap) {
             if (position < tap) { continue; }
             const std::int64_t prev = static_cast<std::int64_t>(h) +

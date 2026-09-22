@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 
+#include "spec/frame_axis.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -322,12 +323,15 @@ std::uint64_t merge_pair_key(int left, int right) noexcept {
            static_cast<std::uint32_t>(right);
 }
 
-std::unordered_map<std::uint64_t, BpeMergeRule>
-load_bpe_merge_rules(const Json& model, std::string_view label,
-                     const std::unordered_map<std::string, int>& token_to_id) {
+BpeMergeTable load_bpe_merge_rules(const Json& model, std::string_view label,
+                                   const std::unordered_map<std::string, int>& token_to_id) {
     const Json& merges = require_array_field(model, "merges", label);
-    std::unordered_map<std::uint64_t, BpeMergeRule> rules;
-    rules.reserve(merges.size());
+    BpeMergeTable rules;
+    rules.reset(merges.size());
+    // Rank order matters here and is not incidental: linear probing lets the first claimant keep
+    // a slot, and a low rank is a merge the encoder performs often, so walking model.merges in
+    // order hands the frequent rules their home slot. Filling the table out of an unordered
+    // container instead is measurably slower.
     int rank = 0;
     for (const Json& item : merges) {
         std::string left;
@@ -357,9 +361,9 @@ load_bpe_merge_rules(const Json& model, std::string_view label,
             throw std::invalid_argument("model.merges references a symbol outside model.vocab in " +
                                         std::string(label));
         }
-        const auto [_, inserted] =
-            rules.emplace(merge_pair_key(left_id->second, right_id->second),
-                          BpeMergeRule{.rank = rank++, .result = result_id->second});
+        const bool inserted =
+            rules.insert(merge_pair_key(left_id->second, right_id->second),
+                         BpeMergeRule{.rank = rank++, .result = result_id->second});
         if (!inserted) { throw std::invalid_argument("duplicate merge pair in model.merges"); }
     }
     return rules;
@@ -546,7 +550,7 @@ std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, i
 }
 
 bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized,
-                               const std::unordered_map<std::uint64_t, BpeMergeRule>& merge_rules,
+                               const BpeMergeTable& merge_rules,
                                const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
                                std::vector<std::size_t>* token_ends = nullptr,
                                std::vector<BpeWordEnd>* word_ends   = nullptr) {
@@ -576,15 +580,15 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
             if (left < 0 || !nodes[static_cast<std::size_t>(left)].live) { return; }
             const int right = nodes[static_cast<std::size_t>(left)].next;
             if (right < 0) { return; }
-            const auto rule =
+            const BpeMergeEntry* rule =
                 merge_rules.find(merge_pair_key(nodes[static_cast<std::size_t>(left)].symbol,
                                                 nodes[static_cast<std::size_t>(right)].symbol));
-            if (rule == merge_rules.end()) { return; }
+            if (rule == nullptr) { return; }
             queue.push(BpeCandidate{
-                .rank             = rule->second.rank,
+                .rank             = rule->rank,
                 .left             = left,
                 .right            = right,
-                .result           = rule->second.result,
+                .result           = rule->result,
                 .left_generation  = nodes[static_cast<std::size_t>(left)].generation,
                 .right_generation = nodes[static_cast<std::size_t>(right)].generation,
             });
@@ -638,7 +642,7 @@ struct IndexedByteBoundary {
 
 bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
-                          const std::unordered_map<std::uint64_t, BpeMergeRule>& merge_rules,
+                          const BpeMergeTable& merge_rules,
                           const std::array<int, 256>& byte_token_ids, std::size_t max_tokens) {
     const std::size_t token_base = encoded.input_ids.size();
     if (text.empty()) {
@@ -891,6 +895,116 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
     }
     (void)append_ordinary(ordinary_begin, text.size());
     return encoded;
+}
+
+// NOTE ON LINE NUMBERS: the `file:line` references in this block are PRE-LANDING (HEAD
+// 3944a53). This landing inserts two include lines and this function, so a cited number is
+// smaller than its current value by the number of lines inserted above it; every reference is
+// also given by SYMBOL. Current values, re-verified after the landing:
+//   append_normalized_bpe_ids:552   ids.push_back:623   has_internal_boundary:657
+//   the conservative branch `if (independently_normalized != normalized)`:697
+//   encode_with_boundaries:797   match_token == nullptr:869   push(match_token->id):884
+//   encode_with_frame_classes:941
+//
+// THE FRAME AXIS, RECOVERED WITHOUT MOVING A SINGLE TOKEN.
+//
+// TWO CALLS, ON PURPOSE. The first is the existing function, untouched: its `input_ids` and its
+// `boundaries` are the ones every current caller already gets, so no marker reading (rewrite
+// checkpoint, message boundary, cache boundary, media run) can move. The second asks the SAME text,
+// the SAME options and the SAME `literal_spans` for the LITERAL-SPAN BYTE EDGES and uses only its
+// `boundaries` -- the ids it returns are compared against the first call's, and a disagreement is an
+// ERROR rather than a silent pick.
+//
+//     Call 1 : encode_with_boundaries(text, byte_boundaries,      options, literal_spans)
+//     Call 2 : encode_with_boundaries(text, literal_edge_offsets,  options, literal_spans)
+//
+// WHY THE IDS CANNOT DIFFER. `byte_boundaries` changes exactly one thing downstream: whether
+// `append_ordinary_text` sees an INTERNAL byte boundary and therefore fills `encoded.boundaries`
+// through the per-BPE-word path (tokenizer.cpp:656-700) or through the two-endpoint shortcut
+// (:670-677). Both paths push their ids through the same `append_normalized_bpe_ids` call on the
+// same input; the conservative branch at :696-698 exists precisely so that a marker which splits a
+// canonical-composition sequence changes only the REPORTED frontier ("The full token stream stays
+// authoritative"). So the id stream is a function of (text, options, literal_spans) alone. That is
+// ASSERTED below, not assumed.
+//
+// WHY THE EDGES ARE NOT ASKED FOR IN CALL 1. Because the existing markers would then share a run
+// with a literal edge and take the conservative path at :696-698, which can turn an `exact_frontier`
+// into `nullopt` -- and `encode_rendered_chat` THROWS on a missing exact frontier for a rewrite
+// checkpoint (processor.cpp:784-786). A separate pass is what makes this landing additive.
+//
+// WHY THE ORDINARY RUNS ARE NOT SPLIT AT THE EDGES. Because `append_ordinary_text` tokenizes its
+// slice INDEPENDENTLY (it re-normalizes at :655 and re-splits words at :664), so splitting a run at a
+// template/literal junction would change the BPE merges spanning it -- a template ending "...assist"
+// followed by literal "ant" merges to ONE token today and would become two. That changes the MODEL'S
+// INPUT, and this landing does not make that change.
+FrameClassifiedEncode
+Tokenizer::encode_with_frame_classes(std::string_view text,
+                                     std::span<const std::size_t> byte_boundaries,
+                                     EncodeOptions options,
+                                     std::span<const ByteSpan> literal_spans) const {
+    namespace fa = ninfer::spec::frame_axis;
+    static_assert(static_cast<std::uint8_t>(fa::TokenClass::Literal) == 0U &&
+                      static_cast<std::uint8_t>(fa::TokenClass::Template) == 1U &&
+                      static_cast<std::uint8_t>(fa::TokenClass::TemplateControl) == 2U,
+                  "the class byte values are part of the column's meaning, not an implementation "
+                  "detail");
+
+    FrameClassifiedEncode result;
+    result.encoded = encode_with_boundaries(text, byte_boundaries, options, literal_spans);
+
+    // No literal span means "everything is template-side" BY THE COMPLEMENT RULE that
+    // `chat_template.cpp:68` vs `:70-74` defines: `append_template` records nothing and
+    // `append_literal` records a span, so the template's extent is everything not covered by a span.
+    std::vector<std::size_t> edge_offsets;
+    edge_offsets.reserve(literal_spans.size() * 2U);
+    for (const ByteSpan span : literal_spans) {
+        edge_offsets.push_back(span.begin);
+        edge_offsets.push_back(span.end);
+    }
+    if (edge_offsets.empty() || options.max_tokens == 0U) {
+        result.encoded.token_classes.assign(
+            result.encoded.input_ids.size(),
+            static_cast<std::uint8_t>(fa::TokenClass::Template));
+        return result;
+    }
+
+    const BoundaryEncodedText probe =
+        encode_with_boundaries(text, edge_offsets, options, literal_spans);
+    if (probe.input_ids != result.encoded.input_ids) {
+        throw std::logic_error(
+            "frame-axis classification pass produced a different token stream; the class column "
+            "cannot be trusted for this input");
+    }
+
+    // A literal span is RESOLVED only when BOTH of its edges land on an exact token boundary. An
+    // unresolved span is COUNTED and its tokens stay on the template side -- never silently guessed
+    // from a `stable_frontier`, whose downward bias could make two adjacent ranges overlap.
+    std::vector<std::uint32_t> begin_frontiers;
+    std::vector<std::uint32_t> end_frontiers;
+    begin_frontiers.reserve(literal_spans.size());
+    end_frontiers.reserve(literal_spans.size());
+    for (std::size_t index = 0; index < literal_spans.size(); ++index) {
+        const TokenBoundaryResult& head = probe.boundaries[2U * index];
+        const TokenBoundaryResult& tail = probe.boundaries[2U * index + 1U];
+        if (!head.exact_frontier || !tail.exact_frontier ||
+            *tail.exact_frontier < *head.exact_frontier) {
+            ++result.literal_spans_unresolved;
+            continue;
+        }
+        begin_frontiers.push_back(static_cast<std::uint32_t>(*head.exact_frontier));
+        end_frontiers.push_back(static_cast<std::uint32_t>(*tail.exact_frontier));
+    }
+    result.literal_spans_resolved = static_cast<std::uint32_t>(begin_frontiers.size());
+
+    std::vector<fa::LiteralTokenRange> ranges;
+    if (!fa::literal_token_ranges_from_frontiers(begin_frontiers, end_frontiers, ranges)) {
+        throw std::logic_error(
+            "frame-axis literal token ranges are not ordered and disjoint; the class column cannot "
+            "be built for this input");
+    }
+    result.encoded.token_classes = fa::class_column_from_literal_token_ranges(
+        static_cast<std::uint32_t>(result.encoded.input_ids.size()), ranges);
+    return result;
 }
 
 std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {

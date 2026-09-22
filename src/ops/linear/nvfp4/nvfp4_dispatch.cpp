@@ -4,6 +4,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#include "ops/linear/qpn/qpn_arch_route.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -28,15 +29,15 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     }
 
     switch (resolve_nvfp4_problem(output_rows, input_rows)) {
-    // UNIFY-A: the per-problem token thresholds (4 / 5 / 8) put T=1 on a different
-    // precision tier than the verify widths. One tier for the whole small-T family.
     case Nvfp4Problem::AttnInput:
+        return tokens >= 4 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::GdnInput:
-    case Nvfp4Problem::MlpGateUp:
         return Nvfp4LinearRoute::W4A4;
+    case Nvfp4Problem::MlpGateUp:
+        return tokens >= 5 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
-        return Nvfp4LinearRoute::W4A4;
+        return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::MuseMlpGateUp:
     case Nvfp4Problem::MuseMlpDown:
     case Nvfp4Problem::MuseVocabulary:
@@ -57,8 +58,11 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
-        // UNIFY-A: one route for the whole small-T family (T=1 included).
-        launch_nvfp4_small_t(input_chunk, weight, output_chunk, stream);
+        if (active == 1) {
+            launch_nvfp4_decode(input_chunk, weight, output_chunk, stream);
+        } else {
+            launch_nvfp4_small_t(input_chunk, weight, output_chunk, stream);
+        }
     }
 }
 
@@ -89,6 +93,42 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     }
     if (workspace == nullptr) {
         throw std::invalid_argument("nvfp4 W4A4 linear requires caller workspace");
+    }
+    // ---------------------------------------------------------------------------
+    // THE ARCHITECTURE ROUTE DECISION, and this is the engine's first one
+    // ---------------------------------------------------------------------------
+    // Before this call the route layer had no engine consumer at all (MEASURED 2026-09-18,
+    // SIM-RUN: `select_route` had zero callers under src/ and apps/, `route_log_line()` had
+    // zero callers anywhere, and six engine arms under NINFER_SIM_ARCH produced byte-identical
+    // token ids because the simulated rung never ran). Two properties are load-bearing:
+    //
+    //  * ON A SHIPPING BUILD THIS IS A NO-OP. With no environment set, arch_view_for_device()
+    //    returns Disabled, effective_sm == the card's own, and select_route(sm_120, NVFP4, ..)
+    //    answers nvfp4-w4a4-tma -- the QPN arm needs caps::fp16_fallback_executable(), which
+    //    is false on every rung whose m8n8k4 lowering is not HardwareMma884. So `use_qpn` is
+    //    false, no stderr line is printed, and the native path below runs unchanged.
+    //  * ON A SIMULATED RUN IT IS NOT SILENT. A refused request throws here rather than
+    //    falling back to the real device, and a SELECTED QPN route throws in
+    //    dispatch_qpn_fallback() naming what is missing -- it never quietly computes tokens on
+    //    a route the run did not ask for, which is the exact trap the six identical arms fell
+    //    into.
+    const qpn::QpnArchRoute arch =
+        qpn::select_qpn_arch_route(qpn::current_device_sm(), x.ne[1], weight.n, weight.k);
+    if (arch.refused) {
+        throw std::invalid_argument("nvfp4 W4A4 linear: the architecture request was REFUSED, "
+                                    "so the native route is not taken either. " +
+                                    arch.why);
+    }
+    if (arch.use_qpn) {
+        // The tables selected the fp16 fallback: qpn-w4a16 + route.kernel. Dispatch, handing
+        // over the op's REAL buffers -- so the day the two missing ports exist (the weight
+        // prepack and the bf16->fp16 step, see qpn_arch_route.h) this becomes a live kernel
+        // call instead of a refusal. Today it throws, naming both.
+        qpn::dispatch_qpn_fallback(
+            arch, qpn::QpnWeightLayout::NativeBlockScale, x.data, weight.qdata, weight.scales,
+            nvfp4_w4a4_alpha(weight), out.data, x.ne[1], weight.k, weight.n,
+            static_cast<void*>(stream));
+        return;
     }
     auto scope                       = workspace->scope();
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);

@@ -55,8 +55,10 @@ std::uint64_t direct_word_bytes(NumericFormat format) {
     case NumericFormat::FP32:
     case NumericFormat::I32:
         return 4;
+    case NumericFormat::I64:
+        return 8;
     default:
-        throw ArtifactError("contiguous-le-v1 requires BF16, FP32, or I32");
+        throw ArtifactError("contiguous-le-v1 requires BF16, FP32, I32, or I64");
     }
 }
 
@@ -82,6 +84,17 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::I64:
+        return "I64";
+    case NumericFormat::FP8_E4M3FN_ROW_F32S:
+        return "FP8_E4M3FN_ROW_F32S";
+    case NumericFormat::U4Z8G16_F16S:
+        return "U4Z8G16_F16S";
+    case NumericFormat::Count:
+        // Not a format: the enum's own count (artifact/reader.h). Named so that this switch, which
+        // has no `default:` on purpose, stays exhaustive under -Wswitch -- and so that a REAL
+        // member added above it is still the thing that warns.
+        return {};
     }
     return {};
 }
@@ -96,6 +109,12 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::RowScaleF32V1:
+        return "row-scale-f32-v1";
+    case StorageLayout::PackedU4G16V1:
+        return "packed-u4-g16-v1";
+    case StorageLayout::ExpertBlockScaleK16M128x4V1:
+        return "expert-blockscale-k16-m128x4-v1";
     }
     return {};
 }
@@ -136,7 +155,22 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
         return block_scale_geometry(format, shape).encoded_bytes;
     }
     if (layout == StorageLayout::RowScaleV1) {
+        if (format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
+            throw ArtifactError("row-scale-v1 requires FP8_E4M3FN_ROW_BF16S");
+        }
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::RowScaleF32V1) {
+        if (format != NumericFormat::FP8_E4M3FN_ROW_F32S) {
+            throw ArtifactError("row-scale-f32-v1 requires FP8_E4M3FN_ROW_F32S");
+        }
+        return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::PackedU4G16V1) {
+        return packed_u4_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::ExpertBlockScaleK16M128x4V1) {
+        return block_scale_bank_geometry(format, shape).encoded_bytes;
     }
     throw ArtifactError("unknown tensor layout");
 }
@@ -197,8 +231,18 @@ BlockScaleGeometry block_scale_geometry(NumericFormat format,
 }
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape) {
-    if (format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
-        throw ArtifactError("row-scale-v1 requires FP8_E4M3FN_ROW_BF16S");
+    // Scale word width is the ONLY difference between the two row-scaled FP8 encodings, and it is
+    // load-bearing: 2 bytes for ..._BF16S, 4 for ..._F32S (donor, same function).
+    std::uint64_t scale_word_bytes = 0;
+    switch (format) {
+    case NumericFormat::FP8_E4M3FN_ROW_BF16S:
+        scale_word_bytes = 2;
+        break;
+    case NumericFormat::FP8_E4M3FN_ROW_F32S:
+        scale_word_bytes = 4;
+        break;
+    default:
+        throw ArtifactError("row-scaled layout requires a row-scaled FP8 format");
     }
     if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
         throw ArtifactError("row-scale-v1 requires a positive rank-two shape");
@@ -210,9 +254,68 @@ RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::u
     out.code_plane_bytes = checked_mul(out.rows, out.columns, "FP8 element count");
     out.scale_plane_offset =
         align_up(out.code_plane_bytes, kTensorAlignment, "FP8 scale plane offset");
-    out.scale_plane_bytes = checked_mul(out.rows, 2, "FP8 scale plane bytes");
+    out.scale_plane_bytes = checked_mul(out.rows, scale_word_bytes, "FP8 scale plane bytes");
     out.encoded_bytes =
         checked_add(out.scale_plane_offset, out.scale_plane_bytes, "FP8 tensor encoded size");
+    return out;
+}
+
+// Donor: igorls/ninfer @ 5e4a66d src/artifact/storage_layouts.cpp, verbatim.
+BlockScaleBankGeometry block_scale_bank_geometry(NumericFormat format,
+                                                 std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::NVFP4) {
+        throw ArtifactError("expert-blockscale-k16-m128x4-v1 requires NVFP4");
+    }
+    if (shape.size() != 3 || shape[0] == 0 || shape[1] == 0 || shape[2] == 0) {
+        throw ArtifactError("expert-blockscale-k16-m128x4-v1 requires a positive rank-three shape");
+    }
+    if (shape[1] % 128 != 0 || shape[2] % 64 != 0) {
+        throw ArtifactError(
+            "expert-blockscale-k16-m128x4-v1 requires N divisible by 128 and K divisible by 64");
+    }
+
+    BlockScaleBankGeometry out;
+    out.experts          = shape[0];
+    out.rows             = shape[1];
+    out.columns          = shape[2];
+    out.groups_per_row   = shape[2] / 16;
+    out.k_tiles          = shape[2] / 64;
+    const auto matrices  = checked_mul(out.experts, out.rows, "NVFP4 bank row count");
+    const auto elements  = checked_mul(matrices, out.columns, "NVFP4 bank element count");
+    out.code_plane_bytes = elements / 2;
+    out.scale_plane_offset =
+        align_up(out.code_plane_bytes, kTensorAlignment, "NVFP4 bank scale plane offset");
+    out.scale_plane_bytes     = elements / 16;
+    out.weight_divisor_offset = checked_add(out.scale_plane_offset, out.scale_plane_bytes,
+                                            "NVFP4 bank weight divisor offset");
+    out.weight_divisor_bytes  = checked_mul(out.experts, 4, "NVFP4 bank divisor bytes");
+    out.encoded_bytes         = checked_add(out.weight_divisor_offset, out.weight_divisor_bytes,
+                                            "NVFP4 bank tensor encoded size");
+    return out;
+}
+
+// Donor: igorls/ninfer @ 5e4a66d src/artifact/storage_layouts.cpp, verbatim.
+PackedU4Geometry packed_u4_geometry(NumericFormat format, std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::U4Z8G16_F16S) {
+        throw ArtifactError("packed-u4-g16-v1 requires U4Z8G16_F16S");
+    }
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || shape[1] % 16 != 0) {
+        throw ArtifactError(
+            "packed-u4-g16-v1 requires a positive rank-two shape with K divisible by 16");
+    }
+
+    PackedU4Geometry out;
+    out.rows             = shape[0];
+    out.columns          = shape[1];
+    out.groups_per_row   = shape[1] / 16;
+    const auto elements  = checked_mul(out.rows, out.columns, "U4 element count");
+    out.code_plane_bytes = elements / 2;
+    out.scale_plane_offset =
+        align_up(out.code_plane_bytes, kTensorAlignment, "U4 scale plane offset");
+    out.scale_plane_bytes = checked_mul(checked_mul(out.rows, out.groups_per_row, "U4 group count"),
+                                        2, "U4 scale plane bytes");
+    out.encoded_bytes =
+        checked_add(out.scale_plane_offset, out.scale_plane_bytes, "U4 tensor encoded size");
     return out;
 }
 

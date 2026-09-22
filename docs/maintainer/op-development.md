@@ -417,6 +417,77 @@ Different production routes use different criteria only when their arithmetic or
 profiles differ materially. Widening a criterion requires a numerical reason and requalification
 of its complete affected domain; one failing implementation is not sufficient justification.
 
+### 6.4 Host test targets registered by this session's landing batch
+
+`tests/CMakeLists.txt` registers host tests through the `ninfer_add_test()` helper (and
+`ninfer_add_op_test()`, which adds `SKIP_RETURN_CODE 77` and the `-fno-fast-math
+-ffp-contract=off` pair for the Op numerical suites). Twenty registrations in that file are new in
+this session, at `tests/CMakeLists.txt@a22d29074e08ca7e` (554 lines, 64 registrations total). They
+are listed here because a target that is registered but not named anywhere is one nobody will run
+deliberately:
+
+| ctest name | Source it pins |
+|---|---|
+| `ninfer_arch_caps_test` | `tests/test_arch_caps.cpp` — the capability ladder and the artifact-format floor gate (`src/core/arch_caps.h`). Host-only by construction: the gate takes the compute capability as a parameter, so every rung of the ladder, including the cards this machine does not have, is asserted on CPU |
+| `ninfer_device_capabilities_test` | `tests/test_device_capabilities.cpp` — the real-probe capability half (`src/core/device_capabilities.h`) |
+| `ninfer_prefill_chunk_mode_test` | `tests/test_prefill_chunk_mode.cpp` — the two operator-selectable modes (`PrefillChunkMode`), the `CLI > environment > default` precedence in both directions, and the identity property that separates `manual` from "a governor that has not throttled yet" |
+| `ninfer_prefill_chunk_mode_cli_test` | `tests/test_prefill_chunk_mode_cli.cpp` + `apps/cli/options.cpp` + `src/serve/serve_options.cpp` — the same mode through both front ends' own parsers, including the refusal of an unknown value |
+| `ninfer_prefill_chunk_wiring_test` | `tests/test_prefill_chunk_wiring.cpp` — the compile-time guard's own named predicate per target package, and an odr-use of `set_prefill_chunk()` / `prefill_chunk_capacity()`, so deleting either forwarder is a build/link failure instead of a silent compile-out |
+| `ninfer_kv_perlayer_policy_test` | `tests/test_kv_perlayer_policy.cpp` — the per-layer KV policy (`src/product/kv_perlayer_policy.h`) |
+| `ninfer_weight_residency_test` | `tests/test_weight_residency.cpp` — the weight-residency counters (`src/product/weight_residency.h`) |
+| `ninfer_sum_dir_test` | `tests/test_sum_dir.cpp` — the `SumDir` row state and the byte-axis predicate, pinning its 64-token block granularity by value against `core/paged_kv_cache.h`'s `kPagedKVPageSize` (that header needs `<cuda_runtime_api.h>`, so it is cited, not included) |
+| `ninfer_recall_identity_test` | `tests/test_recall_identity.cpp` — the recall unit's identity and the overlap arithmetic over it, checked against the landed `src/spec/sum_dir.h` and `product/kv_recall_block.h` rather than against a restatement |
+| `ninfer_stop_boundary_test` | `tests/test_stop_boundary.cpp` — the syntax boundary a recall has to land on (`src/spec/stop_boundary.h`) |
+| `ninfer_lookup_fuse_test` | `src/spec/lookup_fuse_test.cpp` — previously referenced by **nothing** in this tree: no target compiled it, so the test it was believed to be never executed once |
+| `ninfer_turn_recall_journal_test` | `src/spec/turn_recall_journal_test.cpp` — same history as the line above |
+| `ninfer_fnv_convention_test` | `tests/test_fnv_convention.cpp` — both FNV-1a 64 conventions: golden values per convention, `kDigestOffset` / `kDigestPrime` read by text from the file that owns the engine convention, and a walk of `src/`, `tests/` and `tools/` proving no third convention can appear unnoticed |
+| `ninfer_kv_recall_block_test` | `tests/test_kv_recall_block.cpp` — the block-level KV ownership encoding, whose central claim (that its unit **is** the engine's Paged-KV page) is pinned against the authoritative text rather than by including `core/paged_kv_cache.h` |
+| `ninfer_kv_rowscale_persist_test` | `tests/test_kv_rowscale_persist.cpp` — the persisted row-scale loop (`src/product/kv_rowscale_persist.h`); the contract is [kv-rowscale-persistence.md](kv-rowscale-persistence.md) |
+| `ninfer_kv_component_switch_test` | `tests/test_kv_component_switch.cpp` — the KV component switches (`src/product/kv_component_switch.h`) |
+| `ninfer_kv_kv_bits_test` | `tests/test_kv_kv_bits.cpp` — the K/V bit-width entries and the tier score tables (`src/product/kv_kv_bits.h`) |
+| `ninfer_qwen3_6_mtp_tree_produce_test` | `tests/targets/qwen3_6/test_mtp_tree_produce.cpp` — the producing half of the draft-tree path; host only, no engine, no CUDA, no variant macro |
+| `ninfer_qwen3_6_mtp_tree_publish_test` | `tests/targets/qwen3_6/test_mtp_tree_publish.cpp` — the receiving half, against the real ddtree reference builder |
+| `ninfer_qwen3_6_mtp_tree_proposal_test` | `tests/targets/qwen3_6/test_mtp_tree_proposal.cpp` — the proposal-side fill (`mtp_tree_proposal_fill.h`), including the egress depth-stride pin. Contract: [mtp-draft-tree.md](mtp-draft-tree.md) |
+
+**The two that were never compiled.** `src/spec/lookup_fuse_test.cpp` and
+`src/spec/turn_recall_journal_test.cpp` existed in the tree while the registration comment beside
+them says it plainly: `src/spec` is a header-only directory with no CMake target of its own, and
+those two host programs were referenced by nothing — no target compiled them, no ctest could run
+them, and the test they were believed to be therefore never executed once. They register
+deliberately **without** `SKIP_RETURN_CODE`, because neither file has a 77 path and a skip property
+with no skip behind it is the same "state with no check behind it" that this repository refuses
+elsewhere.
+
+**`NEEDS_SOURCE_DIR` — the count, and what the keyword does.** The helper parses the bare keyword
+(`cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})`) and, when it is
+present, adds `NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"` and
+`NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"` to the target's compile definitions. The keyword
+means "this test reads the tree", and that is the only thing it means: it is not a capability
+declaration and it grants no privileges. In `tests/CMakeLists.txt@a22d29074e08ca7e` the token occurs
+**11** times — twice in the helper itself (the `cmake_parse_arguments` line and the
+`if(arg_NEEDS_SOURCE_DIR)` line), once in a comment, and **eight** times as an argument on a
+registration. The eight registrations are `ninfer_device_capabilities_test`,
+`ninfer_fnv_convention_test`, `ninfer_kv_recall_block_test`, `ninfer_qwen3_6_frontend_test`,
+`ninfer_qwen3_6_27b_load_plan_test`, `ninfer_qwen3_6_35b_a3b_dflash_load_plan_test`,
+`ninfer_bench_support_test` and `ninfer_ple_layout_test`; only the first three of those are among
+the twenty above. Read the number as **8 argument uses**, not as "four", and prefer naming the
+targets over quoting a count.
+
+**Three host tests that are landed and NOT registered.** `tests/test_kernel_route.cpp` (340 lines),
+`tests/test_shard_plan.cpp` (534) and `tests/test_multidev_wiring.cpp` (347) — 1221 lines together —
+exist in the tree and are referenced by **nothing** in `tests/CMakeLists.txt`: the tokens
+`kernel_route`, `shard_plan` and `multidev` each occur **0** times in that file, while the sources
+they would pin are all present. They are host-only `int main` programs with no CUDA include and no
+device dependency, so registering them is a `tests/CMakeLists.txt` change and nothing else. Until
+that lands, the invariants `shard_plan.h` and `kernel_route.h` carry are **not** checked by ctest,
+and this section claims nothing about whether the three would pass. The subject matter is
+[multi-device-and-shard-plan.md](multi-device-and-shard-plan.md); registration is tracked as a
+build-side item.
+
+**What this section does not establish.** That these twenty targets build and pass is a build-side
+question and is not answered here. The most the tree supports today is that each is registered with
+its own source and, where it needs one, its own `LIBRARIES` and include directories.
+
 ## 7. Performance evidence
 
 An Op microbenchmark measures the public semantic operation at an exact shape, format, layout,

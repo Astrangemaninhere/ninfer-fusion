@@ -152,11 +152,10 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
 }
 
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
-    const bool geometry_48 = spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-                             spec.conv_channels == 10240;
-    const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
-                             spec.conv_channels == 8192;
-    return geometry_48 || geometry_30;
+    // Asked of the launcher's own registry rather than kept as a second list: this function used
+    // to be a hand-copied pair of geometries, which is exactly how a launcher can gain an
+    // instantiation that the plan still refuses.
+    return detail::gated_delta_net::replay_fold_geometry_supported(spec);
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

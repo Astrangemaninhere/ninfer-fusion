@@ -2,6 +2,8 @@
 // One block per batch row; threads scan candidate offsets in parallel and a
 // block-wide reduction keeps the (longest, latest) tail match.
 
+#include "ninfer/ops/suffix_lookup.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -23,10 +25,9 @@ __launch_bounds__(Block) __global__ void suffix_lookup_kernel(
     const int tid   = static_cast<int>(threadIdx.x);
     const int start = starts[b];
     const int len   = lengths[b];
-    // 只搜严格更早的非重叠窗口: o+query <= start 且给续写留空间
-    const int limit_a = len - query - continuation_tokens;
-    const int limit_b = start - query;
-    const int limit = limit_a < limit_b ? limit_a : limit_b;   // device 端 min
+    // 只搜严格更早的非重叠窗口: o+query < start 且给续写留空间。边界只有一处定义
+    // (suffix_lookup_scan_limit), 宿主参照与两个镜像必须用同一式。
+    const int limit = suffix_lookup_scan_limit(start, len, query, continuation_tokens);
     // (match_len, offset) 联合极值: 长匹配优先, 同长取最新 (offset 大)。
     int best_l = 0;
     int best_o = -1;

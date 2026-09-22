@@ -21,16 +21,14 @@ Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 attn_input_proj: unsupported policy");
     }
-    // UNIFY-A: `tokens >= 4 ? W4A4 : A16` put T=1..3 on a different precision tier than
-    // the verify widths. One tier for the whole small-T family.
-    return Nvfp4AttnInputRoute::W4A4;
+    return tokens >= 4 ? Nvfp4AttnInputRoute::W4A4 : Nvfp4AttnInputRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                 Tensor& v, cudaStream_t stream) {
     constexpr std::int32_t kChunk  = kNvfp4LastSmallT;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
+    constexpr std::int32_t kQRows  = kNvfp4AttnQueryRows;
+    constexpr std::int32_t kKvRows = kNvfp4AttnKeyRows;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +
@@ -48,10 +46,13 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
         Tensor gate_chunk(output_gate, DType::BF16, {kQRows, active});
         Tensor key_chunk(key, DType::BF16, {kKvRows, active});
         Tensor value_chunk(value, DType::BF16, {kKvRows, active});
-        // UNIFY-A: one route for the whole small-T family (T=1 included; only the
-        // A16Only policy reaches this helper now).
-        nvfp4_attn_input_small_t_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
-                                        value_chunk, stream);
+        if (active == 1) {
+            nvfp4_attn_input_decode_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
+                                           value_chunk, stream);
+        } else {
+            nvfp4_attn_input_small_t_launch(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
+                                            value_chunk, stream);
+        }
     }
 }
 

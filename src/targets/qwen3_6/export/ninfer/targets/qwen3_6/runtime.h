@@ -37,6 +37,12 @@ struct PhysicalUsageSnapshot {
     std::uint32_t device_main_kv_pages    = 0;
     std::uint32_t device_backend_kv_pages = 0;
     std::size_t host_kv_bytes             = 0;
+    // Dedicated checkpoint pool, when the Program has one; excludes active recurrent slots.
+    // APPENDED; donor: igorls/ninfer @ 5e4a66d, same file, :37-39.
+    std::optional<std::uint32_t> checkpoint_slots_occupied;
+    std::optional<std::uint32_t> checkpoint_slots_capacity;
+    std::uint32_t checkpoint_slots_reserved = 0;
+
 
     [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
                                                    const PhysicalUsageSnapshot&) noexcept = default;
@@ -51,6 +57,13 @@ struct GraphExecutionProfile {
     std::uint32_t min            = 0;
     std::uint32_t max            = 0;
     std::uint32_t topology_class = 0;
+    // Captured MTP draft width this profile belongs to (kMtpDecodeMaximumDrafts domain);
+    // 0 for the ordinary/DFlash families and for the MTP profiles of a fixed-k run. A
+    // non-zero value means the segment is one rung of the capture-width ladder
+    // (kMtpWindowLadder), and the replay selects the profile by width as well as by batch and
+    // frontier -- that selection is what makes the marginal draft column cost b_width instead
+    // of the 7.2x-smaller b_mask.
+    std::uint32_t draft_width    = 0;
 };
 
 // Program-minted shortlist metadata. It only narrows catalog inspection; Program still performs
@@ -388,6 +401,39 @@ private:
     friend class PressurePlanningSession;
 };
 
+// RAII lease on one construction slot of a PressurePlanningSession.  A move-only handle whose
+// destructor releases the slot; the session accesses session_/slot_/generation_ through the
+// detail::PressurePlanningSessionImpl specialization the implementation defines.
+// Donor: igorls/ninfer @ 5e4a66d src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h,
+// verbatim apart from this comment.  Nothing in this tree instantiates it yet: the Flash-Next
+// target owns the session that leases it (its own impl/program.cpp).
+class PressureConstructionCursor {
+public:
+    PressureConstructionCursor(PressureConstructionCursor&& other) noexcept
+        : session_(std::exchange(other.session_, nullptr)), slot_(other.slot_),
+          generation_(other.generation_), release_(other.release_) {}
+
+    PressureConstructionCursor& operator=(PressureConstructionCursor&&)      = delete;
+    PressureConstructionCursor(const PressureConstructionCursor&)            = delete;
+    PressureConstructionCursor& operator=(const PressureConstructionCursor&) = delete;
+
+    ~PressureConstructionCursor() {
+        if (session_) { release_(session_, slot_, generation_); }
+    }
+
+private:
+    PressureConstructionCursor(const void* session, std::uint32_t slot, std::uint32_t generation,
+                               void (*release)(const void*, std::uint32_t, std::uint32_t) noexcept)
+        : session_(session), slot_(slot), generation_(generation), release_(release) {}
+
+    const void* session_;
+    std::uint32_t slot_;
+    std::uint32_t generation_;
+    void (*release_)(const void*, std::uint32_t, std::uint32_t) noexcept;
+    template <class Variant>
+    friend struct detail::PressurePlanningSessionImpl;
+};
+
 template <class Variant>
 class PreparedPressureExpansion {
 public:
@@ -599,6 +645,10 @@ struct MaterializationVictimResult {
     runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
     bool pressure_committed               = false;
     std::optional<ContinuationSummary> final_summary;
+    // Which planning owner this victim belonged to.  APPENDED, so positional aggregate
+    // initialisation elsewhere is unaffected.  Added for the copied Flash-Next target; the donor
+    // carries it FIRST (igorls/ninfer @ 5e4a66d src/targets/qwen3_6/export/.../runtime.h:792).
+    runtime::PlanningOwnerId owner;
 };
 
 struct MaterializationSharedVictimResult {
@@ -609,8 +659,16 @@ struct MaterializationSharedVictimResult {
 
 struct MaterializationSourceResult {
     runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
+    // Donor spelling of the same fact, ADDED beside `disposition` rather than replacing it so that
+    // this tree's sites keep compiling.  It sits BEFORE `final_summary` because a site from the
+    // copied target aggregate-initialises this struct with C++20 designated initialisers, which the
+    // language requires to appear in declaration order: (.mode, .final_summary).  This tree's own
+    // sites use (.disposition, .final_summary), which stays increasing either way.  Donor:
+    // igorls/ninfer @ 5e4a66d src/targets/qwen3_6/export/.../runtime.h:806.
+    runtime::PrivateSourceMode mode = runtime::PrivateSourceMode::Retain;
     std::optional<ContinuationSummary> final_summary;
 };
+
 
 struct MaterializationSharedSourceResult {
     runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
@@ -771,6 +829,30 @@ public:
     append_forced_tokens(std::span<const SequenceHandle<Variant>> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
                          runtime::ExecutionTiming* failed_timing = nullptr);
+    // M21: append a run of ALREADY-KNOWN tokens to ONE live sequence and prefill it, so the model
+    // can attend to them from the very next round. This is the same Program-level operation as
+    // append_forced_tokens ("extend the sequence, then prefill the extension") and deliberately the
+    // same body: every piece of thinking-control accounting lives in the engine
+    // (EngineCore::run_control_batch), never in Program, so the caller that appends context gets
+    // that body with NO control-token bookkeeping, and there is no second copy to drift from.
+    // Contract (all enforced by the shared body, program_impl.h:8912-8945): the sequence is Active
+    // with no prefill in flight (ledger_frontier == execution_frontier + 1,
+    // text_kv_valid == execution_frontier), and execution_frontier + tokens.size() <= capacity.
+    //
+    // What this entry does NOT do, by construction (why is read off text_context_impl.h:1397):
+    //  * it does not sample. The appended prefill runs with finalize_at_end=false, so the appended
+    //    run's own bonus token comes from the following decode round -- exactly as the forced-token
+    //    path behaves. The block that would read PrefillContext::sampling (text_context_impl.h:1479)
+    //    is unreachable, so passing a sampling pointer here would be dead code.
+    //  * it does not build an MTP proposal ladder (text_context_impl.h:1535 is gated on the same
+    //    is_last), so a --draft-tree L,d (L > 1) run cannot get its round-1 lattice from an
+    //    appended chunk. Chain MTP (paths <= 1) is unaffected: text_context.h:297-302 states that
+    //    the chain spelling launches no extra work at all.
+    //  * it does not publish the appended run as prompt material. The identity ledger records it
+    //    through append_generated (program_impl.h:9075), not through a materialization identity.
+    [[nodiscard]] runtime::ExecutionTiming
+    append_context_prefill(SequenceHandle<Variant> sequence, std::span<const TokenId> tokens,
+                           runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CommitResult<Variant>
     commit(PendingBatch<Variant>&& pending, std::span<const runtime::CommitDecision> decisions,
            runtime::CommitObservation observation  = runtime::CommitObservation::AllRows,
@@ -788,8 +870,32 @@ public:
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;
     [[nodiscard]] std::uint64_t resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    // mtplogxface: mtplogx added the counters and their accessors to ProgramImplCore
+    // (impl/runtime/program.h, `mtp_graph_extension_calls_` / `..._nanoseconds_`) and made
+    // resource_manager.h read them OFF THIS FACADE, but the facade half was never landed
+    // (mtplogx's own pre-image set has no runtime.h), so the tree did not compile.
+    // Pure insertion; the counters, their increments and every consumer stay mtplogx's.
+    [[nodiscard]] std::uint64_t mtp_graph_extension_calls() const noexcept;
+    [[nodiscard]] std::uint64_t mtp_graph_extension_nanoseconds() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+
+    // W6: the mutable prefill unit. The workspace and the persistent buffers are sized for
+    // prefill_chunk_capacity() at startup, so installing any value in
+    // [prefill_chunk_alignment, prefill_chunk_capacity()] at runtime is safe: shrinking always is,
+    // growing past the capacity is not. The engine drives both through
+    // `if constexpr (requires { program->set_prefill_chunk(0u); })`, and before these two
+    // forwarders existed this wrapper exposed neither member, so that guard was FALSE for every
+    // target and the bandwidth governor's prefill-unit shrink could not reach a Program at all --
+    // it was unreachable code, not merely env-gated.
+    //
+    // Both members are pinned: tests/test_prefill_chunk_wiring.cpp asserts the engine's own named
+    // predicate (bandwidth_detail::exposes_prefill_chunk_wire) for each target package and odr-uses
+    // each member, so a declaration without a definition is a link error, and engine_core.h's call
+    // site fails the build outright when the predicate is false. The guard is named in one place
+    // because a guard and the check behind it disagreeing is how this came to be dead code.
+    void set_prefill_chunk(std::uint32_t chunk) noexcept;
+    [[nodiscard]] std::uint32_t prefill_chunk_capacity() const noexcept;
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;

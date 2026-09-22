@@ -44,6 +44,13 @@ def read_meta(path):
     return meta
 
 
+def decode_dtype(value):
+    """`dropped` == the layer has NO KV planes at all (NINFER_KV_DROP_LAYERS);
+    it is NOT a dtype code. -1 so the numeric tests below cannot mistake it for
+    the empty view's default BF16 (0)."""
+    return -1 if str(value) == "dropped" else int(value)
+
+
 def fld(meta, name, key, default="0"):
     return meta.get(name, {}).get(key, default)
 
@@ -109,7 +116,9 @@ def main():
             head = meta.get("layer", {})
             head_dim = int(head.get("head_dim", 0))
             kv_heads = int(head.get("num_kv_heads", 0))
-            dtype = int(head.get("dtype", 1))
+            # l26c3: a discarded layer publishes `dtype=dropped` (see the fix in
+            # text_prefill_impl.h dump_kv_cache), not a BF16 code.
+            dtype = decode_dtype(head.get("dtype", 1))
             group = int(head.get("quant_group", 0)) or 16
             k_raw, k_shape = load_plane(prefix, meta, "k")
             v_raw, v_shape = load_plane(prefix, meta, "v")

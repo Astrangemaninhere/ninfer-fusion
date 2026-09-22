@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/layout.h"
+#include "ninfer/ops/gated_delta_net.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
 
 #include <cuda_bf16.h>

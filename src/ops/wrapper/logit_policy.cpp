@@ -1,6 +1,6 @@
 // ninfer::ops - logit_policy wrapper: implements the public api, validates
 // parameters, and dispatches to the launcher. Host-compiled; never includes
-// the kernel header. See docs/op-development.md \u00a72.
+// the kernel header. See docs/maintainer/op-development.md \u00a72.
 #include "ninfer/ops/logit_policy.h"
 
 #include "ops/launcher/logit_policy.h" // detail::logit_policy_launch

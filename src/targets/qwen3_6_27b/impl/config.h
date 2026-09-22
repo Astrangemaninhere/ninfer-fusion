@@ -10,13 +10,50 @@
 namespace ninfer::targets::qwen3_6_27b::detail {
 
 struct TextConfig {
-    // E3/S24: the shared window wiring in layouts_impl.h binds
-    // TextConfig::sliding_window + TextConfig::is_swa_attention when a variant
-    // declares them. This family is full attention on every layer, so declare the
-    // no-op values explicitly (all-zero window table = full attention, identical to
-    // the previous behaviour) instead of letting the guard hit a name lookup error.
-    static constexpr int sliding_window = 0;
-    [[nodiscard]] static constexpr bool is_swa_attention(int /*layer*/) { return false; }
+    // E3/S24 + 1M WINDOW (window2): the shared window wiring in layouts_impl.h
+    // binds TextConfig::sliding_window + TextConfig::is_swa_attention. This family
+    // is full attention on every layer, so the window is NOT the model's own
+    // declaration -- it is a deliberate POLICY change to attention, declared here
+    // because it is the only bound that lets the Cold Host tier admit a page.
+    //
+    // Only the nvfp4 and iso3 KV tiers honour `sliding_window_tokens`
+    // (gqa_attention_decode_nvfp4.cuh:259, gqa_attention_decode_iso3.cuh:132); the
+    // bf16 / fp8 / i8 / simt_ffma / small-t decode paths hard-code full attention.
+    // On those a declared window is SILENT CORRUPTION (a page is released to the
+    // host and then read anyway), so layouts_impl.h REFUSES those tiers BY NAME
+    // before the table is committed. Per window1/REPORT.md section 2.3.
+    //
+    // LANDED VALUE: 646,720 tokens = 10,105 pages = W_max = D - K, the TOP EDGE of the
+    // admissible band [9,379, 10,105] pages at the shipped --cold-host-bytes = 7 GiB
+    // (window1/REPORT.md Q6; dl/winpolicy/REPORT.md TASK 1).
+    // WHY THIS VALUE AND NOT A SMALLER ONE: the band's two axes are monotone in the
+    // SAME direction -- a larger W means MORE always-attended context AND LESS host
+    // pressure (host holds F-W-K pages). The bottom edge, 600,256 tokens, exactly
+    // saturates the 7 GiB budget with zero spare; this value leaves 726 pages spare.
+    // WHY IT IS A SAFE DEFAULT: the kernel computes token_begin = (last_pos+1) - W and
+    // clamps at 0, and cold_host_page_is_read_free() returns false for every page the
+    // window has not passed -- so for every context <= 646,720 this is bit-identical to
+    // full attention AND produces zero host traffic. It changes exactly one thing: it
+    // makes the 1M band non-empty.
+    // NOT A NO-OP ABOVE 646,720: at 1M the model attends the most recent 646,720 tokens
+    // plus up to K = 43 recalled pages (2,752 tokens) per round; the oldest ~363,328
+    // tokens are attended only when the round plan names them. That is the accuracy
+    // statement behind "1M" on this stack and must be reported when 1M is armed.
+    // 4,096 remains reachable by the per-run knob: NINFER_KV_WINDOW_TOKENS=4096.
+    static constexpr int sliding_window = 646720;
+    // Called with the index into the paged-layer window table, i.e. i in
+    // [0, full_attention_layers() = 16) -- see layouts_impl.h. It is NOT called
+    // with a global layer index: the 48 GDN layers have no paged KV and are never
+    // asked. `cold_host_layers_are_windowed` (cold_host_tier.h:96) requires EVERY
+    // entry of that 16-long span to be non-zero, so the policy is declared on all
+    // 16 paged layers. This is why the answer is `true` on THIS variant and `false`
+    // on qwen3_6_35b_a3b / qwen3_5_9b: a single zero entry makes
+    // cold_host_page_is_read_free() (cold_host_tier.h:81-91) return false for EVERY
+    // page, so the Cold Host tier admits nothing and the 1M band is unreachable at
+    // any --cold-host-bytes. NINFER_KV_WINDOW_TOKENS does NOT fix that: the ternary
+    // at layouts_impl.h keys on is_swa_attention(i), so a variant that returns false
+    // gets 0 on every layer whatever the knob says.
+    [[nodiscard]] static constexpr bool is_swa_attention(int /*layer*/) { return true; }
 
     static constexpr int hidden       = 5120;
     static constexpr int layers       = 64;

@@ -21,10 +21,18 @@ using ninfer::artifact::NumericFormat;
 using ninfer::targets::qwen3_6_27b::Package;
 using namespace ninfer::targets::qwen3_6_27b::detail;
 
-std::filesystem::path artifact_path(const char* environment, const char* filename) {
+// `explicitly_configured` separates the two reasons an artifact can be absent:
+//   * the environment variable is set but the path is not there -> misconfiguration, must fail
+//   * the variable is unset and the default path is absent      -> legitimate skip
+// Conflating them turns a typo in the variable into a silent skip, and because this target
+// declares SKIP_RETURN_CODE 77 that skip is reported by `ctest` as a pass.
+std::filesystem::path artifact_path(const char* environment, const char* filename,
+                                    bool& explicitly_configured) {
     if (const char* value = std::getenv(environment); value != nullptr && *value != '\0') {
+        explicitly_configured = true;
         return value;
     }
+    explicitly_configured = false;
     return std::filesystem::path(NINFER_SOURCE_DIR) / "out" / filename;
 }
 
@@ -237,11 +245,23 @@ int verify_vision_workspace_planning() {
 } // namespace
 
 int main() {
+    bool groupwise_configured = false;
+    bool nvfp4_configured     = false;
     const std::filesystem::path groupwise =
-        artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
-    const std::filesystem::path nvfp4 =
-        artifact_path("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS", "qwen3_6_27b_nvfp4.ninfer");
-    if (!std::filesystem::is_regular_file(groupwise) || !std::filesystem::is_regular_file(nvfp4)) {
+        artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer", groupwise_configured);
+    const std::filesystem::path nvfp4 = artifact_path("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS",
+                                                      "qwen3_6_27b_nvfp4.ninfer", nvfp4_configured);
+    const bool groupwise_present = std::filesystem::is_regular_file(groupwise);
+    const bool nvfp4_present     = std::filesystem::is_regular_file(nvfp4);
+    if ((groupwise_configured && !groupwise_present) || (nvfp4_configured && !nvfp4_present)) {
+        std::cerr << "an explicitly configured 27B artifact is missing: NINFER_QWEN3_6_27B_WEIGHTS=\""
+                  << groupwise << "\" (present=" << groupwise_present
+                  << ") NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=\"" << nvfp4 << "\" (present="
+                  << nvfp4_present << "); refusing to report a skip for an explicitly configured "
+                                     "artifact\n";
+        return 1;
+    }
+    if (!groupwise_present || !nvfp4_present) {
         std::cerr << "skip: both real 27B artifacts are required: groupwise=" << groupwise
                   << " nvfp4=" << nvfp4 << '\n';
         return 77;

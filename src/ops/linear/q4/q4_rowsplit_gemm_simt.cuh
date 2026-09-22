@@ -26,6 +26,53 @@
 
 namespace ninfer::ops::detail {
 
+// ---------------------------------------------------------------------------
+// PREVOLTA-ATTN: the staged copy, with an arch-guarded fallback.
+//
+// This kernel staged its rows with `cp_async<>` UNGUARDED, and `cp_async`'s below-floor arm is
+// `unsupported_instruction_trap()` (ops/common/memory.cuh:73-76). So on every rung below sm_80 --
+// sm_52/sm_61 as well as sm_70 -- the TU COMPILED and the kernel TRAPPED ON ITS FIRST LAUNCH,
+// which is strictly worse than not building: the route selector had nothing to refuse, because
+// the kernel was in the build. Measured per file: q4_rowsplit_gemm_simt.cuh:70,72,104 and
+// q6_rowsplit_gemm_simt.cuh:75,77,125 (dl/oldnvidia/recon/r6_cpasync_sites.txt).
+//
+// The fallback is the one this tree already uses for exactly this reason: q5_rowsplit_gemm_simt
+// .cuh:103,108,114 and w8_rowsplit_gemm_simt.cuh:93,99,105 stage through the `cuda_pipeline`
+// primitives (`__pipeline_memcpy_async` / `__pipeline_commit` / `__pipeline_wait_prior`), which
+// degrade to a synchronous copy below sm_80 and do not trap.
+//
+// sm_80 and up: BYTE-IDENTICAL to before -- `NINFER_MEMORY_HAS_CP_ASYNC` is defined there
+// (memory.cuh:22), so the cp_async arm is the one that is compiled, and nothing about the
+// pipeline on the shipped targets changes. Below sm_80 the staged copy becomes synchronous,
+// i.e. correct and slow, which is the honest pre-Volta rung: this is a "the kernel can run"
+// fix, not a performance claim (no pre-Volta card exists on this box to measure either way).
+// ---------------------------------------------------------------------------
+template <int Bytes, Cache Policy = Cache::ca>
+__device__ __forceinline__ void q4_simt_copy(void* shared_dst, const void* global_src) {
+#ifdef NINFER_MEMORY_HAS_CP_ASYNC
+    cp_async<Bytes, Policy>(shared_dst, global_src);
+#else
+    pipe_copy<Bytes>(shared_dst, global_src);
+#endif
+}
+
+__device__ __forceinline__ void q4_simt_commit() {
+#ifdef NINFER_MEMORY_HAS_CP_ASYNC
+    cp_commit();
+#else
+    pipe_commit();
+#endif
+}
+
+template <int Groups>
+__device__ __forceinline__ void q4_simt_wait() {
+#ifdef NINFER_MEMORY_HAS_CP_ASYNC
+    cp_wait<Groups>();
+#else
+    pipe_wait<Groups>();
+#endif
+}
+
 template <int RowsPerCta_, int ColsPerTile_, int GroupsPerStage_, int PipelineStages_,
           Cache CodeCache_, int LaunchBoundsMinBlocks_>
 struct Q4RowSplitSimtGemmSchedule {
@@ -67,9 +114,9 @@ template <class Schedule>
 __device__ __forceinline__ void q4_simt_copy_code(uint4* shared_dst,
                                                   const std::uint8_t* global_src) {
     if constexpr (Schedule::kCodeCache == Cache::cg) {
-        cp_async<16, Cache::cg>(shared_dst, global_src);
+        q4_simt_copy<16, Cache::cg>(shared_dst, global_src);
     } else {
-        cp_async<16, Cache::ca>(shared_dst, global_src);
+        q4_simt_copy<16, Cache::ca>(shared_dst, global_src);
     }
 }
 
@@ -101,12 +148,12 @@ __device__ __forceinline__ void q4_simt_issue_stage(uint4* __restrict__ shared_c
     const int active_scale_pairs = FullStage ? kScalePairs : active_groups / 2;
     for (int pair = lane; pair < kScalePairs; pair += 32) {
         if (FullStage || pair < active_scale_pairs) {
-            cp_async<4>(&shared_scales[pair], stage_scales + static_cast<std::int64_t>(pair) * 4);
+            q4_simt_copy<4>(&shared_scales[pair], stage_scales + static_cast<std::int64_t>(pair) * 4);
         } else {
             shared_scales[pair] = 0u;
         }
     }
-    cp_commit();
+    q4_simt_commit();
 }
 
 template <class Schedule, bool FullStage, bool FullCols>
@@ -254,7 +301,7 @@ __global__ __launch_bounds__(
                                                  shared_scales[warp][prefetch], code_row, scale_row,
                                                  prefetch, active_groups, lane);
         } else {
-            cp_commit();
+            q4_simt_commit();
         }
     }
 
@@ -269,10 +316,10 @@ __global__ __launch_bounds__(
                                                  shared_scales[warp][buffer], code_row, scale_row,
                                                  fetch, active_groups, lane);
         } else {
-            cp_commit();
+            q4_simt_commit();
         }
 
-        cp_wait<kPipelinePrefetch>();
+        q4_simt_wait<kPipelinePrefetch>();
         __syncwarp();
 
         const int active_groups =

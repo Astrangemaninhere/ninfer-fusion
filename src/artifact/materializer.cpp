@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -65,6 +66,49 @@ struct ReadSpan {
     std::uint64_t end   = 0;
 };
 
+
+// W13: the CUDA backend behind product::WeightResidencyDevice. The pinned mirror
+// uses cudaHostAllocDefault -- the same flag the KV cold tier's disk staging uses
+// (program_impl.h:920), so the two host tiers behave identically under WSL.
+class CudaWeightResidencyDevice final : public product::WeightResidencyDevice {
+public:
+    explicit CudaWeightResidencyDevice(cudaStream_t stream) : stream_(stream) {}
+
+    void* device_alloc(std::uint64_t bytes) override {
+        void* slot = nullptr;
+        if (cudaMalloc(&slot, static_cast<std::size_t>(bytes)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return nullptr;
+        }
+        return slot;
+    }
+    void device_free(void* slot) noexcept override { (void)cudaFree(slot); }
+    void* pinned_alloc(std::uint64_t bytes) override {
+        void* block = nullptr;
+        if (cudaHostAlloc(&block, static_cast<std::size_t>(bytes), cudaHostAllocDefault) !=
+            cudaSuccess) {
+            (void)cudaGetLastError();
+            return nullptr;
+        }
+        return block;
+    }
+    void pinned_free(void* pinned) noexcept override { (void)cudaFreeHost(pinned); }
+    void enqueue_h2d(void* device_slot, const void* pinned, std::uint64_t bytes) override {
+        CUDA_CHECK(cudaMemcpyAsync(device_slot, pinned, static_cast<std::size_t>(bytes),
+                                   cudaMemcpyHostToDevice, stream_));
+    }
+    void synchronize() override { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
+    std::uint64_t now_ns() const noexcept override {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
+private:
+    cudaStream_t stream_ = nullptr;
+};
+
 } // namespace
 
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
@@ -72,6 +116,13 @@ void* MaterializedArtifact::device_data(ObjectHandle handle) const {
         throw ArtifactError("object handle does not name a materialized tensor");
     }
     return objects_[handle.index].device;
+}
+
+std::span<const std::byte> MaterializedArtifact::mapped_tensor_bytes(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || objects_[handle.index].mapped.empty()) {
+        throw ArtifactError("object handle does not name a mapped tensor");
+    }
+    return objects_[handle.index].mapped;
 }
 
 std::span<const std::byte> MaterializedArtifact::resource_bytes(ObjectHandle handle) const {
@@ -98,6 +149,11 @@ DeviceArena& MaterializedArtifact::device_arena() {
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  DeviceContext& device, LoadProgress* progress) {
     MaterializedArtifact out;
+    // Take a share of the Reader's file mapping BEFORE anything can alias it: the spans assigned
+    // below point into that mapping, and without this share the artifact would leave them dangling
+    // the moment the caller's Reader goes out of scope. Gated on the plan having mapped tensors so
+    // that a target with none keeps no mapping alive (see the member's note in materializer.h).
+    if (!plan.mapped_tensor_objects.empty()) { out.mapping_lease_ = reader.mapping_lease(); }
     out.objects_.resize(plan.object_count);
     const std::uint64_t capacity = plan.device_capacity_bytes;
     if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
@@ -107,6 +163,58 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     out.stats_.device_capacity_bytes = capacity;
     out.stats_.tensor_count          = plan.device_objects.size();
     out.stats_.resource_count        = plan.host_objects.size();
+    out.stats_.mapped_tensor_count   = plan.mapped_tensor_objects.size();
+    // Mapped placements: no device copy, no owning resource -- the span aliases the artifact's
+    // own file mapping.  See the lifetime contract on mapped_tensor_bytes().
+    for (const MappedTensorMaterialization& placement : plan.mapped_tensor_objects) {
+        if (placement.object.index >= plan.object_count) {
+            throw ArtifactError("mapped tensor placement does not name an artifact object");
+        }
+        const PayloadSpan payload = reader.payload(reader.objects()[placement.object.index]);
+        out.objects_.at(placement.object.index).mapped = payload.data;
+        out.stats_.mapped_tensor_bytes = checked_add(out.stats_.mapped_tensor_bytes,
+                                                     payload.data.size(),
+                                                     "mapped artifact tensor bytes overflow u64");
+    }
+
+    // W13: the offload arena and its runtime are built here (and only here) so the
+    // CUDA backend above stays inside this translation unit.
+    const product::WeightOffloadPlan& offload = plan.weight_offload;
+    std::vector<std::size_t> offload_of_object(plan.device_objects.size(), SIZE_MAX);
+    if (!offload.empty()) {
+        if (offload.source_indices.size() != offload.spans.size()) {
+            throw ArtifactError("weight offload plan is not internally consistent");
+        }
+        for (std::size_t s = 0; s < offload.spans.size(); ++s) {
+            if (offload.source_indices[s] >= plan.device_objects.size()) {
+                throw ArtifactError("weight offload span does not name a device object");
+            }
+            offload_of_object[offload.source_indices[s]] = s;
+        }
+        std::uint64_t declared = 0;
+        for (std::size_t i = 0; i < plan.device_objects.size(); ++i) {
+            if (plan.device_objects[i].offloaded != (offload_of_object[i] != SIZE_MAX)) {
+                throw ArtifactError("weight offload flag does not match the offload plan");
+            }
+            if (plan.device_objects[i].offloaded) { declared += plan.device_objects[i].bytes; }
+        }
+        if (declared != offload.offloaded_bytes) {
+            throw ArtifactError("weight offload byte accounting does not match the plan");
+        }
+        out.weight_backend_ = std::make_shared<CudaWeightResidencyDevice>(device.transfer_stream);
+        out.weight_residency_ =
+            std::make_unique<product::WeightResidencyRuntime>(offload, out.weight_backend_.get());
+        out.stats_.weight_host_bytes         = offload.offloaded_bytes;
+        out.stats_.weight_device_arena_bytes = offload.device_arena_bytes;
+        out.stats_.weight_device_bytes_freed = offload.device_bytes_freed;
+        std::fprintf(stderr,
+                     "[weight-offload] host=%llu B arena=%llu B freed=%llu B layers=%zu "
+                     "arena_layers=%u stride=%u B\n",
+                     static_cast<unsigned long long>(offload.offloaded_bytes),
+                     static_cast<unsigned long long>(offload.device_arena_bytes),
+                     static_cast<unsigned long long>(offload.device_bytes_freed),
+                     offload.layers.size(), offload.arena_layers, offload.layer_stride);
+    }
 
     for (const HostMaterialization& placement : plan.host_objects) {
         auto& resource            = out.objects_.at(placement.object.index).resource;
@@ -122,8 +230,24 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     std::uint64_t copied         = 0;
     std::uint64_t last_published = 0;
     std::uint64_t total          = 0;
-    for (const DeviceMaterialization& placement : plan.device_objects) {
+    for (std::size_t object_index = 0; object_index < plan.device_objects.size(); ++object_index) {
+        const DeviceMaterialization& placement = plan.device_objects[object_index];
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        if (placement.offloaded) {
+            // Byte-exact mirror of the mmap into pinned host memory. The device
+            // address handed back is STABLE from here on, so nothing downstream has
+            // to know this object ever left the device.
+            //
+            // These bytes are deliberately NOT added to `total`: nothing here reads
+            // them from the artifact (adopt_span fills their mirror straight from the
+            // mmap), and `copied` only ever accumulates the resident ranges, so
+            // counting them made `copied != total` true by construction and the
+            // completeness check below threw on every run that offloaded anything.
+            out.objects_.at(placement.object.index).device =
+                out.weight_residency_->adopt_span(offload_of_object.at(object_index),
+                                                  payload.data.data());
+            continue;
+        }
         DeviceSpan storage =
             out.device_arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
                                            static_cast<std::size_t>(placement.alignment));

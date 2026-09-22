@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -101,7 +103,7 @@ void test_decoder_layout() {
     ninfer::LayoutBuilder fp8_builder;
     const q36::DecoderStateLayout fp8 = q36::plan_decoder_state(fp8_builder, fp8_spec);
     (void)fp8_builder.finish(256);
-    // The fp8 tier is a packed-16 dtype like nvfp4/iso3: FP8-E4M3FN codes plus E4M3FN group
+    // The fp8 tier is a packed-16 dtype like nvfp4/iso4e: FP8-E4M3FN codes plus E4M3FN group
     // scales (ops/wrapper/gqa_attention.cpp:80-82/:121-133, read by
     // gqa_attention_decode_fp8.cuh:159). An FP16 scale plane here is the bug that made every
     // fp8 run fail at that guard with "invalid NVFP4 KV cache scale dtype".
@@ -118,6 +120,136 @@ void test_decoder_layout() {
            "FP8 MTP KV has E4M3FN code and group-16 E4M3FN scale planes");
     expect(fp8.kv_payload_bytes() == fp8.text_kv.payload_bytes() + fp8.mtp_kv->payload_bytes(),
            "FP8 Text/MTP KV payload accounting");
+}
+
+// kv_v_codec_check() must resolve a BF16 per-layer slot the same way plan_cache() does
+// (selected = override == BF16 ? global : override, decoder_state.cpp layer_dtype()), because
+// the layers that reach the kernels are the RESOLVED ones. A global nvfp4 dtype with an
+// all-BF16 override table is therefore a stack of NVFP4 layers, and if such a layer keeps a V
+// residual plane or sits in the entropy cold pool, its E2M1 V plane is decoded by a mechanism
+// that only knows ISO4E -- V is silently mis-decoded. The guard used to read the raw override
+// table, saw BF16, and continued, so the exact configuration both refusals were written for
+// was accepted. Cases 1 and 2 below are the negative control: they MUST be refused, and
+// before the fix they returned no refusal at all (the positive controls are case 0, which
+// must stay accepted, and cases 3/4, which pins that the fix neither narrowed nor widened
+// the guard).
+void test_kv_v_codec_guard_resolves_bf16_slots() {
+    const auto refusal = [](bool explicit_nvfp4_slots, bool residual, std::uint32_t cold_pages,
+                            ninfer::KvVCodec codec,
+                            ninfer::DType global = ninfer::DType::NVFP4) {
+        q36::DecoderStateSpec spec = decoder_spec(global, false);
+        spec.kv_v_codec     = codec;
+        spec.max_cold_pages = cold_pages;
+        if (explicit_nvfp4_slots) { spec.layer_kv_dtypes.fill(ninfer::DType::NVFP4); }
+        if (residual) { spec.layer_residual[0] = true; }
+        ninfer::LayoutBuilder builder;
+        try {
+            (void)q36::plan_decoder_state(builder, spec);
+        } catch (const std::invalid_argument& error) {
+            return std::string(error.what());
+        }
+        return std::string{};
+    };
+    const auto names_residual = [](const std::string& text) {
+        return text.find("kv-v-codec e2m1: NVFP4 layer 0") != std::string::npos &&
+               text.find("residual") != std::string::npos;
+    };
+    const auto names_cold = [](const std::string& text) {
+        return text.find("cold pool") != std::string::npos;
+    };
+
+    // 0. Positive control: the ablation itself is legal, so the guard must stay silent.
+    expect(refusal(false, false, 0, ninfer::KvVCodec::E2M1).empty(),
+           "E2M1 V on an inherited NVFP4 stack with no residual and no cold pool is legal");
+    // 1. The bypassed combination: an all-BF16 slot table on a global nvfp4 dtype IS an
+    //    NVFP4 layer 0, whose residual plane decodes ISO4E only.
+    const std::string inherited_residual = refusal(false, true, 0, ninfer::KvVCodec::E2M1);
+    expect(!inherited_residual.empty(),
+           "E2M1 V + a residual plane on a layer that is NVFP4 only by BF16 inheritance must "
+           "be refused (it was silently accepted before the fix)");
+    expect(names_residual(inherited_residual),
+           "the refusal names layer 0 and the residual plane that would mis-decode V");
+    // 2. The same hole in the cold-pool refusal.
+    const std::string inherited_cold = refusal(false, false, 4, ninfer::KvVCodec::E2M1);
+    expect(!inherited_cold.empty(),
+           "E2M1 V + the cold pool on a layer that is NVFP4 only by BF16 inheritance must be "
+           "refused (it was silently accepted before the fix)");
+    expect(names_cold(inherited_cold),
+           "the cold-pool refusal names the pool whose eviction requant is Iso4eVG16");
+    // 3. The explicit table must keep being refused: the fix did not narrow the guard.
+    const std::string explicit_residual = refusal(true, true, 0, ninfer::KvVCodec::E2M1);
+    expect(!explicit_residual.empty() && names_residual(explicit_residual),
+           "an explicitly NVFP4 slot with a residual plane is still refused, by name");
+    expect(!refusal(true, false, 4, ninfer::KvVCodec::E2M1).empty(),
+           "an explicitly NVFP4 slot in the cold pool is still refused");
+    // 4. ISO4E V is what those two mechanisms expect, so it stays accepted.
+    expect(refusal(false, true, 0, ninfer::KvVCodec::Iso3).empty(),
+           "ISO4E V with a residual plane is accepted (the check is codec-specific)");
+    expect(refusal(true, false, 4, ninfer::KvVCodec::Iso3).empty(),
+           "ISO4E V with the cold pool is accepted");
+    // 5. A BF16 stack has no NVFP4 layer at all: the DOMAIN refusal must fire, not the loops.
+    const std::string bf16_stack =
+        refusal(false, true, 0, ninfer::KvVCodec::E2M1, ninfer::DType::BF16);
+    expect(!bf16_stack.empty() && !names_residual(bf16_stack),
+           "an all-BF16 stack is refused by the domain check, not by the layer loops");
+}
+
+// The per-layer BF16 MASK (DecoderStateSpec::layer_kv_dtypes_set).
+//
+// DType::BF16 is also the "inherit the global --kv-dtype" sentinel, so the table
+// alone cannot express "make THIS layer BF16": `--kv-layer-storage 0-11:bf16`
+// under `--kv-dtype nvfp4` used to resolve every one of those layers to NVFP4,
+// silently. The mask is the missing bit, and this test pins the resolution at the
+// only place that commits it (plan_cache, through kv_resolve_slot_dtype).
+//
+// The assertion is the PLANE GEOMETRY, not just the dtype table, because that is
+// what the pool is actually built from and what the kernels are launched against:
+// a BF16 layer contributes 2 planes, an NVFP4 layer 4.
+//
+// It can fail in both directions, and the second half is the injection: the SAME
+// table with the mask cleared MUST come out all-NVFP4. Deleting the mask from
+// plan_cache()'s layer_dtype() turns the first half red; honouring the mask where
+// the historical rule is meant to apply turns the second half red.
+void test_per_layer_bf16_mask() {
+    const auto plan = [](bool mask_written) {
+        q36::DecoderStateSpec spec = decoder_spec(ninfer::DType::NVFP4, false);
+        spec.full_attention_layers        = 2;
+        spec.layer_kv_dtypes[0]           = ninfer::DType::BF16;
+        spec.layer_kv_dtypes[1]           = ninfer::DType::NVFP4;
+        spec.layer_kv_dtypes_set[0]       = mask_written;
+        spec.layer_kv_dtypes_set[1]       = true;
+        ninfer::LayoutBuilder builder;
+        q36::DecoderStateLayout layout = q36::plan_decoder_state(builder, spec);
+        (void)builder.finish(256);
+        return layout;
+    };
+
+    // Written: layer 0 is a REAL BF16 layer under a global NVFP4 dtype.
+    const q36::DecoderStateLayout written = plan(true);
+    expect(written.text_kv.layer_dtypes[0] == ninfer::DType::BF16,
+           "a slot the spec WROTE as bf16 stays bf16 under --kv-dtype nvfp4 "
+           "(this is the per-layer BF16 baseline that had no spelling before the mask)");
+    expect(written.text_kv.layer_dtypes[1] == ninfer::DType::NVFP4,
+           "the next layer of the same spec keeps the nvfp4 it named");
+    expect(written.text_kv.layer_plane_base[0] == 0 && written.text_kv.layer_plane_base[1] == 2,
+           "the mixed BF16 + NVFP4 pool gives layer 0 two planes and layer 1 four, "
+           "so layer 1 starts at plane 2");
+    expect(written.text_kv.pages.planes.size() == 6 &&
+               written.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::BF16 &&
+               written.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::U8,
+           "the page geometry really carries 2 BF16 planes then 4 NVFP4 planes");
+
+    // Not written: the SAME table is the historical inheritance rule -- both layers
+    // are NVFP4. This is the injection's target: if plan_cache() honours the table
+    // without the mask, this half goes red, and with it the claim that every
+    // pre-mask configuration is unchanged.
+    const q36::DecoderStateLayout inherited = plan(false);
+    expect(inherited.text_kv.layer_dtypes[0] == ninfer::DType::NVFP4,
+           "an UNWRITTEN bf16 slot still inherits the global dtype (all-false mask is the "
+           "pre-mask rule, bit-for-bit)");
+    expect(inherited.text_kv.layer_plane_base[1] == 4 &&
+               inherited.text_kv.pages.planes.size() == 8,
+           "with the mask clear both layers are NVFP4: 4 + 4 planes");
 }
 
 void test_round_layout() {
@@ -364,16 +496,54 @@ void test_rebuild_work_prompt_frontier_boundary() {
            "continuation growth did not preserve the prompt-frontier rebuild split");
 }
 
+
+// The prefill unit is not a constant. bandwidth_governor_.prefill_chunk_for() installs
+// a value in [128, prefill_chunk_capacity()] between two engine steps
+// (engine_core.h:2150-2172), so a co-resident decode request makes it SHRINK while a
+// prefill is in flight. `advance_segmented_rebuild_work` used to recompute the OLD
+// tail's contribution at the SMALLER unit, overshoot the recorded count and throw
+// "sequence rebuild chunk accounting is invalid" -- which killed the request
+// (observed twice, A3 and V3; two other shrinks to 128 finished, so it is timing
+// dependent). A shrink is a legal event and must not be an error.
+void test_rebuild_work_prefill_unit_shrink() {
+    constexpr std::uint32_t wide   = 3072;
+    constexpr std::uint32_t narrow = 128;
+    ninfer::runtime::PrefillWork work = ninfer::runtime::make_prefill_work(0, wide, 0, 0, wide);
+    expect(work.chunks == 1, "one wide unit did not charge exactly one chunk");
+
+    // the frontier advances one narrow unit while the unit collapses to its floor
+    q36::runtime_support::advance_segmented_rebuild_work(work, /*tail_begin=*/0, wide, wide + narrow,
+                                                         narrow);
+    const ninfer::runtime::PrefillWork exact =
+        ninfer::runtime::make_prefill_work(0, wide + narrow, 0, 0, narrow);
+    expect(work.chunks == exact.chunks && work.tokens == exact.tokens &&
+               work.attention_pairs == exact.attention_pairs,
+           "a mid-stream prefill-unit shrink did not re-account the rebuild work at the unit "
+           "in force");
+
+    // and the re-accounted state is exact for the advances that follow it
+    q36::runtime_support::advance_segmented_rebuild_work(work, /*tail_begin=*/0, wide + narrow,
+                                                         wide + 2 * narrow, narrow);
+    const ninfer::runtime::PrefillWork exact2 =
+        ninfer::runtime::make_prefill_work(0, wide + 2 * narrow, 0, 0, narrow);
+    expect(work.chunks == exact2.chunks && work.tokens == exact2.tokens &&
+               work.attention_pairs == exact2.attention_pairs,
+           "the rebuild accounting was not stable after a prefill-unit shrink");
+}
+
 } // namespace
 
 int main() {
     test_topology();
     test_decoder_layout();
+    test_kv_v_codec_guard_resolves_bf16_slots();
+    test_per_layer_bf16_mask();
     test_round_layout();
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
     test_rebuild_work_prompt_frontier_boundary();
+    test_rebuild_work_prefill_unit_shrink();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

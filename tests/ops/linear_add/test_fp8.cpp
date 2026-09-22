@@ -27,6 +27,14 @@ constexpr ReductionCriterion kA16Tolerance{
 };
 constexpr ReductionCriterion kA8Tolerance{0.04, kBf16UnitRoundoff, 0.06};
 
+// ⚠️ ACCEPT2 — THE CONTRACT THIS SUITE ASSERTS, named rather than transcribed. The verify tier must
+// be the batch-1 decode's tier, i.e. A16, for EVERY width a verify round can present. `kVerifyWidthCeiling`
+// is the widest a chain-verify round reaches today (kMtpDecodeMaximumDrafts + 1 = 16);
+// `kWideVerifyWidthCeiling` is the widened domain the ngram-draft line introduces (it widens verify to
+// 1..63). Above that domain only prefill and the draft model reach, where A8 is legal and measured.
+constexpr std::int32_t kVerifyWidthCeiling     = 16;
+constexpr std::int32_t kWideVerifyWidthCeiling = 64;
+
 struct Invocation {
     std::int32_t tokens;
     ops::LinearPolicy policy;
@@ -88,15 +96,18 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
     return 1;
 }
 
-int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed) {
+int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    // The sampled widths are the CONTRACT's boundaries, not the predicate's old crossover:
+    //   1/2  = the batch-1 decode;  16 = the current verify ceiling;  64 = the widened
+    //   domain's last A16 width;  65 = the first width where A8 is legal again;  1024 = a
+    //   prefill-scale width.
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},
         Invocation{26, ops::LinearPolicy::A16Only},
-        Invocation{first_a8 - 1, ops::LinearPolicy::AllowA8},
-        Invocation{first_a8, ops::LinearPolicy::AllowA8},
-        Invocation{48, ops::LinearPolicy::AllowA8},
-        Invocation{65, ops::LinearPolicy::AllowA8},
+        Invocation{kVerifyWidthCeiling, ops::LinearPolicy::AllowA8},
+        Invocation{kWideVerifyWidthCeiling, ops::LinearPolicy::AllowA8},
+        Invocation{kWideVerifyWidthCeiling + 1, ops::LinearPolicy::AllowA8},
         Invocation{1024, ops::LinearPolicy::AllowA8},
     };
     constexpr std::int32_t kMaximumTokens = 1024;
@@ -128,8 +139,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize FP8 linear_add");
 
-        const bool a8 =
-            invocation.policy == ops::LinearPolicy::AllowA8 && invocation.tokens >= first_a8;
+        // The tier is read off the CONTRACT (the named domain), never re-derived from the
+        // production predicate: a suite that recomputes the predicate ratifies the predicate.
+        const bool a8 = invocation.policy == ops::LinearPolicy::AllowA8 &&
+                        invocation.tokens > kWideVerifyWidthCeiling;
         const std::string label = "FP8 linear_add [" + std::to_string(n) + "," + std::to_string(k) +
                                   "] " + (a8 ? "A8" : "A16") +
                                   " T=" + std::to_string(invocation.tokens);
@@ -177,20 +190,34 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
 
     const std::size_t a16_interval = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::A16Only, 1, 2048);
-    const std::size_t pre_boundary = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, first_a8 - 1);
-    const std::size_t hot_interval = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, 48);
-    const std::size_t exact_48 = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 48, 48);
+    // THE VERIFY DOMAIN, asserted as a DOMAIN. A16 needs no storage and A8 does, so
+    // "capacity == 0 for every width the verify can present" IS "the verify takes the
+    // decode's own tier" -- the same instrument FIX-C2's run_fp8_verify_domain_contract uses
+    // for the sibling projection. Every width in [1, kWideVerifyWidthCeiling] must report 0
+    // under the permissive policy, and the first width ABOVE the domain must not.
+    std::size_t widest_domain_nonzero = 0;
+    for (std::int32_t tokens = 1; tokens <= kWideVerifyWidthCeiling; ++tokens) {
+        widest_domain_nonzero |=
+            ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, n, k,
+                                                     ops::LinearPolicy::AllowA8, tokens,
+                                                     tokens);
+    }
+    const std::size_t just_above = ops::linear_add_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8,
+        kWideVerifyWidthCeiling + 1, kWideVerifyWidthCeiling + 1);
     const std::size_t through_1024 = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, 1024);
     const std::size_t exact_1024 = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1024, 1024);
-    if (a16_interval != 0 || pre_boundary != 0 || hot_interval != exact_48 ||
-        through_1024 != exact_1024 || exact_1024 <= exact_48) {
+    if (a16_interval != 0 || widest_domain_nonzero != 0 || just_above == 0 ||
+        through_1024 != exact_1024) {
         std::cerr << "FP8 linear_add [" << n << ',' << k
-                  << "]: workspace interval contract mismatch\n";
+                  << "]: workspace interval contract mismatch: the A8 scratch must be zero "
+                     "for every width in [1," << kWideVerifyWidthCeiling
+                  << "] and non-zero at "
+                  << (kWideVerifyWidthCeiling + 1) << " (a16=" << a16_interval
+                  << " domain=" << widest_domain_nonzero << " just_above=" << just_above
+                  << ")\n";
         ++failures;
     }
     return failures;
@@ -204,8 +231,11 @@ int main() {
         return 77;
     }
     int failures = 0;
-    failures += run_shape(5120, 6144, 22, 861U);
-    failures += run_shape(5120, 17408, 25, 863U);
+    // The crossover constants are gone from the call: after the fix the first A8 width is
+    // kWideVerifyWidthCeiling + 1 for BOTH registered geometries, which is what the interval
+    // assertion above measures directly.
+    failures += run_shape(5120, 6144, 861U);
+    failures += run_shape(5120, 17408, 863U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

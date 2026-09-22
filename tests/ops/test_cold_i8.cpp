@@ -123,6 +123,12 @@ std::uint16_t float_to_half(float f) {
 } // namespace
 
 int main() {
+    // No device: report the repository's skip code instead of letting cudaMalloc throw out of main()
+    // (pre-change: std::terminate, rc=134, and ctest recorded a hard error rather than a skip).
+    if (cuda_unavailable()) {
+        std::printf("SKIP: no usable CUDA device\n");
+        return 77;
+    }
     std::mt19937 rng(20260830);
     int failures = 0;
     const auto check = [&](bool ok, const char* what) {

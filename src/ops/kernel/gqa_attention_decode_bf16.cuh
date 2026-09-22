@@ -10,6 +10,11 @@
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_decode.cuh"
+// BF16-COLD-LAND A4: the raw int8-raw cold slot and its device accessors. The bf16
+// tier's OWN cold record is that slot (decoder_state.cpp cold_slot_codec_of(BF16) ==
+// ColdSlotCodec::Int8Raw, A1), so the decode body reuses cold_i8_slot_codes/_scales
+// instead of growing a second slot format.
+#include "ops/kernel/cold_i8_kernels.cuh"
 
 #include <cstdint>
 
@@ -19,11 +24,39 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
           typename CacheInput>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
-    const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
+    __nv_bfloat16* cache_v,
+    // BF16-COLD-LAND A4: the cold slot pool, PLANE-RELATIVE -- the launcher hands over
+    // K = base, V = base + nb[2] for the slots and V = base + nb[1] for the validity
+    // planes, exactly as the i8/nvfp4 decode launchers do, so K and V take the same flat
+    // id `slot * 2*KVHeads + head` here. Null on every tier with no cold codec and null
+    // whenever the pool was not armed, which makes the cold branch below dead code on
+    // those stacks and the tile load byte-identical to what it was before.
+    //
+    // UNLOAD-NORMALQUANT FIX (argument #6): these five parameters sit HERE, straight
+    // after cache_v, because that is where BOTH callers put them --
+    // gqa_attention_decode_partial.cuh:112 and gqa_attention_decode_impl.cuh:163 read
+    // `... cache_v(data), cold_k_slots, cold_v_slots, cold_k_valid, cold_v_valid,
+    // cache.slot_bytes, block_tables, ...`. A4 originally declared them AFTER
+    // table_stride, so the sixth argument (const uint8_t*) met the sixth parameter
+    // (const int32_t* block_tables) and nvcc refused the instantiation with
+    // "argument #6 does not match parameter" at decode_partial.cuh(108) -- i.e. the
+    // tree did not compile at all, on any target, not just on this stack. The position
+    // is also the one the tier this shares its record with uses:
+    // gqa_attention_decode_i8.cuh:75-79 puts cold_k_slots/cold_v_slots/slot_bytes after
+    // the cache and scale planes and before block_tables.
+    const std::uint8_t* cold_k_slots, const std::uint8_t* cold_v_slots,
+    const std::int32_t* cold_k_valid, const std::int32_t* cold_v_valid, std::int32_t slot_bytes,
+    const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    const std::uint64_t* column_masks, const std::int32_t* table_rows, std::int32_t table_stride,
+    std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
     std::int32_t split_units, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
+    float* partial_acc, float* partial_m, float* partial_l,
+    // bf16win: the declared sliding window, in TOKENS, as the nvfp4/i8 siblings take it
+    // (gqa_attention_decode_nvfp4.cuh:234, gqa_attention_decode_i8.cuh). DEFAULTED so that
+    // every call site compiled before this patch keeps full attention: 0 means "the field is
+    // not read", which is byte-identical to `window = last_pos + 1` below.
+    std::int32_t sliding_window = 0) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -37,7 +70,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     constexpr int PVNt    = D / 8;
     constexpr int PVKs    = Bc / 16;
     // The YaRN-extended 1,010,000-key maximum envelope spans at most 186 pages in one 27B split.
-    constexpr int PageIds       = 256;
+    constexpr int PageIds       = paged_kv_page_ids(kCausalAttentionMaximumVisibleKeysYarn);
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     constexpr int QkvRows       = 2 * Bc;
@@ -122,31 +155,38 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         return;
     }
 
-    const int window = last_pos + 1;
+    // bf16win: THE WINDOW IS READ NOW. Before this line the bf16 decode path answered
+    // `last_pos + 1` unconditionally, i.e. full attention, which is why the field's readers
+    // were the census {NVFP4, ISO3} and why installing a windowed artifact on bf16 was
+    // refused by name (product/kv_component_switch.h:kv_sliding_window_domain_error). The
+    // form below is the nvfp4 kernel's (gqa_attention_decode_nvfp4.cuh:381), including its
+    // max(0, ...) clamp: token_begin = max(0, window_full - sliding_window).
+    const int window_full = last_pos + 1;
+    const int token_begin =
+        (sliding_window > 0 && window_full > sliding_window) ? window_full - sliding_window : 0;
+    const int window = window_full - token_begin;
     // Fixed split grid (split_units > 0): split s owns the keys
     // [s*split_units, min((s+1)*split_units, window)). Its interior boundaries are
-    // launch constants, so the partial a split contributes for a key range -- and the
-    // fp32 addition order it used to build it -- no longer move when the launch covers
-    // a different number of tokens. The live window still clips every range (no split
+    // launch constants, so the partial a split contributes for a key range -- and the fp32
+    // addition order it used to build it -- no longer move when the launch covers a
+    // different number of tokens. The live window still clips every range (no split
     // addresses a key past the last valid one) and split_units == 0 keeps the legacy
     // window-driven partition.
-    int active_split_count = 0;
-    int split_start        = 0;
-    int split_limit        = 0;
-    if (split_units > 0) {
-        active_split_count = gqa_small_t_split_active(window, split_units, split_count);
-        split_start        = split * split_units;
-        split_limit        = split_start + split_units;
-    } else {
-        active_split_count =
-            gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
-        const int logical_tiles = div_up(window, Bc);
-        const bool tile_split   = logical_tiles >= active_split_count;
-        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
-                                               : div_up(window, active_split_count);
-        split_start = split * units_per_split * (tile_split ? Bc : 1);
-        split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    }
+    //
+    // The count and the tiling come from gqa_small_t_split_range, the family's one
+    // definition of "which keys does split s own" (ops/kernel/gqa_attention_decode.cuh).
+    // With NINFER_VERIFY_EXACT=1 the token tile cannot reach either of them: with a pinned
+    // split_units the range is [s*split_units, ...) outright, and the legacy branch derives
+    // its tiling from `window` alone because the active count does. At one and the same
+    // window, and for one and the same dtype, the tiling and the count are therefore
+    // identical for TokenTile == 1 and TokenTile == 6 (item 3 of the fix), and the KV dtype
+    // no longer moves the lossless-region bound (item 1 / H39).
+    const GqaSmallTSplitRange split_range =
+        gqa_small_t_split_range<Geometry, false>(window, split_count, split_units, TokenTile,
+                                                  Bc, split, gqa_verify_exact_mode());
+    const int active_split_count = split_range.active;
+    const int split_start        = split_range.start;
+    const int split_limit        = split_range.limit;
     if (split >= active_split_count) { return; }
 
     const int split_end = (split_limit < window) ? split_limit : window;
@@ -158,6 +198,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+    // Contract: page_count is bounded by PageIds =
+    // paged_kv_page_ids(envelope) for every split a launcher can dispatch.
+    // Without this check a larger envelope would run off the end of shared
+    // memory silently instead of declining the split.
+    if (page_count > PageIds) {
+        write_neutral();
+        return;
+    }
     for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
@@ -221,6 +269,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     }
     __syncthreads();
     int physical_page = physical_pages_s[0];
+    // BF16-COLD-LAND A4: the block-table ENTRY for the tile, tracked alongside the page
+    // it resolves to. A cold page is written into the table as a sentinel (entry <= -2)
+    // and `physical_page` IS that sentinel, so the cache-plane loads below must not run
+    // for it.
+    int page_entry = physical_pages_s[0];
     float acc[PVNt][4];
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
@@ -233,7 +286,23 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         const int k0 = first_tile + kb * Bc;
         if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+            page_entry    = physical_page;
         }
+        // BF16-COLD-LAND A4. A Bc=32 tile never crosses a 64-token page boundary, so the
+        // entry cached for this tile decides the whole tile's load path. The sentinel
+        // semantics, the guard set and the flat head-slot id `slot * 2*KVHeads + head`
+        // are the i8 tile body's (gqa_attention_decode_i8.cuh:443-455) and the bf16
+        // causal-cache body's (small_t_bf16.cuh:231-238); the second validity plane
+        // arrives plane-relative, so K and V use the SAME flat id here.
+        const int slot_flat = (-page_entry - 2) * (2 * Geometry::KVHeads) + kv_head;
+        const bool cold     = page_entry <= -2 && cold_k_slots != nullptr &&
+                          cold_v_slots != nullptr && cold_k_valid != nullptr &&
+                          cold_v_valid != nullptr && slot_bytes >= 1024 + 320 &&
+                          cold_k_valid[slot_flat] != 0 && cold_v_valid[slot_flat] != 0;
+        const std::uint8_t* k_slot =
+            cold ? cold_k_slots + static_cast<std::int64_t>(slot_flat) * slot_bytes : nullptr;
+        const std::uint8_t* v_slot =
+            cold ? cold_v_slots + static_cast<std::int64_t>(slot_flat) * slot_bytes : nullptr;
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
         // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #pragma unroll 1
@@ -252,11 +321,57 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                         const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
                         ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
                         ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                    } else if (cold) {
+                        // A cold page: decode the key row out of the raw slot instead of
+                        // the (freed) cache plane. 128 B of packed E2M1 nibbles and 16 B
+                        // of E4M3 group-16 scales per 64-token row, the slot's fixed
+                        // geometry, are the same numbers the warm restore writes back.
+                        const int row = key & kPagedKVPageMask;
+                        const std::uint8_t* k_row = detail::cold_i8_slot_codes(k_slot) + row * 128;
+                        const std::uint8_t* k_row_s =
+                            detail::cold_i8_slot_scales(k_slot) + row * 16;
+                        const std::uint8_t* v_row = detail::cold_i8_slot_codes(v_slot) + row * 128;
+                        const std::uint8_t* v_row_s =
+                            detail::cold_i8_slot_scales(v_slot) + row * 16;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const int chan        = d + i;
+                            const std::uint8_t kb = k_row[chan >> 1];
+                            const std::uint8_t vb = v_row[chan >> 1];
+                            const float k_code =
+                                gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (kb >> 4) : (kb & 0x0F));
+                            const float v_code =
+                                gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (vb >> 4) : (vb & 0x0F));
+                            const float k_scale = gqa_kv_nvfp4_e4m3_to_f32(k_row_s[chan >> 4]);
+                            const float v_scale = gqa_kv_nvfp4_e4m3_to_f32(v_row_s[chan >> 4]);
+                            k_dst[i]            = __float2bfloat16(k_code * k_scale);
+                            v_dst[i]            = __float2bfloat16(v_code * v_scale);
+                        }
                     } else {
                         const std::int64_t off = gqa_cache_index<Geometry>(
                             physical_page, kv_head, d, key & kPagedKVPageMask);
                         ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                         ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                    }
+                } else if (cold) {
+                    const int row = key & kPagedKVPageMask;
+                    const std::uint8_t* k_row   = detail::cold_i8_slot_codes(k_slot) + row * 128;
+                    const std::uint8_t* k_row_s = detail::cold_i8_slot_scales(k_slot) + row * 16;
+                    const std::uint8_t* v_row   = detail::cold_i8_slot_codes(v_slot) + row * 128;
+                    const std::uint8_t* v_row_s = detail::cold_i8_slot_scales(v_slot) + row * 16;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int chan        = d + i;
+                        const std::uint8_t kb = k_row[chan >> 1];
+                        const std::uint8_t vb = v_row[chan >> 1];
+                        const float k_code =
+                            gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (kb >> 4) : (kb & 0x0F));
+                        const float v_code =
+                            gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (vb >> 4) : (vb & 0x0F));
+                        const float k_scale = gqa_kv_nvfp4_e4m3_to_f32(k_row_s[chan >> 4]);
+                        const float v_scale = gqa_kv_nvfp4_e4m3_to_f32(v_row_s[chan >> 4]);
+                        k_dst[i]            = __float2bfloat16(k_code * k_scale);
+                        v_dst[i]            = __float2bfloat16(v_code * v_scale);
                     }
                 } else {
                     const std::int64_t off = gqa_cache_index<Geometry>(physical_page, kv_head, d,
@@ -296,6 +411,18 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         gqa_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
         const int qabs0 = (row0 < row_count) ? pos[token0] : -1;
         const int qabs1 = (row1 < row_count) ? pos[token1] : -1;
+        // M1: the two query rows' ancestor masks. Rows past row_count take column 0's word so the
+        // load stays in bounds; their scores are discarded by the `row < row_count` guards below.
+        const std::uint64_t mask0 =
+            column_masks == nullptr
+                ? ~std::uint64_t{0}
+                : column_masks[static_cast<std::int64_t>(batch) * full_width + column_begin +
+                               (row0 < row_count ? token0 : 0)];
+        const std::uint64_t mask1 =
+            column_masks == nullptr
+                ? ~std::uint64_t{0}
+                : column_masks[static_cast<std::int64_t>(batch) * full_width + column_begin +
+                               (row1 < row_count ? token1 : 0)];
 
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
@@ -304,20 +431,49 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             const int col1 = col0 + 1;
             const int key0 = k0 + col0;
             const int key1 = col1 + k0;
+            // M1: the same cut, plus each query's ancestor bit set for the columns of this round
+            // block. `rel` is the key's column index within the ROUND's whole row (the round's
+            // column 0 sits at cache position first_pos - column_begin), so rel < 0 is a key below
+            // the round -- the shared, already committed history -- and is always visible, while
+            // every key of this round is visible only where the mask says so.
+            //
+            // The round base (and not this launch's chunk base) is what makes the rule true for a
+            // CHUNKED launch: a width above kSmallTChunkTokens is dispatched as several launches
+            // with column_begin > 0, and the keys below a chunk are not all history -- the earlier
+            // chunks' columns belong to this same round block and a tree's sibling is not an
+            // ancestor. With the chunk-relative spelling every earlier chunk's column was admitted
+            // unconditionally (rel < 0), which silently over-visible a tree round's branches. For
+            // a chain the mask is the prefix (1 << (j+1)) - 1, so every column that rel < 0 used to
+            // admit is admitted by the mask too: bit-for-bit unchanged, and for column_begin == 0
+            // the two spellings are the same expression.
+            const int rel0 = column_begin + key0 - first_pos;
+            const int rel1 = column_begin + key1 - first_pos;
+            const bool vis0k0 =
+                rel0 < 0 || ((mask0 >> static_cast<unsigned>(rel0)) & std::uint64_t{1}) != 0;
+            const bool vis0k1 =
+                rel1 < 0 || ((mask0 >> static_cast<unsigned>(rel1)) & std::uint64_t{1}) != 0;
+            const bool vis1k0 =
+                rel0 < 0 || ((mask1 >> static_cast<unsigned>(rel0)) & std::uint64_t{1}) != 0;
+            const bool vis1k1 =
+                rel1 < 0 || ((mask1 >> static_cast<unsigned>(rel1)) & std::uint64_t{1}) != 0;
             score[nt][0] =
-                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0 &&
+                 vis0k0)
                     ? score[nt][0] * scale
                     : -CUDART_INF_F;
             score[nt][1] =
-                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0 &&
+                 vis0k1)
                     ? score[nt][1] * scale
                     : -CUDART_INF_F;
             score[nt][2] =
-                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1 &&
+                 vis1k0)
                     ? score[nt][2] * scale
                     : -CUDART_INF_F;
             score[nt][3] =
-                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1 &&
+                 vis1k1)
                     ? score[nt][3] * scale
                     : -CUDART_INF_F;
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

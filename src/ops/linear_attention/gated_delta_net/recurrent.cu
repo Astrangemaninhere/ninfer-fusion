@@ -187,21 +187,36 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
     }
 }
 
+namespace {
+// One predicate per compiled instantiation, used by BOTH the dispatch below and
+// replay_fold_geometry_supported, so the launcher and the plan validator cannot drift apart.
+template <class Geometry>
+bool fold_geometry_matches(const GdnReplayRecordSpec& spec) noexcept {
+    return spec.layers == Geometry::kLayers && spec.qk_heads == Geometry::kQkHeads &&
+           spec.value_heads == Geometry::kValueHeads &&
+           spec.conv_channels == Geometry::kConvChannels;
+}
+} // namespace
+
+bool replay_fold_geometry_supported(const GdnReplayRecordSpec& spec) noexcept {
+    return fold_geometry_matches<FoldGeometry48x48>(spec) ||
+           fold_geometry_matches<FoldGeometry30x32>(spec) ||
+           fold_geometry_matches<FoldGeometry24x32>(spec);
+}
+
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {
-    if (records.spec.layers == FoldGeometry48x48::kLayers &&
-        records.spec.qk_heads == FoldGeometry48x48::kQkHeads &&
-        records.spec.value_heads == FoldGeometry48x48::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry48x48::kConvChannels) {
+    if (fold_geometry_matches<FoldGeometry48x48>(records.spec)) {
         launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows, stream);
         return;
     }
-    if (records.spec.layers == FoldGeometry30x32::kLayers &&
-        records.spec.qk_heads == FoldGeometry30x32::kQkHeads &&
-        records.spec.value_heads == FoldGeometry30x32::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry30x32::kConvChannels) {
+    if (fold_geometry_matches<FoldGeometry30x32>(records.spec)) {
         launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows, stream);
+        return;
+    }
+    if (fold_geometry_matches<FoldGeometry24x32>(records.spec)) {
+        launch_replay_fold_fixed<FoldGeometry24x32>(records, states, rows, active_rows, stream);
         return;
     }
     throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");

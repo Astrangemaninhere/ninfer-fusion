@@ -51,7 +51,49 @@ qwen3_6 家族 runtime 就是范本:
 
 v1 (2026-09-03 已落地, g++ 语法验证通过):
 1. `config.h` — TextConfig/MoE/GDN/PLE/MTP constexpr (spec → 常量直译)
-2. `arch_manifest.json` — 机器可读清单 (GUI 白名单/registry/转换器输入)
+2. `manifest.json` — 机器可读清单 (GUI 白名单/registry/转换器输入)
+
+   名字与读者一致: tools/gui/model_import.find_manifest 找的就是 `manifest.json`
+   (旧名 `arch_manifest.json` 仍被读者接受)。本生成器原来写 `arch_manifest.json`,
+   于是缺口报告永远找不到它写的清单。本生成器没有算子目录, 所以清单里是
+   `"gaps": null` + `"gaps_measured": false`: "缺口未测量", **不是**"没有缺口" ——
+   报真实缺口的是 `adapt.py`。`gui_hint` 里也不再断言 `"supported": true`
+   (那是一句关于"引擎能跑"的话, 树里没有任何读取方、也没有任何检查); 现在是
+   `spec_extracted` / `engine_supported`(=null, 未验证), 由
+   `tools/gui/model_import.gui_hint_claims()` 读出来放进"未测量"报告里。
+
+   ⚠️ **唯一有效的旗标键是 `gaps_measured`**。清单里出现别的拼法(尤其是
+   `measured`)不是"多写了一个字段": 树里**没有任何地方读 `measured`**, 所以写者
+   用它表达"我没测过"时, 那句话会被无声忽略 —— `{"gaps": [], "measured": false}`
+   曾经因此被判成 CLEAR / rc=0 /"引擎可以直接吃"。现在含 `measured` 的清单判
+   UNKNOWN, 且报告里指名是哪个键 (shape `alias_key:measured`)。**要加旗标, 就加
+   `gaps_measured`; 拼错了会被拒绝, 不会被执行到一半。**
+
+   `gaps` 必须是**对象列表**: 元素不是对象时判 UNKNOWN 并指名是第几个、什么类型
+   (shape `bad_element:T@i`)。以前这是在读端抛 `AttributeError` —— GUI 拿到的是
+   Python 栈, 退出码 1, 与"读不到清单"撞号。
+
+## 3b. 层记账: `block_count` 含 nextn/draft 块 (⭐ 会静默错位)
+
+`qwen35.block_count` **把 nextn/draft 块也算进去**。`Ornith-1.5-9B-Q4_K_M` 声明
+`block_count = 33` + `nextn_predict_layers = 1`, 而 `blk.32` 是那个草稿块 (它带着
+`blk.32.nextn.eh_proj|enorm|hnorm|shared_head_norm`) ⇒ **主栈 32 层** (full attention
+在 3,7,...,31 = 8 层), 草稿块 1 层。
+
+规则**唯一有效的实现**是 `tools/convert/gguf_names.layer_split(kv, arch)`
+(`block_count - nextn_predict_layers`), `tools/archkit/gguf_spec.py` 直接调它, 不复制。
+`gguf_spec` 另外拿张量表独立核对: 带 `.nextn.*` 张量的块必须正好是最后 N 个, N 必须
+等于元数据声明的数 —— 两边不一致就指名拒绝, 因为"哪一块不是解码层"直接决定
+`geometry.layers` 与 `layer_types` 的每一项。
+
+⚠️ **几何门对这个错位不敏感**: `tools/archkit/check_geometry.py` 只判定
+`(query_heads, kv_heads, head_dim)` 是否在引擎分派表里。实测同一个几何下
+`geometry.layers = 32 / 33 / 64 / 64000` 的门输出与退出码**完全相同** (rc=0)。所以
+"几何门绿了"**不等于**层数记对了 —— 那是两件事, 层数只能靠本条记账规则保证。
+
+⚠️ **`tools/gui/model_import._scan_gguf` 仍在用 `max(blk.N)+1` 当层数** (它只扫张量名),
+所以同一条 GGUF 在导入向导里仍报 33 层 (它拿 33/64 去比 `ENGINE_LAYERS` 判断"几何是否
+等同于支持规格")。**这条还没有人修**, 见下一版。
 
 v2 (待做, 对着真实 runtime API 回填):
 3. `impl/variant.h/.cpp` — 叶子函数: 口味枚举 → 共享 ops 调用

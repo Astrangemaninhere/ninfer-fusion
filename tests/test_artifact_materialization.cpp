@@ -82,6 +82,13 @@ void require(bool condition, const char* message) {
 } // namespace
 
 int main() {
+    // The Binder planning calls below (require_*/retain_on_host/validate_only/materialize_on_device/
+    // finish) are PURE HOST bookkeeping -- src/artifact/binder.cpp's materialize_on_device() and
+    // finish() contain no CUDA call at all -- so both plan checks are host contracts. They are
+    // settled BEFORE the device gate so that a broken plan cannot be reported as a skip, and the
+    // verdict line prints both terms.
+    int host_failures   = 0;
+    int device_failures = 0;
     try {
         auto fixture = write_fixture();
         ninfer::artifact::Reader reader(fixture.path);
@@ -105,23 +112,16 @@ int main() {
             ninfer::artifact::StorageLayout::RowScaleV1, fp8_shape);
         validation_binder.validate_only(validated_fp8);
         const auto validation_plan = validation_binder.finish();
-        require(validation_plan.object_count == 4 && validation_plan.host_objects.size() == 1 &&
-                    validation_plan.device_objects.size() == 1 &&
-                    validation_plan.device_capacity_bytes == kSecondTensor.size(),
-                "validate-only tensor was included in the materialization plan");
-
-        int device_count              = 0;
-        const cudaError_t count_error = cudaGetDeviceCount(&device_count);
-        if (cuda_unavailable(count_error)) {
-            std::cout << "SKIP: no usable CUDA device\n";
-            return 77;
-        }
-        CUDA_CHECK(count_error);
-        if (device_count == 0) {
-            std::cout << "SKIP: no CUDA devices\n";
-            return 77;
+        if (!(validation_plan.object_count == 4 && validation_plan.host_objects.size() == 1 &&
+              validation_plan.device_objects.size() == 1 &&
+              validation_plan.device_capacity_bytes == kSecondTensor.size())) {
+            std::cerr << "validate-only tensor was included in the materialization plan\n";
+            ++host_failures;
         }
 
+        // The second, non-validation Binder. Its plan check is the same kind of host-only contract
+        // as the validation plan above, so it is hoisted above the gate with it: the plan's object
+        // count, its host/device split and its device_capacity_bytes are decidable with no device.
         ninfer::artifact::Binder binder(reader);
 
         const auto resource = binder.require_resource(
@@ -147,10 +147,37 @@ int main() {
         binder.materialize_on_device(fp8);
 
         const ninfer::artifact::MaterializationPlan plan = binder.finish();
-        require(plan.object_count == 4 && plan.host_objects.size() == 1 &&
-                    plan.device_objects.size() == 3 && plan.device_capacity_bytes == 772,
-                "binder produced the wrong materialization plan");
+        if (!(plan.object_count == 4 && plan.host_objects.size() == 1 &&
+              plan.device_objects.size() == 3 && plan.device_capacity_bytes == 772)) {
+            std::cerr << "binder produced the wrong materialization plan\n";
+            ++host_failures;
+        }
 
+        int device_count              = 0;
+        const cudaError_t count_error = cudaGetDeviceCount(&device_count);
+        if (cuda_unavailable(count_error)) {
+            if (host_failures != 0) {
+                std::cout << "FAIL artifact_materialization (host_term=" << host_failures
+                          << " device_term=not-run)\n";
+                return 1;
+            }
+            std::cout << "SKIP: no usable CUDA device (host_term=0)\n";
+            return 77;
+        }
+        CUDA_CHECK(count_error);
+        if (device_count == 0) {
+            if (host_failures != 0) {
+                std::cout << "FAIL artifact_materialization (host_term=" << host_failures
+                          << " device_term=not-run)\n";
+                return 1;
+            }
+            std::cout << "SKIP: no CUDA devices (host_term=0)\n";
+            return 77;
+        }
+
+        // The device half runs under its own handler, so a red device half still reaches the verdict
+        // line below instead of short-circuiting it.
+        try {
         ninfer::DeviceContext device(0);
         auto materialized = ninfer::artifact::materialize(reader, plan, device);
 
@@ -196,9 +223,18 @@ int main() {
         require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
                     materialized.device_arena().used() == plan.device_capacity_bytes,
                 "materialized tensor does not own the planned device backing");
-        return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "artifact_materialization device half: " << error.what() << '\n';
+            ++device_failures;
+        }
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
+        // Reached only from the host half or from CUDA_CHECK(cuGetDeviceCount) rejecting an error
+        // that is NOT one of the two "unavailable" codes.
+        std::cerr << "artifact_materialization before the device half: " << error.what() << '\n';
         return 1;
     }
+    std::cout << (host_failures == 0 && device_failures == 0 ? "PASS" : "FAIL")
+              << " artifact_materialization host_term=" << host_failures
+              << " device_term=" << device_failures << '\n';
+    return (host_failures == 0 && device_failures == 0) ? 0 : 1;
 }

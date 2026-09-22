@@ -40,7 +40,12 @@ bool throws_logic(Function&& function) {
     return false;
 }
 
-RequestLimits limits() { return RequestLimits{.default_max_tokens = 512}; }
+// def3: max_context is the ceiling validate_output_budget() refuses above; the harness
+// NAMES it (512) instead of leaving it at the 0 sentinel, so the boundary below is the
+// same number the front ends carry from ServeOptions::max_context.
+RequestLimits limits() {
+    return RequestLimits{.default_max_tokens = 512, .max_context = 512};
+}
 
 Json base_request() {
     return Json{{"model", "qwen"},
@@ -681,6 +686,74 @@ int test_common_objects() {
     return failures;
 }
 
+
+// mtplogfix: the 0 sentinel in RequestLimits::max_context is no longer a silent pass. A
+// harness that assembles RequestLimits without naming the ceiling cannot have its budget
+// checked against it, so the budget is refused BY NAME (500 / output_ceiling_unnamed) instead
+// of being handed to the engine's clamp. A request that presents no budget is still served:
+// nothing is consulted, so nothing is lost in silence.
+int test_output_ceiling_must_be_named() {
+    int failures = 0;
+
+    RequestLimits unnamed;
+    unnamed.default_max_tokens = 512;
+    // max_context stays at its 0 sentinel.
+
+    Json with_budget          = base_request();
+    with_budget["max_tokens"] = 512;
+    const ApiError sentinel = api_error([&] {
+        (void)parse_chat_completion_request(with_budget, unnamed);
+    });
+    failures += check(sentinel.status == 500 && sentinel.code == "output_ceiling_unnamed" &&
+                          sentinel.param == "max_tokens" &&
+                          sentinel.message.find("max_context") != std::string::npos,
+                      "a budget against an unnamed ceiling is refused by name");
+
+    Json without_budget = base_request();
+    failures += check(parse_chat_completion_request(without_budget, unnamed)
+                              .generation.max_tokens == 512,
+                      "a request with no budget is still served under an unnamed ceiling");
+
+    Json at_ceiling          = base_request();
+    at_ceiling["max_tokens"] = 512;
+    failures += check(parse_chat_completion_request(at_ceiling, limits())
+                              .generation.max_tokens == 512,
+                      "the same budget passes once the ceiling is named");
+    return failures;
+}
+
+// def3 (task book s4.B): an output budget above the server's ceiling is refused BY NAME, and
+// the value AT the ceiling still passes. Before the fix both were http 200: the engine's own
+// clamp answered for the out-of-range value and the client was never told.
+int test_output_budget_ceiling() {
+    int failures = 0;
+
+    Json at_ceiling          = base_request();
+    at_ceiling["max_tokens"] = 512;
+    const OpenAIChatRequest at_boundary = parse(at_ceiling);
+    failures += check(at_boundary.output_tokens_explicit &&
+                          at_boundary.generation.max_tokens == 512,
+                      "max_tokens equal to the ceiling still passes");
+
+    Json above           = base_request();
+    above["max_tokens"]  = 513;
+    const ApiError error = api_error([&] { (void)parse(above); });
+    failures += check(error.status == 400 && error.param == "max_tokens" &&
+                          error.message.find("exceeds this server's output ceiling") !=
+                              std::string::npos &&
+                          error.message.find("513") != std::string::npos &&
+                          error.message.find("512") != std::string::npos,
+                      "max_tokens above the ceiling is refused by name with both numbers");
+
+    // The same field spelled the OpenAI way, and the zero budget, both keep working.
+    Json completion_above                  = base_request();
+    completion_above["max_completion_tokens"] = 513;
+    const ApiError completion_error        = api_error([&] { (void)parse(completion_above); });
+    failures += check(completion_error.status == 400 &&
+                          completion_error.param == "max_completion_tokens",
+                      "max_completion_tokens is refused under its own name");
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -695,6 +768,8 @@ int main() {
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_common_objects();
+    failures += test_output_budget_ceiling();
+    failures += test_output_ceiling_must_be_named();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

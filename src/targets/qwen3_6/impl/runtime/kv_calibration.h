@@ -5,9 +5,11 @@
 #include "core/device.h"
 #include "core/dtype.h"
 #include "core/tensor.h"
+#include "product/kv_rowscale_frame_identity.h"
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -39,6 +41,27 @@ public:
             throw std::invalid_argument("KV calibration directory must not be empty");
         }
         std::filesystem::create_directories(directory_);
+        // THE PRODUCING RUN'S IDENTITY. Read ONCE, here, for the same reason the
+        // directory is read once (kv_rowscale_persist.h installs both before the
+        // first prefill). ABSENT is legal and produces an UNSTAMPED frame: the solve
+        // refuses one BY NAME, which keeps a hand-run capture usable by
+        // tools/calib and unusable as the source of a table. MALFORMED is refused
+        // HERE rather than turned into a zero, because a frame whose stamp is a lie
+        // is worse than a frame with no stamp at all.
+        const char* identity = std::getenv(ninfer::product::kKvRowScaleFrameIdentityEnv);
+        if (identity != nullptr && *identity != '\0') {
+            std::string identity_err;
+            if (!ninfer::product::kv_rowscale_frame_identity_parse(
+                    identity, identity_fingerprint_, identity_version_, identity_err)) {
+                std::fprintf(stderr,
+                             "[kvcalib] refusing to capture: %s: %s (an unstamped frame is "
+                             "refused by the solve, so nothing is written)\n",
+                             ninfer::product::kKvRowScaleFrameIdentityEnv, identity_err.c_str());
+                identity_refused_ = true;
+            } else {
+                identity_ready_ = true;
+            }
+        }
     }
 
     // S38: the stream parameter is REQUIRED. A plain cudaMemcpy here
@@ -98,6 +121,11 @@ public:
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
+        if (identity_refused_) {
+            // Named once in the constructor; refuse here rather than write frames
+            // that cannot be attributed to the run that produced them.
+            return;
+        }
         Header header{};
         std::memcpy(header.magic, kMagic, sizeof(header.magic));
         header.header_bytes  = sizeof(Header);
@@ -108,6 +136,18 @@ public:
         header.record_index  = record_index_;
         header.first_position = positions_host.front();
         header.last_position  = positions_host.back();
+        // The identity, byte-for-byte little endian, at the offsets the reader
+        // (product/kv_rowscale_bake.h) reads them from. `reserved` is uint32_t[4], so
+        // the cast is a view of the same 16 bytes; the static_assert below is what
+        // keeps that true if the struct ever moves.
+        auto* identity_bytes = reinterpret_cast<unsigned char*>(header.reserved);
+        for (int i = 0; i < 8; ++i) {
+            identity_bytes[i] = static_cast<unsigned char>((identity_fingerprint_ >> (8 * i)) & 0xFFu);
+        }
+        for (int i = 0; i < 4; ++i) {
+            identity_bytes[8 + i] = static_cast<unsigned char>((identity_version_ >> (8 * i)) & 0xFFu);
+        }
+        // flags[60..63] stay zero: the reader refuses any bit it does not know.
 
         const std::filesystem::path path =
             directory_ / (std::to_string(record_index_) + ".kvc");
@@ -142,6 +182,13 @@ private:
         std::uint32_t reserved[4];
     };
     static_assert(sizeof(Header) == 64);
+    static_assert(offsetof(Header, reserved) == ninfer::product::kKvRowScaleFrameIdentityOffset,
+                  "the frame identity lives in the .kvc header's reserved[4] and nowhere else; "
+                  "if the header grew a field, move the identity's offsets in "
+                  "product/kv_rowscale_frame_identity.h and this fires");
+    static_assert(offsetof(Header, last_position) + sizeof(std::int32_t) ==
+                      ninfer::product::kKvRowScaleFrameIdentityOffset,
+                  "the 16 identity bytes are the 16 bytes after last_position");
 
     static std::uint64_t calib_token_cap() {
         static const std::uint64_t cap = [] {
@@ -153,6 +200,12 @@ private:
     }
 
     std::filesystem::path directory_;
+    // Zero until the environment says otherwise: an all-zero identity IS the
+    // unstamped frame, and the solve's refusal for it names the fix.
+    std::uint64_t identity_fingerprint_ = 0;
+    std::uint32_t identity_version_     = 0;
+    bool identity_ready_                = false;
+    bool identity_refused_              = false;
     std::uint32_t record_index_ = 0;
     std::map<std::uint32_t, std::uint64_t> tokens_per_layer_;
     std::set<std::uint32_t> cap_logged_;

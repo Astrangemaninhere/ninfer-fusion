@@ -54,13 +54,6 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
                       .format = format};
 }
 
-bool layer_mlp_fp8(int layer, bool gate_up) {
-    // Source format table (measured): mlp gate/up fp8 on layers 5..11,
-    // down fp8 on layers 1..12; everything else NVFP4-packed.
-    if (gate_up) { return layer >= 5 && layer <= 11; }
-    return layer >= 1 && layer <= 12;
-}
-
 WeightPlan bind_nvfp4_weight(artifact::Binder& binder, const std::string& name,
                                    std::uint64_t rows, std::uint64_t columns) {
     const std::array<std::uint64_t, 2> shape = {rows, columns};
@@ -85,24 +78,62 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, const std::string& name,
                       .input_scale_divisor_bits  = input_bits};
 }
 
+// The MLP precision is the artifact's own declaration.  The converter derives it
+// from the source tensor's dtype (tools/convert/muse_glimmer_30b/convert.py:
+// `mlp_layer_fmt`) and the artifact stores exactly what it derived; the table of
+// layer numbers that used to live here ("gate/up fp8 on 5..11, down fp8 on
+// 1..12") was a second, independently maintained copy of that decision, and the
+// loader and the artifact would disagree the moment either moved.  Reading the
+// declared format keeps the registered pair {FP8_E4M3FN_ROW_BF16S, NVFP4} as the
+// contract while letting the two sides agree by construction.
 WeightPlan bind_mlp_weight(artifact::Binder& binder, const std::string& prefix,
-                           const char* which, int layer, bool gate_up, std::uint64_t rows,
-                           std::uint64_t columns) {
-    if (layer_mlp_fp8(layer, gate_up)) {
-        return bind_weight(binder, prefix + which, NumericFormat::FP8_E4M3FN_ROW_BF16S,
-                           {rows, columns});
+                           const char* which, std::uint64_t rows, std::uint64_t columns) {
+    const std::string name                      = prefix + which;
+    const artifact::TensorDescriptor* declared  = binder.find_tensor(name);
+    if (declared == nullptr) {
+        throw artifact::ArtifactError("required artifact tensor is missing: " + name);
     }
-    // NVFP4 block-scale: paired input divisor object (unity; activations are
-    // dynamic-quantized by the engine kernels).
-    const std::string name = prefix + std::string(which);
+    if (declared->format == NumericFormat::FP8_E4M3FN_ROW_BF16S) {
+        return bind_weight(binder, name, NumericFormat::FP8_E4M3FN_ROW_BF16S, {rows, columns});
+    }
+    if (declared->format != NumericFormat::NVFP4) {
+        throw artifact::ArtifactError(name + " is declared " +
+                                      std::string(artifact::format_name(declared->format)) +
+                                      ", but this projection is registered as FP8 or NVFP4");
+    }
+    // NVFP4 block-scale: the paired divisors are read OUT of the artifact, not
+    // assumed.  This branch used to return `WeightPlan{.object = parent,
+    // .format = NumericFormat::NVFP4}` with both divisor bit-fields left at their
+    // default 0, and `materialized_weight` bit-casts those zeros into
+    // Weight::weight_scale_divisor / input_scale_divisor -- which the shared
+    // validator rejects: `validate_nvfp4_weight`
+    // (src/ops/linear/nvfp4/nvfp4_format.cpp:61-62) requires both to be finite and
+    // > 0.  Measured on models/muse_glimmer_30b_nvfp4.ninfer: every NVFP4 MLP weight
+    // failed at prefill with `[nvfp4] invalid weight n=19968 k=6656 ... wsdiv=0
+    // isdiv=0` / `nvfp4 linear: invalid NVFP4 weight`, even though the artifact
+    // carried the right words (mlp/gate divisor 9252.1406 at payload offset
+    // 74760192, input divisor 1.0).  Same extraction as bind_nvfp4_weight above,
+    // which is why the head path never had this defect.
     const std::array<std::uint64_t, 2> shape = {rows, columns};
     const artifact::ObjectHandle parent =
         binder.require_tensor(name, NumericFormat::NVFP4,
                               artifact::StorageLayout::BlockScaleK16M128x4V1, shape);
     binder.materialize_on_device(parent);
-    artifact::bind_tensor(binder, name + "/input_scale_divisor", NumericFormat::FP32, {},
-                          artifact::TensorPlacement::ValidateOnly);
-    return WeightPlan{.object = parent, .format = NumericFormat::NVFP4};
+    const artifact::ObjectHandle input_divisor =
+        artifact::bind_tensor(binder, name + "/input_scale_divisor", NumericFormat::FP32, {},
+                              artifact::TensorPlacement::ValidateOnly);
+    const artifact::BlockScaleGeometry geometry =
+        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
+    const std::uint32_t weight_bits =
+        read_u32_le(binder.payload(parent).data, geometry.weight_divisor_offset, name);
+    const std::uint32_t input_bits =
+        read_u32_le(binder.payload(input_divisor).data, 0, name + " input divisor");
+    require_positive_finite(weight_bits, name);
+    require_positive_finite(input_bits, name + " input divisor");
+    return WeightPlan{.object                    = parent,
+                      .format                    = NumericFormat::NVFP4,
+                      .weight_scale_divisor_bits = weight_bits,
+                      .input_scale_divisor_bits  = input_bits};
 }
 
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
@@ -208,28 +239,14 @@ void bind_text_layers(artifact::Binder& binder, BindingPlan& out) {
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "pre_feedforward_layernorm", NumericFormat::BF16,
             {TextConfig::hidden});
-        const bool gu_fp8 = layer_mlp_fp8(static_cast<int>(layer), true);
-        target.mlp.gate = gu_fp8
-                              ? bind_weight(binder, prefix + "mlp/gate",
-                                            NumericFormat::FP8_E4M3FN_ROW_BF16S,
-                                            {TextConfig::intermediate, TextConfig::hidden})
-                              : bind_nvfp4_weight(binder, prefix + "mlp/gate",
-                                                  TextConfig::intermediate,
-                                                  TextConfig::hidden);
-        target.mlp.up = gu_fp8
-                            ? bind_weight(binder, prefix + "mlp/up",
-                                          NumericFormat::FP8_E4M3FN_ROW_BF16S,
-                                          {TextConfig::intermediate, TextConfig::hidden})
-                            : bind_nvfp4_weight(binder, prefix + "mlp/up",
-                                                TextConfig::intermediate,
-                                                TextConfig::hidden);
-        target.mlp.down = layer_mlp_fp8(static_cast<int>(layer), false)
-                              ? bind_weight(binder, prefix + "mlp/down",
-                                            NumericFormat::FP8_E4M3FN_ROW_BF16S,
-                                            {TextConfig::hidden, TextConfig::intermediate})
-                              : bind_nvfp4_weight(binder, prefix + "mlp/down",
-                                                  TextConfig::hidden,
-                                                  TextConfig::intermediate);
+        target.mlp.gate =
+            bind_mlp_weight(binder, prefix, "mlp/gate", TextConfig::intermediate,
+                            TextConfig::hidden);
+        target.mlp.up =
+            bind_mlp_weight(binder, prefix, "mlp/up", TextConfig::intermediate, TextConfig::hidden);
+        target.mlp.down =
+            bind_mlp_weight(binder, prefix, "mlp/down", TextConfig::hidden,
+                            TextConfig::intermediate);
         target.mlp.mlp_out_norm = artifact::bind_device_tensor(
             binder, prefix + "post_feedforward_layernorm", NumericFormat::BF16,
             {TextConfig::hidden});
@@ -267,6 +284,9 @@ LoadedModelData::LoadedModelData(WeightsProfile weights_profile, BindingPlan pla
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
+    // W13: publish the artifact's weight-offload runtime to the layer-boundary hook.
+    // Null unless a host budget was set, so the hook stays a no-op by default.
+    runtime.backing.bind(backing.weight_residency());
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;

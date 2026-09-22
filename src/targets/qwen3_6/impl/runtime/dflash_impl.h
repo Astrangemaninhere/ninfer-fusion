@@ -223,21 +223,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         Tensor attention_valid = valid_columns;
         if constexpr (Config::bf16_weights) {
             attention_valid = state.execution.work.alloc(DType::I32, {batch_size});
-            // DSpark keeps exactly k live draft columns, but this table is also the
-            // target verify's cache/rope position table, and that contract is
-            // target_valid_columns = extent + 1 = width live columns. Build the table
-            // at width so its last column sits at frontier + k instead of repeating
-            // the position of column k-1 (which also aliases its KV cache slot).
-            ops::set_i32_scalar(attention_valid, width, state.execution.device.stream);
+            ops::set_i32_scalar(attention_valid, static_cast<std::int32_t>(k),
+                                state.execution.device.stream);
         }
 
         ops::prepare_masked_block(anchors, frontiers, attention_valid, Config::mask_token, ids,
                                   positions, state.execution.device.stream);
-        // The table stays at `width` (= k + 1) live columns. prepare_masked_block only
-        // reads it -- it ramps positions to frontier + k -- and never writes it, so
-        // lowering it to k hides column k from its own KV slot while column k is exactly
-        // the last hidden the proposal consumes (source_column_offset = 1). The sibling
-        // DFlash2 implementation keeps width for the same reason (dflash2_impl.h:190).
         Tensor residual = state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
         ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
                        state.execution.device.stream);
@@ -442,13 +433,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         const std::size_t source_pitch =
             static_cast<std::size_t>(Config::hidden) * width * element_bytes;
         const auto* source = static_cast<const std::byte*>(residual.data);
-        // The trainer pairs block column p (position a+p) with token x_{a+p} and only
-        // consumes `out[:, 1:]` (train_dspark.py:168-169,428-432): column 0 is the anchor
-        // and never part of the proposal. Taking columns 0..k-1 here therefore shifted the
-        // whole draft block by one column for bf16 drafts (the dspark artifact is bf16),
-        // which is what collapsed its position-0 acceptance. Skip the anchor column always;
-        // the offset stays a named constant so it can become an artifact property later.
-        constexpr std::size_t source_column_offset = 1;
+        std::size_t source_column_offset = 0;
+        if constexpr (!Config::bf16_weights) {
+            // Legacy DFlash keeps the anchor column out of the proposal rows.
+            source_column_offset = 1;
+        }
         source += source_column_offset * static_cast<std::size_t>(Config::hidden) * element_bytes;
         CUDA_CHECK(cudaMemcpy2DAsync(packed.data, row_bytes, source, source_pitch, row_bytes,
                                      static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,

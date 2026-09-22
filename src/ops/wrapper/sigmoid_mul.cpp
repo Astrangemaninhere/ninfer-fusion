@@ -1,6 +1,6 @@
 // ninfer::ops - sigmoid_mul wrapper: implements the public api, validates parameters,
 // and dispatches to the launcher. Host-compiled; never includes the kernel header.
-// See docs/op-development.md §2.
+// See docs/maintainer/op-development.md §2.
 #include "ninfer/ops/sigmoid_mul.h"
 
 #include "ops/launcher/sigmoid_gate_mul.h" // detail::sigmoid_gate_mul_launch
@@ -27,11 +27,33 @@ std::int64_t numel_allow_zero(const Tensor& t) {
     return total;
 }
 
+// Headwise scalar gate form: `x` is [D,H,T] and `gate` is [H,T] -- one sigmoid per (head,
+// token) broadcast over the head_dim axis. Selected by shape alone, and only for pairs the
+// per-element route below rejects: equal shapes satisfy it only for a single-element tensor,
+// where both routes compute the same value. Contract: ninfer/ops/sigmoid_mul.h.
+bool headwise_gate_shape(const Tensor& gate, const Tensor& x) {
+    return x.ne[3] == 1 && gate.ne[2] == 1 && gate.ne[3] == 1 && gate.ne[0] == x.ne[1] &&
+           gate.ne[1] == x.ne[2];
+}
+
 } // namespace
 
 void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
     if (gate.dtype != DType::BF16 || x.dtype != DType::BF16) {
         throw std::invalid_argument("sigmoid_mul: gate/x must be BF16");
+    }
+    // Headwise scalar form (attention-output gate): one sigmoid per (head, token),
+    // broadcast over the head_dim axis. Reachable only for shapes the per-element route
+    // below does not accept.
+    if (headwise_gate_shape(gate, x)) {
+        if (!gate.is_contiguous() || !x.is_contiguous()) {
+            throw std::invalid_argument("sigmoid_mul: headwise gate/x must be contiguous");
+        }
+        if (gate.data == nullptr || x.data == nullptr) {
+            throw std::invalid_argument("sigmoid_mul: gate/x data must be non-null");
+        }
+        detail::headwise_sigmoid_gate_mul_launch(gate, x, x.ne[0], stream);
+        return;
     }
     for (int d = 0; d < 4; ++d) {
         if (gate.ne[d] != x.ne[d]) {

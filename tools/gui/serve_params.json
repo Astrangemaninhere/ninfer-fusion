@@ -1,189 +1,400 @@
 {
- "total": 56,
+ "source": "src/serve/serve_options.cpp",
+ "source_sha1": "4f3b67bc1f5c14f06e398f822823e8c528ea1dc4",
+ "total": 78,
+ "parse_chain_flags": 78,
+ "group_order": [
+  "core",
+  "kv",
+  "speculative",
+  "sampling",
+  "thinking",
+  "media",
+  "perf",
+  "network",
+  "diagnostics",
+  "advanced",
+  "ungrouped"
+ ],
  "groups": {
   "core": [
    {
     "flag": "--api-key",
     "arg": "KEY",
-    "takes_value": true
+    "takes_value": true,
+    "type": "string"
    },
    {
     "flag": "--default-max-tokens",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int",
+    "hint": "defaults to … when omitted",
+    "default": "…"
    },
    {
     "flag": "--device",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--host",
     "arg": "H",
-    "takes_value": true
+    "takes_value": true,
+    "type": "string"
    },
    {
     "flag": "--kv-capacity",
-    "arg": "must",
-    "takes_value": true
+    "arg": "N|auto",
+    "takes_value": true,
+    "type": "string",
+    "choices": [
+     "N",
+     "auto"
+    ],
+    "hint": "auto leaves … MiB of sizing headroom"
    },
    {
     "flag": "--max-concurrency",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--max-context",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--max-pending-requests",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--model-id",
     "arg": "ID",
-    "takes_value": true
+    "takes_value": true,
+    "type": "string",
+    "hint": "overrides the artifact identity.model_id reported by the server"
    },
    {
     "flag": "--pending-timeout-ms",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--port",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    }
   ],
   "kv": [
    {
     "flag": "--cold-disk-bytes",
     "arg": "",
-    "takes_value": false
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--cold-disk-path",
     "arg": "",
-    "takes_value": false
+    "takes_value": true,
+    "type": "string"
    },
    {
     "flag": "--cold-host-bytes",
     "arg": "",
-    "takes_value": false
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--cold-keep-tokens",
     "arg": "",
-    "takes_value": false
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--cold-policy",
     "arg": "",
-    "takes_value": false
+    "takes_value": true,
+    "type": "string",
+    "choices": [
+     "none",
+     "off",
+     "window",
+     "host",
+     "disk",
+     "host-then-disk",
+     "host+disk"
+    ]
    },
    {
     "flag": "--device-state-slots",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int",
+    "hint": "is extra checkpoint capacity beyond active lanes; --host-kv-mib uses MiB"
    },
    {
     "flag": "--host-kv-mib",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--host-state-slots",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
+   },
+   {
+    "flag": "--kv-bit-budget",
+    "arg": "",
+    "takes_value": true,
+    "type": "float",
+    "list": true
+   },
+   {
+    "flag": "--kv-bits",
+    "arg": "B",
+    "takes_value": true,
+    "type": "float",
+    "hint": "is the JOINT K/V ceiling (one number for the whole stack); --kv-k-bits with --kv-v-bits is the SPLIT form, where each plane's per-layer layering is solved in its own budget and a layer whose K and V requirements meet no single tier is refused by index with the missing (K,V) cell named. --kv-bits-mode split (default) | joint | ceiling picks the reading. Both planes always cost the same bits per element: one DType drives both."
+   },
+   {
+    "flag": "--kv-bits-mode",
+    "arg": "joint|split|ceiling",
+    "takes_value": true,
+    "type": "string",
+    "choices": [
+     "joint",
+     "split",
+     "ceiling"
+    ]
    },
    {
     "flag": "--kv-dtype",
     "arg": "bf16|int8|fp8",
-    "takes_value": true
+    "takes_value": true,
+    "type": "string",
+    "choices": [
+     "bf16",
+     "int8",
+     "fp8"
+    ]
+   },
+   {
+    "flag": "--kv-k-bits",
+    "arg": "BK",
+    "takes_value": true,
+    "type": "float"
+   },
+   {
+    "flag": "--kv-k-tier-scores",
+    "arg": "",
+    "takes_value": true,
+    "type": "string"
    },
    {
     "flag": "--kv-layer-storage",
     "arg": "",
-    "takes_value": false
+    "takes_value": true,
+    "type": "string"
+   },
+   {
+    "flag": "--kv-quality-weight",
+    "arg": "W",
+    "takes_value": true,
+    "type": "float",
+    "hint": "W is the speed/quality slider for the fit (0 fastest, 1 most accurate); it needs a ceiling (--kv-bits / --kv-k-bits / --kv-v-bits) and is refused without one rather than silently ignored. --kv-tier-scores FILE replaces the score table."
+   },
+   {
+    "flag": "--kv-residual-layers",
+    "arg": "",
+    "takes_value": true,
+    "type": "string",
+    "list": true
+   },
+   {
+    "flag": "--kv-rotation",
+    "arg": "on|off",
+    "takes_value": true,
+    "type": "string",
+    "choices": [
+     "off",
+     "on",
+     "auto",
+     "default"
+    ]
+   },
+   {
+    "flag": "--kv-row-scale",
+    "arg": "auto|off|FILE",
+    "takes_value": true,
+    "type": "string",
+    "choices": [
+     "auto",
+     "off",
+     "FILE"
+    ]
+   },
+   {
+    "flag": "--kv-score-table",
+    "arg": "",
+    "takes_value": true,
+    "type": "string",
+    "hint": "show|emit=PATH is the penalty table's own entry point: it runs with no model, prints or writes the table the planner would use, and states the real provenance of each column (the shipped quality column is a PRIOR)."
+   },
+   {
+    "flag": "--kv-tier-formats",
+    "arg": "SPEC",
+    "takes_value": true,
+    "type": "string",
+    "hint": "hot=auto|bf16|int8,tail=...,cold=... names the KV tiers"
+   },
+   {
+    "flag": "--kv-tier-scores",
+    "arg": "FILE",
+    "takes_value": true,
+    "type": "string"
+   },
+   {
+    "flag": "--kv-v-bits",
+    "arg": "BV",
+    "takes_value": true,
+    "type": "float"
+   },
+   {
+    "flag": "--kv-v-codec",
+    "arg": "iso4e|e2m1",
+    "takes_value": true,
+    "type": "string",
+    "choices": [
+     "iso4e",
+     "e2m1"
+    ]
+   },
+   {
+    "flag": "--kv-v-tier-scores",
+    "arg": "",
+    "takes_value": true,
+    "type": "string"
+   },
+   {
+    "flag": "--max-cold-pages",
+    "arg": "",
+    "takes_value": true,
+    "type": "int"
+   },
+   {
+    "flag": "--weight-host-bytes",
+    "arg": "",
+    "takes_value": true,
+    "type": "int"
    }
   ],
   "speculative": [
    {
     "flag": "--draft-tokens",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--lm-head-draft",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool"
    },
    {
     "flag": "--spec",
-    "arg": "mtp|dflash",
-    "takes_value": true
+    "arg": "mtp|dflash|dflash2|auto",
+    "takes_value": true,
+    "type": "string",
+    "choices": [
+     "mtp",
+     "dflash",
+     "dflash2",
+     "auto"
+    ]
    }
   ],
   "sampling": [
    {
     "flag": "--frequency-penalty",
-    "arg": "",
-    "takes_value": false
+    "arg": "F",
+    "takes_value": true,
+    "type": "float"
    },
    {
     "flag": "--greedy",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool",
+    "hint": "forces temperature 0 (exact argmax)."
    },
    {
     "flag": "--min-p",
     "arg": "F",
-    "takes_value": true
+    "takes_value": true,
+    "type": "float"
    },
    {
     "flag": "--presence-penalty",
     "arg": "F",
-    "takes_value": true
+    "takes_value": true,
+    "type": "float"
    },
    {
     "flag": "--seed",
-    "arg": "",
-    "takes_value": false
+    "arg": "N",
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--temperature",
     "arg": "F",
-    "takes_value": true
+    "takes_value": true,
+    "type": "float"
    },
    {
     "flag": "--top-k",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--top-p",
     "arg": "F",
-    "takes_value": true
+    "takes_value": true,
+    "type": "float"
    }
   ],
   "thinking": [
    {
     "flag": "--default-thinking-budget",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int",
+    "hint": "caps model-origin thinking for enabled requests; control tokens count toward the request output limit"
    },
    {
     "flag": "--no-thinking",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool"
    },
    {
     "flag": "--preserve-thinking",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool",
+    "hint": "retains closed-turn assistant reasoning in later prompts"
    }
   ],
   "media": [
@@ -191,63 +402,75 @@
     "flag": "--media-cache-mib",
     "arg": "N",
     "takes_value": true,
-    "default": "1024; 0 disables retained media reuse\\n",
-    "type": "string"
+    "type": "int",
+    "hint": "defaults to 1024; 0 disables retained media reuse",
+    "default": "1024"
    },
    {
     "flag": "--media-live-mib",
     "arg": "N",
     "takes_value": true,
-    "default": "2048 and bounds all live BF16 patch payloads\\n",
-    "type": "string"
+    "type": "int",
+    "hint": "defaults to 2048 and bounds all live BF16 patch payloads",
+    "default": "2048"
    },
    {
     "flag": "--media-preprocess-threads",
     "arg": "N",
     "takes_value": true,
-    "default": "0 (auto, at most 16 workers)\\n",
-    "type": "string"
+    "type": "int",
+    "hint": "defaults to 0 (auto, at most 16 workers)",
+    "default": "0 (auto, at most 16 workers)"
    },
    {
     "flag": "--vision",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool",
+    "hint": "enables media and loads the fixed Vision GPU allocations"
    }
   ],
   "perf": [
    {
     "flag": "--no-auto-system-shared-prefix",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool"
    },
    {
     "flag": "--no-cuda-graph",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool"
    },
    {
     "flag": "--no-prefix-reuse",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool",
+    "hint": "disables compatible-prefix caching (enabled by default)"
    },
    {
     "flag": "--prefill-chunk",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    }
   ],
   "network": [
    {
     "flag": "--cors",
     "arg": "",
-    "takes_value": false
+    "takes_value": false,
+    "type": "bool"
    },
    {
     "flag": "--max-request-mib",
     "arg": "N",
     "takes_value": true,
-    "default": "384 and is enforced before JSON parsing\\n",
-    "type": "string"
+    "type": "int",
+    "hint": "defaults to 384 and is enforced before JSON parsing",
+    "default": "384"
    }
   ],
   "diagnostics": [
@@ -255,63 +478,118 @@
     "flag": "--log-stats-interval-ms",
     "arg": "N",
     "takes_value": true,
-    "default": "5000; 0 disables periodic throughput logs\\n",
-    "type": "string"
+    "type": "int",
+    "hint": "defaults to 5000; 0 disables periodic throughput logs",
+    "default": "5000"
    },
    {
     "flag": "--request-log-jsonl",
     "arg": "FILE",
-    "takes_value": true
+    "takes_value": true,
+    "type": "string",
+    "hint": "appends full-precision server/request records"
    }
   ],
   "advanced": [
    {
     "flag": "--context-cost-presets",
     "arg": "FILE",
-    "takes_value": true
+    "takes_value": true,
+    "type": "string"
    },
    {
     "flag": "--max-long-anchors-per-continuation",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--max-private-continuations",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--max-shared-prefixes",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--response-store-max-mib",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
    },
    {
     "flag": "--response-store-max-records",
     "arg": "N",
-    "takes_value": true
+    "takes_value": true,
+    "type": "int"
+   },
+   {
+    "flag": "--yarn",
+    "arg": "",
+    "takes_value": false,
+    "type": "bool"
    }
   ]
  },
  "ungrouped": [
   {
-   "flag": "--help",
-   "arg": "",
-   "takes_value": false
+   "flag": "--ft-stats",
+   "arg": "on|off",
+   "takes_value": true,
+   "type": "string",
+   "choices": [
+    "on",
+    "off"
+   ]
   },
   {
-   "flag": "--kv-residual-layers",
-   "arg": "",
-   "takes_value": false
+   "flag": "--ft-vram-axis",
+   "arg": "on|off",
+   "takes_value": true,
+   "type": "string",
+   "choices": [
+    "on",
+    "off"
+   ]
   },
   {
-   "flag": "--yarn",
+   "flag": "--kv-auto-relayout",
+   "arg": "SECS",
+   "takes_value": true,
+   "type": "int",
+   "hint": "SECS re-derives the per-layer KV table from the FreeToken energy table every SECS seconds (default 0 = off; NINFER_FT_RELOAD_SECS is the env spelling). --ft-stats on enables that observation (NINFER_FT_STATS); --ft-vram-axis off removes the free-VRAM term from the decision (NINFER_FT_VRAM_AXIS, default on and inert while the relayout is off). CLI beats the environment beats the default."
+  },
+  {
+   "flag": "--nvfp4-mode",
+   "arg": "fusion|pure",
+   "takes_value": true,
+   "type": "string",
+   "choices": [
+    "pure",
+    "fusion"
+   ]
+  },
+  {
+   "flag": "--weight-device-arena-bytes",
    "arg": "",
-   "takes_value": false
+   "takes_value": true,
+   "type": "int"
+  },
+  {
+   "flag": "--weight-prefetch-layers",
+   "arg": "",
+   "takes_value": true,
+   "type": "int"
+  },
+  {
+   "flag": "--weight-span-floor-bytes",
+   "arg": "",
+   "takes_value": true,
+   "type": "int"
   }
  ]
 }

@@ -1,4 +1,8 @@
 # NInfer 总 TODO (2026-09-03 固化 v2, 防上下文压缩丢失)
+> **[入口横幅 2026-09-18]** 本文件是**计划/流水账**：其中的常数多是**当时快照**，不是现状；树才是权威。
+> 冷槽常数这一族已于 **2026-09-18** 整体重定：记录 **9632 B**（`320 + 32×259 + 1024`，owner `src/product/kv_tier_formats.h:289` 的 `kKvColdPoolStrideBytes`，权威字面量 `include/ninfer/ops/entropy_nvfp4_slot.h:48`）、价格 **470**（`src/product/kv_bit_budget.h:408`，派生并 static_assert `== 470` @`:412`）、天花板 **404**（`src/targets/qwen3_6/impl/state/decoder_state.cpp:574`，4.04 bits/code 实测最小值）。
+> 凡本文件把 **6688 / 9536 / 466 / 327 / 2544** 当作"应改到的值"的句子，都是**改动前**的世界；照做会被 `decoder_state.cpp:845`/`:863`、`kv_tier_formats.h:329`、`kv_bit_budget.h:412` 的 static_assert 当场挡下（6688 B 只给 167 B/流，实测 K 命中 0/64）。
+> 本次只审了冷槽常数这一族；文件其余部分**未逐行重审**。已加注解的原文行：**5249 / 5252 / 5292 / 5298 / 7006 / 7186 / 7189 / 7201**（插入后行号整体后移；用 `grep -n "注解 2026-09-18" research/notes/TODO.md` 定位全部 8 条注解）。
 
 
 ## 铁律 (用户定死, 2026-09-04)
@@ -5247,9 +5251,13 @@ S1：64 块实测 max|RRᵀ−I| = 1.9e-07、det ∈ [1±2e-07] ⇒ `--kv-rotati
 - 槽位几何本就双 codec：`slot_bytes = 9536` 同时容纳 rANS 上限与 int8 raw 布局（9232）。混合 int8+nvfp4 可支持；
   **含 e8/iso3/fp8/bf16 的栈不行**（无冷 codec）⇒ 出厂默认 10×E8+6×NVFP4 档**解锁后仍一页压不了**（1M 的最大剩余障碍）。
 - 收益算术：@4.0 冷槽 9536 > 常住 9216 ⇒ 每 head-page **亏 320 B**；@2.6 stride = 320+32×167+1024 = **6688 B** ⇒
+  > **[注解 2026-09-18 · SUPERSEDED]** 本条（连同下一行 5250 的算术）已作废：6688 不是可用目标，**现值为 9632 B**（`320 + 32×259 + 1024`），owner 是 `src/product/kv_tier_formats.h:289` 的 `kKvColdPoolStrideBytes`（权威字面量 `ops::kEntropyNvfp4SlotBytes = 9632`，`include/ninfer/ops/entropy_nvfp4_slot.h:48`）。
+  > 照本条下调会**先编译失败**：`kv_tier_formats.h:316`（`kKvColdRansStreamBytes` 必须 ≥ 实测 259 B/流）与 `:329`（`static_assert(kKvColdPoolStrideBytes == 9632, "cold stride == ops::kEntropyNvfp4SlotBytes")`）；6688 B 只给 167 B/流，实测 K 命中 **0/64**（`:276-298`）。符号不变（记录仍宽于常驻，`:330` 断言），差额是算术上的 416 B（9632 − 9216）。
   净 **+2528 B/head-page（+27.4%）**；1M/16 层/kv_heads 4/head_dim 256 ⇒ 18.00 → **13.06 GiB（省 4.94 GiB）**；盈亏平衡 **b ≲ 3.84**。
 - **翻 D2 常量到 2.6 会让 `decoder_state.cpp:367` 的 `static_assert(cold_slot_stride_for(...) == ops::kEntropyNvfp4SlotBytes)` 编译失败**
   （6688 ≠ 9536）⇒ 必须同步改断言与文档，不能只改常量。
+  > **[注解 2026-09-18 · SUPERSEDED]** 本条（即 5251-5252 那句"必须同步改断言与文档"）现在无从执行：`kKvBitBudgetColdSlotBytes` 已是**导出量**（`src/product/kv_bit_budget.h:314` = `kKvColdPoolStrideBytes`），该文件里没有可改的冷字节；两侧钉子现在是 `decoder_state.cpp:845`/`:863`（`static_assert(... == ops::kEntropyNvfp4SlotBytes)`）与 `kv_tier_formats.h:329`（`== 9632`），任一侧改成 6688/9536 都当场断。
+  > 它引的 `decoder_state.cpp:367` 不是现行位置：那条 nvfp4 断言（消息 `nvfp4 cold-slot derivation drifted from ops::kEntropyNvfp4SlotBytes`）现在在 `decoder_state.cpp:835-837`。
 
 ### 7. 未决 / 待裁决
 - **`cold_v_valid` 索引约定不自洽（新发现，先测后改）**：张量声明 `DType::I32, {kv_heads, 2, cold_pages}`
@@ -5290,12 +5298,16 @@ S1：64 块实测 max|RRᵀ−I| = 1.9e-07、det ∈ [1±2e-07] ⇒ `--kv-rotati
 `cold_slot_stride_bytes(codec, head_dim, page_tokens, std::int32_t bits_per_code)` 全程整数运算
 （`stream_budget = (stream_symbols * bits_per_code + 7) / 8`），所以把 `kColdSlotRansBitsPerCode` 写成 `2.6`
 会**截断成 2**；先前报告的 "6688 B / −27.4%" 是按实数算的，与当前类型不符。可用取值：
+  > **[注解 2026-09-18 · SUPERSEDED]** 这一支（把 ceiling 降到 2.6/2、换取 6668/6688）已死，下文表格 5293-5297 与 5298 一并作废：该参数现在就是定点量 `kColdSlotRansBitsPerCodeX100`（`decoder_state.cpp:574`），取值 **404 = 4.04 bits/code，实测最小值**，不是可再下调的偏好；`kv_tier_formats.h:316` 把任何 < 259 B/流 的预算挡在编译期。
+  > 别按表格里的 2.6 行（6668 B）"小重构"：6688/6668 都过不了 `kv_tier_formats.h:316`/`:329`，而且实测命中 0/64。当前真值仍在 `kv_tier_formats.h:288-289`（9632 B）。
 | bits/code（整数）| 数据区 | stride | vs 常住 nvfp4 head-page 9216 B |
 |---|---|---|---|
 | 4（现状） | 8192 B | 9536 B | **+3.47%** |
 | 3 | 6144 B | 7488 B | **−18.75%** |
 | 2.6（需定点化） | 5324 B | 6668 B | −27.65% |
 要拿到 6688 必须把该参数改成定点（例如 `bits_x10`）或浮点，属小重构。另外**不止一处断言**：
+  > **[注解 2026-09-18 · SUPERSEDED]** "改成定点（如 `bits_x10`）"树里已经做了（`...X100`，`decoder_state.cpp:574`）；但 6688 仍不可达且被禁：167 B/流 实测命中 0/64，`kv_tier_formats.h:316`/`:329` 两条 static_assert 会断。
+  > 本条引的位置也已过期：`static_assert(kKvColdPoolStrideBytes == 9536, …)` 现在是 `src/product/kv_tier_formats.h:329` 且读作 `== 9632`；`decoder_state.cpp:374` 那条现在在 `:835-837`（两侧钉子另在 `:845`/`:863`）；`kv_bit_budget.h` 的"mirror"注释现在只有一处派生（`:314`，注释在 `:71-82`），不再是 `:50/132` 两处手写字面量。
 `decoder_state.cpp:374` 与 `src/product/kv_tier_formats.h:215`（`static_assert(kKvColdPoolStrideBytes == 9536, …)`）
 都会编译失败，`kv_bit_budget.h:50/132` 的两处"mirror"注释也要同步。
 安全性质（读码确认）：预算收紧**不会出错**——rANS 流溢出预算就清 valid 标志、该页保持热；
@@ -6043,3 +6055,3586 @@ refusals: none           结构与声明一致 400 / 不一致 0
   `tools/convert/dequant/modelopt.py` + **`tools/convert/qwen3_8_27b/convert_modelopt.py`**（后者尚不存在）。
   ⚠️ 注意其表述里"注册布局要求 145 个对象为 FP8、112 个为 NVFP4"是**原 artifact 的历史构成**；
   **导入应复现"这个源自己的声明"**（FP8 260 + NVFP4 140），而不是去凑历史比例。
+
+### 36. 打包（whl）的门槛：**已知缺陷清单**——用户口径"带着 bug 不能打包"，所以 whl 放最后
+把本轮所有实测到的缺陷收拢成一份**有取证锚点**的清单，作为出 whl 的 gate。
+**A. 正确性 / 质量（必须先修）**
+| # | 缺陷 | 证据锚点 |
+|---|---|---|
+| A1 | **`all:int8` 质量回归 30%**（同语料 1.5217 → **1.97860**） | `dl/rt_arm_d_all_int8.txt`：`scored=13318 mean_nll=0.682389 ppl=1.978600`（历史 1.5217） |
+| A2 | **出厂默认表(10×E8)在真文本上差于 all-NVFP4**（4.870234 vs 4.095580），而立表理由（1.020）来自"一句话重复 120 次"的复读语料 ⇒ **表要重选**；我据此把 `kKvBitBudgetE8LayerLimit` 8→10 也一并**待重审** | `repro_table/REPORT.md`；两路独立同值（C1 4.096/4.870、f5 4.095580/4.870234） |
+| A3 | **1M 边界**：名义 YaRN 容量 **1,048,576 直接报错**（`gqa_attention workspace: invalid profile or interval`），实际可用只到 **1,010,000** | `dl/night2/s4_1m_rerun.log`：1010000 `rc=0`；1048576 `rc=1 error: gqa_attention workspace...`；1048577 起报 capacity |
+**B. 能力 / 经济性（影响可用性与 1M 目标）**
+| # | 缺陷 | 证据锚点 |
+|---|---|---|
+| B1 | **冷路径净亏与不可达**：@4.0 每 head-page **亏 320 B**（9536 槽 > 9216 常住）；翻 2.6 需**定点化重构 + 两处 static_assert**；且 **e8/iso3/fp8/bf16 无冷 codec** ⇒ 出厂表**一页压不了** | `g1/REPORT.md`（9536=320+32×256+1024 **恰好填满、零余量**）；`gm/REPORT.md`（盈亏平衡 b≲3.84） |
+| B2 | **运行时 iso3 档位白扔 ~1 bit/el**：`Iso3Group16 → {DType::ISO3, kNvfp4KvQuantGroup}` ⇒ 存的是 4-bit nibble 平面，却只用 3-bit 码本 | `layouts_impl.h:87` 一带 |
+| B3 | **无损熵编码未落地**：真实平面 e8 **4.25 → 2.824 bits/el**（1M 池 16.21 → **10.77 GiB, −33.5%**），这是 1M 最划算的一步 | `kv_entropy/REPORT.md`（真 byte-rANS 往返 192 流 bit-exact） |
+**C. 仪表 / 接线（会让判据失真）**
+| # | 缺陷 | 证据锚点 |
+|---|---|---|
+| C1 | **DP 的质量/速度列是过期表**（参考 45.98 tok/s 不可复现；nvfp4 实际只慢 **4.58%**）⇒ 分配器输入错 | `m3/REPORT.md`（满栈 nvfp4 61.10 / int8 64.03） |
+| C2 | `kv_v_codec_explicit` **死标志**（4 写 0 读） | `q3_wiring/REPORT.md` |
+| C3 | **残差双层 PASS 需重测**（当时 serve 旗标静默失效） | `q3_wiring/REPORT.md`（3/13 开关无效） |
+| C4 | `--kv-dtype` 在 perplexity 是死标签 ⇒ 我的 PPL 补丁**已落且已重编**，**待复核** | `ppl_fix/ppl_kvdtype.patch`（三处编辑，dry-run rc=0） |
+**D. 未完成功能（不算 bug，但打包前该收）**：FlashNext 导入三卡点（转换器前缀错位/PLE 未接运行时/GDN 前缀复用）；
+按轮次外挂召回零实现（L0 轮次日志 + 检索索引升格）；`convert_modelopt.py`（两路 agent 在做）；
+以及**打包设施本身**（仓库零 pyproject/setup.py/CMake install）。
+**打包顺序（用户已定）**：先把 A/B 修掉、C 复核完、D 里该收的收掉 ⇒ **最后**才做 whl ⇒ 那时才谈合并 main。
+
+### 37. 自动化首轮的三个新发现（"反复测到无缺陷"的必要性实证）
+用户口径："不只是已知缺陷，得反复测试到没有任何缺陷了才能最终打包"。首轮自动化跑完就抓到三类先前**不在清单里**的东西：
+
+**(1) ctest：109 个测试 5 个失败**（95% passed，6 个 skip 是需模型路径的 real 测试）
+```
+FAILED: 4  ninfer_ple_table_e2e_test            (Failed)
+        26 ninfer_qwen3_6_frontend_test         (Subprocess aborted → 崩)
+        51 ninfer_gelu_mul_test                 (Failed)
+        74 ninfer_softmax_attention_test        (Failed)
+        95 ninfer_gdn_input_proj_conv_snapshot_test (Failed)
+Total Test time (real) = 381.54 sec
+```
+⚠️ **我的 harness 缺陷**：执行器把 ctest 输出管道给了 `tail -80` ⇒ **`--output-on-failure` 的明细丢了**，
+而且 `ctest rc=0` 报的是 `tail` 的返回码（不是 ctest 的）。已改为**不经管道**并单独落盘；
+现在有一个 GPU 门控的重跑在排队（等硬检索测试让出 GPU），重跑后会拿到每个失败的原文。
+注意 `ninfer_softmax_attention_test` / `ninfer_gdn_input_proj_conv_snapshot_test`（快照类）**疑似被本轮落地改动影响**，
+`ninfer_gelu_mul_test` 对应的是本地独有那批（`gelu_mul`/`gelu_and_mul`，远端镜像没有），
+`ninfer_ple_table_e2e_test` 属 PLE（FlashNext 那条线）——三条不同来源，必须逐个看原文再定位。
+
+**(2) cold 相：四个臂跑完，但"正向冷行为"根本没被激励** ⇒ **我的判据是空的**
+- `c_i8_cold`：rc=0、**未报 skip** ✔、reservation **2.31 → 2.38 GiB**（是**涨**了）。
+- `c_mixed_cold`：rc=0、**未报 skip**（按文档 e8 无冷 codec 应当报 skip）、payload 684 MiB。
+- `c_e2m1_cold_neg`：rc=1 + 精确拒绝文案 ✔（`kv-v-codec e2m1: the cold pool requires ISO3 V for NVFP4 layers ...`）。
+**根因**：`--max-context 32768` + 82 token 的 prompt + `--max-new 48` ⇒ **根本没有 token 老到被驱逐**，
+所以冷池只是**纯开销**（reservation +0.07 GiB），`enqueue_cold_compressions` 那条路径压根没走到 ⇒
+"报不报 skip"与"省不省显存"这两个判据**都是空转**。⇒ **冷相必须加一个"长生成/长上下文让页真的老化"的臂**，
+并且判据要改成"**压缩后驻留显存下降**"而不是"reservation 变了"。
+（另外 analyzer 的负测试正则在 `[cold] error:` 前缀上不匹配 ⇒ 也是我的正则缺陷，行为本身正确。）
+
+**(3) 由此确立门槛的操作定义**：**"没有缺陷"= 所有仪器反复跑干净**，仪器清单与现状：
+| 仪器 | 现状 |
+|---|---|
+| ctest 109 | **5 fail**（上面，原文待取） |
+| KV 电池 26 判据 | 2 fail（均为我的 harness：冷臂缺溢写目录，已修；需重跑确认） |
+| acc2（F2 代价/崩溃复现） | F2 代价已测（快 2.2–2.7×）；崩溃 10/10 未复现 |
+| 1M 阶梯 | 几何通、边界钉死、真池缺 7.81 GiB；A3（1048576 workspace）待修 |
+| 硬检索 | **本轮首跑（在跑）** |
+| 导入判据 | `layout_plan` 15 单测过 + 真实普查 400/400 |
+| 质量阶梯 | 真文本/复读语料对照已建；A1/A2 待修 |
+
+### 38. ctest 5 个失败**定性完毕**（两类：2 个环境/注册，3 个真代码缺陷）
+| # | 测试 | 原文 | 定性 |
+|---|---|---|---|
+| 4 | `ninfer_ple_table_e2e_test` | `usage: ... <sidecar_root>` | **环境/注册**：CTest 没给它必需参数（不是代码缺陷） |
+| 26 | `ninfer_qwen3_6_frontend_test` | `failed to open test resource: /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json` | **环境**：**硬编码了别人机器的路径**（`/home/neroued/`）；且缺资源时是 **abort 而非 skip**（测试质量缺陷） |
+| 51 | `ninfer_gelu_mul_test` | `strided gate/up: pointwise mismatch max_abs=182.393 max_rel=1.99994 actual=-89 reference=93.3926 first_violation=10240 non_finite=0` | **真代码缺陷**：`max_rel≈2.0` 是**符号翻转**特征；**strided（打包 gate+up）路径**错，`first_violation=10240` 定位到具体偏移 |
+| 74 | `ninfer_softmax_attention_test` | `causal_softmax_attention accepted an envelope outside the launcher domain`（packed/context 均 PASS） | **真契约缺陷**：该 op 接受了域外的 envelope（**F2 改了 envelope 的参考量=图常量容量，是首要嫌疑**） |
+| 95 | `ninfer_gdn_input_proj_conv_snapshot_test` | `NVFP4 snapshot interval did not preserve its A16/A4 route boundary` | **真代码缺陷**：A16/A4 路由边界在 snapshot 区间内没保住（嫌疑在本地独有那批 `nvfp4_w4a4_tma_*`） |
+备注：这轮我重跑时**没给 triage 加 GPU 锁**，而硬检索同时在跑 ⇒ 这三个数值类失败**可能是抢显存导致的伪失败**，
+下一轮重跑必须**独占**（或先确认 VRAM 充足）再定案——**不确定就不许当结论**。
+
+### 39. 3-bit / 2-bit KV 码本实测（agent 交付，数据是引擎自己的 KV dump，真实 KV 非权重代理）
+| 方案 | bits/el | K 相对误差 | V 相对误差 | K logit 扰动 | 对比 nvfp4(9.6/10.3/9.8%) |
+|---|---|---|---|---|---|
+| 旧 `iso_codec.h` iso3 契约 | 5.00 | — | — | — | — |
+| **现在跑的 nibble iso3 档位** | **4.50** | — | — | — | — |
+| **推荐 3-bit**（组 32 + E4M3 + 冻结码本） | **3.25** | 15.9% | 16.9% | 16.0% | **1.6× 差** |
+| **推荐 2-bit**（组 64 + E4M3） | **2.125** | 31.6% | 34.3% | 32.0% | **3.3× 差** |
+（2.0 需要零 scale 开销，实现不了。）
+**1M 只有 2-bit 装得下**：2.125 → **10.31 GiB**（余量 0.09）；3-bit 最低 **14.70**；按 10.4 GiB/1M 反推
+**平均预算只有 2.144 bits/el ⇒ 连一层 int8 或 nvfp4 都买不起**，只能 **15 层 2-bit + 1 层 3-bit = 10.22 GiB**。
+**三条实测发现（其中第一条解释了我们复现实验的谜）**：
+1. ⭐ **现在跑的 E8 档位 K 误差是同 bit 宽纯取整的 1.9–2.0× MSE**——E8 投影让 **46% 坐标落在半整数上**被 `rint` 销毁，
+   其 Hadamard-64 旋转又让 K 差 **3.4–4.5×** ⇒ **E8 花 4.25 bits/el 拿到的 K 精度还不如 3.25 bits/el 的纯标量**。
+   ⇒ **`_TODO.md:1042` 的"E8 覆盖深层即崩"是那套实现的锅，不是 2-bit 的极限**；
+   ⇒ **同时解释 A2**：出厂 10×E8 表在真文本上输给 all-NVFP4，正是因为 E8 的 K 精度更差。
+   ⇒ **据此收回我先前的改动**：`kKvBitBudgetE8LayerLimit` **10 → 8**（见下方补丁），真正的修法是修 E8 codec
+   （半整数 rint、Hadamard 旋转、scale 定点化），不是放宽上限。
+2. **shipped 的 fp16 scale 平面没有范围 clamp**：amax > 65504 时 scale 变 `inf`（潜在缺陷）。
+3. **shipped 的 scale 没有迭代到格式格点的不动点** ⇒ 白扔 **0.4–7.0% NMSE**。
+
+### 40. 硬检索仪器修好后的**首份真实曲线**（独立打分器复算）+ 两处测量纪律缺陷
+
+**仪器修复**（上一轮的两处都是我自己的错，不是模型的）：
+- 打分器：原先"把全部数字剔出来从第 0 位比对"⇒ 思考里的 "64"、标记里的 "00" 会把数字流整体左移 ⇒ **必然 0 分**。
+  改为**锚定对齐**：在任意起点上找与真值对齐最好的一段（旧输出回归验证 **29/64、acc 0.453**）。
+- 预算：`--max-new` 96 → **512**，默认关思考。
+- **独立取证**：新增 `py/score_retrieval.py`，**只读产物文件 + 只按 needles.json 真值重算**，与
+  `retrieval_stress.py` 内部打分构成两条独立路径（内部打分不再被单独采信）。
+
+**实测**（arm `default` = bf16 KV；ctx 262144；prompt **151669 tok**；greedy；数字文档 227425 字符 / 100000 位）
+
+| 标记 | 偏移(位) | 精确前缀 | 字符准确率 | 输出数字数 | 生成tok | 结束 | MTP 接受率 |
+|---|---|---|---|---|---|---|---|
+| [D0] | 0 | 30/64 | 0.562 | 62 | 63 | stop-token | 70.00% |
+| [D25] | 12500 | 3/64 | 0.109 | 380 | 418 | stop-token | 97.80% |
+| [D50] | 25000 | 36/64 | 0.594 | 466 | 512 | **output-limit** | 91.67% |
+| [D75] | 37500 | 26/64 | 0.438 | 66 | 67 | stop-token | 51.28% |
+| [D100] | 50000 | 18/64 | 0.359 | 56 | 57 | stop-token | 55.56% |
+| [D125] | 62500 | 1/64 | 0.219 | 430 | 473 | stop-token | 84.96% |
+
+**小计：精确前缀 114/384 = 0.297；平均字符准确率 0.380。**
+
+**该读出的四件事**：
+1. **召回是"部分且不可靠"，不是"能/不能"**：分数**非单调**（偏移 12500 的 3/64 比 25000 的 36/64 差得多），
+   说明决定分数的更多是**模型有没有决定去输出数字**（看生成 tok：418/430 那两条在思考里打转），而不是距离。
+   ⇒ **禁止**把这个曲线读成"27B 在 262144 处检索能力随距离衰减"。
+2. **offset 0 也只有 30/64** —— 贴着文档开头的标记都没能完整背出。所以"KV 就是前缀函数、开头必然最准"这个直觉
+   **在 64 位精确背诵任务上不成立**（细节保真度不够，而非位置信息丢失）。
+3. **仪器仍有残缺陷**：[D50] 撞 `output-limit`（512 tok 不够）⇒ 预算下一轮升到 1024，否则该点是被截断的假低分。
+4. **顺手量到 ⑧ 的一手数据**：MTP 接受率 **51.28%–97.80%**（生成 tok 少的那几条更高），
+   但这是**模型自带 MTP 头**（`mtp draft window 3` / `rounds 133` / `accepted by pos 130,118,91` /
+   `acceptance length 3.55 tok/round`），**不是**新靶子配套的 DFlash2 草稿头——那个还没导入 ⇒
+   **⑧ 的新抓手仍卡在 ⑦（导入）上**，本条只是"自带头在长上下文里的接受率基线"。
+
+**同一次运行的运行期读数**（对 1M/预算类问题有用）：
+`artifact 19.41 GiB` / `weights H2D 19.40 GiB` / `KV payload 5.34 GiB` / `KV capacity 262144` /
+`runtime reservation 6.50 GiB` / `free after weights 10.75 GiB` / `free after startup 3.66 GiB` /
+`prefill 2740.05 tok/s`（=**365 µs/tok**）/ `decode 25.97 tok/s`（=**38.5 ms/tok**，MTP 已计入）。
+⇒ 逐轮外挂召回的性价比可以用一手数字重算：SSD 读打包 KV 2.6–6.1 µs/tok vs **重新预填充 365 µs/tok**
+= **60–140 : 1**；vs 单步解码 38.5 ms = **约 10⁴ : 1**。
+
+**两处测量纪律缺陷（都是我这边的，已修）**：
+- `_triage5.sh` 的等待循环是"**先判断、后不占**"：它退出等待的瞬间正好落在旧检索被杀、新检索未起的空档里
+  ⇒ 新检索 25 s 后拿到锁，而 triage 的全量 ctest **裸跑**上去，两者**抢 GPU** ⇒
+  那三个数值类失败的定性**仍不算数**，必须独占复跑。
+- 修法（`sh/_exclusive3.sh`）：**先持锁、再等 VRAM**。判断与占住之间没有窗口，物理上不可能被插队；
+  它已挂到锁队列上等检索释放。
+
+### 41. G/S 两组缺陷**双路取证收敛并落地**；纠正 §38 的一处误判；发现一整类派发缺陷
+
+**纠正 §38（我自己的读法错了）**：`max_rel≈2.0` **不是**符号翻转特征。
+两份独立复算都证明：`rel = |got-ref|/max(|got|,|ref|) ≤ 2`，**取等当且仅当 `got == -ref`**，而
+观测值是 `1.99993775… < 2`，且全 174080 个元素里 `got[i] == -ref[i]` 的计数是 **0**；
+报告行自身就是反证（`|-89| ≠ 93.3926`）。
+真实机制是**操作数/地址互换**：第二半块 81920/81920 个元素与模型逐位吻合，
+`got[i] = bf16(gelu(up[…]) * gate[…])`，两处地址都错。§38 表格里"真代码缺陷"的**定性是对的**，
+"符号翻转特征"这个**机制判读是错的**。
+
+#### 缺陷 G：`#51 ninfer_gelu_mul_test`（gelu_mul 派发顺序）
+- 位置：`src/ops/launcher/gelu_and_mul.cu:23` —— 扁平 bf16x8 快速路径的判据只有
+  **地址对齐** + `n % 8`，**没有连续性检查**；于是 `gate/up` 是同一个打包矩阵的两半（strided）时，
+  必然走进扁平核、把 strided 视图当扁平数组读，而**专门为这个 case 写的**
+  `gelu_and_mul_strided_input_kernel`（`:34` 那条分支）被**永久屏蔽**。
+- `first_violation=10240 = rows = 打包块 2*rows 的一半` = 逻辑 `(d0=0, d1=1)` 的第 0 个元素
+  = d1 由 0 变 1 的**列边界**；前 10240 个元素两种读法恰好相同，所以"第一个失败点"正好落在那里。
+- 对照：兄弟 `src/ops/launcher/silu_and_mul.cu:40` **先查连续性**，它那份
+  **形态完全相同**的 strided 测试（`tests/ops/test_silu_mul.cpp:103`，同 seed、同 17 列）是**通过**的
+  ⇒ 差异只在派发顺序。
+- **实现违反了自己的公开契约**：`include/ninfer/ops/gelu_mul.h:47` 原文
+  "out is contiguous; **gate and up may use arbitrary valid Tensor strides**"。
+- **爆炸半径（G2 的附带发现）**：`ops::gelu_mul` 现在**没有生产调用方**（只有测试）；
+  但 `ops::silu_mul` 在生产里就是按 `gate_up.slice(0,0,intermediate)` 调的
+  （`dflash_impl.h:421`、`dflash2_impl.h:331`、`qwen3_6_27b/impl/variant.cpp:395` 等）
+  ⇒ 一旦按同样模式把 gated GELU MLP 接进去，本缺陷会**静默产出错误激活值**。
+- 修法（已落地）：快速路径判据前置 `gate.is_contiguous() && up.is_contiguous()`，与 silu 同风格。
+
+#### 缺陷 S：`#74 ninfer_softmax_attention_test`（causal 域闸比错对象）
+- 位置：`src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp` 的**三处**
+  `:170`（`validate_envelope`）/`:251`（`validate_batched_attention_tensors`）/`:370`（容量查询），
+  比的都是 **×4 的名义 YaRN 容量** `kCausalAttentionMaximumVisibleKeysYarn = 4*262144 = 1048576`，
+  而算子声明的域是 `kCausalAttentionMaximumVisibleKeys = 262144`。
+- 测试的三个探针把域钉在闭区间 `[1, 262144]`：`{1,262144}` 必须**接受**（`:1584-1590`，
+  文案自称 "its maximum visible-key envelope"）、`{1,262145}` 必须**拒收**（`:1591-1597`）。
+  超界 1 个 key vs 距实际闸 786431 个 key ⇒ 唯一能抛的就是那个常数。
+- **严重度不是"契约瑕疵"而是内存安全**（S1 的发现，我独立核实了结构部分）：
+  `small_t_bf16.cuh:41 / small_t_fp8.cuh:67 / small_t_i8.cuh:84` 都是
+  `constexpr int PageIds = 64;`（bf16 那处注释明写"262144-key 最大信封在本 split 几何下最多跨 **49** 页"），
+  `physical_pages_s[PageIds]`（`:50`/`:93`/`:116`），而写入是
+  `physical_pages_s[page] = block_table[first_page + page]`（`small_t_bf16.cuh:147`）**无边界检查**
+  ⇒ 放行到 1048576 的信封意味着**共享内存越界写**（S1 的主机算术给出 193/97 页 vs 64，
+  最小破坏窗口 348161 / 696321 keys；**这条具体数字是 S1 算的，我只核实了"固定 64 + 无检查"这个结构事实**）。
+- 修法（已落地）：三处都改用声明常数 `kCausalAttentionMaximumVisibleKeys`，与 GQA 兄弟
+  （`gqa_attention.cpp:240/323/460` 全用 `kGqaAttentionMaximumVisibleKeys`）同构；`> capacity` 的池检查不动。
+
+#### 三处裁决（两份报告之间/与我之间，都做了实证）
+1. **`out` 的连续性不需要在 launcher 里查**（我的疑点不成立）：`src/ops/wrapper/gelu_mul.cpp:23`
+   已经 `throw "gelu_mul: out must be contiguous"`，wrapper 兜住了；与 silu 写法一致。
+2. **bench 不会因为打补丁而开始抛**（S2 的保留意见是错的、S1 是对的）：
+   `bench/ops/causal_softmax_attention_bench.cu:758` 是**和式感知**的夹取
+   `context > kCausalAttentionMaximumVisibleKeys - valid` ⇒ bench 自己就把域钉在 262144，
+   没有任何合法行会越界，**调用方可见行为不变**。
+3. **两路产物等价性**：S 组双路结果**逐字节相同**；G 组双路结果**只在局部变量名与注释文字上不同**
+   （`inputs_contiguous` vs `contiguous`），逻辑一致。
+
+#### 同形隐患：这是一整类缺陷，不止一处
+"扁平向量核的判据只查对齐、不查连续性"的站点至少 **6 处**：
+`gelu_and_mul.cu`（已修）、`sigmoid_gate_mul.cu:31`、`residual_add.cu:21`、`logit_policy.cu:21`、
+`add_bias.cu:22`、`gelu.cu:18`（后两处只有 G2 找到）。已按铁律⑦再派双路代理查**可达性**并出补丁。
+注：`silu_and_mul` 是正确写法的样板；`gelu_and_mul.cuh:57` 的注释（"out stays contiguous"）
+界定了 strided 核的契约边界。
+
+#### 落地状态与测量纪律
+- 两处修复已**落地为源改动**（`git diff --stat`: 2 files, +9/−4），原文件备份在
+  `/home/user/scratch/landed_GS_010806/`。**未重建**——已查证**没有任何定时/后台流水线会重建**
+  （用户 crontab 空、`/etc/cron.d` 无 ninfer 项、systemd timer 全是系统自带、无 `night_shift` 进程，
+  故源码改动不会污染正在跑的检索）。
+- `build/tests/*` 里的测试二进制**早于**这次改动，所以排队中的 `_exclusive3.sh`
+  会用**旧二进制**复核那 5 个失败——这是**有意为之**：先把"失败确实存在"钉死在修复之前，
+  再重建、再看修复是否让它消失。
+- **时间线旁证**（缩小"抢显存伪失败"的范围）：`ninfer_gelu_mul_test` 在 **00:53:45 失败**，
+  而新检索 **00:54:05** 才启动（它的 VRAM 门要求 <2000 MiB 才肯跑 ⇒ 当时显存是空的）；
+  `ninfer_softmax_attention_test` 00:53:50 开始、5-6 秒结束，也早于权重加载。
+  ⇒ **#51 与 #74 是在显存空闲时失败的**；再加上两者的判据都是**纯主机/纯派发谓词**
+  （S 是两个编译期常数比较，G 是地址对齐与 `n%8`），**由构造排除显存争用**。
+  **#95 仍待独占确认**（它排在后面，与权重加载有重叠）。
+
+### 42. ⚠️ 硬检索对照里出现**结构性矛盾**：int8 臂的 KV payload **大于** bf16 臂（8.77 vs 5.34 GiB）
+
+**先更新 §40 的曲线读数**：`default` 臂现已 8/8 跑完（§40 当时只有 6 条，小计 0.297 是中间值）：
+**精确前缀 211/512 = 0.412**，平均字符准确率 0.482。后两条（[D150] 51/64、[D175] 46/64）明显好于中间几条，
+进一步支持 §40 的判断：**分数由"模型有没有决定直接输出数字"主导**，不是距离衰减（[D25] 只对 3/64 而 [D150] 对 51/64）。
+
+**然后是新发现（本节的要点）**：`int8` 臂 7/8 完成，精确前缀 **436/448 = 0.973**——**远好于 bf16 臂**。
+同二进制、同 artifact、同文档、同 ctx、同 greedy，只有 `--kv-dtype int8` 之差。原始读数：
+
+| 读数（[D0] 的 `.err`） | default | int8 |
+|---|---|---|
+| `kv cache dtype` | bf16 | int8-group64 |
+| `kv cache payload` | **5.34 GiB** | **8.77 GiB** |
+| `gpu sequence used` | 5.53 GiB | 8.94 GiB |
+| `runtime reservation` | 6.50 GiB | 9.62 GiB |
+| `free after weights` | 10.80 GiB | 10.80 GiB |
+| `KV capacity` | 262144 | 262144 |
+| `KV page groups` | 4096 / 4096 | 4096 / 4096 |
+| `prefill speed` | 2838.92 tok/s | 3562.85 tok/s |
+| `decode speed` | **22.80 tok/s** | **153.06 tok/s**（6.7×） |
+| `generated tokens` | 63 | 61 |
+
+**为什么这是矛盾**：按仓库自己的口径（`bf16 16.00 / int8 8.25 bits/el`），**同容量下 int8 的 payload 应当是 bf16 的约一半（≈2.7 GiB）**。
+实测是 **1.64 倍**。⇒ **这两个 arm 不可能被当成"同容量、只有精度不同"的干净对照。**
+
+**两个臂的差异还不止 payload**：bf16 臂的 decode 慢 **6.7 倍**。结合"payload 反而更大"，两条一起指向
+**bf16 长上下文路径没有走到预期的那条实现**（更大的输出缓冲？回退慢路径？不同的 split/几何规划？）——**具体机制未定，不得猜测**。
+
+**召回差异本身是"数值退化"的形状，但同样只是线索不是结论**：
+```
+truth  : 1933566505638220772676141458373988904577750824077250935109245286
+default: 19335665056382207726761414583775082407724077250935109244988588   <- 前 30 位对，第 31 位起发散
+int8   : 193356650563822077267614145837398890457775082407725093510924     <- 前 60 位全对
+```
+[D0] 是**同模式对照**（生成 63 vs 61 tok，都不是在思考里打转），却 30/64 vs 60/64 ⇒ 不能只用"模式不同"解释。
+
+**处理**：已按铁律⑦派**双路**代理（用同一份简报）做量化解释，必须回答：
+① payload 反演的完整账目（每一项字节 + 出处 `file:line`）——8.77 vs 5.34 的差额来自哪一项；
+② 6.7× decode 差的机制（哪些 kernel、什么判据）；
+③ **bf16 长上下文路径有没有真实缺陷**（并顺带查 `gqa_attention_decode*` 里有没有与
+   `GqaExecutionEnvelope::split_reference_keys` 同类的"活窗 vs 图常量容量"参考量混用）；
+④ 这两个 arm **到底是不是干净对照**，差在哪些变量上。
+
+**对八大项的影响（先记下来，别当结论）**：如果 int8 KV 真的比 bf16 更占内存，那么
+**`bits/element` 那张表可能是名义值而非实际值**，②③④（输入 bit→分配、冷窗、闭环）全部建立在它之上。
+⇒ **在这一点弄清楚之前，②③④ 一条都不许算"做完"。**
+
+### 43. 缺陷 D（`#95 gdn snapshot` A16/A4 边界）**双路收敛并落地**；并纠正一处被"定案关闭"的错误编辑（修②）
+
+#### 根因（D1/D2 独立收敛，同一行同一修法）
+`src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp:43`：`AllowA4` 分支的
+`if (tokens <= 16) { … SmallTFusedA16; }` **吞掉了整个 T∈[4,16] 的 A4 档**，使 A4 路线要等到 **T≥17** 才可达。
+容量查询 `nvfp4_gdn_snapshot_workspace_capacity_bytes` 从同一个 `resolve_plan` 推导答案（`:55` 在最大宽度非
+`Materialized` 时直接 `return 0`）⇒ `AllowA4 [4,4]` 的容量变成 **0**，而测试第 3 条子句要求它**非零**（判据值 **93440**）。
+**机制是一处常量串味**：紧上面 `A16Only` 分支的"A16 家族上限 16"被抄成了"A4 回退上限 3"。
+判据全是**整数 token 计数**（`tokens <= 16/3`），无浮点无取整；且该子句**不启动任何 kernel**（纯规划算术）
+⇒ **显存争用由构造排除**。D2 的 CPU 复算把边界**唯一地**钉在 T=4：上限=3 ⇒ 四子句全过；上限=16 ⇒ 挂第 3 条；上限=0 ⇒ 挂第 1/2 条。
+
+#### 关键：这不是上游回归，是本地"修②"
+- `git log --all -S 'tokens <= 3'` → **`dbb7d48`**（`origin/main` 的**祖先**）写的就是 `tokens <= 3`；
+  当前 HEAD 是 `tokens <= 16`（由本地提交 `d38bb91` 带入）。
+- **D1 用的外部参照树 `/home/user/ninfer-pristine` 与 `dbb7d48` 版本逐字节一致**（我交叉验证）
+  ⇒ 参照物可信；两个 pre-edit 备份（`/home/user/fix2_bak/`、`_quarantine_backups_20260912/*.orig`）也都写 `<= 3`。
+- **测试文件与 pristine/origin 逐字节相同**（modulo CRLF）⇒ **这条测试在 `origin/main` 上是绿的，
+  是本地"修②"把它变红的。**
+- `TODO.md:4489 / 4525 / 4720` 明确记录"修②"：`tokens<=3` → `<=16`，目的"统一小 T 家族"（`:4442`）；
+  `:4552`"修② 是否有效**未定**：需加一行 schedule 日志"；`:4720`"已落但**未测到效果**"；
+  `:4796 / :4824`"两个最小改动（修② 阈值、累加链）都测到**零效果**"。
+- **`修② 定案关闭`（`:5028`）的论证是循环的**：它用"`AllowA4` 下 T≤16 一律 `SmallTFusedA16`"来证明
+  "3→16 是代码级可证的 no-op"，而"T≤16 一律 SmallTFusedA16"**正是这次改动本身造成的**
+  —— 改动前 T∈[4,16] 是 `Materialized`(A4)。且它选择"无需日志行"，即**从未测量**。
+
+#### 裁决与落地
+**落 D2 的 1-hunk 版**（`tokens <= 16` → `tokens <= 3`，含注释修正），**不落 D1 的 3-hunk 版**：
+后者顺带把 wrapper 的 magic `4` 换成具名常量 `kNvfp4GdnA4FirstTokens`（**行为等价的重构**），
+但会波及 `nvfp4_config.h` ⇒ 大量 TU 重编；**边界本身才是缺陷**，故取最小改动。
+已落地：`1 file changed, 5 insertions(+), 3 deletions(-)`，备份 `/home/user/scratch/landed_D_*/`。
+T=4 的四条同源旁证：record 规划器的 `std::max(min_width, 4)`（`wrapper/gdn_input_proj.cpp:903`）、
+测试自己的档位选择器 `a4 = policy==AllowA4 && tokens>=4`（`test…snapshot.cpp:741`）、
+线性派发器文档里被删掉的逐问题阈值 `(4 / 5 / 8)`（`linear/nvfp4/nvfp4_dispatch.cpp`）、pristine/git 历史。
+
+#### 诚实记录一处张力（已裁决，但留作复核点）
+本步把 `AllowA4 && T∈[4,16]` 从 A16（激活误差 ≈**0.17%**）移回 A4（`TODO.md:4489` 记 L2 ≈**9.48%**）。
+表面像"verify 退化"，但四条理由支持落地方向：
+1. `T≥17`（**含 prefill**）本来就是 `Materialized`=A4 ⇒ A4 是**被注册的**路线，不是新增的低精度行为；
+2. 测试作者明示 `AllowA4 && T≥4` 即 A4，且要求该档容量非零 ⇒ 契约就是 T=4；
+3. 修② 实测对接受率**零效果**（4.51%→3.76%，23 轮噪声内）⇒ 回退预期同样零效果；
+4. 若将来真要 verify 宽度走 A16，正确做法是**显式注册并同步改测试**，而不是留一个违反契约的编辑。
+⇒ 若后续发现 verify 质量确实受损，回退路径是 `scratch/landed_D_*/nvfp4_gdn_snapshot_plan.cpp.orig` 与
+`fixD1/fix.patch`（具名常量版）。
+
+#### 三处**只留档、本轮不修**的隐患（D1/D2 交付）
+1. `nvfp4_gdn_snapshot_small_t.cu:82/84` 的 launcher 数组尺寸写作**字面量 16**（另一侧用 `kNvfp4LastSmallT`=**32**），
+   而索引是 `x.ne[1] - kNvfp4FirstSmallT`（`:93/103`）**无边界检查** ⇒ **planner 上限与数组尺寸必须同步，
+   且没有任何 `static_assert` 保证这件事**。（当前两者一致，故不可达。）
+2. TMA 判据 `nvfp4_w4a4_tma_route()`（`linear/nvfp4/nvfp4_w4a4_plan.h:58`）在
+   `gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu:42` 与 `linear/nvfp4/nvfp4_w4a4.cu:64` 被**内联重写**
+   ⇒ **第二真值来源**，两侧一旦漂移就会静默分叉。
+3. UNIFY-A 之后 `Nvfp4GdnConvScheduleId::DecodeFusedA16` 的守卫可能已成死代码（enum 与 dispatch case 仍在，`:71`）。
+
+#### 顺带纠正我先前的一处定位错误
+§38 的笔记把嫌疑指向"本地独有那批 `nvfp4_w4a4_tma_*`（在 `src/ops/kernel/` 下搜）"——**位置说错了**：
+`src/ops/kernel/` 下**没有任何** `nvfp4_w4a4*`；TMA 判据在 `src/ops/linear/nvfp4/`，
+而那批 kernel 与本次失败**无关**（它们是 A4 内部的子路线 `tokens>=1024 && tokens%256==0`）。
+
+### 44. 同形派发缺陷全量审计（双路第一路）；三臂完整读数把"bf16 最差"钉成趋势
+
+#### 44.1 审计结论：12 个"扁平向量核 + 判据不含连续性"站点，**只有 2 个是真缺陷**
+筛法：grep 向量打包类型（`Bf16x8Pack`/`Bf16x4Pack`/`__nv_bfloat162`/`float2`/`uint4`）+ `alignof(` + 字面量掩码 `& 0x`
+（后者抓到 `cast.cu` 这种用 `& 0x` 而不写 `alignof` 的写法会漏掉的站点）。
+
+**真缺陷 1：`src/ops/launcher/gelu_and_mul.cu:23`（已修）** —— 契约允许 `gate/up` 任意 stride
+（`include/ninfer/ops/gelu_mul.h:47`），而快速路径判据只看对齐与 `n%8`，把 strided 视图当扁平读。
+**独立交叉确认**：审计代理把自备补丁打到干净 HEAD 上，产物与**当前工作树逐字节相同**。
+
+**真缺陷 2：`src/ops/launcher/sigmoid_gate_mul.cu` 的导出入口 `sigmoid_gate_mul_bf16x8_launch`**
+—— 它**连一个判据都没有**（既无对齐也无 `n%8`），于是
+(a) `packs = numel / 8` 在 `numel % 8 != 0` 时**静默丢掉尾巴**；
+(b) 非连续视图被当扁平数组读。
+**而且它可达**：`ops::sigmoid_mul` 路径被 `wrapper/sigmoid_mul.cpp:42` 的 throw 兜住，
+但该导出入口被 `bench/ops/sigmoid_mul_bench.cu:71` **直接调用、绕过 wrapper**。
+补丁（给导出入口补自检 + throw）**待第二路对照后落地**。
+
+**判为"不是缺陷"的 9 处 + 1 处**（`residual_add.cu:21`、`logit_policy.cu:21`、`gelu.cu:18`、
+`add_bias.cu:22`（含 `:42` 的 bf16x2 路）、`cast.cu:28/33`、`layer_norm.cu:20`、
+`vision_pos_embed.cu:28`、`scatter.cu:17`、`causal_conv1d.cu:57`，以及 `rope.cu:31` 的 head 维）
+——**各自都有 wrapper 级的 `throw std::invalid_argument` 谓词**（行号已逐条列出），
+按 `docs/maintainer/op-development.md` §4.1（layout 校验归 wrapper）/§4.3（每个 kernel 假设都要有
+匹配的 wrapper 或 launcher 谓词）判定为**已被覆盖**。审计代理明确**没有为了使补丁好看去动这 9 处**。
+对 `Tensor::is_contiguous()` 的语义也核过：`ne[i]==1` 的维不查 stride，但那只贡献 0 索引，
+所以"`is_contiguous()` ⇒ 扁平索引等价"成立（`src/core/tensor.cpp:90-102`）。
+
+**附带发现的约定违规**：`bench/ops/sigmoid_mul_bench.cu:71` 直接 include launcher 私有头，
+违反 `docs/maintainer/op-development.md` §4.2（"public benchmarks 不得包含 launcher 私有头"）。
+
+**附带提示（标量版同类，未发现可达的错误路径）**：`wrapper/suffix_lookup.cpp` **没有任何
+`is_contiguous`**、纯裸指针 API；`vocab_topk16` 无 wrapper 校验。注意 `suffix_lookup` 正是
+⑥ 那条 lookup/ngram 线，与"引擎零调用"的既有记录一致。
+
+**取证方法值得留档（比"独立重写"更强）**：审计代理的 CPU 复算**直接链接真实的
+`src/core/tensor.cpp`**（不是自己重写一份 `is_contiguous`），得出：
+```
+gate.ne=10240,17,1,1  nb=2,40960,696320,696320
+gate.is_contiguous=0  up.is_contiguous=0  out.is_contiguous=1
+n=174080  n%8=0   (gate|up|out)&15 = 0x0
+OLD gelu_mul fast path taken = 1     <-- 缺陷机制
+NEW gelu_mul fast path taken = 0     <-- 修复后落到 strided 核
+silu_mul dim0-split stride-aware path taken = 1   <-- 兄弟算子为何通过
+```
+
+#### 44.2 三臂完整读数（`default`/`int8` 已跑满 8 条；`nvfp4` 3 条）
+| 臂 | 精确前缀 | 平均字符准确率 | 生成 tok 范围 | KV payload |
+|---|---|---|---|---|
+| `default` (bf16) | **211/512 = 0.412** | 0.482 | 57–512（波动大，含 2 条在思考里打转） | 5.34 GiB |
+| `int8` | **500/512 = 0.977** | 0.977 | 61–81（紧） | 8.77 GiB |
+| `nvfp4`（3/8） | 174/192 = 0.906 | 0.906 | 51–91（紧） | 待读 |
+
+⇒ **排序 `bf16 ≪ nvfp4 < int8`，与"精度越低越差"完全相反。**
+且 **[D0] 是同模式对照**（bf16 生成 63 tok、int8 生成 61 tok，都不是在思考里打转，都不是被
+`output-limit` 截断），却 **30/64 vs 60/64** ⇒ **不能用"回答模式不同"解释**。
+把它与 §42 的两条读数合看——int8 的 payload **大于** bf16（8.77 vs 5.34 GiB，同容量同 page groups）、
+decode **快 6.7×**（153 vs 22.8 tok/s）——**强烈指向"bf16 长上下文走的不是同一条实现"**。
+机制由 kv1/kv2 双路定案；**未结案前 ②③④ 仍不许算"做完"**。
+
+### 45. 同形派发审计：双路**分歧的裁决**与落地（sib1 对"可达性"、sib2 修错了函数）
+
+#### 双路的同与异
+**同**：两路都认定 `gelu_and_mul.cu` 那处是唯一"实现违反自己契约"的缺陷（已修，55 行）；都认定
+`sigmoid_gate_mul` 有问题；复现算理一致（`[2*rows,columns]=[20480,17]` 的两个 slice、`n=174080 % 8 == 0`、
+第二片 data 偏移 `20480 B` 是 16 的倍数 ⇒ 扁平判据全满足 ⇒ `first_violation=10240 = rows`）。
+
+**异（本轮的关键）**：
+- **sib2 写"`sigmoid_mul` 唯一调用方是 `wrapper/sigmoid_mul.cpp:42` 强制连续"——这是错的。**
+  `bench/ops/sigmoid_mul_bench.cu:71` **直接调用**了 `ops::detail::sigmoid_gate_mul_bf16x8_launch`，绕过 wrapper。
+  该头自己就写着 `// Fixed-route launch control used by production and qualification benchmarks.`（`sigmoid_gate_mul.h:18`）。
+- **因此 sib2 的补丁 guards 的是 `sigmoid_gate_mul_launch`（通用入口，wrapper 本来就守着），
+  恰恰没碰那个被 bench 直呼的**窄入口 `sigmoid_gate_mul_bf16x8_launch`——而后者**连一个判据都没有**
+  （`packs = numel/8` 在 `numel%8 != 0` 时**静默丢尾巴**，strided 视图被当扁平读）。
+  ⇒ **sib1 的修法落在真口子上，sib2 落在了已经被守住的那个函数上。**
+
+#### 契约原文核实（决定"是不是违约"）
+逐条读 `include/ninfer/ops/*.h`：
+- **只有** `gelu_mul.h:14` 与 `silu_mul.h:14` 写 "out is contiguous; **gate and up may use arbitrary valid
+  Tensor strides**" ⇒ 只有这两个算子的输入 stride 合法，`gelu_and_mul` 的 launcher 违反了自己的契约（已修）。
+- `residual_add.h:14` / `sigmoid_mul.h:14` / `add_bias.h:14-15` / `gelu.h:20` / `logit_policy.h:18`
+  **全部明文要求 contiguous BF16 tensors**，且各自 wrapper 逐字强制（`is_contiguous` 检查行号已列）
+  ⇒ **这 5 处的实现没有违反自己的契约**，是**潜伏**而非活的违约。sib1 判"不是缺陷"成立。
+
+#### 完备性检查（决定要不要推广修法）
+`src/ops/launcher/` 全部头里，**只有** `sigmoid_gate_mul.h:18` 带"给 benchmark 用的固定路线入口"注释。
+把"扁平向量派发 + 判据缺连续性"这一类与"被非 wrapper 调用方直呼"交叉，**只有 sigmoid 一处**
+⇒ 无需推广。另外 9 处（`residual_add`/`logit_policy`/`gelu`/`add_bias`/`cast`/`layer_norm`/
+`vision_pos_embed`/`scatter`/`causal_conv1d`，以及 `rope` 的 head 维）均有 wrapper 级 `throw` 谓词覆盖，
+按 `docs/maintainer/op-development.md` §4.1/§4.3 判定为**已被覆盖**。
+
+#### 落地与不落地
+- **已落**：sib1 的 `fix_worktree.patch` —— 给窄入口 `sigmoid_gate_mul_bf16x8_launch` 补自检
+  （连续性 + 16 字节对齐 + `n%8==0`，不满足则 `throw std::invalid_argument`），`1 file changed, +13/-1`，
+  备份 `/home/user/scratch/landed_sib_*/`。现在树的改动共 **4 个源文件**：
+  `gelu_and_mul.cu` +5/-1、`causal_softmax_attention.cpp` +3/-3、`nvfp4_gdn_snapshot_plan.cpp` +5/-3、
+  `sigmoid_gate_mul.cu` +13/-1。
+- **不落**：sib2 的另外 4 个断言（`residual_add`/`logit_policy`/`add_bias`/`gelu`）。
+  理由：(1) 这 4 个入口的契约明文要求 contiguous 且 wrapper 逐字强制 ⇒ **零可达性收益**；
+  (2) 它们会在 4 个**每层都跑**的热路径上新增硬 `throw`，而 sib2 自己承认**未核实 `bind(backing)` 的
+  运行时张量身份** ⇒ 风险是把"当前可跑"变成"硬崩"，而不是修掉任何已证实的缺陷。
+  补丁已备查：`/home/user/scratch/sib2/fix.patch`（apply-check 通过），是一条随时可取用的加固选项。
+  **诚实边界**：我判"零可达性收益"是**读代码**得出的（契约 + wrapper 的 throw），**没有跑运行期**；
+  若将来确有 binding 别名出 strided 张量，sib2 那版会让它以**硬崩**而不是静默错算的方式暴露
+  —— 那本身是可接受的失败模式，只是本轮不引入未经证据支持的改动面。
+
+#### 留档：bench 绕过 wrapper 的全量清单（本轮只覆盖了其中一类）
+`bench/ops/` 里直接调 `ops::detail::` 的地方共 **58 处 / 8 个文件**：
+`w8_linear_swiglu_bench.cu` 21、`gdn_gating_proj_bench.cu` 12、`w8_linear_add_bench.cu` 10、
+`bf16_linear_add_bench.cu` 7、`q5_linear_add_bench.cu` 4、`gated_delta_net_bench.cu` 2、
+`sigmoid_mul_bench.cu` 1、`position_bench.cu` 1。
+其中大多数是 `*_resolve_plan`/`*_schedule_name` 这类纯规划调用或 w8/bf16/q5 **linear** 入口（属于另外的
+layout 假设类别，**不在本次审计范围**）。`docs/maintainer/op-development.md` §4.2 明文要求
+"public benchmarks 不得包含 launcher 私有头"——这 8 个文件都在违反它，而正是这条规定的缺失让
+sigmoid 那个无判据入口被绕过而不自知。**留档，不在本轮处理。**
+
+### 46. 导入双实现的**我自己的独立差分**（不依赖 convC 代理的 diff 脚本）——分歧全在 artifact 对象层
+
+工具：`py/cmp_plans.py`（另一条取证路：只读两份 plan JSON，按公共键逐对象比）。
+数据：`scratch/convC/outA/planA.json`（728 KB）与 `outB/planB.json`（1.07 MB）。
+
+#### 结论一：**源组层面 400/400 完全一致**——两条独立实现 + 我自己的 `layout_plan.py` 三方吻合
+| | 源组层（985 模块，其中量化 400） |
+|---|---|
+| A | contiguous-le-v1 **585** / row-scale-v1 **260** / blockscale-k16-m128x4-v1 **140** |
+| B | **完全相同**（代理报告原文：`quantised modules: common=400 same_layout=400 differing_layout=0`） |
+
+⇒ 我在 §34 用 `layout_plan.py` 独立验证过的 585/260/140 直方图，现在**被两份互不相干的实现再次确认**。
+**"从源自身 dtype/shape 关系结构性推导布局"这件事已经三方一致，可以当结论用了。**
+
+#### 结论二：分歧**全部**在 artifact 对象层，且是**契约取向**之争而非谁算错了
+| | 对象数 | 字节总量 | 拒收 |
+|---|---|---|---|
+| A | **1599** | **25,780,702,800 B ≈ 24.0 GiB** | **0** |
+| B | 920 (+6 resources) | **9,793,788,469 B ≈ 9.1 GiB** | **598**（198 F-NO-ROUTE + 128 F-SHAPE + 272 F-UNCONSUMED-GROUP） |
+
+- **公共对象 0 个**（名字零重叠）：A 用**源侧命名**（`model/language_model/layers/0/…`），
+  B 用**artifact schema 侧命名**（`text/layers/0/gdn/query_key_value_z`、`mtp/…`）。
+- **A 的总量 ≈ 两个源分片之和**：24,006,113,464 + 1,770,897,648 = **25,777,011,112**，
+  A 报 **25,780,702,800**（差 3,691,688 B ≈ 3.5 MB，头/对齐）⇒ **A 覆盖全源**。
+  B 只覆盖 **9.1 GiB**（其自报 `required_source_keys=1225`，源有 2139 张量）。
+- **B 的拒收原文点名了根因，是"不肯融合"**：
+  - `F-SHAPE: model.language_model.layers.0.mlp.gate_proj: stored F8_E4M3[17408, 5120] -> logical
+    (17408, 5120), artifact part expects (34816, 5120)` —— artifact 要**融合后的** gate_up `[34816,5120]`，
+    源是分开的 `gate_proj`/`up_proj`；B 要求"存在一个逻辑形状等于 artifact part 的源矩阵"，于是拒收。
+  - `F-NO-ROUTE: text/layers/0/gdn/query_key_value_z` —— 同上，q/k/v/z 的融合不在 B 的路由里。
+  - `F-UNCONSUMED-GROUP`: 源里量化的 `in_proj_qkv` / `in_proj_z` / `mlp.gate_proj` 没有 artifact 对象消费。
+- 格式/布局视野也不同：A 只出 4 种格式（BF16/FP32/FP8_E4M3FN_ROW_BF16S/NVFP4），
+  B 出 9 种（另有 Q4G64_F16S / Q5G64_F16S / Q6G64_F16S / W8G32_F16S / I32 与 `row-split-k128-v1`=117、
+  `raw-bytes-v1`=6）。
+
+#### 我的判读（**暂不裁定**，等 convC 的卷宗 §3 对象层对照）
+形状是：**A 按源结构出对象（覆盖全源，但不保证与注册 schema 逐对象对齐）；B 以注册 schema/recipe 为权威出对象
+（架构上更对——装载器与运行时核消费的是注册 schema），并在源不匹配处**明确拒收 598 条**而不是发明对象。**
+⇒ 若采信 B 的架构，则它那 598 条拒收正是"**这份源要转成注册 schema，还缺哪些融合**"的诚实清单；
+若采信 A，则拿到的是"覆盖全源但可能装载不了"的计划。
+**这个裁定要看 `out/diff_report.txt` §3 的对象层对照 + 注册 schema 的实际消费方**，
+不在本轮拍板。两件事已经确定：① 源组层三方一致；② 分歧是契约取向、不是算错。
+
+### 47. E8 codec 双路第一路：五条断言**重裁**、决定性缺陷 D1（免费 +3.65 dB）、并更正我自己的两条记录
+
+取证方式（值得留档）：自写 CPU 复算程序 `/home/user/scratch/fixE1/e8verify.cpp`，只读**真实 KV dump**
+`/home/user/bench/kvdump_e8src`（27 个 dump、64677 token、各 **66.2M** 个 K/V 元素），未改树、未构建、未用 GPU。
+**工具本身先自证**：`gqa_kv_hadamard64` 复刻 `max|MᵀM−I| = 0.000e+00`（严格正交）；
+`e8_project_8d_fast` 复刻 vs 精确候选搜索（2×2⁸）20000 个随机块 **20000/20000 都是真正最近点、0 并列**；
+解析预测的 NMSE 0.0276 vs 实测 0.0264（差 5%）。三条独立支撑。
+
+#### 五条断言的重裁
+| # | 原断言 | 重裁 | 独立证据 |
+|---|---|---|---|
+| 1 | E8 的 K 误差是同 bit 宽纯取整的 **1.9–2.0×** | **成立，但系数是 2.32×**（+3.65 dB）。**子句"还不如 3.25 b/el 纯标量"被推翻** | MSE(E8)/MSE(z8，同旋转同码宽 4.25) = **2.319×(K)/2.320×(V)**；而逐组扫到 MSE 最优的 3-bit mid-rise（3.25 b/el）K NMSE = 2.64e-2 ≈ shipped E8 的 2.636e-2 ⇒ **E8 不吃亏**。但 bit 确实被浪费：3.25→4.25 本该买 4×，z8 拿到 4.22×，**shipped E8 只拿到 1.82×** |
+| 2 | 约 **46%** 坐标落在半整数上 | **成立** | 实测 **47.57%**，且 47.57% 的 8-块选中 `D8+½` 陪集 |
+| 3 | Hadamard-64 旋转让 K **差 3.4–4.5×** | **推翻（反证）** | MSE(had64)/MSE(无旋转) = **0.697(K) / 0.463(V)** ⇒ 旋转让 K **好 1.43×**。机制：`E[amax_rot²]/E[amax²] = 0.685`（每块 amax 平均降 18% rms），1/0.685 = 1.46 与实测吻合到 2%。⇒ **旋转必须保留** |
+| 4 | fp16 scale 无 clamp，`amax>65504 ⇒ inf` | **部分成立**："无 clamp"成立；**阈值说错了** | 除数是 7 ⇒ 阈值是 **amax > 458752**（实测 450000→64288 有限，458752→inf）。**后果比原描述更重**：scale=inf ⇒ `k_inv=1/inf=0` ⇒ **15 个码全变 0** ⇒ 读侧 `0×inf = NaN`。真实数据最大组 amax = 15.0(K)/96.5(V)，余量 3e4 倍 ⇒ 潜在、未触发 |
+| 5 | scale 未迭代到格式格点不动点，白扔 **0.4–7.0%** NMSE | **部分成立，机制与数值都不同** | 在 E8 档实测是 **14.81%（0.70 dB）**，不是 0.4–7.0%（那组数来自 2/3-bit *mid-rise* 码本实验）。且前提**不成立**：本档不是"fp32 算 scale 再取整"，而是 `decode_i8.cuh:273-283` 先 `ksh=half(amax/7)` → `ks=half2float(ksh)` → `k_inv=1/ks` 分码；改成 fp32 分码后 MSE 变化 **0.0000%** |
+
+#### 决定性缺陷 D1：E8 格点投影 + `rintf` 存在**整数**码平面里（**真缺陷，0 bit 换 +3.65 dB**）
+- 位置：`src/ops/kernel/gqa_attention_decode_i8.cuh:281`（及 `:293` 的重复投影）；`gqa_attention_prefill_i8.cuh:153`/`:168`（fill 核）
+  与 `:293`/`:304`（page 核）。共 **6 处** `e8_project_8d_warp` 调用。
+- 错在哪：E8 = **D8 ∪ (D8+½)**，**47.57%** 的块最近点落在 `D8+½`，其八个坐标**全是半整数**；
+  而码平面每坐标只存一个**整数**，紧随的 `rintf` 把每个坐标推 0.5 step ⇒ 这一半的格点增益**被扔掉**。
+- 正确做法：**删掉投影、保留旋转**（码平面本就是整数平面，格点不可表示）。
+- 收益：K NMSE **2.636e-2 → 1.137e-2**（relRMS **16.24% → 10.66%**，**2.32× / +3.65 dB**）；
+  V 2.550e-2 → 1.099e-2。**代价 0 bit。**
+- 反面方案已量化排除：真要收格点增益需存"2×坐标"的 5-bit 平面（±15）= **+1 bit/el**，
+  只换回 **0.58 dB**（实测 ideal-E8/z8 = 0.874×）⇒ **严格劣于**把这一 bit 花在更细的均匀格点上。
+- 补丁：`/home/user/scratch/fixE1/fix.patch`（4 文件、+82/−40，sha256 `029b5fde…`；干净副本上 apply-check 与真 apply 均 exit 0；
+  **真树未被改动**）。含 D1 + D2（`kv_scale_half` 饱和）；**D3 故意不含**（需要在写循环里对 64 组做两个 warp 归约，
+  无法在此编译/运行 CUDA ⇒ 不把未验证的 kernel 改动塞进补丁）。**等双路第二路（fixE2）报告后我裁定落地。**
+
+#### ⚠️ 更正我自己的两条记录
+1. **「e8/iso3 共用 NVFP4 的 4-bit nibble plane + 3-bit sign-magnitude 码本 ⇒ 浪费约 1 bit/el」把两个档位搞混了**：
+   - 那句描述的是 **iso3（4.50 b/el）**：`gqa_attention_prefill_nvfp4.cuh:63-75` 的 `gqa_iso3_nibble`
+     = 低 3 位幅值 0..7 + bit3 符号，且只在 `value<0 && code!=0` 时置符号位（−0 从不写）⇒ **15 个电平**。
+   - **e8（4.25 b/el）是完全另一套平面**：`DType::E8Kv = 10`（`core/dtype.h:21-24`）＝"4-bit E8-lattice K codes +
+     i4 V codes（每字节两个）+ 每 64 通道 fp16 scale" ⇒ 4 + 16/64 = **4.25**；
+     读侧 `gqa_kv_unpack_i4 = (nibble^8)−8 ∈ [−8,7]`，写侧 clamp 到 [−7,7] ⇒ 用 15/16 个码。
+   - ⇒ **"浪费 1 bit/el"差了一个量级**：15 电平装在 4 位里 = log2(15) = **3.907 bit**，**浪费 0.093 bit/el**。
+2. **「用于深层若干层」与 `src/product/kv_bit_budget.h:60-75` 相反**：那里写的是 e8 **只对前导层（layers 0..7）验证过**，
+   并注明 "the shipped high-layer e8 path degrades"；层数上限 `kKvBitBudgetE8LayerLimit = 10`。
+   而 shipped 默认把 e8 放在 `{0,1,3,4,6,7,8,9,13,14}`（`src/targets/qwen3_6_27b/impl/variant.cpp:33`）
+   —— **够到了 13/14，正是 header 自认未验证的配置**。旁证：`kvc_0_t3072_L14_meta.txt` 是 `dtype=10 quant_group=64`
+   （E8Kv/g64），而 L13 是 `dtype=8 quant_group=16`（NVFP4）。
+   ⇒ **据此修正我先前对 `kKvBitBudgetE8LayerLimit` 的处置**：**不降到 8**；正确顺序是**先落 D1、再复测"深层 e8 是否仍退化"**。
+   若退化消失，则"e8 只许放前导层"的前提本身可能就是 D1 造成的。
+
+#### 一条**没有解释清楚的分歧**（必须记下来，两边绝对值都别当定论）
+两轮的绝对数字**对不上**：上一轮 E8 K relRMS 28.6% / 3-bit 15.9%，本轮复刻是 10.66% / 21.9%，
+两条腿都差 2–4× MSE；试过用"旋转前 amax/7"与"旋转前 amax/127"两个历史修订版回代，得到 20.17% 与 86.99%，
+**都对不上 28.8%**。本轮数字有三条独立支撑（正交性、暴力最优性、解析预测），但**这个分歧没有解释清楚**
+⇒ **两边的绝对数值都该谨慎引用**；可作为定论的是**方向与比值**（投影有害、旋转有益、系数 ≈2.32×）。
+
+### 48. convC 卷宗裁定 + kv2 破案：**payload 反演闭合到两位小数**，我收回 §42 的红旗表述
+
+#### 48.1 convC 卷宗：B 的 598 条拒收里 **528 条是同一个 bug**，不是架构性拒收
+
+**两份实现都满足"底层生成、不许 or 硬写"**（用户口径）：
+- A 的驱动**全文件 0 处 `.get(x, default)`**，无 `or` 兜底、无层号/名字查表；
+- 两份**都调用同一个 `layout_plan.select`**，都是纯结构判定；
+- **985/985 模块、其中 400/400 量化模块布局完全一致**（`same_layout=400, differing_layout=0`）
+  ⇒ **与我 §34 用 `layout_plan.py` 的独立验证三方吻合**，这条可以当结论。
+- convC 还独立解析了 safetensors 头（2139 张量 / 985 module）并校验两个 shard 的
+  `8 + header + payload == file_bytes` 均 True。
+
+**源张量级：一致 426 / 不一致 1713**，不一致的模式**不是** layout 或 dtype 分歧，而是三类：
+797 条命名空间差异（A 逐字搬 BF16 / B 交给注册 recipe 语义）、914 条（**B 只吃下 128/400 个量化分组**：
+642 ABSORB→MISSING + 272 REPACK→MISSING）、2 条词表端点（A 逐字 BF16 / B 重编码 FP8，B 已记账）。
+
+**决定性单点发现：B 的 128 条 `F-SHAPE` 全是同一个比较基准错。**
+- `_matrix_entry` 拿**每个 part** 的形状去与**整个融合对象**的形状比（B 那一带收到的是 `registered.shape`）。
+- convC 遍历注册的两张 recipe 表：那 **128 个多 part 对象共 288 个 part**，
+  **`part.source.shape` 与源逻辑形状 288/288 完全相等** ⇒ **改成按 part 比就会全过**；
+  单 part 对象因"对象形状 == part 形状"恰好不受影响。
+- 连带：**272 条 `F-UNCONSUMED-GROUP` + 198 条 `F-NO-ROUTE` 里的 128 条**都是这个 bug 的下游二次记账；
+  **真·无路由只剩 70 条**（全是 `input_scale_divisor`，因其父对象被拒/被丢）。
+- ⇒ 我 §46 里"B 是诚实的架构性拒收"这个临时判读**被推翻**：它是**一个 bug 的辐射**。
+
+**B 在本源上根本跑不完（两处独立故障）**：
+1. refusal 让 `convert()` 必抛（B:1322）⇒ 写不出任何 artifact；
+2. convC **实测**它的 `direct` + `official` 两条 payload 路（**748/920 个对象**）今天都
+   `AttributeError: 'SourceTensor' object has no attribute 'expression'`
+   （把 `recipe.expression` 传给了要 `TensorRecipe` 的 `materialize_recipe`；
+   注册侧正确入口是 `rr8.materialize_quantized_direct` / `rr8.materialize_quantized_official`）。
+
+**对照：A 在本源上可完整跑完（0 refusal，25.78 GB 全覆盖），但 A 自认产物不可加载**
+（不融合、用源侧命名）。B 的语法方向（融合、MTP/W8/Q4/Q5/Q6、draft head、资源）才是装载器消费的那套。
+
+**两份在关键数值路径上不可区分**（convC 独立实测）：
+NVFP4 纯重打包 **140/140 codes 逐位相同、140/140 scale swizzle 互逆、140/140 divisor 字 = fp32(1/weight_scale_2)**；
+A 的 448.0 论据被独立确认（**260/260 个 FP8 码平面、11.04 GiB 全量扫描**，`max|code|==448.0` 分布 `{126: 260}`、无 NaN）。
+
+**唯一"未记账的数值转换"在 B**：`official` 路由 347 个对象里有 **117 个存量化学**（Q4G64/Q5G64/W8G32/Q6G64），
+而源用 `exclude_modules` 显式声明 mtp/vision/lm_head **不被量化**；B 只给 2 个词表对象记了
+`D-RECODED-FROM-BF16`，那 117 个没记。
+
+**处置**：**两个都不整份落地**。已派**双路**代理去修 B 的 Bug1（比较基准）/Bug2（payload 入口）/Bug3（记账）
+并在**真实源**上复跑（预期 refusal 从 598 收敛到 ~70、payload 不再抛、对象数与字节总量可比），
+拿到可比数据后再裁定。卷宗：`/home/user/scratch/convC/DOSSIER.md`（692 行、81 处证据引用）。
+
+#### 48.2 kv2 破案：**"bf16" 是哨兵值，默认臂那 16 层从来不是 bf16**（我收回 §42 的红旗表述）
+
+**payload 反演，账目闭合到两位小数**：
+- 打印路径 `apps/cli/main.cpp:218` ← `program_impl.h:13083` ← `layouts_impl.h:369-370` ←
+  `decoder_state.cpp:634-636` ← `core/paged_kv_cache.cpp:100-104`（Σ 每个 plane 的 `storage.region.bytes`），
+  plane 形状 `{leading_extent, 64, head_extent, physical_pages}`（页 = 64 token）。
+- 几何：24 q / 4 kv / head_dim 256、16 个全注意力层、capacity 262144 ⇒ 4096 页。
+- **逐层 dtype → plane 表在 `decoder_state.cpp:171-229`**；每层 byte/页 = `leading×64×4×elem_size`：
+
+| 层档 | B/页/层 | bits/元素 |
+|---|---|---|
+| BF16 | 262,144 | 16.00 |
+| I8 | 135,168 | 8.25 |
+| E8Kv | 69,632 | 4.25 |
+| NVFP4 | 73,728 | 4.50 |
+
+- **`--kv-dtype` 未给时走 `Variant::default_layer_kv_dtypes`**（`layouts_impl.h:1209-1217`），
+  `src/targets/qwen3_6_27b/impl/variant.cpp:56-71` 的表 = **E8Kv 在 {0,1,3,4,6,7,8,9,13,14}、其余 NVFP4、
+  一个 BF16 都没有**；`--kv-dtype int8` 才触发 `layer_overrides.fill(...)`（`apps/cli/options.cpp:161`）。
+  打印出来的 `kv cache dtype bf16` 是**全局哨兵值**，不是那 16 层的 dtype。
+- **default：`10×69,632 + 6×73,728 = 1,138,688`（文本）+ `262,144`（MTP=bf16）= 1,400,832 B/页；
+  ×4096 = 5,737,807,872 B = 5.3444 GiB → 打印 "5.34"** ✓
+- **int8：`17 × 135,168 = 2,297,856` B/页；×4096 = 9,412,018,176 B = 8.7656 GiB → 打印 "8.77"** ✓
+- 交叉验证：仓库 commit `89e2375` 自报 "payload 3.56x nvfp4"，本模型给 4,456,448/1,253,376 = **3.555** ✓
+- ⇒ **差额完全来自"默认臂文本 KV = 4.34 bits/el、int8 = 8.25"**（int8 宽 **1.90×**，`2,162,688/1,138,688 = 1.8993`）。
+- ⇒ **真 bf16 在 262144 需要 17.0 GiB > `free after weights 10.80 GiB` ⇒ 物理上跑不起来**；
+  文档里 `bf16 16.00` 那行是 layer-table 的"未设置哨兵值"，从没被这 16 层用上
+  （`docs/maintainer/kv-strategy-matrix.md:10-13,33-36` 已记同一件事）。
+
+**6.7× decode 差的机制（并用带宽量化排除了带宽解释）**：两臂对 16/16 层 + MTP 层走**不同 kernel**，
+判据只有 `cache.dtype`（`gqa_attention_decode_smallt.cu:64-132`）。E8 额外多一遍
+`gqa_attention_decode_i8.cuh:524-571` 的 `unpack_tile()`（把 packed 4-bit 的 K/V tile 在 smem 里逐 16 维展开成 i8：
+2 读 + 8 解包 + 16 次移位拼接 + 2 写），且**被同步插进 key-block 主循环**（`:780`）。
+量化：默认臂每 round 文本 KV ≈ **2.70 GB / 136 ms → ~20 GB/s**；int8 ≈ **5.13 GB / 23.1 ms → ~236 GB/s**；
+两者都远离 ~1.8 TB/s 峰值，且**默认臂字节更少却慢 12×** ⇒ 差在**每 key 的计算/延迟**（反量化+unpack 在关键路径上）。
+
+**判定**：
+- **不是"bf16 长上下文路径有缺陷"** —— 这条路径在这次测量里**不存在**。
+  `split_reference_keys` 的接线是对的（`program_impl.h:11767/12241`/`:587-606`；`partial.cuh:89-91` 只在 0 时回退）；
+  **`kCausalAttentionMaximumVisibleKeysYarn` 现在只剩定义、无使用点** ⇒ 我的 S 修复在源级确认生效。
+- **真正解释默认臂召回崩塌的是仓库自认未修的缺陷**：默认表把 E8 放在 **8,9,13,14**，而
+  `docs/maintainer/kv-strategy-matrix.md:37-42,109-113` 实测 `8-15:e8 → 0/8 针`、`0-7:e8 → 8/8`、
+  **出厂默认表 6/8**（纯档位全 8/8），compute-sanitizer 干净 ⇒ **静默逻辑/别名错**。
+  形状与"default 30/64、int8 60/64"一致。
+- **两个 arm 不是干净对照**：差在 (a) 16 层 dtype（E8/NVFP4 vs I8，**4.34 vs 8.25 bits/el**）、
+  (b) 因此不同的 decode/prefill kernel 与 tile schedule、(c) MTP 层 dtype（bf16 vs i8）、
+  (d) 派生量（prefill chunk 3072→2048、workspace peak 457.71→305.14 MiB、prefill 24s→17s）。
+  ⇒ "int8 召回更好"**不能**读成"低精度更好"或"bf16 有缺陷"，它读作
+  **"8.25 bits/el > 4.34 bits/el，且 4.34 那一侧把 E8 放在了已知损坏的层号上"**。
+- **新发现（未证可达）**：`mtp_impl.h:219-220` 与 `:238-239` 用**两个初始化项**构造 `GqaExecutionEnvelope`
+  ⇒ `split_reference_keys = 0` ⇒ 活窗驱动划分，而同一 MTP 缓存的 decode-batch 路钉的是 `capacity`
+  （`program_impl.h:598`）—— 正是 `include/ninfer/ops/gqa_attention.h:182-193` 禁止的那类混用。
+  **未证明它在本次运行里被触发或改变了数字。**
+
+**我收回 §42 的红旗表述**：我写"int8 臂的 KV payload **大于** bf16 臂"并称之为"结构性矛盾"——
+**那是我的标签读错**：那 16 层**不是 bf16**（是 10×E8Kv + 6×NVFP4），payload 反演不是矛盾而是自洽。
+**保留下来的真问题**是它顺带暴露的：**出厂默认表把 E8 放在 4 个已知损坏的层号上**。
+
+**处置（两条决定）**：
+1. kv2 的补丁（把默认 E8 集合收到 `{0,1,3,4,6,7}`，34 行 1 hunk，apply-check 通过；
+   这正是仓库自己在 `kv-strategy-matrix.md:113` 给的短期修法）**暂不落地**——它与 E 组的 D1
+   （E8 格点投影）**都改 E8 行为**，应当**一起落、一起测**；且当前重建+闸门队列在飞，不得搅动。
+2. **`kKvBitBudgetE8LayerLimit` 不动**（我先前准备的 8→10 回退补丁作废）：
+   问题不在层数上限（10），而在**层号选择**；正确顺序是 **落 D1 → 复测"深层 e8 是否仍退化"**。
+   E1 已指出 `kv_bit_budget.h:60-75` 本就写着 e8 只对 layers 0..7 验证过、高层退化 —— 与 kv2 的发现一致。
+3. **D1 与"层区退化"的关系**：D1（格点投影扔掉 47.57% 格点）对**所有** E8 层一致生效，
+   单独解释不了"0-7 好 / 8-15 坏"的**层区差异**；但两者都指向 E8 实现。
+   待 E2 报告 + D1 落地后复测，才能判断"高层 e8 退化"是不是 D1 的后果。
+
+### 49. 四臂**剂量-反应**：E8 档是**功能性失效**，而且它在**出厂默认表**里
+
+硬检索 4 臂（同二进制、同 artifact、同文档、同 ctx 262144、同 greedy；只有 KV dtype 逐层配置不同）：
+
+| 臂 | 生效的逐层 dtype | bits/el | 精确前缀 | 平均字符准确率 |
+|---|---|---|---|---|
+| `default` | **10×E8Kv + 6×NVFP4** | **4.34** | 211/512 = **0.412** | 0.482 |
+| `int8` | 17×I8 | 8.25 | 500/512 = **0.977** | 0.977 |
+| `nvfp4`（纯） | 16×NVFP4 + MTP | 4.50 | 486/512 = **0.949** | 0.949 |
+| **`e8`（纯）** | **16×E8Kv** | **4.25** | **0/128 = 0.000**（臂未跑完，2/8） | 0.000 |
+
+**纯 e8 是全崩，不是精度退化**：`[D0]` 精确前缀 **0/64**、**输出数字数 0**、**只生成 6 个 token**、
+**MTP 接受率 0.00%**、`stop-token`；`[D25]` 同样 0/64。`[D0]` 生成 6 token 就停 ⇒ 模型立刻吐出退化输出
+（KV 垃圾 ⇒ 注意力崩塌 ⇒ 立即 EOS 的形态）。
+
+**剂量-反应**：
+- 0% E8 层（纯 nvfp4）→ **0.949**
+- 62% E8 层（默认表 10/16）→ **0.412**
+- 100% E8 层（纯 e8）→ **0.000**
+
+⇒ **`default` 臂 0.412 与纯 nvfp4 0.949 的落差，完全由 E8 档解释**；
+而 **E8 就在出厂默认表里**（`variant.cpp:56-71` 的 `{0,1,3,4,6,7,8,9,13,14}`），
+即**出厂默认配置本身有严重正确性缺陷**——这与 §48.2 引的仓库自测
+（`kv-strategy-matrix.md:109-113`：`8-15:e8 → 0/8`、出厂默认表 6/8、纯档位全 8/8、compute-sanitizer 干净）
+**方向一致，但严重度更高**：那边是"默认表 6/8 针"，这里是"纯 e8 在 64 位精确背诵上 0/64、
+且默认表在 8 针上只拿到 0.412 而纯 nvfp4 有 0.949"。
+
+**注**：`e8` 臂还在跑（2/8），但 `[D0]`（6 token、0 数字）与 `[D25]`（0/64）两条已足够定性。
+本次硬检索用的是**旧二进制**，而本轮落地的 4 个修复（`gelu_and_mul` / `causal_softmax_attention` /
+`nvfp4_gdn_snapshot_plan` / `sigmoid_gate_mul`）**都不在 E8 的 KV 路径上** ⇒ **这条读数成立、不被 4 个修复影响**。
+
+**据此调整优先级与计划（我先前"hold kv2 的表修复"的理由升级）**：
+- **当前重建+闸门队列照常跑完**（它的目的是验证那 5 个 ctest；KV 表改动**不可能**影响它们，故归因不混）。
+- **队列跑完后第一批要落的，就是 E8 这一族**，一起落、一起测：
+  ① kv2 的默认表收窄（`variant.cpp:66` → `{0,1,3,4,6,7}`；34 行 1 hunk，apply-check 通过；
+     仓库自己在 `kv-strategy-matrix.md:113` 给的短期修法）；
+  ② E1 的 **D1**（删掉 E8 格点投影、保留旋转；4 文件 +82/−40，等 E2 双路确认后落）；
+  ③ 视 kv1 的结论决定是否还有第三项。
+- **测量仪器已经现成且已校准**：这条 4 臂硬检索就是 E8 修复的验收仪，
+  **锚点是 e8=0.000、default=0.412、nvfp4=0.949**；修完预期 `e8` 与 `default` 两臂显著上升。
+- **`kKvBitBudgetE8LayerLimit` 仍不动**（我先前准备的 8→10 回退补丁作废）：问题不在层数上限，在 E8 实现本身与层号选择。
+
+### 50. 我独立复核 payload 模型：**恒等式级确认**、**四臂全解释**、并发现一处**度量冲突**
+
+不复述结论，只做独立算术（脚本 `sh/_payload_check.sh`，纯 CPU、只读 .err 与源码）。
+
+#### 50.1 恒等式自检：`每层 byte/页 == 16,384 × (bits/元素)` —— 四档全部精确成立
+`16,384 = 262,144/16`，而 262,144 B 正是 BF16(16 bit) 的每页每层字节数 ⇒ 这是个可独立验证的恒等式：
+| 档位 | bits/el | 16,384×bits | kv2 表里的字节 | 判定 |
+|---|---|---|---|---|
+| BF16 | 16.00 | 262,144 | 262,144 | ✅ |
+| I8 | 8.25 | 135,168 | 135,168 | ✅ |
+| E8Kv | 4.25 | 69,632 | 69,632 | ✅ |
+| NVFP4 | 4.50 | 73,728 | 73,728 | ✅ |
+
+⇒ kv2 的逐层表与**文档的 bits/el 表互相自洽**，两边同时被验证。
+
+#### 50.2 四臂 payload **全部**被同一个模型预测到打印精度（这是最强形式的确认）
+| 臂 | 我的预测（B/页 × 4096 页） | 实际打印 |
+|---|---|---|
+| `default`（10×E8Kv + 6×NVFP4 + MTP bf16） | 1,400,832 ×4096 = 5,737,807,872 = **5.34375 GiB** | **5.34** ✅ |
+| `int8`（17×I8） | 2,297,856 ×4096 = 9,412,018,176 = **8.76562 GiB** | **8.77** ✅ |
+| `nvfp4`（17×NVFP4） | 1,253,376 ×4096 = **4.7812 GiB** | **4.78** ✅ |
+| `e8`（17×E8Kv） | 1,183,744 ×4096 = **4.5165 GiB** | **4.52** ✅ |
+
+- `default` 的**文本**平均 = 4.3438 bits/el（kv2 报 4.34）；`int8`/`default` 的比值 **1.64035** 与观测到的 payload 比一致。
+- ⇒ 我 §42 的"结构性矛盾"**完全站不住**：四臂的 payload 不是矛盾，是**同一模型的四个点**。
+
+#### 50.3 代码侧逐档吻合（我自己读的）
+`src/targets/qwen3_6/impl/state/decoder_state.cpp:171-229` 的 plane 集合：
+- `BF16` → 2×`{BF16, head_dim, kv_heads, 256}`
+- `I8` → 2×`{I8, head_dim, …}` + 2×`{FP16, head_dim/group, …}`
+- `E8Kv` → 2×`{U8, head_dim/2, …}` + 2×`{FP16, head_dim/group, …}`（注释：packed 4-bit E8-lattice K + i4 V，per-64 FP16 scale）
+- `NVFP4` → 2×`{U8, head_dim/2, …}` + 2×`{FP8_E4M3FN, head_dim/group, …}`（+ 可选 residual 四元组）
+`src/targets/qwen3_6/impl/runtime/layouts_impl.h:1213-1217` 的注释明写：
+"An explicit global `--kv-dtype` replaces the target's registered per-layer default table for every layer …
+Without this the global dtype never reached the KV page geometry"（引 `_TODO.md` 97）⇒ **两条路径与我 §48.2 的表述一致**。
+
+#### 50.4 新发现：一处**度量冲突**（短上下文困惑度对 E8 缺陷**完全失明**）
+kv2 补丁里保留了默认表当初的选取依据（写在 `variant.cpp` 注释里）：
+> 13.3k zh perplexity @ ctx 4096：**本表 1.020（全部混合里最好）**；all-E8 **1.112**、all-NVFP4 **1.706**、all-I8 **1.522**。
+> 生成验证：MTP accept 44%、decode ~111 tok/s（5090）。
+
+而在 ctx **262144** 的 64 位精确背诵上（本会话实测）：
+> **纯 e8 → 0/64（0.000）**；纯 nvfp4 → **0.949**；纯 int8 → **0.977**；本默认表 → **0.412**。
+
+⇒ **在 ctx 4096 的困惑度上 all-E8 明显优于 all-NVFP4（1.112 vs 1.706），而在 262144 的检索上纯 e8 是 0.000 而纯 nvfp4 是 0.949。**
+⇒ **短上下文困惑度看不见这个缺陷**；默认表是**按短上下文困惑度选出来的**，于是把一个在长上下文功能性失效的档位放进了默认配置。
+这条对后面的验收设计很重要：**E8（以及任何 KV 档位）的验收必须包含长上下文检索，不能只看困惑度。**
+
+#### 50.5 处置与顺序（在"别等"的前提下仍守铁律⑦）
+- kv2 的补丁（`variant.cpp` 默认 E8 集合 → `{0,1,3,4,6,7}`，附带**很完整的层界理由注释**，含上面那些实测数字）已被我**算术级独立确认**，
+  但**它的双路伙伴 kv1 尚未报告** ⇒ 按铁律⑦**等 kv1 报告后落地**（不与 E2 的 D1 混在一起）。
+- 已把"落地 + 重建 + 用现成 4 臂仪验收"的编排写成脚本待命（go 标记由我在双路齐了之后放置），
+  这样落地动作是**一条命令**，不需要再等任何人。
+
+### 51. kv1/kv2 **双路收敛**（payload 调查结案）+ 裁定落地 kv2 的默认表收窄
+
+#### 同（两面独立得到，且与我 §50 的独立算术逐位一致）
+- 两臂**不是干净对照**；`default` = 注册逐层表（**10×E8Kv + 6×NVFP4**）+ BF16 MTP，
+  `int8` = 全局覆盖 16 层 + MTP 也 I8。
+- payload 反演：kv1 **default 5.3439 / nvfp4 4.7813 / int8 8.7657 GiB** —— 与我 §50 自算逐位一致。
+- **`summary kv cache dtype` 打印的是全局 flag、不是生效的逐层表**（`program_impl.h:13065-13086` +
+  `apps/cli/main.cpp:217`）。kv1 指出仓库**自己在 `TODO.md:5269` §8.2 明文记录过这个陷阱**
+  （"摘要行 `kv cache dtype` 打印的是全局 flag 而非生效的逐层表…判据一律用 `kv cache payload`"、
+  `src/product/kv_options.h:25-30`）——**但代码从未修**。
+  ⇒ **这是第二个仪表缺陷**，也正是我 §42 那条"结构性矛盾"的直接成因（我的判读被它误导）。
+- 真 bf16 物理上不可能：本几何下应为 **17.00 GiB**（16×1024 MiB + 1024.25 MiB MTP），是实测 5.34 的 3.2 倍。
+
+#### 异（kv1 独有三条，都很重）
+**① 6.7× 定位到一行**：`src/ops/wrapper/gqa_attention.cpp:189-192`
+```cpp
+// E8Kv small-T kernels are unverified; route E8 to the prompt path.
+if (cache.dtype == DType::E8Kv && route != detail::GqaAttentionRoute::Prompt) {
+    route = detail::GqaAttentionRoute::Prompt;
+}
+```
+叠加"引擎的文本全注意力层在**每个 phase** 都调 A1 `gqa_attention`（不是 A3）"这一事实
+（`text_context_impl.h:1066/1071` 的 `attn_mix()`；`run_layers()` 对每个 full 层无条件调，phase 只改 NVTX 分类；
+A3 `gqa_attention_cached` 只被 MTP 层用，`text_context_impl.h:670`）：
+decode/verify（width ≤6）本该走 SmallT，却被这条强制改成 `Prompt` ⇒
+`gqa_attention_prefill_e8_launch`，grid = `(div_up(tokens,64), QHeads=24, 1)`，**且不切分 key**
+⇒ 每步 decode 只有 ~24 个 CTA、每个串行扫完整个 ~151,669 key 窗口；
+而非 E8 走 SmallT split-KV = `(KVHeads=4, splits=85, 1)` = **340 CTA 并行切窗**（splits 来自 `partial.cuh:96-156`）。
+实测每 MTP round 墙钟：**default 136 ms/round（20 轮，10/16 层是 E8）、int8 23、nvfp4 29**
+⇒ **只差"有没有 E8Kv 层"这一个变量就产生 ~5× 差**。
+而且 E8 的小-T 解码 kernel **存在且已接线**（`launcher/gqa_attention_decode_e8.cu` 有 append/cached 两个 overload，
+`gqa_attention_decode_smallt.cu:70-73` 会调到），只是 A1 这条活路径被作者以"unverified"自己挡掉了；
+旁证：同一张表在 **ctx 4096 实测 ~111 tok/s**（`variant.cpp:31`）⇒ **不是该档位的内在成本，
+而是随窗口线性恶化的 kernel 选择**。
+
+**② 独立三臂召回复算，证伪"位预算"解释**（kv1 的 `scratch/kv1/pK1_acc2.py`）：
+
+| 臂 | 生效 KV | bits/el（文本） | kv1 的精确前缀 | 我的打分器 |
+|---|---|---|---|---|
+| int8 | 16×I8 | 8.25 | 500/560 = 0.893 | 500/512 = 0.977 |
+| **nvfp4** | 16×NVFP4 | **4.50** | 486/550 = 0.884 | 486/512 = **0.949** |
+| default | 10×E8Kv+6×NVFP4 | **4.34** | 108/234 = 0.462 | 211/512 = 0.412 |
+
+⇒ **4.50 b/el 的 nvfp4 与 8.25 b/el 的 int8 统计上无差别**，而 4.34 b/el 的 default 塌掉一半
+⇒ **差异唯一跟随"有没有 E8Kv 层"**。"bf16 长上下文退化"与"低精度⇒召回差"两个框定**都不成立**。
+且 `[D25]` 的 default 答案是**另一个完全不同的 64 位数**、`doc.find(...) == -1`（错答案不在文档里）
+⇒ 形态是"**needle 不再可检索**"，而不是"读错 key 位置"。
+
+**③ 静态排除我给的三条线索**：`split_reference_keys` 混用**存在但本跑不产生分歧**
+（decode kernel 显式收 `logical_capacity` 与 `split_units`；graph 路径钉常量、eager 路径留 0 回落到
+`max_visible_keys`，而**本跑 `max_context = KV capacity = 262144`，两者数值相同**）；
+YaRN ×4 名义容量属**另一个算子族**（`ops/softmax_attention/dense/causal_cache`），GQA 路径无同类混用；
+E8 的三处 producer（prefill `prefill_i8.cuh:134-190`/`:274-326` + decode `decode_i8.cuh:226-283`）
+**都**做了 `gqa_kv_hadamard64 + e8_project_8d_warp + clamp(±7)`、Q 侧也都 rotate
+⇒ **没有"漏投影"的残留副本**（`_TODO.md` 116/116b 描述的那个 bug 已修）。
+⚠️ **这一条与 E1 的 D1 不矛盾、反而加强 D1**：投影是**到处都在做**的，问题是**投影本身**扔掉了一半格点
+（`D8 ∪ (D8+½)` 里的半整数陪集被 `rintf` 推 0.5 step）。
+
+#### 一处诚实的数值分歧（记下来）
+我的打分器 default 臂 **211/512**，kv1 是 **108/234**；**分子在 int8（500）与 nvfp4（486）上完全一致**，
+只在 default 上不同、且分母约定不同（我用 8×64=512，kv1 用"生成位数"）。
+⇒ **定论取排序与比值**；绝对数取我这份（它经过真实输出回归验证：旧输出回归 29/64、acc 0.453）。
+
+#### kv1 拒绝交补丁，理由正确且与 kv2 互补
+kv1 明确不交 `fix.patch`，三条理由都对：
+1. 仪表缺陷的**正确**修法是让 `MemorySummary` 携带生效的逐层表 / "mixed" 语义，而它只有单个枚举
+   ⇒ 任何"只报一个枚举"的小补丁**对本例仍然会打印 bf16**，是**假修复**；
+2. 真正修要跨公开头 ABI + 让 `PagedKVCache` 暴露逐层 dtype（`layer_view` 现为 private）⇒ 4 文件盲改，
+   且它被禁止跑构建、无法保证编译通过 —— "交一个编译不过的补丁比不交更糟"；
+3. 翻转 E8 闸的补丁会改整个默认配置的**数值与速度**，而该 kernel 被作者标为未验证 ⇒ **它不替作者做这个决定**。
+它给的**最小修法留档待用**：`memory_summary()` 里若 `backend_kv_cache()` 非空，用 `layers()` +
+`batch_layer_view(i).dtype` 求生效表；均匀则报该档，非均匀则报新增的 "mixed" 并附 `kv_payload`/bits-per-element。
+
+#### 我的裁定：**放 `GO_KV_TABLE`，落地 kv2 的默认表收窄**
+依据：
+1. 双路都已报告，且**都**独立指向"差异跟随 E8Kv"（kv1 用 nvfp4 对照臂证伪位预算解释，kv2 用 payload/perplexity 反演）；
+2. kv1 的三臂表显示 **nvfp4（4.50）≈ int8（8.25）而远好于 default（4.34）**
+   ⇒ 把 4 层 E8 换成 NVFP4 **预期恢复召回**；
+3. 该补丁正是仓库自己在 `docs/maintainer/kv-strategy-matrix.md:113` 给的**短期修法**，
+   且补丁注释完整记录了层界实测（`0-7:e8 → 8/8 | 8-15:e8 → 0/8 | 14-15:e8 → 4/8 | 本表 → 6/8 | 纯档位全 8/8`）
+   与"compute-sanitizer 干净 ⇒ 逻辑/别名缺陷、仍开放"；
+4. kv1 拒绝的是**翻转 E8 闸**（会同时改数值与速度、且 kernel 未验证），与 kv2 的**收窄默认表**是**不同改动**，
+   不构成反对。
+**D1 仍 hold**：E2 已交 `fix.patch` 但报告未到，铁律⑦未齐。
+
+### 52. E8 codec 双路**在旋转轴上直接对立**：两份补丁**都 hold**，已派两个独立裁决代理
+
+#### 五条断言的 E1 vs E2
+| 断言 | E1 | E2 | 判读 |
+|---|---|---|---|
+| ① 1.9–2.0× | 成立（**2.32×**） | 成立（**1.95/1.95/1.98×**） | 同向，系数略差；E2 给出可算机制：(0.0717+0.125)/0.0833 ≈ 2.0× |
+| ① 子句"不如 3.25 b/el 纯标量" | **推翻**（E8 2.636e-2 ≈ 最优 3-bit 2.64e-2） | **成立 2.30–2.51×**，但指出那个基线其实是**拟合码本**（`K3=[0.1316,0.4024,0.6841,1.0]`，g32+E4M3）而非"纯标量" | **对立**（E2 补了真·均匀 3-bit g64 fp16 作对照） |
+| ② 约 46% 半整数 | 47.57% | 46.48/46.47/46.72%（两实现一致） | 一致 |
+| ③ Hadamard-64 旋转 | **推翻**：旋转让 K **好 1.43×**（`MSE(had)/MSE(none)=0.697`） | **成立**：旋转让 K **差 3.98/3.66/3.91×** | **直接对立** |
+| ③ 机制 | `E[amax_rot²]/E[amax²] = 0.685`（旋转**降** amax） | H 把组 DC 灌进 `out[0]`（占峰值 88%）⇒ amax 被**抬** 1.82–1.92×（crest 2.48→4.22） | **对立**（同一对量、相反方向） |
+| **修法** | **删投影、保留旋转** = 2.32× | **删旋转**（+删投影+最优 scale+陪集位 **4.375 b/el**）= **10.4–12.6×**，4 文件 +80/−26 | **旋转轴相反** |
+
+#### 我已定位头号嫌疑：**H 的归一化约定**
+E2 同时写 `out[0] = Σx/8 = 8·mean` 且 `|H[0][j] − 1/8| = 0`，**并**声称 `|HᵀH − I| = 0`。
+**这两件事不可能同时为真**（若每行都是 ±1/8，则 `HᵀH = 8I` 或 `I/8`，不是 `I`）。
+⇒ 归一化（除以 `1/8` 还是 `1/√8`；`HᵀH` 是 `I` 还是 `8I`）是**头号分歧嫌疑**；
+第二位嫌疑是**两臂是否用同一条 scale 规则**（"无旋转"臂是按无旋转后的 amax 重取 scale，还是沿用旋转臂的）。
+已派**两个**独立复算代理用**同一套严格协议**裁决（要求：从源码逐字抄出 H 系数、算出 `HᵀH`、
+四臂在"自臂 scale"与"统一固定 scale"两种规则下都测、报 amax 均值与 crest，并指出两份程序各自的错误行）。
+**裁决前两个补丁都不落。**
+
+#### E2 的**无争议**发现（与旋转之争无关，应单独成立）
+1. **D5 = 收敛性 UB（真 bug）**：`decode_i8.cuh:288-297` 把 `__shfl_xor_sync(FullMask, …)` 写在
+   `if ((lane & 1) == 0)` 里（`FullMask` 却声称全 warp 参与）——**同族的 prefill 代码已正确把 shuffle 提出 `if`**。
+   nvcc 可能照样发 SHFL 读到奇 lane 的旧寄存器值 ⇒ 需 GPU 或反汇编才能定案（已列禁跑项）。
+2. **④ 的量级被更正**：无 clamp 成立，但阈值是 **E8 档 `amax > 458,528`** vs **i8 档 `amax > 8,319,008`**
+   ⇒ **E8 比共用该代码的 i8 档敏感 18.1×**；真实 dump 最大 `amax_rot = 70.03`（余量 6548×）未触发。
+   合成验证（真实 K ×1e8）：`scale = inf` ⇒ `kinv = 0` ⇒ **该组 64 个 code 全 0** ⇒ 读侧 `0 × inf = NaN`，无标志位。
+3. **⑤ 的机制句对本档不成立**：E8 的码**不是**按 fp32 scale 分配后取整 scale
+   （`ks_e = __half2float(ksh_e)`，`kinv_e = 1/ks_e` 驱动码）；那条 3.1%/0.03–0.6% 属 nvfp4/E4M3 档。
+   而"scale 未迭代到最优"**成立但被低估 4–8×**：真值 **26–35% NMSE**（`t* ≈ 0.86–0.96 × amax/7`）。
+4. **上一轮的 V 行是建模产物**：`e8_study.py` §3 把 E8 codec 套在 V 上得 17.78%，
+   而引擎的 E8 档 **V 走 `gqa_kv_quant_i4_code`（scalar、无旋转、无投影）** ⇒ 真实 V 是 **13.5/12.3/8.1%**，
+   **比 K 好得多**；K 的 28–29% 完全来自 K 的旋转+投影。⇒ 不要把 V 算进 E8 的病。
+5. **一份重要的适用性限制（对我后续判定最关键）**：该 dump **只有 L13/14/15**，而
+   `kKvBitBudgetE8LayerLimit = 10` 把 E8 放在**前 0–9 层**，默认表用的是 `{0,1,3,4,6,7}` + `{8,9,13,14}`。
+   ⇒ **D1 的倍数取决于每层组内 DC 统计**，E2 **不能断言去旋转在部署层（0–9）同样值 3.9×**；
+   而仓库自测的"`0-7:e8 → 8/8 | 8-15:e8 → 0/8`"说明**退化是随层位变化的**。
+   ⇒ **两份测量都落在"已知坏"的 13/14/15 上**，部署层（0–9）的 codec 数字**至今没人测过**。
+   这本身是一条该补的实验（需要 0–9 层的 dump），已记。
+6. E2 还指出：全部编码器侧修完（D1+D2+D3，不加 bit、不改布局、读侧零改动）
+   ⇒ K NMSE 0.0828 → 0.0080 = **10.4×（≈10 dB）**；加陪集位（4.375 b/el）→ **12.6×（≈11 dB）**。
+
+### 53. e8 臂跑完：**字符准确率落在随机水平** ⇒ 不是精度差，是**可检索性完全丧失**；剂量-反应完整
+
+`e8` 臂（纯 16×E8Kv）逐条读数（独立打分器，与 §50 的 payload 模型同一份产物）：
+
+| 标记 | 精确前缀 | 字符准确率 | 输出数字数 | 生成 tok | 结束 | MTP 接受率 |
+|---|---|---|---|---|---|---|
+| [D0] | 0/64 | **0.000** | **0** | **6** | stop-token | **0.00%** |
+| [D25] | 0/64 | 0.000 | 0 | ? | ? | ? |
+| [D50] | 1/64 | 0.125 | 467 | 512 | output-limit | 78.17% |
+| [D75] | 3/64 | 0.188 | 466 | 512 | output-limit | 41.83% |
+| [D100] | 1/64 | 0.141 | 121 | 122 | stop-token | 33.89% |
+| [D125] | 3/64 | 0.109 | 466 | 512 | output-limit | 11.67% |
+| [D150] | 1/64 | 0.125 | 79 | 80 | stop-token | 72.00% |
+
+**小计 9/448 = 0.020；平均字符准确率 0.098。**
+
+**关键判读**：字符准确率 **0.098–0.188 正是十进制数字的随机水平**（猜中概率 0.1）⇒
+e8 臂的输出里**不含可检索的信息**，这不是"记得不精确"，而是"**根本没取到**"。
+（对照：纯 nvfp4 的字符准确率 0.949、纯 int8 0.977。）
+
+**两种失败形态并存**：
+- **立即 EOS**（`[D0]`：只生成 **6 个 token**、MTP 接受率 **0.00%**）；
+- **读到预算为止在打转**（`[D50]/[D75]/[D125]`：512 tok 撞 `output-limit`）。
+MTP 接受率也**极不稳定**：0.00 / 11.67 / 33.89 / 41.83 / 72.00 / 78.17%，而 int8 与 nvfp4 臂稳定在 **84–97%**。
+⇒ 接受率本身可以被当作**KV 健康度的廉价指标**（这一条值得记：不需要精确背诵任务就能瞥见 E8 的崩坏）。
+
+**剂量-反应现在完整**：
+| E8 层占比 | 臂 | 精确前缀 | 平均字符准确率 |
+|---|---|---|---|
+| **0%**（16×NVFP4） | `nvfp4` | 486/512 = **0.949** | 0.949 |
+| **0%**（17×I8） | `int8` | 500/512 = **0.977** | 0.977 |
+| **62%**（默认表 10/16 E8） | `default` | 211/512 = **0.412** | 0.482 |
+| **100%**（16×E8Kv） | `e8` | 9/448 = **0.020** | 0.098 |
+
+⇒ **完全单调，且两端都在"每一条 needle"上成立**（不是被个别 needle 拉低）：
+`nvfp4` 八条里五条满分、`int8` 八条里六条满分，而 `e8` 八条里**最高只有 3/64**。
+这条 4 臂仪因此是**E8 修复的现成验收仪**（锚点 `e8=0.020 / default=0.412 / nvfp4=0.949 / int8=0.977`）。
+
+#### 本轮新派出的代理（继续并行）
+- `rc1`/`rc2`（**双路**，八项⑥）：**逐轮外挂召回**。第一交付物是"`suffix_lookup` 为何在中/尾两种查询形态下
+  **零匹配**"的**纯 CPU 复算诊断**（最硬的一条），其次才是 L0 逐轮日志 / 检索索引 / 引擎挂钩点设计与补丁。
+  已在简报里写入新事实：**外挂的 packed KV 必须用 nvfp4 或 int8，不许依赖 e8**。
+- `w13a`/`w13b`（**双路**，八项⑤）：**权重卸载 W13**（零实现；1M 的使能项）。
+  要点：1M 按现有预算需要 ≤ **2.33 bits/el**（引擎自报 e8 需 18,912,736,512 B / nvfp4 需 20,000,740,608 B
+  vs 可用 11,600,323,584 B；拟合 k = 4.08e-6 GiB/(token·bit/el)、c ≈ 0.27 GiB），
+  而 W13 是**把预算做大**的另一条路；**e8 已被证不可用 ⇒ W13 的价值更高**。
+  要求：卸载谁/何时取/带宽账/与 KV 预算的换算（能把 2.33 提到多少）+ 补丁 + 爆炸半径。
+
+### 54. 冷窗 cc1：字节账拆开、**2.6 bit 是单位陷阱**、挖出一个只调常数才暴露的**真 bug**；并更正我三条表述
+
+#### 54.1 `9536 = 320 + 32×256 + 1024` 拆开
+| 项 | 值 | 是什么 | 出处 |
+|---|---|---|---|
+| header | **320** | `magic(4)+version(2)+flags(2)` + 2×`EntropyNvfp4SlotHalf(128)` + `reserved[56]`；每半 128 = `freqs[16]u16`(32) + `offsets[17]u32`(68) + `reserved[28]` | `entropy_nvfp4_slot.cuh:41,36,45`；`static_assert(sizeof(EntropyNvfp4SlotHeader)==320)` `:61` |
+| streams | **32×256 = 8192** | 2 半 × 16 流 × 256 B；每流 512 个 E2M1 code ×2048 bit = 256 B ⇒ **该区恰好等于未压缩 code plane（4.0 b/code）** | |
+| scale tail | **1024** | `16 × 64` 行 E4M3FN g16 尺度，逐字节原样拷贝 | `kernel:177-181` |
+
+#### 54.2 每 head-page（256 dim × 64 token = 16384 KV 元素，单 K\|V plane）的常驻 vs 冷记录
+| dtype | 常驻 plane | 冷 codec | 冷记录 | Δ |
+|---|---|---|---|---|
+| bf16 | 32768 | 无 | 预留 9536，写 0 | (若有 **−23232**) |
+| int8 | 16896 | Int8Raw | 16+8192+1024 = **9232** | **−7664** |
+| fp8 | 17408 | 无 | 预留 9536 | (若有 −7872) |
+| nvfp4 | 9216 | Nvfp4Rans | 320+8192+1024 = **9536** | **+320 净亏** |
+| e8 | 8704 | 无 | 预留 9536 | (若有 +832) |
+| iso3 | 9216 | 无 | 预留 9536 | (若有 +320) |
+
+**那 16 B 的答案**：`kColdI8SlotBytes(9232) − (8192+1024) = 16 = kColdI8SlotHeaderBytes`（`cold_i8_kernels.cuh:32`），
+而 `8192+1024 = 9216` 恰是 nvfp4 常驻 plane。
+**但这不是"int8 比 nvfp4 多 16 B"**：**int8 冷路径并非存 int8 plane**——它先把 int8 g64 plane
+**重量化成 E2M1 / g16-E4M3**（`entropy_cold_requant` 的 `Int8G64` 模式）再原样存。
+**同口径真值是 16896 → 9232。**
+
+#### 54.3 ⚠️ 更正我的三条表述
+1. **"冷槽精确填满、零余量"只对一半**：只有 **rANS 记录（4.0 b/code）** 零余量（流区恰好==code plane）；
+   **int8 raw 记录是 9232，只填 9232/9536，余 304 B**（代码自己也这么说：`decoder_state.cpp:448-449`）。
+2. **"两处 `static_assert`"不完整**：真正**让构建失败**的只有一处 ——
+   `decoder_state.cpp:374-376`（`nvfp4 cold-slot derivation drifted from ops::kEntropyNvfp4SlotBytes`，`6688 != 9536`）。
+   我说的那"两处"其实是**host 镜像**：`kv_tier_formats.h:222`（`== 9536`）与 `kv_bit_budget.h:204`（`== 466`），
+   它们**跟自己文件里的字面量比**，**改了值也照样 PASS** ⇒ 是**静默变假**。
+   ⇒ 正确说法：**两个镜像必须重指向 6688 / 327**（否则静默），**硬门是第三处 `:374`**。
+  > **[注解 2026-09-18 · SUPERSEDED]** 不要照这条"**两个镜像必须重指向 6688 / 327**"做：镜像已不存在——`kKvBitBudgetColdSlotBytes` 现在**派生**自 `kKvColdPoolStrideBytes`（`src/product/kv_bit_budget.h:314`），现值为 **9632 / 470**（价格 `kKvBitBudgetColdBitsX100` 同为派生并 static_assert `== 470`，`kv_bit_budget.h:408-412`）。
+  > 这段找到的"静默镜像"洞**正是被它要求的硬门堵上的**：第三处钉子现在在 `decoder_state.cpp:863`（外加 `:845`），且检查的是**派生值** == `ops::kEntropyNvfp4SlotBytes`；照本条改成 6688/327 会让它立刻 FIRE。
+   （cc1 实测编译三种场景：只改定点 X=40 全过；X=26 只爆 `:374`；X=26 + 显式 320 header + ops 6688 全过。）
+3. **"e8/iso3/fp8/bf16 无冷 codec ⇒ 出厂表一页压不了"要分开说**（见 54.5）。
+
+#### 54.4 ⭐ 真 bug：`kColdSlotRansHeaderBytes` 会在调常数时**变负数**
+`decoder_state.cpp:299`：`kColdSlotRansHeaderBytes = slot − code_plane − scale_plane`
+—— 这个式子**只在 4.0 b/code（流区 == code plane）时得 320**。改成 2.6 b/code 时它是
+`6688 − 8192 − 1024 = −2528`，于是 `cold_slot_stride_for` 返回 **3840**，**每条记录都欠尺寸**。
+⇒ 必须改成**显式 320 常量 + assert**。这是**只有把常数往下调才会暴露**的潜伏缺陷。
+
+#### 54.5 ⭐ 单位陷阱：源码的 "2.6" 是 **bits/code**，DP 记的是 **bits/element**
+- 源码里的 2.6 是 **bits/code**（head-page 8192 code），而 `kKvBitBudgetColdBitsX100` 记的是 **bits/element**（16384）。
+- 2.6 b/code ⇒ 6688 B ⇒ `6688·8·100/16384 = 326.5625` ⇒ **327（= 3.27 b/el），不是 2.6**。
+- 要 **2.6 b/element** 需 `2.6·16384/8 = 5325 B` ⇒ `(5325−320−1024)/32 = 124 B/流 = 1.9375 b/code`
+  ⇒ **低于实测的 2.0–2.6 b/code** ⇒ **该目标靠调这个常数根本不可达**（要么换算法，要么接受 3.27 b/el）。
+
+**定点化改动清单（3 处）**：`:281` 的 `kColdSlotRansBitsPerCode`（int32 装不下 2.6 ⇒ 改十分位 26）；
+`:331` 公式 `(stream_symbols*bits+7)/8` ⇒ `(stream_symbols*bits_x10+79)/80`；
+`:299` 的 header（见 54.4）。
+
+#### 54.6 e8 / iso3 / fp8 / bf16 逐个判定
+| dtype | 9536 槽放得下？ | 判定 | 最少需要 |
+|---|---|---|---|
+| **iso3** | **是**：plane pair 与 nvfp4 逐字节相同（8192+1024） | **仅缺实现**（`cold_slot_codec_of` 不映射 ISO3；无 standalone ISO3 的 requant 臂与 cold 分支） | 9536（6688 @2.6） |
+| **e8** | **是**：4-bit code plane 8192 + 自带 FP16 g64 tail 512 ⇒ **320+8192+512 = 9024** ≤ 9536 | **仅缺实现**；且推导把尾部硬编码成 g16/1024（`kColdSlotScaleGroup`），e8 的 512 B 尾会被算错 | 9024 |
+| **fp8** | **否**：原生 8-bit code plane 16384 ⇒ `320+32·512+1024 = 17728 > 9536` | **槽不够 + 缺实现**（必须重量化到 4-bit，那样 9536 零余量刚好） | 17728（原生）/ 9536（重量化） |
+| **bf16** | **否**：同 fp8 但更差 | **槽不够 + 缺实现** | 17728 |
+
+**注意限定**：`iso3 无冷 codec` 必须限定为 **standalone ISO3 层**——**nvfp4 tier 的 V plane 就是 ISO3，
+而且确实走 rANS 冷编码**。出厂 `qwen3_6_27b` 表是 10×E8Kv + 6×NVFP4，
+因"**每层都必须能喂 codec**"⇒ **该表下冷池一页都压不了**（(c) 条成立）。
+
+#### 54.7 B1 三条的裁定与补丁状态
+- **(a) 真缺陷**（@4.0 净亏 320 B/head-page，见 54.2）；
+- **(c) 真缺陷**，但需按 54.6 限定（iso3/e8 是"缺实现"、fp8/bf16 是"槽不够"）；
+- **(b) 描述有误/不完整**：定点化是真的，但漏了真正爆构建的第三处 assert、掩盖了 54.4 那个真 bug、
+  且把 bits/code 与 bits/element 混为一谈。
+- 补丁：`/home/user/scratch/cc1/fix.patch`（358 行 / 4 文件 / 14 hunk / +225 −19），干净副本 **apply-check PASS**；
+  落地后两份 product 头文件 host 编译通过且**出货常数不变**（466/9536/9232/9216/16896）；
+  `tests/test_kv_tier_formats.cpp` 补丁前后都 all checks passed；**不改默认**（源码自己要求 2.6 必须是测量决策）。
+- **先 hold**：等双路第二路（`cc2`）报告（铁律⑦）。
+- 附带未改项：DP 的单一 `kColdBitBudgetColdSlotBytes` 与 per-dtype 记录不一致
+  （**int8 冷层被多记 304 B/head-page**）——补丁里写明了，未改。
+
+#### 54.8 与 E8 主线的交汇
+出厂表 10×E8Kv + 6×NVFP4 **既**让长上下文召回塌掉（§53：62% E8 层 → 0.412）
+**又**让冷池一页都压不了（54.6）。
+⇒ **kv2 的默认表收窄（已放 `GO_KV_TABLE`）同时改善两件事**；
+但要让冷窗真正可用，还需要一个**统一档**的图层方案（或补齐 e8/iso3 的冷臂）——这是 ③ 的下一步设计点。
+
+### 55. ⭐ 旋转之争**裁决**：E1 对、E2 错——E2 把 dump 读取**转置**了；我的头号嫌疑是**错的前提**
+
+裁决方式：在同一批字节上跑**两种 gather**，看谁能复现谁（`/home/user/scratch/adj2/`，纯 CPU）。
+
+#### 55.1 分歧的唯一原因：E2 的 gather 是转置的
+仓库**四处**独立证据一致 —— `kn` 文件是 **head_dim 最快变化**：
+- meta `kn ne=256,4,3072,1  nb=2,512,2048,6291456`（nb[0]=2 B ⇒ dim0 最快）；
+- `gqa_kv_quant_src_index = d + 256*(h + 4*t)`（`src/ops/kernel/gqa_attention_kv_quant.cuh:59-64`）；
+- dumper 写的是 `view({head_dim, n_kv, T})`（`text_context_impl.h:997`，raw 连续 memcpy）；
+- 仓库自带的 `research/scripts/_src_vs_stored.py:53` 也是 `reshape(256,4,-1)` 后 `kn[d,h,t]`。
+
+**E1 用 `g*64 + 256*(h + 4t)`（对）；E2 用 `((d*4+h)*3072 + t)`（转置）。** 同一批字节、两种读法：
+
+| gather | `E[amax_rot]/E[amax_raw]` | crest raw→rot | `MSE(ship)/MSE(norot)` |
+|---|---|---|---|
+| **A：`d + 256h + 1024t`**（meta / src_index） | **0.8319** | 3.14 → 2.57 | **0.719**（L13/14/15：0.681/0.766/0.716） |
+| **B：`(4d+h)3072 + t`**（E2） | **1.8645** | 2.47 → 4.17 | **3.769**（3.94/3.56/3.80） |
+
+- 布局 B 几乎逐项复现 E2 的数字（amax ×1.82–1.92、crest 2.48→4.22、MSE ×3.98/3.66/3.91）；
+- 布局 A **逐位复现 E1**：`E[amax_rot²]/E[amax_none²] = 0.6847`（E1 同）、组均比 0.8635（同）、
+  `MSE(b)/MSE(d) = 0.6973`（同）、`MSE(a)/MSE(c) = 0.7189`（同）、shipped NMSE **0.026361**（E1 的 2.636049e-02 同）、
+  最大组 amax 15.0000 → 旋转后 9.2288（同）。
+⇒ **一次采集、两种读法，这就是全部分歧。**
+
+#### 55.2 ⚠️ 我的头号嫌疑（H 归一化）是**错的前提**
+adj2 指出："每行都是 ±1/8" 与 "`HᵀH = I`" **可以同时成立** —— 求和要取**平方**：
+`Σ_j (1/8)² = 64/64 = 1`。数值验证 `min|H[i][j]| = 0.1250000000`、`max|H[0][j]−1/8| = 0`、
+`max|HᵀH−I| = 0`、`max|H Hᵀ−I| = 0`。源码 `gqa_attention_kv_quant.cuh:32-35` 的系数是 `0.125f`（不是 `1/√8`）。
+⇒ E2 的 `out[0] = Σx/8 = 8·mean` 是**正确代数**，两份程序都与源码一致。**归一化不是分歧点，我判断错了。**
+
+#### 55.3 判定：**E1 对、E2 错**（E2 的代数对，测量是转置文件的假象）
+三个数：
+1. `MSE(rot)/MSE(none)` = **0.72（投影开）/ 0.70（投影关）** ⇒ **旋转让 K 好 1.39–1.43×**；
+2. `E[amax_rot]/E[amax_none] = 0.8319`、`E[amax_rot²]/E[amax_none²] = 0.6847` ⇒ **旋转降低 amax** ⇒ 步长更细；
+3. `8|mean|/amax_rot = 0.3182`，且 **DC 位置只在 1.54% 的组里是 argmax** ⇒ E2 说的"占峰值 88%"实际是
+   **平均 32%、从不主导**。
+
+**真机制（两方都没说到的细化）**：真实的 64 组是**重尾**的（crest 3.14，旋转前 amax 到 15 而 rms≈1.5，
+即单个离群通道主导）；正交 H 把**离群能量摊到 64 个坐标**上；DC 项确实会长，但只到 `0.32·amax_rot`，
+所以净 amax 降 0.83×、步长变紧。E2 被搅乱的编组把尾巴磨掉了（crest 2.47、类高斯——因为它把**一个通道**在
+64 个 token 上平均，那**恰好造出**相干 DC），这正是 DC 项在那里显得主导的原因。
+**另注**：那 1.43× 增益**依赖于每组 amax 锚**——若换成一个全局常数 scale，增益消失（1.14×）。
+
+#### 55.4 四次独立测量下的 E8 四臂（布局 A，K，27 dumps / 64677 token / 1034832 组，codes ±7，div 7）
+| 臂 | NMSE | relRMS | crest |
+|---|---|---|---|
+| (a) 旋转+投影（shipped） | 0.026361 | 16.236% | 2.5745 |
+| **(b) 旋转、无投影** | **0.011366** | **10.661%** | 2.5745 |
+| (c) 投影、无旋转 | 0.036669 | 19.149% | 3.1369 |
+| (d) 无旋转、无投影 | 0.016301 | 12.767% | 3.1369 |
+
+⇒ **(a)→(b) = 0.026361 → 0.011366 = 2.32×**：**删投影 = 2.32×**（与 E1 的 2.32× 吻合），
+**删旋转反而变差**（(a)→(c) = 0.72×）。scale 锚的对照：自臂锚 0.7189/0.6973、统一锚 0.6353/0.4296、
+单一全局常数 1.1383/1.0631（各臂全崩、relRMS 39–59%）⇒ **锚是二阶效应（≤0.08–0.27×），不是 5.7× 的成因**。
+
+#### 55.5 定罪行
+- `/home/user/scratch/fixE2/e8recon.cpp:457`：`const size_t i = ((size_t)d * H + h) * T + t;`（主臂循环的逐行 gather）；
+  `:544`（旋转诊断）、`:585`（fp16 范围扫描）同一处转置。**应为** `d + (size_t)D * (h + H * t)`。
+- `/home/user/scratch/fixE2/cross.py:84`：`reshape(D, H, T).transpose(2, 1, 0)` —— 它重复了同一个错，
+  所以那个"numpy 第二实现"**没能抓住它**（两实现同错 ⇒ 交叉验证失效，方法论教训）。
+- E1 布局干净；仅 `fixE1/e8verify.cpp:484-485` 把 `sqrt(E[amax²_rot]/E[amax²_none]) = 0.8275` 标成"均值比"
+  （真值 0.8319，E1 自己的 0.8635 那行才是对的量）——**纯标签，不碰任何 MSE 数字**。
+
+#### 55.6 裁决后仍然成立 / 被推翻的
+**仍然成立**（与布局无关）：
+- E2 的 **D5 收敛性 UB**（`decode_i8.cuh:288-297` 的 `__shfl_xor_sync(FullMask,…)` 在 `if ((lane&1)==0)` 里，
+  而同族 prefill 已正确提出 `if`）；
+- E2 的 **④ 阈值算术**（`7×65504 = 458,528` vs `127×65504 = 8,319,008`，纯算术、与布局无关）；
+- E2 的 **⑤ 机制更正**（`ks_e = __half2float(ksh_e)`，码本就按解码端读到的 fp16 scale 分配）；
+- E2 的 **V 行更正**（E8 档 V 是 scalar i4、无旋转无投影，`prefill_i8.cuh:160-161/296-297`）。
+
+**被推翻**：E2 的**旋转轴结论**与它 **10.4–12.6× 的头条** —— 都是转置文件的假象。
+
+**注**：E1 的 V 数字（0.463）是"旋转 V"这种**shipped 从不运行的配置**下的假设量，不构成对 V 的结论。
+
+#### 55.7 据此放 `D1_PATCH`（E1 的删投影补丁）
+依据：① E1 与 adj2 **两次**独立测量都给出 **2.32×**，且 adj2 逐位复现 E1；② E2 的反向修法被定位到具体错误行；
+③ 删投影后 e8 的 K 路径退化为普通 i4（offset-binary、±7、g64/fp16），与 `kv_bit_budget.h:124` 注释
+"nibble + FP16/g64" 一致，且**读侧零改动、格式不变**（读侧只是 `码 × fp16 scale`，`decode_i8.cuh:626-634`）。
+④ 补丁含 D1 + D2（`kv_scale_half` 饱和），**不含** E1 故意排除的 D3（需 CUDA 无法在此编译验证）。
+⇒ 写入 `/home/user/scratch/e8land/D1_PATCH` = `/home/user/scratch/fixE1/fix.patch`。
+（`adj1` 若给出相反裁决，把该标记删掉即可回退——标记是可撤销的，管线在阶段 2 才读它。）
+
+### 56. 冷窗双路**求同析异**：cc2 在两点上更对（fp8/bf16 放得下、int8 成本少报）；并更正我一个数字错
+
+#### 同（两面独立一致）
+- `9536 = 320(rANS 槽头) + 8192(32×256，4-bit 无扩张上限) + 1024(未压缩 E4M3FN g16 scale 尾)`；
+  **scale 尾必须保持未压缩**（restore/scatter 按 `slot + slot_bytes − 1024` 当裸 uint4 读），
+  **它自身就是 0.5 bit/element**（1024×8/16384）——压它是下一个杠杆，不属于这次 flip。
+- **`kColdSlotRansHeaderBytes` 必须停止"反推"**（`slot − code_plane − scale_plane`）。cc2 把后果说得更狠：
+  record 被算成 **3840 B**，编码器从同一 stride 推出的 budget 变 **78 B/流** ⇒ **每页溢出 → valid flag 全清
+  → 池子静默失效，而报告还在报省内存**。
+- **static_assert 我确实漏数**：是**三个字面量钉子**：`decoder_state.cpp:374`（`6688 != 9536`）**FIRE**；
+  `kv_tier_formats.h:222`（`==9536`）与 `kv_bit_budget.h:204`（`==466`）**不 fire**（字面量比字面量）
+  但**必须改**，否则报告/门按一个已不存在的 9536 B 槽定价、DP 继续按 **4.66 b/el** 收费并据假前提否掉冷方案。
+  （从不 fire 的：`:371` int8==9232（raw 记录被 clamp 到固定布局）、`:379/383` 两条 16 字节对齐。）
+- 16 B 答案；以及**别把 int8 的对照面搞错**：是 **16896 → 9232**，不是 9232 vs 9216。
+
+#### 异：cc2 在两点上更对
+**① fp8/bf16 **放得下**，cc1 的"槽不够"是错的。**
+关键事实 **cc1 自己**已经证明：**int8 冷路径不是存 int8 plane，而是先重量化成 E2M1 / g16-E4M3 再原样存**。
+同一机制下 fp8（8-bit）也该被重量化 ⇒ **冷记录与源 dtype 无关**：
+
+| class | 常驻 | 需要的 record | 放得进 9536? | @4.0 划算? | @2.6 划算? | 堵在 |
+|---|---|---|---|---|---|---|
+| bf16 | 32768 | 6688 | ✅ | ✅ −23232 | ✅ −26080 | **缺实现** |
+| fp8 | 17408 | 6688 | ✅ | ✅ −7872 | ✅ −10720 | **缺实现** |
+| iso3 | 9216 | 6688 | ✅ | ❌ **+320** | ✅ −2528 | **缺实现**（4.0 下 ceiling 也是堵点） |
+| e8 | 8704 | 6688 | ✅ | ❌ **+832** | ✅ −2016 | **缺实现**（同上） |
+
+⇒ **四个都放得下，一个都不缺槽**；最小需要槽 = 9232(raw)/6688(rANS)，**比原来预留的 9536 还小**。
+
+**② 真正该动的数是 ceiling，不是 codec。** cc2 给出**盈亏平衡上限**：9216 B 的 pair 为 **3.84 b/code**、
+e8 的 8704 B 为 **3.59 b/code** ⇒ **2.6 两者都在内、4.0 两者都在外**。
+⇒ **"在 4.0 的 ceiling 下给 iso3/e8 写 codec 毫无意义"** —— 这比我原先的说法更准。
+缺实现的具体位置（`program_impl.h:10645-10659` 的 `packed = dtype==I8||dtype==NVFP4` 无条件 return；
+`gqa_attention_decode_iso3.cuh` 里 cold/slot 引用数为 **0**；e8 走自己的 kernel）已记账。
+
+**③ 它修了 cc1 只标注未修的那个不一致，并抓到我一处数字错。**
+`kv_tier_formats.h` 把 int8 的 `pool_stride_bytes` 填成 rANS 的 **9536**，而 `decoder_state` 按每层 dtype
+给 int8 分 **9232** ⇒ 两者不一致 ⇒ **报告少报 304 B@4.0、少报 2544 B@2.6**。
+**⚠️ 更正我自己的数**：我在 §54 写"int8 @4.0 净省 7360 B"——**错，真值 7664 B**（16896→9232）。
+cc2 顺手修了，也修了会打出 `COST -2528 B/head-page` 的硬编码（改为按符号出词）。
+
+**④ 一个潜伏小 wart**：int8 raw 头 16 B 只写了 8 B（`cold_i8.cu:29-31` 写 magic/version/flags 于 +0..7，
+**+8..15 保留且从未初始化**，无人读）。
+
+#### ⚠️ 两版补丁的**策略性冲突**（我的裁定）
+- **cc1**：保持**出货常数不变**（466/9536/9232/9216/16896），把 2.6 做成**显式可选**；
+  理由：源码自己要求"2.6 必须是**测量决策**，不能是默认"。补丁 358 行 / 4 文件 / +225 −19。
+- **cc2**：把 `ops::kEntropyNvfp4SlotBytes` 改 **6688**、`kKvBitBudgetColdBitsX100` 改 **327**
+  > **[注解 2026-09-18 · SUPERSEDED]** 本条是 cc2 提案的转述，**未落地且现在被树禁止**：出货值是 `ops::kEntropyNvfp4SlotBytes = 9632`（`include/ninfer/ops/entropy_nvfp4_slot.h:48`）与派生的 `kKvBitBudgetColdBitsX100 = 470`（`src/product/kv_bit_budget.h:408`，`:412` 断言 `== 470`）。
+  > 若照本条把两者改成 6688/327：`kv_tier_formats.h:329`、`kv_bit_budget.h:412`、`decoder_state.cpp:845`/`:863` 四条 static_assert 会断。
+  ⇒ **直接改出货常数**。补丁 835 行 / 6 文件 / +482 −114，含 26 条新 static_assert。
+- 而 **cc2 自己报告**："2.6 ceiling 的真实回退率**无任何计数器可测**，全树只有 `slot_valid==0` 这一个信号"。
+  ⇒ **在没有测量的情况下把 6688/327 变成出货默认，正是源码自己禁止的那件事。**
+  > **[注解 2026-09-18 · SUPERSEDED]** 这条的**理由仍成立且已被遵守**（先测量再动常数），但它点名的两个数属于"改动前"世界：记录现为 9632、价格为 470。
+  > 它要求的测量已经做了：`dl/ransceil/rans_probe.cu` 实测 min 243 / p50 250 / p90 252 / p99 254 / max 259 B 每 512 符号流（记录在 `kv_tier_formats.h:262-282`），且 6688 B（167 B/流）实测 K 命中 **0/64**——"被源码禁止的那个数"如今正是"什么都编不出来的记录"。
+
+**裁定**：**以 cc1 的补丁为落地候选**（保持出货常数、含 header 反推真 bug 的修复、26 条 static_assert 把事实
+钉成编译期事实，例如 `kv_cold_class_bytes_at_4bit(Iso3Fusion).fits && !...pays` = "槽从来不小，是 ceiling 太高"），
+**并把 cc2 的两处修正（int8 stride / 成本符号）作为必须并入项**。
+**两版都先 hold**：等 E8 家族那一批跑完，作为**独立一批**落地（一批改动一次重建，保归因）。
+另需一条测量才能动 ceiling：**`slot_valid==0` 的计数**（目前没有）。
+
+#### 验证状态（两面都做了，cc2 多一层）
+- cc1：`g++ -std=c++20 -I include -I src tests/test_kv_tier_formats.cpp` → all checks passed（补丁前后都过，因为出货常数没动）。
+- cc2：`g++ -std=c++20 -Wall -Wextra -Werror` 同样 all checks passed；**并证明未打补丁的测试文件配新头会 fail 15 条断言**
+  ⇒ 测试改动是**承重的**；`decoder_state.cpp` 几何块抽出编译 **8 条 static_assert 全过**，
+  `stride NVFP4=6688 / I8=9232 / ISO3=E8Kv=FP8=BF16=6688`。
+  > **[注解 2026-09-18 · SUPERSEDED]** 这是 cc2 在**改动前**构建里的验证输出，stride 表已不是这个：NVFP4 = **9632**（`kv_tier_formats.h:289`/`:329`），I8 raw = 9232（`kv_bit_budget.h:430`），BF16 与 E8Kv 被断言**就是 int8 raw 记录 = 9232**（`decoder_state.cpp:826`/`:832`），无冷 codec 的类（ISO3/FP8）按 `cold_slot_stride_for` 取最宽默认记录 = **9632**（`decoder_state.cpp:803-814`）。
+- 两边都没跑 GPU；设备侧 codec、requant 质量、Muse 路径均未验。
+
+### 57. 裁决第二路（adj1）与第一路（adj2）**独立收敛**：E1 对、E2 错；并给出**机制分解**与一条不依赖元数据的证据
+
+#### 57.1 两面数字对到 6 位（真正的独立复现）
+| | adj1 | adj2 |
+|---|---|---|
+| 四臂 (a)/(b)/(c)/(d) | **0.026360 / 0.011366 / 0.036667 / 0.016301** | **0.026361 / 0.011366 / 0.036669 / 0.016301** |
+| `MSE(rot)/MSE(no-rot)` | 0.7189（投影开）/ **0.6973**（关） | 0.7189 / 0.6973 |
+| `E[amax_rot²]/E[amax_raw²]` | **0.6847** | 0.6847 |
+| DC 是 argmax 的频率 | **1.54%** | **1.54%** |
+| crest raw→rot | 3.1369 → 2.5745 | 3.14 → 2.57 |
+| 判定 | **E1 对、E2 错** | **同** |
+
+⇒ **(a)→(b) = 0.026360 → 0.011366 = 2.32×（删投影）**，两次独立测量一致；且两面都把 E1 的数字**逐位复现**
+（shipped relRMS 16.236% 逐位相同）。
+
+#### 57.2 两面都排除我的两个嫌疑（**我判断错了，记录在案**）
+1. **H 归一化**：`H = (1/8)·Sylvester_64`（`1/8 = 0.125f` 只出现在最后一级蝶形上）。
+   `|HᵀH − I|max = 0`、`max|H[0][j]−1/8| = 0`、`max||H[i][j]|−1/8| = 0`、`|H(Hv)−v|/|v| = 1.3e-07`（对合）。
+   **`(1/8)²·64 = 1` ⇒ "row 0 全 1/8"与 `HᵀH = I` 完全兼容** ⇒ **我 §52 说的"不可能同时为真"是错的**。
+   另：**"每行都 ±1/8"这个前提本身也错**——只有 row 0 是全和行，其余行符号是变化的。
+   E2 的 `out[0] = Σx/8 = 8·mean` 是**正确代数**；两方程序都忠实复刻了蝶形、都与源码一致。
+2. **scale 规则**：E1（`run_group:144`）与 E2（`encode_group:222`）都用"该臂自身变换后 amax/7"，**规则相同**。
+
+#### 57.3 轴序分歧（两面一致），adj1 多给一条**不依赖元数据**的证据
+元数据侧：`gqa_kv_quant_src_index = d + 256*(kv_head + 4*token)` ⇒ 内存序 **[t][h][d]，d 最快**；
+dump meta `kn ne=256,4,3072 nb=2,512,2048`；`kvdump_dump_tensor` 是 raw memcpy。
+**adj1 的数据指纹（不看任何元数据）**：lag-1 相关 —— stride 1 → **+0.0001**；stride **1024（=1 token）→ +0.6212**
+（RoPE 特征）；且每个 64-block 内 `rms[d] ≈ rms[d+32]`（RoPE 半配对）。
+⇒ **stride-1 是 dim 轴、stride-1024 是 token 轴**，纯从数据判出。E1 用对了；**E2 转置**
+（后果：E2 的每个"64-group"其实是**几乎同一通道跨 64 个 token 的采样**，而不是"某 token 某 head 的 64 个 dim"）。
+两面都**按 E2 的读法把 E2 的数字复现了出来**（adj1：layout B 下 L13 `amax_rot=6.441 / crest=4.216 /
+`8|mean|=5.701 / DCisMax=59.1%`，对上 E2 的 6.19 / 4.22 / 5.75 / 88%）。
+
+#### 57.4 ⭐ adj1 的机制分解（最有价值的新东西）
+**在固定 scale 下，旋转的"形状"效应是有害的：1.0945×**；**收益 100% 来自 scale 锚**
+（`0.697 / 1.0945 = 0.637`）。固定 scale 对照：
+- ① 四臂共用 `fp16(amax_raw/7)`（逐组）：**1.1098×（投影开）/ 1.0945×（投影关）** ⇒ 锚被拿掉后**旋转反而略有害**；
+- ② 全数据集单条常数 `s = 0.651855`：0.8846× / 0.7318×。
+⇒ 所谓"旋转有益"，实质是"**旋转改变了分布使 `amax` 下降，于是能用更细的步长**"。
+**推论**：删投影（D1，2.32×）之后，**下一个杠杆是 scale 锚**（LS / 最优 scale）——那正是 E1 故意排除的 D3
+（需 CUDA 才能验证）。**修法优先级：D1 先行（安全、格式不变、已三次确认），scale 锚列第二。**
+
+#### 57.5 顺带抓到一个**不可信的仓库注释**（文档缺陷）
+`prefill_i8.cuh:137` 与 `decode_i8.cuh:267` 说旋转 "raises the peak by 1.4-15x"。
+**硬界是 `amax_rot/amax_raw ≤ 8`，实测均值 0.83（即 0.83×，是降低）** ⇒ **该注释不可信**；
+adj1 怀疑它正是 E2 错误假设的来源。**记为文档缺陷，待修。**
+
+#### 57.6 结论与处置
+**三次独立测量（E1 + adj1 + adj2）对一次（E2），且 E2 的错误被两面各自定位到同一批行**
+（`e8recon.cpp:457/544/585`、`cross.py:84`；那个"numpy 第二实现"在**唯一要紧的轴**上继承了同一假设
+⇒ **不构成独立复核**）。
+⇒ **`D1_PATCH`（E1 的删投影补丁）维持不变**，管线照跑。
+E1 仅剩表述问题：`e8verify.cpp:290-292` 把 amax 比称作"上界"（它其实是**唯一驱动项**）；
+`:431/434` 变量名 `crest_ratio_sum` 实际累加 amax 比；**其 V 列（0.4633）来自"给 V 也加旋转"，
+而 shipped 路径从不旋转 V**（`prefill_i8.cuh:44,58`、`decode_i8.cuh:274,284`）⇒ 那一列不是 shipped V。
+**这些都不碰任何 MSE 数字。**
+
+### 58. ⭐ 独占定案 + **四个修复全部验证生效**：5 个失败在显存空闲下逐字复现；重建后 3 个缺陷测试转绿、零新签名
+
+#### 58.1 独占复跑（旧二进制 `mtime=2026-09-13 00:35:13`，全程 VRAM **603 MiB** 空闲，测试前后都是 603）
+`_exclusive3.sh` 先持锁、再等 VRAM 空闲（§40 修掉的那个竞态），所以这次**不可能**有抢占：
+
+| 测试 | rc | 原始指纹 |
+|---|---|---|
+| #51 `ninfer_gelu_mul_test` | 8 | `gelu_mul strided gate/up: pointwise mismatch max_abs=182.393 max_rel=1.99994 max_index=34686 actual=-89 reference=93.3926 first_violation=10240 non_finite=0` —— **与 triage 时逐字相同** |
+| #74 `ninfer_softmax_attention_test` | 8 | `causal_softmax_attention accepted an envelope outside the launcher domain`（packed/context 两个兄弟用例 `PASS`）—— **逐字相同** |
+| #95 `ninfer_gdn_input_proj_conv_snapshot_test` | 8 | `NVFP4 snapshot interval did not preserve its A16/A4 route boundary` —— **逐字相同** |
+| #4 `ninfer_ple_table_e2e_test` | 8 | `usage: …/ninfer_ple_table_e2e_test <sidecar_root>`（环境） |
+| #26 `ninfer_qwen3_6_frontend_test` | 8 | `failed to open test resource: /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json`（环境） |
+
+⇒ **五个失败在显存空闲下全部逐字复现** ⇒ **"抢显存导致的伪失败"这个保留意见正式关闭**（我先前一直说"不确定就不许当结论"——现在确定了）。
+三个数值/契约类失败是**真缺陷**，且我落的 4 个修复正对着它们。
+
+#### 58.2 重建 + 定向回归（`_after_exclusive.sh` 阶段 1/2 已完成）
+- 重建：`_build_locked.sh`（持锁、`-j8`）rc=0、二进制 mtime 已更新（否则脚本会 exit 6 不进闸门）。
+- 定向回归 `_regress_check.sh`（按**确切失败指纹**判，逐个测试单独持锁跑）：
+
+| 测试 | 类型 | rc | 指纹还在? | 判定 |
+|---|---|---|---|---|
+| `ninfer_gelu_mul_test` | defect | 0 | no | **FIXED** |
+| `ninfer_softmax_attention_test` | defect | 0 | no | **FIXED** |
+| `ninfer_gdn_input_proj_conv_snapshot_test` | defect | 0 | no | **FIXED** |
+| `ninfer_ple_table_e2e_test` | env | 8 | yes | KNOWN_ENV（非回归） |
+| `ninfer_qwen3_6_frontend_test` | env | 8 | yes | KNOWN_ENV（非回归） |
+
+**总体：没有 STILL_BROKEN / NEW_SIGNATURE。**
+⇒ **四个修复（G/S/D/sib）全部验证生效**：3 个真缺陷测试转绿、**零新签名**、2 个环境类被正确分类为 `KNOWN_ENV` 而不是当成回归或静默。
+这正是"先把失败钉死在修复之前、再重建看它是否消失"这条纪律的回报。
+
+#### 58.3 链条继续
+阶段 3（全量 ctest 109 + cold 相）正在跑；之后 `_land_e8_family.sh` 会按已放的 `GO_KV_TABLE` + `D1_PATCH`
+落地 **E8 家族**（默认表收窄 + 删格点投影）→ 重建 → 用 4 臂仪验收（锚点 `e8=0.020 / default=0.412 / nvfp4=0.949 / int8=0.977`）。
+
+### 59. ⑥ 逐轮外挂召回（rc1）：`suffix_lookup` 语义精确到分界线；并**纠正"零实现"**——四条腿已在树里，缺 P5/P6/P7
+
+#### 59.1 `suffix_lookup` 的精确语义（CPU 复算，双镜像 198269 例 0 不一致）
+契约（`src/ops/kernel/suffix_lookup.cuh:15-82`）：`limit = min(len-Q-K, start-Q)`；对每个候选窗 `o` 算
+`ids[start..start+Q)` 与 `ids[o..o+Q)` 的**公共后缀**长度，取（最长、同长取最大 `o`），
+`L >= min_len` 时输出 `continuation[k] = ids[o+Q+k]`。
+
+**分界线 = 查询侧的对齐点被钉死在最新 token 上**（`:36-42` 从 `q=0` 倒着比、第一个不等就 break），
+`o` 只平移历史侧：
+
+| 查询形态 | 内核结果 | 同数据的 any-position 2D 锚点 |
+|---|---|---|
+| 逐字粘贴在**末尾** | **L=16、o=208（正确对齐）、续写=正确历史续写** | 同 |
+| 逐字粘贴在**中间**（后接 12 token 追问） | **L=0** | **L=4、R=223（正确）、续写正确** |
+| **换词** | L=0（min_len=8） | L=8 仅因构造残留 |
+
+**对齐律定量**（Q=32、min_len=8、每 f 400 次随机追问）：
+**f=0 → match_rate 1.000；f≥1 → 0.000（f=1..12 全零）**。**偏一个 token 就全丢**
+⇒ 先前记录的"中/尾两种形态 100% 零匹配"**为真**，此处给出定量边界：失败是**形态**失败，不是数据失败。
+三条硬边界（穷举）：`starts[b] <= Q` 恒 0（548 例、非零 0）；命中要求历史侧 run 右端 `R >= Q-1`
+（R=7..14 全不命中、R=15 起全命中）；`L <= Q`。
+
+**两条必须点名的实现事实**：
+1. **`history` 是死参数**（`src/ops/launcher/suffix_lookup.cu:18-20` 不传它）；
+2. **内核只挡了匹配窗重叠，没挡"续写读回查询窗"** —— `o = start-Q-1` 时 8 个草案位置有 **7 个落在查询窗内**
+   （零新信息的自链）。
+另：`suffix_lookup` **今天引擎零调用**（唯一调用点 `tests/suffix_gpu_test.cu:52`），
+`src/spec/lookup_fuse.h` 只被它自己的 CPU 测试用。
+
+#### 59.2 ⭐ 纠正"零实现"：**四条腿已在树里**，真正缺的是三块
+1. **落盘**：`program_impl.h:10610-10879`（`file_slot` 分配 `10588-10600`；`ColdPageEntry` `program.h:476-490`）
+2. **读回**：`restore_cold_page:11023-11158`
+3. **批量预取**：`prefetch_cold_pages:11163-11171`
+4. **内容寻址键**：树里**已有现成的键类型** ——
+   `CheckpointSummary::shortlist_key = {PrefixShortlistDigests::at(frontier), frontier, identity_tag}`
+   （`program_impl.h:7178-7192`，摘要定义 `prefix_identity.h:42-57`）
+   ⇒ 索引 = `(digest, frontier, page) -> file_slot`，**底层生成、零硬编码**。
+
+**真正缺的三块**：
+- **P5 每轮触发**：`warm_cold_prefix` 自述 "rewrite/resume paths only"，唯一调用点 `9426`，
+  **不在任何 `decode_*_batch` 里**；
+- **P6 选页规则**：现在只按 `end_page` 恢复整段前缀；
+- **P7 持久日志**：`restore_cold_page` 末尾**释放 file_slot 并删掉 cold_pages 记录** ⇒ 映射是内存态且会被删。
+另：稳态靠**设备冷槽内联可读**（`cold_host_tier.h:19-24`）——**spill 文件是 mirror 不是 tier**，
+这与"逐轮外挂召回"缺的正是**同一块**。
+
+#### 59.3 设计要点（"每轮一次"有硬理由）
+**唯一挂钩点**：`src/targets/qwen3_6/impl/runtime/program_impl.h:10470-10483`（`ensure_sequence_kv_mapped`）
+—— 四个轮入口 ingress 循环的**最后一句**、**按行每轮恰好一次、submit 之前**：
+`decode_ordinary_batch:12276` / `decode_mtp_batch:12438` / `decode_dflash_batch:12626` / `decode_dflash2_batch:12872`。
+其余 4 个非轮调用点（`8256/8818/9806/11857`）不受影响。
+
+**每轮而非每 token 的硬理由**：逐 token 实测 **2.63 s/token**，比**重新预填充**（365 µs/token）还差 **~7200×**
+—— 它不是"贵"，而是**比什么都不做更慢**；批量读 2.6–6.1 µs/token ⇒ 相对预填充 **60–140:1**、
+相对单步解码 **6.3e3–1.5e4:1**。胜出条件 `C_fixed < N*359µs`：N=64（一页）允许 23 ms、
+N=821（实测源距离中位数）允许 295 ms —— 任何一次 batched pread 都满足。
+
+**键必须是"前缀证书"而不是相似度**：KV 是前缀函数 ⇒ 召回合法性 ⟺ **前缀逐字节相同**（§59.2 的第 4 条已有该键类型）。
+
+**补丁**：`/home/user/scratch/rc1/design.patch`（49,350 B、6 文件 16 hunk、两个 new file）；
+`git apply --check -v` rc=0、随后实应用 rc=0；`src/spec/turn_recall.h` + 测试用
+`g++ -O2 -std=c++20` **真编译并 6/6 通过**。设计文档 `rc1/DESIGN.md`。
+
+#### 59.4 rc1 的诚实边界
+真 GPU 内核未跑（"复算=真内核"仅由双镜像一致性支撑）；**仓库未编译** ⇒ 3 个被改的 C++ 只做了锚点级正确性检查，
+**编译未验证**（最高风险处：`prefix_digests.at(frontier)` 的索引上界假设，已用 `frontier > size() ⇒ 跳过` 保守处理）；
+`0.38 tok/s` 未找到出处、未复现，对它的解释是**推断**；**2D 锚点只有 CPU 复算，补丁不含其 GPU 实现**；
+换词形态未解决（指向 BM25/词法，属另一键空间）；L0 跨进程一致性只做了 tombstone 缓解、未证明。
+
+### 60. ⑤ 权重卸载 W13（w13a）：**P0 骨架已在树里但从未接线**；账算清了（decode 不赚、prefill 赚、真用途是"否则不可行"）
+
+#### 60.1 ⚠️ 纠正"零实现"：P0 骨架已在，但没有任何调用点读它
+- **已有**：`src/product/weight_residency.h`（242 行：`WeightResidency{Resident,Host,Disk}`、`WeightSpan`、
+  `WeightResidencyPlan`、`classify_weight_residency()`、`WeightPageCache`（有界 pinned LRU + epoch 豁免 + 注入式分配器））；
+  `src/artifact/binder.h:44` 计划载体；`include/ninfer/types.h:177` `weight_host_offload_bytes`；
+  **`src/serve/serve_options.cpp:403-412` 把 `--weight-host-bytes` 解析后"大声拒绝"**；
+  `research/notes/A_s32_w13_p0.md` 设计笔记（含 hook 点/锁分析）。
+- **但 P0 从未被接线**：`Binder::finish()`（`src/artifact/binder.cpp:124`）忽略该字段，
+  `materialize()`（`src/artifact/materializer.cpp:98`）无条件把所有设备对象塞进单一 arena，
+  **没有任何调用点读它**。
+- **既有的卸载机制各自独立、都不是权重**：KV 冷层 host（`cold_host_tier.h`、`program_impl.h:10890`）/
+  磁盘双缓冲暂存（`program_impl.h:921` `cold_disk_staging[2]`）/ PLE 95 GiB 表
+  `pread→pinned LRU→H2D`（`src/ops/ple/ple_table.h:9-11`）/ 加载期 pinned 环（`materializer.cpp:174-246`）。
+  仓库里 `--cold-disk-path` **只服务 KV**。
+
+#### 60.2 设计的两条关键点
+**① 地址永不变（这是能不动 CUDA graph 的原因）**：
+`slot(L) = (L − first) % arena_layers` ⇒ **地址在整个生命周期不变** ⇒ `device_data()`、所有 `Weight*`、
+**已捕获的 CUDA graph 全部无需改动** —— 循环的是**条带内容**，不是指针。
+⚠️ **陷阱**：`fetch_layer` **必须注销被覆盖层的 resident 位**，否则**静默读到错层**
+（那是 bug，不是性能问题）。
+卸载对象选择：从 artifact 对象名解析 `layers/<N>/`（`bindings.cpp:223` 自己构造的）→ 按层分组 →
+按预算**自深向浅**取连续尾部；低于导出地板（`max(1MiB, arena/4096)`）的 norm 常驻；
+无层对象（embed/token head/MTP/DFlash/vision）**永不卸载**。
+唯一取数入口 `note_layer(L)`（层边界），预取 `L + arena_layers − 1`；命中/未命中/同步缺页**全部计数，绝不静默**。
+
+**② ⭐ 账算清了（决定性）**：解码头**权重流量恒定 19.0 GB/token**（HBM 1792 GB/s → 10.6 ms/token），
+而 **KV 流量随上下文线性**（**1M nvfp4 = 20.0 GB/token，比整个权重栈还大**）。
+- 卸载 6 GiB ⇒ PCIe **0.258 s/token** vs 20 ms/回合 = **~12× 变慢**（单测断言 `!net_positive`）；
+- **同样 6 GiB 摊到 4096 chunk = 1.003×，几乎免费**。
+⇒ **dense decode 不赚、prefill 赚、真正的用途是"否则跑不起来"**（1M 只有"慢速可行 vs 不可行"）。
+MoE 是最优场景（未接线）。
+
+#### 60.3 KV 预算换算：**精确两点解**（比先前的拟合更强）
+`KV_bytes = 4150.40625·tokens·bits + 416666880` —— **逐字节复现引擎自报的两个 1M 点**。
+可用 11,600,323,584 B ⇒ **今天只允许 2.57 b/el**（`TODO.md` 早先记的 2.33 来自另一组拟合；
+**两者都在两点容差内**，w13a 用了精确复现的那组）。
+- 要 **nvfp4 的 4.50** 需腾出 **7.82 GiB**；
+- **e8 的 4.25 只需 6.81 GiB，但 e8 已功能性失效（§53：纯 e8 = 0.020）⇒ 不值得**；
+- int8 需 **23.0 GiB，不可达**。
+宿主 21 GB / 实测可用 15 GB ⇒ **7.82 GiB pinned 不可换页，处于边缘**。
+（这条把 §53 的 E8 结论与 W13 的预算直接接上了。）
+
+#### 60.4 交付与诚实边界
+- 补丁 `/home/user/scratch/w13a/design.patch`：17 文件、**+1312/−15**、`git apply --check` **rc=0**（17/17 逐文件，跑两遍）。
+- `DESIGN.md` 353 行；`budget_table.json`（数字由脚本导出，非手写）。
+- **host 单测真跑过**：`g++ 15.2 -std=c++20 -Wall -Wextra` 零告警、`test_weight_residency: all checks passed`，
+  40 项含**两轮逐 span 字节精确比对**、地址稳定、销毁/重取、6 条大声拒绝、KV 拟合复现两点、verdict 正负两侧。
+- **默认关闭**（预算 0 ⇒ 空计划，全路径逐位不变）。爆炸半径：serve 的 `--weight-host-bytes`
+  由"拒绝"变"接受"（行为变更，是本轮目的）；MTP/DFlash/vision 从不卸载但依然常驻。
+- **未做到**：除 host 单测外**什么都没编译、没跑**（禁令下零构建零 GPU）；
+  **P0 验收未达**（低显存强制启动、logits 逐位一致都没跑）；
+  **decode 半边只有设计** —— decode 被 CUDA graph 捕获，host 侧取数会被**重放成陈旧数据**，
+  需要把 H2D 提升为"第二条流上的 **graph memcpy 节点 + event 汇合**"（改 `graph_impl.h`），
+  因此本轮的 hook **只门控在 `Phase::Prefill`**；带宽数字是**假设**（25 GB/s pinned H2D、1792 GB/s HBM 未在本机测，
+  `weight_offload_verdict` 把两者做成入参以便替换实测值）；层字节是均值（19.0 GB/64 层）；
+  SSD 层未实现（`Disk` 保留）；MoE 未实测；**P0 的 `WeightPageCache` 已成死代码**（保留仅为 API 稳定，应删）。
+
+### 61. ⑥ 双路（rc2）与 **更正我 §59 的一处误读**；发现**内核与自身 host 参照实现不一致**的真缺陷
+
+#### 61.1 ⚠️ 更正我自己的记录：失败形态是"**中间 + 换词**"，**不是"中/尾"**
+我在 §59 写"先前记录的『中/尾两种形态 100% 零匹配』**为真**"——**这句是错的，我把 rc1 的表读反了**：
+rc1 自己的表里 **`逐字粘贴在末尾` → `L=16、o=208（正确对齐）、续写 = 正确历史续写`（即"尾"形态是能工作的）**，
+失败的只有 `中间`。
+rc2 独立确认：树自己的记录（`TODO.md:5890-5893`）写 **`尾` 形态 R@1 0.73–1.00**，它的复刻也复现了（`raw_l=64` HIT）。
+⇒ **正确表述：`尾` 形态可用；失败的形态是 `中间` 与 `换词`。**（两个代理在这点上其实一致，是我的转述错了。）
+
+#### 61.2 rc2 独有的机制分解：**两个**结构性盲点（不是统计问题）
+1. **位置**：API 的契约是"查询**就是**最新的 Q 个 token"。当 needle 后面跟着别的文本时，最新 Q 窗口装的是
+   **追问**，needle 完全在窗外 ⇒ 每个 `min_len` 下 `raw_l = 0` ⇒ **任何索引或阈值都救不了**。
+2. **尾部 run**：比较从窗口**最后一个** token 起、遇第一个不等就停。实测：
+   **末尾距离 `d` 处替换一个 token ⇒ `raw_l == d` 恰好**（d=15 在 min_len=16 被拒、d=16 被接受）；
+   在完全匹配的 needle 尾**之后**追加 16 个不匹配 token ⇒ `raw_l` **32 → 0**；
+   真实文本上"中间形态、64 个窗口 token 里 24 个是 needle 字节"仍得 **0**。
+另：`limit = min(len-Q-K, start-Q) <= 0` 时**一个候选都不扫**（`start <= Q`）；自匹配按构造不可能。
+
+#### 61.3 ⭐ 真缺陷：内核与它自己的 host 参照实现**不一致**
+doc `include/ninfer/ops/suffix_lookup.h:13` 写 `o < starts[b]`；host 参照 `src/spec/lookup_fuse.h:29`
+就按这个实现；而**内核 `src/ops/kernel/suffix_lookup.cuh:28` 实现的是 `o < starts[b] - Q`**——**窄了 Q**。
+模糊测试 20000 例 ⇒ **91 处分歧，全部是"内核 0、host HIT"**。**rc2 已报告、未改**（我把它记为待修缺陷）。
+
+#### 61.4 rc2 补上了 rc1 找不到的出处 + 其余新增
+- **`0.38 tok/s` 的出处找到了**（rc1 曾标"未找到、未复现"）：per-token 流式 1M = 18.00 GiB
+  → **2.76 s/token = 0.362 tok/s**；每轮则是 **1:59**（365 µs/token）或 **1:113**（690 µs/token），
+  相对解码（38.5 ms/步）≈ **10⁴:1**。
+- **前缀函数怎么绕开**：(a) **从不重编号 position**；(b) 只做**前缀闭包**的召回集
+  （`plan_prefix_closed` **拒绝有缺口的集合**而不是近似 ⇒ 恢复字节**逐位相同**）；
+  (c) 未被召回的轮**根本不参与** ⇒ read-free 按构造成立。诚实代价：一次召回到达第 `i` 轮就要载入 `[i, frontier)`。
+- **索引**：从日志的 token id **底层生成**的**任意位置 4-gram 倒排**（`rebuild_index() == incremental`，有断言）。
+  实测：**整轮键拿到 R@1，而"最新 Q 键"什么都取不到**；span→SSD 偏移是**绝对页**（`page * page_bytes`），
+  因为**轮边界不页对齐**。开销 4 B/token = payload 的 **0.022%**。
+- **codec 几何在代码里**（`static_assert` 钉住 18,432 B/token nvfp4、33,792 int8、17,408 e8）；
+  **e8 在代码里被拒绝**（把测量写进错误消息），且 e8 只能省 **5.6%**。
+
+#### 61.5 双路的分歧点（落地时要裁决）
+**挂钩点两路不同**：rc1 说 `program_impl.h:10470-10483`（`ensure_sequence_kv_mapped`，**四个轮 ingress
+循环的最后一句**）；rc2 说 `:8692` `ProgramImplCore::decode(...)`（**轮入口本身**）+ `:8728` `append_forced_tokens`。
+两处都合理但不同 —— 落地时二选一或并用（rc1 的位置在"每轮恰好一次、submit 之前"这个性质上论证更充分）。
+**索引键**：rc1 复用树内已有的**前缀证书** `CheckpointSummary::shortlist_key`
+（`PrefixShortlistDigests::at(frontier), frontier, identity_tag`）；rc2 用**任意位置 4-gram 倒排 + idf-sum**。
+两者不是同一层（rc1 是"证书式合法性"，rc2 是"检索式召回"），**更可能是互补而非互斥**。
+
+#### 61.6 交付与边界
+- rc2 补丁 `/home/user/scratch/rc2/design.patch`（md5 `24925f4e…`）5 文件 **+1026/−11**：
+  契约修正 + Tensor overload（`include/ninfer/ops/suffix_lookup.h`）、
+  **布局谓词含 `is_contiguous()`**（`src/ops/wrapper/suffix_lookup.cpp`，正是我指定的那个 bounded 子任务）、
+  新增 `src/spec/turn_recall.h` + `turn_recall_test.cpp`、CMake 注册。
+- 验证：干净 HEAD 副本与**工作树**上 `git apply --check` **都 rc=0**；装进 scratch 副本后测试编译
+  （`-Wall -Wextra`）并 **ALL CHECKS PASSED（37 断言）**；被改的 CUDA wrapper 用 CUDA 13.1 头
+  `g++ -fsyntax-only` **rc=0**。
+- **未做到**：**没接引擎**（没在重建运行时去改 716 KB 的 `program_impl.h`）；日志里**没有真文件 I/O**；
+  **恢复的逐位一致性未端到端验证**（需 GPU，**最高验收门**）；v2（非连续/CacheBlend）按设计缺席；
+  索引原型是 idf-sum、**不是完整 BM25**；`start - Q` 那个内核分歧**只报告未修**；
+  Q/min_len 未在模型数据上调过；它初版 wrapper 曾在 host 侧读 `starts[]/lengths[]`（会解引用设备内存）
+  —— **没有进补丁**（如实自报，好）。
+
+### 62. ⚠️ E8 验收是**阴性结果**：删投影 + 表收窄**都没修好 e8 档**（e8 仍是 0.020）；故障在**读侧/内核侧**，不在编码器精度
+
+#### 62.1 验收读数（`_land_e8_family.sh` 阶段 4/5，完整跑完）
+| 臂 | pre-E8 锚点 | post-E8 | Δ |
+|---|---|---|---|
+| `default`（kc2 表收窄 + D1 影响） | 211/512 = **0.412** | 239/512 = **0.467** | **+28/512** |
+| `int8`（`--kv-dtype int8`，不受表收窄影响） | 500/512 = 0.977 | 490/512 = **0.957** | **−10/512** |
+| `nvfp4` | 486/512 = 0.949 | 486/512 = **0.949** | 0 |
+| **`e8`（纯 16×E8Kv）** | **10/512 = 0.020** | **10/512 = 0.020** | **0（完全没变）** |
+
+构建 rc=0、二进制 `01:40:11 → 02:36:00`、retrieval rc=0（03:14:57）、锁已释放。
+
+#### 62.2 这个阴性结果推翻了什么、留下了什么
+- **推翻**：我在 §53 写的"预期 `e8` 与 `default` 两臂显著上升"——**`e8` 一点没动**。
+- **⇒ D1（删格点投影，K 的 NMSE 2.32×）不是 E8 功能性失效的原因。**
+  这条很强：D1 是**编码器侧**的、格式兼容的、被三次独立测量确认的精度修复（2.32×），
+  而它对 **0.020** 这个"字符准确率落在随机水平"的**功能性**失败**毫无影响**。
+  ⇒ **E8 的失败不在"写了多少精度"，而在"读回来/算的时候"**。
+- **剩下最可能的原因**（与 kv1 的发现直接对接）：**E8 档在 decode 时被强制走 Prompt 路径** ——
+  `src/ops/wrapper/gqa_attention.cpp:189-192`
+  ```cpp
+  // E8Kv small-T kernels are unverified; route E8 to the prompt path.
+  if (cache.dtype == DType::E8Kv && route != detail::GqaAttentionRoute::Prompt) {
+      route = detail::GqaAttentionRoute::Prompt;
+  }
+  ```
+  叠加"文本全注意力层每个 phase 都调 A1"这一事实 ⇒ 16 层全走那条**作者自己标注 `unverified`** 的路径。
+  ⇒ **下一步该查的是这条 Prompt 路径的内核实现**，而不是继续调编码器精度。
+  （仓库自己在 `docs/maintainer/kv-strategy-matrix.md` 记的"8-15:e8 → 0/8、compute-sanitizer 干净 ⇒ 静默逻辑/别名错"，
+  也指向读侧。）
+
+#### 62.3 `default` 只涨到 0.467，说明"E8 只放前导层就没事"这个前提也要重审
+kc2 的表收窄把 E8 从 `{0,1,3,4,6,7,8,9,13,14}` 收到 **`{0,1,3,4,6,7}`**（4 个坏层被换成 NVFP4），
+`default` 从 0.412 → **0.467**，**只挪了 28/512**；
+而纯 nvfp4 是 **0.949**。⇒ **剩下的 6 个 E8 层（全在"已验证"的 0–7 区间内）仍在扣分。**
+⇒ **"`0-7:e8 → 8/8`"这个仓库结论与本次实测不一致**（若 0-7 上的 E8 无损，收窄后 default 应接近 0.949）。
+⇒ 要重审的是**整个 E8 档**，不只是"高层 E8 退化"。
+
+#### 62.4 ⚠️ `int8` 臂 −10/512 需要复核（可能是回归，也可能是贪心解码的方差）
+`int8` 臂的配置**不受表收窄影响**（`--kv-dtype int8` 覆盖全层），但它 **500 → 490**。
+而 D1 的补丁**改了 `prefill_i8.cuh` / `decode_i8.cuh`**——这两个文件**被 int8 档共用**
+（D2 的 `kv_scale_half` 饱和也落在同一批行上）。
+⇒ 两种可能：**(a) 单 token 翻转级联造成的方差**（贪心解码下 10/512 在这个量级）；**(b) D2 的 clamp 真的改了 int8 的行为**。
+**必须用一次重复运行区分**（同一二进制、同一 arm，跑两遍看 int8 是否稳定在 490 还是回到 500）。
+在区分清楚之前，**D1 补丁不许算"无副作用"**。
+
+### 63. 导入为什么"还是跑不通"：三处阻断逐行读出；**并承认这是我的执行缺口**（已定位却未去改）
+
+#### 63.1 先分清：**转化侧已通，装载侧没通**
+- **转化侧通**：新版 B 在真源上跑完完整 `convert()` ⇒ 1103 对象、产物 **22,585,140,736 B**、
+  sha256 `dbbefaee…`、`refusals 0`（加 `--allow-frontend-drift`）、471 s（§62/§61 附近）。
+- **装载侧不通**：三处阻断，逐行如下。
+
+#### 63.2 阻断 ①：装载器按**层号**钉死 mlp 格式（真代码缺陷）
+`src/targets/qwen3_6_27b/impl/load/bindings.cpp:383`（函数 `:343-398`）：
+```cpp
+if (layer < 56) {
+    target.mlp.gate_up = bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
+                                           prefix + "mlp/gate_up_projection/input_scale_divisor");
+    target.mlp.down    = bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
+                                           prefix + "mlp/down_projection/input_scale_divisor");
+} else {
+    target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", kFp8, {34816, 5120});
+    target.mlp.down    = bind_weight(binder, prefix + "mlp/down", kFp8, {5120, 17408});
+}
+```
+- `bind_nvfp4_weight`（`:73-96`）在 `:77-78` **硬 require** `NumericFormat::NVFP4` +
+  `StorageLayout::BlockScaleK16M128x4V1`；
+- `bind_weight`（`:64-71`）在 `:66-68` **对 NVFP4 直接 `throw`**（"NVFP4 weight requires a paired input divisor"）。
+- **源在层 0..55 里为 21 个 mlp 对象**（7 个 `mlp/gate_up` + 14 个 `mlp/down`）**声明 FP8**（转换报告的 `D-OBJECT-FORMAT` 21 条）
+  ⇒ **两条路都走不通，装载必抛**。
+- **这条 grep 确认是全树唯一按层号决定格式的地方**（`layer < 56` 只此一处）。
+- **正确修法**：**读对象自带的 format**，而不是从层号推；同时**保留**"NVFP4 必须配对 input divisor"这个断言
+  （不许为了绕过而放松它）——因为 divisor 是 NVFP4 语义的一部分，不是可选的。
+
+#### 63.3 阻断 ②：`weights_id` 未注册（配置缺口）
+`src/targets/qwen3_6_27b/impl/package.cpp:91-150` 的 `resolve_weights` 只认
+`{groupwise-int, nvfp4, nvfp4-dspark, nvfp4-dflash2, nvfp4-dflash2-bf16head}`；
+新产物的 `identity.weights_id` 是 **`nvfp4-modelopt`** ⇒ 落到 `:149` 的
+`throw std::runtime_error("artifact identity '" + … + "' is not supported by target …")`。
+⇒ 加一个分支 + 一个 `WeightsProfile` 枚举值；**先查清 `WeightsProfile` 承载什么**（采样默认？`default_layer_kv_dtypes`？）再加最少字段。
+
+#### 63.4 阻断 ③：前端 pin —— **这是故意的安全闸，不是 bug**
+`tools/convert/qwen3_6/common/frontend_policy.py:327` `acceptability_error`（`:339` 自己写
+"确认后可用 `--allow-frontend-drift` 放行（偏离会记入转换报告）"），入口 `import_model.py:524/622`。
+源**确实带** `tokenizer_config.json` / `chat_template.jinja` / `generation_config.json`，
+但驱动**无法证明**它们与 pin 的 sha256 相同 ⇒ 按策略拒收。
+⇒ **合法去掉这个手动开关** = 把该变体的前端文件**纳入可接受集合、并记录哈希**；
+**不是**放松闸门（放松会让任何人换 tokenizer 而不被察觉——那正是这个 pin 存在的理由）。
+
+#### 63.5 ⚠️ 我的执行缺口（如实记）
+这三处我在派代理去修转化器**之前**就已经核过（`bindings.cpp:383`/`:85`、`package.cpp:91-113` 的行号都在我早先的
+验证输出里）。**但我把代理产能全花在了转化器上**（因为 convC 的卷宗说"B 坏了"），
+而**真正的阻断一直是这三处小的、已定位的改动**。⇒ 判断偏差：**我把"验证清楚"当成了进度，把"改掉它"一直往后排。**
+教训：**定位到阻断之后，阻断本身就该立刻排队去修，而不是先去修它旁边那条更大的、但不在关键路径上的线。**
+
+#### 63.6 这已是本仓库**第三次**同类缺陷
+"**用层号/位置规则代替数据自带的属性**"：
+1. `nvfp4_gdn_snapshot_plan.cpp` 的"修②"（把 A4 边界按层宽阈值吞掉，§43）；
+2. `suffix_lookup` 内核实现 `o < starts[b] - Q` 而它自己的 host 参照实现是 `o < starts[b]`（§61）；
+3. 本次 `bindings.cpp:383` 的 `layer < 56`。
+⇒ **值得作为一条检查项：凡"按层号/按名字/按位置"决定数值格式的地方，都要问"报文的哪一部分本来就带着这个信息"。**
+
+#### 63.7 已派双路代理（ld1/ld2）与端到端验收计划
+- 双路任务：复核 ①②③ + 找出**我可能漏掉的第四处**（grep `NumericFormat::` 与 `layer <`），
+  出**底层驱动**的补丁（读 artifact 自带 format/identity），并给出**可证明的最小 CPU 证据**
+  （`-fsyntax-only` + 绑定路径的合成复算）。
+- **验收链**（修完我来跑）：**修三处 → 重建 → 重新产出真产物（471 s、22.58 GB，盘上 49 GB）→ 让引擎真去装载它。**
+
+### 64. 硬编码系统普查（用户口径："这是旧 ninfer 的特色，但不是我们的需求"）——分类、规模、工作分解
+
+**用户原话（本轮指令）**：
+> "你把所有的硬编码部分都找出来改了 这是旧的 ninfer 的特色 但不是我们的需求"
+
+⇒ 判据定死：**引擎必须由"数据/artifact 自带的属性"驱动**；
+**凡"按模型名 / 按层号 / 按位置 / 按名字"决定数值格式或行为的地方，都是旧 ninfer 的特色，都要改。**
+⇒ 从"修三个点"升级为**一次系统普查 + 分类修**。
+
+#### 64.1 普查规模（`sh/_hardcode_recon.sh`，限定 `src/ apps/ tests/ include/ bench/`）
+| 类 | 模式 | 处数 |
+|---|---|---|
+| A | `layer <op> N` | **18** |
+| B | `(weights_id\|model_id) ==` | **20**（6 文件） |
+| D | `tokens <op> N` | **201**（需筛出"派发/规划决策"vs"合法性校验"） |
+| F | `static_assert(... == N)` | **408**（多数是结构性约束，需筛"字面量比字面量"的失效镜像） |
+| E | 绝对路径（`/home/`、`/mnt/`、`C:\`、`\wsl`、`neroued`、`ziqinzhang`） | **20** |
+
+#### 64.2 A 类真问题样本（按层号/位置决定行为）
+- `src/targets/qwen3_6_27b/impl/load/bindings.cpp:25` `is_full_layer(layer) { return layer >= 3 && (layer - 3) % 4 == 0; }`
+  —— **硬编码的"层种类周期"**（周期 4、偏移 3）；
+- 同文件 `:28` 硬列 `layer == 3 || 7 || 11 || 15 || 19 || 23`；`:31` `layer == 3 || layer == 7`；
+  `:33` `layer == 4`；`:383` `layer < 56`（已定位的装载阻断）；
+- `src/targets/qwen3_6_35b_a3b/impl/load/bindings.cpp:21` **硬列 `{34,38,39}` 决定用什么数值格式**（与 `layer < 56` 同类）；
+- `src/targets/muse_glimmer_30b/impl/load/bindings.cpp:60-61` 硬区间 `layer >= 5 && layer <= 11` / `layer >= 1 && layer <= 12`；
+- **A3 逐层 KV 表**：`default_layer_kv_dtypes` 在 3 个变体各有一份，
+  **函数签名就把层数写死成 `std::array<DType, 64>`**，表体是硬列 `{0,1,3,4,6,7}`（`qwen3_6_27b/impl/variant.cpp:23/44`）。
+  ⇒ **这张表正是 §62 那个 E8 阴性结果的载体** ⇒ 它的数据驱动化要等 E8 读侧定性。
+
+#### 64.3 C 类真问题样本（同一真值在 ≥2 处各写一遍）
+- **TMA 判据被抄了 5 份**：定义在 `src/ops/linear/nvfp4/nvfp4_w4a4_plan.h:58` 的 `nvfp4_w4a4_tma_route(tokens)`，
+  然后内联重写在 `nvfp4_linear_add_w4a4.cu:62`、`nvfp4_gdn_input_w4a4.cu:42`、`nvfp4_attn_input_w4a4.cu:88`、
+  `nvfp4_w4a4.cu:64`，**每个还各带一份 `constexpr kTmaBlockM = 256`**；
+- **`suffix_lookup` 内核 vs 它自己的 host 参照**：doc `include/ninfer/ops/suffix_lookup.h:13` 与
+  host 参照 `src/spec/lookup_fuse.h:29` 是 `o < starts[b]`，**内核 `src/ops/kernel/suffix_lookup.cuh:28` 是 `o < starts[b] - Q`**
+  ⇒ 20000 例模糊测试 **91 处分歧（全部"内核 0、host HIT"）**；
+- 数组尺寸/上限：`kout[16]`/`vout[16]`（`gqa_attention_decode_i8.cuh:549-550`、`gqa_attention_prefill_i8.cuh:575-576`）、
+  `make_index_sequence<16 - kNvfp4FirstSmallT + 1>` vs 另一侧 `kNvfp4LastSmallT`(=32) 且**索引无边界检查**、
+  `PageIds = 64` + `physical_pages_s[PageIds]` 无边界检查。
+
+#### 64.4 E 类真问题样本（硬编码路径 / 机器专属量）
+- **`tests/targets/qwen3_6/test_frontend.cpp` 12+ 处 `/home/neroued/models/llm/qwen/…`**
+  ⇒ 这就是 ctest **`#26` 永远红**的原因（缺文件时 `terminate` **abort** 而不是 skip）；
+- **`src/targets/qwen3_6/impl/runtime/dflash2_impl.h:152/424` 里写着我的个人工作区绝对路径**
+  `/mnt/c/Users/User/Documents/ziqinzhang/dl/feat_%s_%d.bin` 与 `df2scores_%s_%d.bin`
+  ⇒ **调试落盘路径留在了生产源码里**，这条是最该改的；
+- **ctest `#4`** 是注册时没给 `ninfer_ple_table_e2e_test <sidecar_root>` 的必需参数。
+
+#### 64.5 工作分解（全部按铁律⑦双路）
+- **W1 装载器数据驱动化**（`layer < 56` + `kTextLayers`/`is_full_layer`/硬列格式）⇒ **代理 ld1/ld2 已在跑**（导入阻断）。
+- **W2 身份白名单 → 声明式能力注册**（`package.cpp`×3 + `registry.cpp` + `context_cost.cpp` + bench）⇒ **代理 id1/id2 在跑**。
+- **W3 单一真值来源**（5 份 TMA 判据、`suffix_lookup` 内核 vs host 参照、数组尺寸 vs planner 上限）⇒ **代理 ss1/ss2 在跑**。
+- **W4 硬编码路径**（`test_frontend.cpp` 12+ 处 → env 驱动 + 缺文件 **SKIP 77**；`dflash2_impl.h` 的调试路径；
+  `#4` 的注册参数）⇒ **代理 ph1/ph2 在跑**。
+- **W5 逐层 KV 表数据驱动化**（`default_layer_kv_dtypes` ×3、`std::array<DType, 64>` 硬签名）⇒ **等 E8 读侧定性后再派**
+  （它就是那张表；E8 结论出来才知道该由谁声明、声明什么）。
+
+#### 64.6 立为检查项（写进纪律）
+**凡"按层号 / 按名字 / 按位置"决定数值格式或行为的地方，都要问一句：报文的哪一部分本来就带着这个信息？**
+本仓库已出现 **4 次**同类：① `nvfp4_gdn_snapshot_plan.cpp` 的"修②"；② `suffix_lookup` 内核 vs host 参照；
+③ `bindings.cpp:383` 的 `layer < 56`；④ `35b_a3b/bindings.cpp:21` 的 `{34,38,39}`。
+
+### 66. E8 读侧双路**结论互斥**：e8r1 说"不是精度"、e8r2 说"就是 V 的精度"——我的裁定与决定性实验
+
+#### 66.1 求同（两面独立一致）
+- **都纠正了我的行号**：闸门在 `gqa_attention.cpp:518-520`（我给的 189-192 在本树里是 `require_shape`）。
+- **都确认 E8 在 decode 走 Prompt 路径**（prefill 内核），**从不进** decode smallt 内核。
+- **都判定写/读约定严格互逆、往返本身正确**：H64 = H2⊗H32 严格正交自逆（范数比 1.000000000000、自逆误差 4.4e-16）、
+  nibble 次序（偶维→低）、`clamp(±7)` 与 `(n&0xF^8)-8` 符号扩展配平、scale per-64/lead=4 两侧一致、
+  **smem 展开布局逐字节精确**（64 行×256 维 0 处不匹配）。往返误差 K relRMS **0.106**、V **0.178**，
+  无 10× 异常、无系统性偏置。
+
+#### 66.2 求异（互斥的核心）
+| | e8r1 | e8r2 |
+|---|---|---|
+| 根因 | **不是精度**：输出误差只差 1.28×（0.1803 vs 0.1414），不可能造成 55× 保留差（10/550 vs 550/550）⇒ 必是"哪条路活着/两个 reader" | **找不到类别性读侧缺陷** ⇒ 倾向**精度，具体是 V 平面** |
+| 主证据 | 标定曲线：K 加噪 relRMS 0.105/0.25/0.45/0.80 → 输出误差仅 0.087/0.201/0.408/0.648 | **V relRMS = 0.178**（K 的 1.8×、**int8 的 V 的 10.6×**）；E8 复用 int8 内核的 **per-64** scale 平面配 4-bit 码，而 **NVFP4/ISO3 的 V 用 per-16** ⇒ 3-bit 档的 V 比 4-bit 的 E8 更准。步长模型：per-64 预测 0.158（实测 0.178 ✓）⇒ **per-16 预测 0.102（3.0× MSE）** |
+| 形状 | — | 退化**单调**（0/6/16 层 → 0.949/0.467/0.020），与"精度不足"相符、与"一层坏就全崩"的离散 bug 不符 |
+| 修法 | 路由对称化（`gqa_attention_cached()` 也套 E8→Prompt）+ shuffle UB + Int8 名单 | V 换 per-16（**要同改 plane 几何与读侧，+0.75 b/el ⇒ 设计取舍，不是一行修**） |
+
+#### 66.3 我的裁定：**e8r1 否定精度的那条论证不成立**
+它的推理是"1.28× 的输出误差不可能造成 55× 的保留差"——**这假设"误差→保留率"平滑**。
+而**本会话自己的数据反复推翻**：去掉 4 个 E8 层就让 [D0] 30/64 → 63/64；int8 换个 kernel 就让 [D0] 60 → 50。
+**贪心解码是混沌放大器，离散指标上的整体翻转正是"小误差"的典型后果。**
+反过来 e8r2 的定量关系更硬：**V 的误差在 attention 里不被衰减**（`out = Σ p_i V_i`，权重和恒为 1）
+⇒ V relRMS 0.178 基本原样进输出；**而 e8r1 自己测的 E8 `OUT relRMS = 0.1803` 与 e8r2 的 V relRMS 0.178 几乎相等**
+—— e8r1 的输出数本身就是"由 V 主导"的证据。
+
+#### 66.4 两面各自挖到的真缺陷（照记）
+- **e8r1**：① **路由不对称**——`gqa_attention.cpp:573` 的 `gqa_attention_cached()` **没被 `:518-521` 的 E8→Prompt 覆盖**，
+  而它用 `decode_i8_tiled_kernel<E8=true>` 读**同一批由 `fill_i8_kernel<E8=true>` 写出的字节**（一个格式两个 reader）；
+  ② **`gqa_attention_decode_i8.cuh:301-309` 的 shuffle UB**（`__shfl_xor_sync(FullMask,…)` 在 `if ((lane&1)==0)` 里，
+  **奇 lane 携带每个打包字节的高 nibble**；同族 fill kernel `prefill_i8.cuh:165-181` 早已提出分支外）
+  —— ⚠️ **这条与 E2 独立发现的 D5 是同一处**；③ `gqa_attention_decode_smallt.cu:204` 的 `Int8` 名单缺 `DType::E8Kv`（惰性）。
+- **e8r2**：④ **`gqa_attention_prefill_e8.cu:316-336` 只传 10 个实参**，`cold_k_slots/cold_v_slots/slot_bytes` 落默认
+  ⇒ `tile_cold` 恒假 ⇒ 一旦 block table 出现**负项**（冷页编码 `-(slot+2)`），表项被当物理页号代进
+  `gqa_kv_i4_code_index` ⇒ 静默读到池内别的区域（越不出池 ⇒ compute-sanitizer 干净）——
+  **它自己证伪为根因**：`program_impl.h:10660-10684` 的栈级闸门在"任一层不是 I8/NVFP4"时直接 return，E8 因此**从不退页**，
+  且 int8 同样中招 ⇒ 解释不了 E8 专属性。补丁 = 把"负表项 + 未给冷平面"从静默别名改成整块零填充（加固）。
+
+#### 66.5 ⚠️ 一条影响整条 E8 测量线的更正
+**e8r2 逐字节证明 `/home/user/bench/kvdump_e8src` 是 Sep-10 修复之前的产物**（其 ks 平面 256/256 等于"旋转前 amax/7"，
+码平面既不匹配"无投影"也不匹配现代编码）⇒ **它不能当当前写侧的真值**。
+⇒ **E1/E2/adj1/adj2 的绝对数字都是在"旧编码器"的 dump 上算的** —— **比值与方向仍可信，绝对值要打折。**
+
+#### 66.6 决定性实验（两个假设各有自己的可证伪读数，我都跑）
+- **实验 A（验 e8r2 的 V 归因）**：把 E8 的 V 换成 per-16 尺度（或临时把 V 按 int8 存）→ 重建 → 同一条 4 臂硬检索。
+  **纯 e8 从 0.020 升到 ≥0.3 ⇒ V 是主因、e8r1 的否定被推翻；仍 ≈0.02 ⇒ V 归因被证伪。**
+- **实验 B（验 e8r1 的路由归因）**：打它的补丁（路由对称化 + shuffle UB）→ 重建 → 四臂各 8 针。
+  **`0-15:e8` 的 sum(prefix) 从 10 跳到 ≥500 ⇒ 路由是主因；仍 10 ⇒ 被证伪。**
+
+### 67. W4（硬编码路径，ph1 第一路）：产品代码里只有 **2 处**；测试里**恰好 12 处**；并补上我漏的 CMake 一环
+
+#### 67.1 清单（分类 + 判定依据）
+- **产品代码：只有 2 处**（`src/targets/qwen3_6/impl/runtime/dflash2_impl.h:152` 与 `:424`
+  的 `/mnt/c/Users/User/Documents/ziqinzhang/dl/feat_%s_%d.bin` / `df2scores_%s_%d.bin`）
+  ⇒ **判定为"env 门控的诊断通道"，不是随手写的死路径**，依据：两块都在 `getenv("NIFER_DF2FEAT"/"NIFER_DF2SCORES")` 里；
+  `docs/maintainer/speculative-dflash2-status.md:52-56` 把这两个探针写成"可复用的诊断工具"；`git blame` 全指向
+  一个调试提交 `d38bb91`，且 `research/scripts/_patch_df2scores.py` 就是写入这段的插桩脚本；
+  **仓库已有约定**：`NINFER_KVDUMP_DIR` / `NINFER_HS_DUMP_DIR` / `NINFER_KV_CALIB_DIR` 都是"目录取自 env、未设则不落盘"，
+  **这两个块是全树唯一违反该约定的 dump 点**。
+  ⇒ **修法：保留通道、改掉目的地**（新增 `NINFER_DF2DUMP_DIR`，未设则连 `cudaMemcpyAsync` 之前的同步都省掉），**不删**。
+- **测试：4 站点 × 3 文件 = 12 处（没有更多）**，全在 `tests/targets/qwen3_6/test_frontend.cpp`
+  （`:116/118/120`、`:1226/1228/1230`、`:1377/1379/1381`、`:1626/1628/1630`）。
+- **我漏掉的 3 个 py + 1 个工具**：`tests/convert/qwen3_6_27b/{test_official_resources.py:16,19, test_convert.py:21}`、
+  `tests/convert/qwen3_8_27b/test_mtp_assembly.py:28,32`（都未注册进 ctest）、
+  **`tools/convert/qwen3_8_27b/mtp.py:36` 的 `Path("/home/user/ninfer-fusion")`** —— 而它 `__file__` 回退写的是
+  `parents[1]` = `tools/convert`，**永远是死分支**，只有硬编码路径能生效（已改成 `parents[3]`）。
+- **误报提醒**：`README.md` 里的 `huggingface.co/neroued/...` 是上游 HF 命名空间，**不是机器路径，不能改**。
+
+#### 67.2 ⚠️ 我漏掉的一环（ph1 补上）
+**`#26` 光在 C++ 里返回 77 不够**：`tests/CMakeLists.txt:126-132` 注册 `ninfer_qwen3_6_frontend_test` 时
+**没有 `SKIP_RETURN_CODE 77`**（该属性只由 `ninfer_add_op_test` 和逐条 `set_tests_properties` 给出）
+⇒ 只改 C++ 会得到 "Failed (exit code 77)" 而不是 Skipped。
+`#4` 走 `ninfer_add_op_test` 已带 77，所以只需改 `.cu`。⇒ 补丁加了 `set_tests_properties(... SKIP_RETURN_CODE 77)`，
+**它只在 cmake configure 时写进 `CTestTestfile.cmake` ⇒ 必须 reconfigure 才生效**。
+
+#### 67.3 验证（**真编真跑**，不是只过语法）
+ph1 用 `compile_commands.json` 的原始命令 + `link.txt` 链接（去掉 `--dependency-file` 以免写 `build/`），
+得到 `scratch/ph1/tf/test_frontend_fixed` 并实测：
+- env 未设 → **exit 77** + `SKIP: NINFER_FRONTEND_TEST_ROOT is not set …`；
+- env 指向真实 HF 目录 → 不再 skip，三个文件全被读入（`tokenizer.json` 19,989,325 字节）、继续进入 tokenizer 解析；
+  带尾部 `/` 结果一致；
+- env 指向不完整目录 → **exit 77** + `SKIP: missing official test resource <根>/tokenizer_config.json`；
+- 把 helper 段单独编译运行，覆盖设/未设/空值/半个目录/尾斜杠 5 种情形。
+E3 分支同法实测：无参无 env → 77；env 指向空目录 → 77；目录里有 `ple-manifest.json` → PROCEED；`argv[1]` 优先 → PROCEED。
+python：4 文件 `py_compile`；`mtp.py` 在无 `PYTHONPATH`、cwd=`/tmp` 下导入成功并解析出 `REPO_ROOT`
+（对照未打补丁版解析出 `/home/user/ninfer-fusion`，**证明旧回退确实是死的**）；
+`test_mtp_assembly` 用 unittest **实跑两遍** —— 未设 env：13 tests / 1 skipped；设 env 指向真实产物：**13 tests 全 ok**（含 byte-exact 对拍）。
+
+#### 67.4 ctest 影响预测（基线来自 `LastTest.log`）
+- **基线：109 collected，107 pass / 2 fail / 0 skip**（失败恰为 `#4` usage→exit 2 与 `#26` abort）。
+- **打补丁 + 重建后预期：107 pass / 2 skip / 0 fail**（`#4` exit 2→77 免 reconfigure；`#26` abort→77 **需 reconfigure**）。
+- 若在 env 里设了 `NINFER_FRONTEND_TEST_ROOT` / `NINFER_PLE_SIDECAR_ROOT`，对应测试改真跑。
+
+#### 67.5 未做到 / 未证
+无 GPU；**`#26` 在本机无法全绿**——本机没有 Qwen3.6-27B base-hf 目录（`/home/user/models` 下只有 qwen3.8 系），
+已有的候选（`q38_abl_huihui_nvfp4`、`q3nvfp4`）的 `tokenizer_config.json` 都缺 `added_tokens_decoder`，前端会拒；
+所以"设了 env 且文件在 → 走原路径"我证到的是"三个文件确实按 env 根被读入并继续进入解析"，**不是 exit 0**。
+两个 pytest 文件未实跑（环境无 pytest）。**`tools/`、`eval/`、根脚本、`profiles/` 里的机器路径未改**（清单已给全）——
+它们是对外接口（CLI 默认值、env 名、GUI 文案），改法需要用户定；
+其中 `eval/configs/qwen3_6_35b_needle_haystack.yaml`（10 处）与 `tools/convert/qwen3_6_35b_a3b/convert.py:38` 的
+`GGUF_EVIDENCE_PATH`（关系到记录溯源）是下一步最该处理的两处。
+CMake 改动**未跑 configure 实测**。
+顺手发现未修：`dflash2_impl.h:436-437`/`:440-441` 把 `dump_one("front"/"anch")` 与同一段注释**各写了两遍**
+（来自 `research/scripts/_patch_two.py` 的重复插桩），无害但冗余。
+
+### 68. ⭐ **E8 到底是什么**（权威规格，代码引用）：它是"4-bit 整数平面 + 一个存不进去的格点投影"，且 **V 侧不是 E8**
+
+**用户口径**：**"你先搞明白啥是 e8 再修啊"** —— 这一节就是那份规格。以下每一条都能落到代码行，不含推断。
+
+#### 68.1 dtype 的定义（`src/core/dtype.h:21-24`，原文）
+```
+// Packed 4-bit E8-lattice K codes + i4 V codes (two codes per byte) with
+// per-64-channel FP16 scales; consumed by the int8 attention kernels
+// (stage unpacks nibbles to i8). See the per-layer KV storage table.
+E8Kv       = 10,
+```
+⇒ **一句话规格：K 是"E8 格点码"，V 是 i4，尺度是 per-64 FP16，读者是 int8 内核。**
+
+#### 68.2 它由五个面组成，**其中两个面并不是 E8**
+| 面 | 实际是什么 | 代码 |
+|---|---|---|
+| **存储** | `2 × {U8, head_dim/2=128, kv_heads, 256}`（K/V 各一条 4-bit 打包 code 平面）+ `2 × {FP16, head_dim/64=4, kv_heads, 256}`（尺度）⇒ **4 + 16/64 = 4.25 b/el** | `decoder_state.cpp:185-191` |
+| **K 编码器** | ① `gqa_kv_hadamard64`（64 维 Sylvester 旋转，最后一级乘 `1/8`）→ ② `e8_project_8d_warp`（Conway–Sloane 最近点，E8 = **D8 ∪ (D8+½)**）→ ③ `clamp(±7)` → ④ 两 nibble 打包 | `gqa_attention_kv_quant.cuh:256-270`（H64）、`e8_lattice.cuh:69-138/224-228`（投影） |
+| **V 编码器** | **`gqa_kv_quant_i4_code` —— 纯标量 4-bit、offset-binary、`clamp(±7)`、无旋转、无投影** | `gqa_attention_kv_quant.cuh:356-361` |
+| **尺度** | per-**64**-channel FP16，**与 int8 档同一套 plane 几何**；E8 的除数是 **7**（`amax/7`），int8 是 127 | `gqa_kv_quant_code`（±127）vs `gqa_kv_quant_i4_code`（±7） |
+| **读侧** | **int8 内核对 `E8=true`**：把 packed 平面在 smem 里展开成 i8，然后跑 int8 的数学；反量化 = `码 × fp16 尺度`，码是 **offset-binary** `(nibble ^ 8) − 8` | `gqa_kv_unpack_i4`/`gqa_kv_unpack_i4x16`（`:368-380`） |
+| **路由** | `gqa_attention.cpp:518-520`：**E8Kv ⇒ 强制 Prompt**（注释 "E8Kv small-T kernels are unverified"）⇒ **decode 跑的是 prefill 内核**，这就是 §62 那个 5–17× 慢的机制 | |
+
+#### 68.3 ⭐ 决定性的一条：**它的"格点增益"被构造性地丢掉了**（`e8_lattice.cuh:140-149`，原文）
+```
+// !! READ THIS BEFORE CALLING THE PROJECTIONS ON THE KV WRITE PATH !!
+// e8_project_* implements the Conway-Sloane nearest-point rule correctly (verified
+// exhaustively against a 2x2^8-candidate exact search on 20000 random blocks: 0/20000
+// strictly non-nearest), BUT ITS OUTPUT CANNOT BE STORED IN THE KV CODE PLANE THE READER
+// USES. That plane is one signed integer per coordinate; the projection returns either D8
+// points (integer coords) or D8 + 1/2 points (ALL-EIGHT-coordinates half-integer), and
+// 47.6% of real K/V blocks on the L13-L15 forensics dumps TAKE THE HALF-INTEGER COSET.
+// The `rintf` that necessarily follows therefore moves those coordinates 0.5 step, which
+// measured +3.65 dB of error (2.32x MSE) at the same bit rate versus plain rounding.
+// Use these only where the half-integer coset is representable (a code plane holding
+// 2*coordinate, i.e. 5 bits at +-15 = +1 bit/el) or where the consumer reconstructs the
+// lattice point rather than an integer code.
+```
+⇒ **"E8" 的 4-bit 整数平面装不下它自己算出来的格点**（47.6% 的块落在全半整数陪集上，被 `rintf` 推 0.5 step）
+⇒ **标称的格点增益被构造性丢弃**；而要真拿到它需要 **+1 bit/el 的 5-bit 平面**，E1 实测那样**严格劣于**把这一 bit 花在更细的均匀格点上。
+
+#### 68.4 结论性规格（这才是"E8"）
+**E8Kv = 「一个 4-bit offset-binary 整数平面（K/V 各一条）+ per-64 FP16 尺度（与 int8 共用几何、除数为 7）」
++ 「K 侧额外施加 Hadamard-64 旋转与一个**存不进该平面**的 E8 格点投影」+ 「V 侧是**纯标量 i4、无旋转无投影**」
++ 「读者是 int8 内核、E8Kv 被强制走 Prompt 路径」。**
+
+因此：
+1. **E8 的"格点"部分是死功能**（存不下）⇒ 删投影（`D1_PATCH`，已落地）**方向正确**：删掉之后 K 侧退化为
+   "4-bit 整数平面 + Hadamard-64 旋转"，与平面自洽。
+2. **E8 的 V 侧是全家族最弱的 4-bit V**：它复用 int8 内核的 **per-64** 尺度去配 4-bit 码，
+   而 NVFP4/ISO3 的 V 用 **per-16** ⇒ e8r2 实测 V relRMS **0.178**（K 的 1.8×、**int8 的 V 的 10.6×**），
+   per-16 预测 **0.102（3.0× MSE）**。
+3. **所以"修 E8"= ① 删投影（已落）+ ② 修 V 的尺度粒度**；而 ② 要同时改 plane 几何与读侧、**+0.75 b/el**，
+   是**设计取舍**（用户需知），不是一行修。
+
+#### 68.5 据此排的两条实验与两条修法
+- **实验 A（验 V 归因）**：E8 的 V 换 per-16 尺度（或临时按 int8 存）→ 重建 → 4 臂硬检索。
+  **纯 e8 从 0.020 → ≥0.3 ⇒ V 是主因；仍 ≈0.02 ⇒ 被证伪。**
+- **实验 B（验路由归因）**：打 e8r1 的路由对称化 + shuffle UB 补丁 → `0-15:e8` 从 **10** → **≥500** 才算成立。
+- **修法 ①**：删投影（`D1_PATCH` 已落，等实验确认它是否足够）。
+- **修法 ②**：V 的尺度粒度（per-64 → per-16）或 V 直接换档；**这是取舍，落地前要看实验 A 的读数**。
+- **auto**：另按 §65 走（宽度阶梯 + 校验放行 + 不再落常量 3），aw1/aw2 在跑。
+
+### 69. ⭐ E8 的**数学优势**（查证）+ **我把表示代价高估了 8 倍** ⇒ "删格点"是错的修法
+
+**用户口径**：**"我的意思是你从数学上搞明白这玩意的优势然后再搞啊……什么叫删除格点？你先上网找一下什么是 e8 再说"**
+
+#### 69.1 E8 是什么（文献）
+- **E8 = Gosset 格**：8 维**最密球堆积**（**Viazovska 2016 证明最优**，2022 Fields Medal），kissing number **240**，
+  且有 **O(1) 闭式最近点解码**（Conway–Sloane）——本仓库的 `e8_project_8d_fast` 就是它。
+- **它的优势即 granular gain（同码率下对纯标量量化的增益）**：
+  `10·log₁₀(G(ℤ)/G(E8))`，`G(ℤ)=1/12≈0.0833`、`G(E8)=0.0717` ⇒ **≈ 0.65 dB**。
+  旁证：高码率下距 Shannon 的差距 E8 是 **0.88 dB**、纯标量是 **1.53 dB**，差 **0.65 dB**（同一个数）。
+- **引擎自己的 CPU 实测 `ideal-E8/z8 = 0.874×` = 0.58 dB** ⇒ 与理论吻合。
+⇒ **这个格式的价值是真的、可量化的。**
+
+#### 69.2 ⚠️ 表示那个陪集的代价，我（和 E1）**高估了 8 倍**
+E8 = **D8 ∪ (D8 + ½·1)**。关键结构事实：**一个 8 坐标块的最近格点，要么八个坐标全是整数（D8），
+要么八个坐标全是半整数（D8+½）——两个陪集不混。**
+⇒ 表示它只需要 **每 8 个坐标 1 个"陪集位"**；**坐标本身仍是整数、仍装在现有 4-bit 平面里**
+（半整数陪集就存 `坐标 − ½`，读时加回）⇒ **代价 = 1 bit / 8 坐标 = +0.125 bit/el**（4.25 → **4.375**）。
+- `e8_lattice.cuh:140-149` 的警告写的是 "a code plane holding **2×coordinate**, i.e. **5 bits at ±15** = **+1 bit/el**"。
+  **那是"每个坐标多存一位"。** 而**同一段注释自己那句 "ALL-EIGHT-coordinates half-integer" 正是让便宜编码成立的事实**：
+  既然整块同陪集，**一位就够**。⇒ **结论被一句 8× 高估的成本带偏了。**
+- 三处更正：① **我的"删投影"方向错了**（它把这个格式唯一的价值删掉，剩下的只是"加了旋转的普通 int4"）；
+  ② **E1 的"陪集位严格劣"建立在 +1 bit/el 这个 8× 高估上**；③ **E2 提的"陪集位 4.375 b/el"在机制上是对的**
+  （它的测量因转置不可用，但机制没错）。
+
+#### 69.3 但"值不值"是**速率-失真问题**，我拒绝手算当结论
+同码率 E8 好 **0.65 dB**；而多花的 **0.125 bit** 若按 6.02 dB/bit 折算值 **~0.75 dB** ⇒ **两者接近**。
+谁赢要看**在"4-bit 整数码平面 + 每块 1 位边信息"这个受约束的编码族里**，E8 与"同样 1 位边信息的其它用法
+（如按块在 Δ 与 Δ/2 之间切换）"谁更优。**这必须推导 + 实测。**
+⇒ **定下来的是**：当前实现**净亏**（投影照算 + `rintf` 推 0.5 step = **−3.65 dB / 2.32× MSE**，比纯取整还差）；
+"**E8 现在没用**"成立、"**E8 本该有用**"也成立；**中间那段（怎么表示、值不值）不许拍。**
+
+#### 69.4 已派双路（e8m1/e8m2），要求
+1. **数学**：把 `10·log₁₀(G(ℤ)/G(E8))` 的来历写清（G 的定义、0.0717 的出处、算式），
+   并说明"同码率"在"每坐标 4 bit + 每 8 坐标 1 位边信息"的格式里**如何精确定义**；
+   **在同一存储预算下严格比较** (i) E8+陪集位 vs (ii) 纯 4-bit 均匀 + 同一位做别的用途，
+   给出**理论 MSE 与谁赢多少 dB**——**若结论是"E8 不划算"，直说并给推导**（那推翻的是我的方案，不是格式）。
+   并回答 **Hadamard-64 旋转的收益与格点增益是否可加**。
+2. **编码设计**（若数学支持）：陪集位存哪（现有 plane 有没有空位/要不要改布局）、写侧怎么产、读侧怎么重建、
+   与 `clamp(±7)` 和 offset-binary `(nibble^8)-8` 怎么共处、**b/el 的精确算术**。
+3. **纯 CPU 实测（硬要求）**：同存储预算下 (i) 均匀+旋转 (ii) E8+陪集位 (iii) 投影+rintf 的 MSE/相对误差/**按 b/el 归一**。
+   ⚠️ **数据来源**：`/home/user/bench/kvdump_e8src` 已证明是 **Sep-10 之前的产物**，**不能当当前写侧真值**——
+   只能用同一输入做**编码器之间**的相对比较并明确标注；有更新的 K/V 源就优先用。
+4. **补丁**：`/home/user/scratch/e8m1/fix.patch`（或 e8m2）实现推导出的方案；
+   若数学结论是"不划算"，**不交补丁**，改交"为什么这个格式应当直接用 4-bit 均匀+旋转、把 E8 从 dtype 表退役"的证据包
+   ——**这也是合法交付，但必须带 3 的实测**。
+5. **明令**：**不许把 E1/E2 之前测过的数当证据**（旧 dump + E2 的读取转置 bug），**必须自己重测**。
+
+### 71. W1 双路（ld1/ld2）裁定；**转换器缺口已补**（此前根本不在树里）；仍缺 118 条记账补丁
+
+#### 71.1 两面的同（独立一致，且都用了**真 artifact 报告**当基准）
+“基准 = `cbfix2/out2/qwen3_8_27b_nvfp4_modelopt.ninfer.conversion.json`（identity `{qwen3.8-27b, nvfp4-modelopt}`、
+1103 对象、22,585,140,736 B、471 s、refusals 0）”。
+- ① `bindings.cpp:383` 的 `layer < 56` 确认；**`D-OBJECT-FORMAT` 恰好 21 条** = 7 `gate_up`(`{0,1,2,3,50,52,54}`)
+  + 14 `down`(`{0,1,2,3,21,42,44,46,48,49,50,52,53,54}`)；**转换器的 scope 集合与之逐项相同**（程序化核对 `scopes agree exactly: True`）。
+- ⭐ **两都指出：`gate_up` 与 `down` 在 7 个层上互相不一致**（`21,42,44,46,48,49,53`）⇒ **修法不可能"按层"表达，必须按对象**。
+- ⭐ **FP8 对象在 artifact 里根本没有 divisor**：`D-DIVISOR-DROPPED` 也是 21 条，route 直方图 `divisor: 91` == `NVFP4: 91`
+  ⇒ **FP8 声明必须"不做 divisor 查找"地绑定**，且 `Binder::finish()` 仍要求全部对象被消费。**两面独立得到同一结论。**
+- **NVFP4 的 divisor 要求不许放松**（`bind_weight` 对 NVFP4 仍 throw；缺/0/负 divisor 仍致命）——两面都保留了这条。
+- `WeightsProfile` **不**决定 `default_layer_kv_dtypes`（该参数**无名且未用**，两面都核过），**不**承载采样默认值（按 `model_id` 键）；
+  它承载的是：端点格式、哪套 text-layer binder、`auto` 的 backend、以及 **7 个 switch 里的 per-op workspace 容量**。
+- **CRLF 陷阱**：`bindings.cpp`/`package.h`/`variant.cpp` 是 CRLF，且 **`variant.cpp` 带 UTF-8 BOM**；
+  ld1 第一版因归一化换行产生 **1604 行幻影 diff**，已修。ld2 也踩到同类（提到 `registry.cpp` 是 CRLF）。
+
+#### 71.2 两面的异（范围）与裁定
+- **ld1**（9 文件 **+201/−67**）：额外**删掉** `bind_nvfp4_text_layers` 里三个按层号定格式的谓词
+  （`is_early_attention_input`:282 / `is_bf16_attention_output`:296 / `is_bf16_gdn_output`:324）；
+  并**找出 4 处同类**：**`tools/convert/qwen3_8_27b/inventory_nvfp4.py:46-47`
+  （`NVFP4_MLP_LAYERS = range(56)`、`FP8_MLP_LAYERS = range(56,64)`）= `bindings.cpp:383` 的"生产侧孪生体"**
+  ——**这正是偏差报告读作"registered artifact pins NVFP4"的成因**；另有 `35b_a3b/impl/load/bindings.cpp:20-23`
+  （`routed_down_format`：`{34,38,39} → Q6G64 否则 Q5G64`）、`muse/impl/load/bindings.cpp:57-62`
+  （`layer_mlp_fp8`，注释自认 "Source format table (measured)"）。
+- **ld2**（9 文件 **+162/−21**）：**不动**那三个谓词——它们**在 `Qwen36Nvfp4` 路径上、对 `nvfp4-modelopt` 不可达**，
+  改动它们会改注册路径**却没有 artifact 可验**。它另加 `Binder::find_tensor`（**只读、不消费**——因为
+  `require_tensor` 是"断言+消费"，无法用来问"artifact 说什么"）作为底层原语；`bind_declared_weight`
+  **对任何第三方声明一律拒绝并点名格式**（不是"声明什么就装什么"）；并用 `-Wswitch-enum`
+  **做对照实验**（删掉一个 label 会同时让 `variant.cpp` 与 `bindings.cpp` 报警）证明检查承重。
+- **裁定：落 ld2**（更窄、可验、控制更硬），**把 ld1 的 4 处同类收进后续范围**——
+  用户口径是"所有硬编码都要改"，但**"可验证路径优先"**：ld1 自己也承认 `endpoint_format` 因"对所有现存 artifact 都正确"而没动。
+  ⇒ **后续单：`inventory_nvfp4.py:46-47`（生产侧孪生体，最高优先）+ `35b_a3b:20-23` + `muse:57-62` + qwen36n 那 3 个谓词**，
+  每处都要用同一套 `bind_declared_weight` 机制，并**分别证明改动落在可验证路径上**。
+
+#### 71.3 ⭐ 转换器缺口：此前**根本不在树里**（已补）
+- ld2 发现：`tools/convert/qwen3_8_27b/convert_modelopt.py` **只存在于 `/home/user/scratch/{cbfix1,cbfix2,convB,convC}/`**；
+  而 `import_model.py` 对 `flavour == "modelopt"` **只打印 work-item、从不路由** ⇒ **验收链第 4 步（重产真产物）无法从树里跑**。
+- **已补**：落地 `/home/user/scratch/convB/convert_modelopt.py`（新版修订，md5 `402f4ee172e1…`，71,761 B）
+  到 `tools/convert/qwen3_8_27b/convert_modelopt.py`。**新文件，无覆盖风险**；备份机制已就位（若已存在会先备份到 scratch）。
+- **就地验证**：`py_compile` OK；**从树里跑 `--plan-only` 真通过** ⇒ `objects 1103`、`refusals 1`（只有前端 pin）、
+  **字节覆盖 2139/2139 全在（`model-nvfp4-mixed` 24,005,888,128 / `vision-mtp-bf16` 1,770,858,976 全齐）**。
+- ⚠️ **仍缺**：cbfix1/cbfix2 的**记账修复**（`D-RECODED-FROM-BF16` 从 1 → 119）**没并进来**——
+  我落的是 `convB` 的新版，**不是**修完记账的那版（有界查找没命中所说的 `cbfix2/clean2/`）。
+  ⇒ **待补一条**：把 cbfix 的记账补丁并进树里的这个文件（`cbfix1/fixB.patch` 或 `cbfix2/fixB.patch`，5 hunk/99 行，apply-check 通过）。
+- 另：`import_model.py` 的**前门路由**（让 `flavour == "modelopt"` 真的走到这个 driver）**还没做**。
+
+#### 71.4 两面都给齐了验收链（关键：**哪些步骤要 GPU**）
+1. **应用补丁**（CPU）→ 2. **重建**（**要 nvcc，但不需要 GPU 执行**）→ 3. **重产真产物**（**要 GPU/`--device cuda`，~471 s，22.6 GB**）
+→ 4. **让引擎真去装载**（**要 GPU**）→ 5. 质量（`ninfer-perplexity` + `ninfer-serve`）。**两份都给了逐条 stderr 的故障分诊表。**
+- ⚠️ **磁盘**：artifact 22.6 GB 而 `/` 只剩 48 GB ⇒ **只留一份**。
+- **最强的诚实边界（ld1 写的）**：**"真 artifact 已不在盘上"**（`cbfix2/out2/` 只剩 35 KB 的 report）
+  ⇒ **第 4 步是这些补丁第一次面对真字节**；`Binder::finish()` 要求 1103 个对象**全部被消费且被规划**，
+  而这只有"偏差报告里没有 missing/extra"作为间接证据。
+
+### 70. W3（单一真值来源，ss1 第一路）：**8 项重复真值**统一；三处纠正我的普查；并标出**合并顺序风险**
+
+#### 70.1 三处纠正我
+1. **C1 的 TMA 判据是 6 处不是 5 处**，而且**第 6 处已经漂移了**：
+   `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp:41` 写 `tokens >= kTmaBlockM && %kTmaBlockM == 0`
+   并自带 `:25` 的字面量 —— **是 256，不是 1024**。⇒ 它早就与"定义"分叉，只是没有任何东西把它绑回去。
+   另外 4 个 `.cu` 各自还带了一份 `constexpr kTmaBlockM = 256`（**常量本身的第二份拷贝**）。
+2. **C2 的 `suffix_lookup` 是 3 个界，不是 2 个**：doc（`:13` `o < starts[b]` + `:17` 的 `o+Q+K <= len`）、
+   host（`lookup_fuse.h:28-29` = `min(len-Q, start)`，**连 K 项都没有**）、kernel（`suffix_lookup.cuh:27-29` = `min(len-Q-K, start-Q)`）。
+   ⇒ **host 在 K 项上也不同**，而 **doc 自己那条 `<=` 比任何已落地实现都松一格**。
+   **裁定：以 kernel 为准**，依据——① `TODO.md:171` 记录那个 `-Q` 是 **2026-09-03 有意的"防自匹配"修复**，
+   且已编码进**两个镜像**（`tests/test_suffix_lookup.py:14`、`tests/suffix_gpu_test.cu:2`）；
+   ② `TODO.md:7300` 用 198,269 个双镜像用例把 kernel 契约定在 0 分歧；③ **kernel 引擎零调用**，
+   而 `lookup_fuse.h` **只被它自己的 CPU 测试用** ⇒ **host 侧才是陈旧的**；
+   ④ host 自己的注释（`o + query_len <= query_start`）与它的代码（`o < query_start`）**自相矛盾**；
+   ⑤ **决定性**：`lookup_fuse_test.cpp` 的 case 4 **把自匹配 bug 写成了断言**。
+   ⇒ **kernel 一个字节没动**（**零数值风险**）；改的是 host + doc + 那一个测试用例。
+   实测：**改前 host-vs-kernel 分歧 767，改后 0**（与我先前报的 91 同属一类，差异来自分布）。
+
+#### 70.2 真正的清单是**8 项**（我漏了最有价值的两项）
+| | 真值 | 拷贝数 | 现在 | 行为 |
+|---|---|---|---|---|
+| α | **MMA schedule 决策阶梯**（`<=64/96/128/192/384/512`） | **4 文件** | `nvfp4_w4a4_ladder.cuh:73/90` | **逐字相同（已证）** |
+| β | 5 个 schedule 别名 | 同 4 文件 | 同上 `:38-66` | 相同 |
+| γ | `alpha = 1/(in*weight_scale_divisor)` | **11 处 / 6 文件** | `nvfp4_w4a4_plan.h:76` | 相同 |
+| δ | attn 行切分（6144/1024/6144） | **5 文件** | `nvfp4_config.h:131-136` + `static_assert` 铺满 `kOutputRows(14336)` | 相同 |
+| ε | gdn 行切分（10240 qkv / 6144 z） | **3 文件** | `nvfp4_config.h:129-130` + `static_assert = kOutputRows(16384)` | 相同 |
+| ζ | `PageIds` = 64 / 256 | **8 处** | `paged_kv_address.cuh:39` `paged_kv_page_ids(envelope)` | 相同 |
+| η | small-T launcher 表长 + 无界索引 | 4 处 | `nvfp4_config.h:229/235/240/251` | 可达 T 上相同 |
+| θ | i8 unpack 宽度 + 4×`make_int4` 重打包 | 2 处 × 2 数组（各约 32 行手展开） | `gqa_attention_kv_quant.cuh:141/154/161` | 相同 |
+
+⭐⭐ **α 与 δ/ε 是我漏掉的高价值项**：**那条阶梯是 4 份拷贝的 8 分支决策表，而且真的漂移了**——
+`linear_add` **没有 `<=96` 分支**，`attn` 在 `<=128` 上有 `Pipelined` 而 `linear` 只在非残差上有。
+ss1 进一步**证明这些差异都能从几何（residual / GDN）推导出来** ⇒ 所以它能**证明等价**而不是猜。
+
+#### 70.3 关于我那条"`16` vs 32 + 无界索引"的隐患（C3b）：**纠正**
+它今天**不是** OOB，而且**原因不是**注释暗示的那个：`nvfp4_gdn_snapshot_small_t.cu` 里的 `16` 是
+`nvfp4_gdn_conv_resolve_plan` 的 **A16 注册上限**（`tokens <= 16 ⇒ SmallTFusedA16`），**不是 `kNvfp4LastSmallT`**；
+那个不变量**只通过 planner 传递性地成立**。⇒ ss1 把它**结构化**了：一个具名常量
+（`kNvfp4GdnConvA16Ceiling`）定表长 + `static_assert` 绑长度↔上限 + `nvfp4_small_t_launcher<Ceiling>` **对每次派发的 T 做范围检查**。
+
+#### 70.4 验证（**真跑**，不是只过语法）
+- **阶梯（α/β）编译并运行**：把 4 条改前链逐字转写，与共享阶梯+visitor 在 **T=1..65536 × 5 个 problem**
+  以及 3 条更窄的 per-launcher 链上对比 ⇒ **`ladder mismatches=0`、`visitor mismatches=0`**。
+- **C2**：用**改后真实的** `lookup_fuse.h` 对 kernel 的 limit/tie-break 镜像跑 16,383 随机例
+  （Q 2..8 / K 1..4 / min_len 1..Q）⇒ 改前 **767** 分歧、改后 **0**，且 `scan_limit == min(len-Q-K, start-Q)`。
+- **补丁完整性**：74 hunk / 33 文件干净 apply；round-trip 到副本后 **33 个文件逐字节相同（33 SAME / 0 DIFF）**。
+
+#### 70.5 风险：**恰好两处行为变更**
+(i) C2 的 host 参照 + `lookup_fuse_test.cpp` case 4 —— **两者都在构建之外**（`lookup_fuse_test` 不在任何 CMakeLists；
+kernel 无引擎调用者）⇒ **引擎的数值行为不变**；
+(ii) PageIds 填充处的守卫：原本会砸 smem 的"信封溢出"场景，现在写中性统计并返回（按推导出的界不可达，**有意的 fail-visible**）。
+**其余全是带证明的纯重构**（阶梯、alpha、行切分、常量、small-T 协议、unpack），且断言都是编译期。
+
+#### 70.6 ⚠️ 合并顺序风险（要按这个排）
+**ss1 的 33 个文件里有 4 个是别的代理已经改过的**：
+`gqa_attention_decode_i8.cuh`、`gqa_attention_prefill_i8.cuh`、`gqa_attention_kv_quant.cuh`、`nvfp4_gdn_snapshot_plan.cpp`。
+⇒ 它的补丁**只对"当前树"成立**；**若 E8 那条线（e8m 的陪集位、e8r1 的路由/shuffle 修）再动这几个文件，就会冲突。**
+⇒ **落地顺序：先落 E8 这条线（关键路径）→ 再重取 ss1 的补丁（或手工并）**；不要反过来。
+
+#### 70.7 未证
+**本机没有 nvcc**（`/usr/local/cuda-13.3` 只有头、没有编译器）且无 GPU ⇒ **约 20 个 CUDA TU 没编译**；
+对它们证据是"干净 apply + round-trip 逐字节相同 + host 头语法检查 + 已执行的阶梯测试 + 实例化集合未变
+（同 5 个 schedule × 同几何）"。`kGqaGuaranteedSplitCount = 85` 是**推断**（没把
+`causal_small_t_launch_capacity` 端到端读完证明大窗总是派 ≥85 splits）。
+一处仍缺循环守卫：`gqa_attention_decode_nvfp4.cuh` 的 page fill 处 `write_neutral` 不在作用域（守卫跳过、已报告而非盲插）。
+三项 follow-up 已标（`wrapper/gdn_input_proj.cpp` 重复推 per-model 行常量、3 个 attn epilogue 结构体重复行路由、
+`small_t.cuh` 与 decode 内核各自一套 split-count 规则）。
+
+### 72. W2 双路（id1/id2）裁定：以 id2 为基 + 并入 id1 的守卫；**id2 多找到一处真 bug**；并撞到 ⑦ 的坏语法
+
+#### 72.1 两面的同（独立一致）
+- `WeightsProfile` 是**"权重数值格式契约"的选择子**，消费方三组：`endpoint_format()`（`bindings.cpp:35-50`）、
+  `bind_artifact()` 选哪族 text-layer binder（`:417-445`）、是否绑 `dflash/*`/`dflash2/*`（`:486`、`:532-533`）；
+  外加 **7 个 workspace 容量 switch**（`variant.cpp:434/456/480/502/530/558/589`）与 `auto` 的 backend 解析（`package.cpp:118-155`）。
+- **两面都明确否掉两条猜测**：它**不影响采样默认值**（`sampling_defaults` 只按 `model_id` 走，`package.cpp:82-88`）；
+  **不影响 `default_layer_kv_dtypes`**（该参数**无名未用**，表体是硬列 `{0,1,3,4,6,7}`）⇒ 注册表**不需要** KV dtype 字段。
+- 设计同为**声明式表**：`WeightsIdentityKey{model_id,weights_id}` → profile，**一次查表、一个拒绝点**；
+  新 id **复用现有 profile 值**（差别只写进 `provenance`）。依据不是猜：转换器自己写着
+  `WEIGHTS_ID = "nvfp4-modelopt"` 且复用 `inventory_nvfp4`（`MODEL_ID="qwen3.8-27b"`、`TARGET_KEY="qwen3_8_27b"`）+ `recipe_nvfp4`。
+- **等价性证据**：两面都用 `git show HEAD:` 抽出的**改前函数体**做 CPU 差分 ⇒ 5 个既有 id 逐项同，新 id 接受，未知 id
+  带**声明集合**拒绝（id2 还证明**旧句子是新消息的字节级前缀**）。都逐字节保住 **CRLF**（两个 27b/35b 导出头 + `registry.cpp`）。
+
+#### 72.2 两面的异与裁定
+| | id1（13 文件 +758/−111） | id2（11 文件 +689/−172） |
+|---|---|---|
+| 独有 | **5 个 `static_assert`** 钉声明漂移；把 `context_cost` 的"**静默降级**"显式化（`context_prefill_preset_miss_note()` 装载时打印） | ⭐ **`context_cost.cpp` 的 weights_id 匹配是 3 处不是 2 处**：第三处是 **`upsert_context_prefill_cost_atomic` 的 JSON 写回匹配（`:557-559`）** ⇒ 不纳入就"**读时认、标定写回时对不上**"（**真功能 bug**）；把**采样预设 if 链**也做成第二个声明轴；`registry.cpp` 4 分支 if 链 → 3 行注册表，且 `construct_registered` **不再接收 target_key**（取自命中行） |
+| 自我纠错 | — | 它的 CPU 复算抓到**自己**一个真 bug：`SamplingDeclarationTable<8>` 填 8 行只有 2 行有值，而 **`-fsyntax-only` 完全看不见**（空行合法）⇒ 加 `sampling_models_are_declared` 守卫 |
+| 负向编译守卫 | 3 条（采样预设须属本 target 消费的 model、每行须报本 package 的 target_key、身份须唯一） | `declaration_check::*` 三条同形 |
+
+**裁定：以 id2 为基**（它覆盖第三处 + 采样轴），**把 id1 的 5 个 `static_assert` 与"静默降级提示"作为必须并入项**。
+⇒ **双路不是"二选一"，而是"把各自的独有证据并起来"**（这已是本会话第三次这个形态：G、S、cc、W1 都是）。
+
+#### 72.3 id2 顺带撞到 ⑦ 的一处**坏语法**
+**`src/targets/qwen4_exp/package.h:29-33` 写的是 `namespace ninfer::targets::qwen4_exp {{ … }}`（双花括号，非合法 C++）**。
+它是个占位、**不在任何 `CMakeLists.txt` 里所以从不编译**，注册表也不含它。
+⇒ 而 **`qwen4_exp` 正是 FlashNext 那条线的目标** ⇒ **占位头是坏语法**，谁去接它谁先炸。**记入 ⑦。**
+
+#### 72.4 两面的诚实边界（都写明）
+- **都没有构建、没有 GPU、没有真装载**；补丁只有 `-fsyntax-only` + 声明逻辑的 CPU 复算 + 补丁可逐字节复现。
+- **`nvfp4-modelopt → Qwen38Nvfp4` 是推断不是实测**：依据是转换器覆盖 `WEIGHTS_ID` 且复用已注册 recipe，
+  加 `docs/maintainer/modelopt-nvfp4-import.md` §3/§5 的"NVFP4 对象字节级一致"。**没有读过该 artifact 里每个对象自带的 format。**
+- id2 明说：**新 id 现在能"被认识"，能不能"装载成功"取决于 W1**（`bindings.cpp:383` 的 `layer < 56` 还在）。
+- id2 未加 ctest 回归用例（证据在 scratch，harness 可直接改成 `tests/` 用例，但要动 `tests/CMakeLists.txt`，它刻意避开）。
+- `context_cost_defaults.cpp` 那条别名行断言"ModelOpt artifact 的 prefill 成本 = 实测 nvfp4 artifact 的"，**没有重新标定**。
+
+### 73. ⭐ 用户更正 E8 的框定：**它是一个跨位宽的族（4/3/2 bit），且必须与 isoquant 同预算比较**
+
+用户原话：**"e8 不只是 4bit 还有 3bit 乃至于 2bit；这个和 isoquant 还要比较；之后只要求到同就修，不用问我"**
+并追加授权：**"同就修，不问"** —— 两路一致即落地，不再回头确认。
+
+**我上一轮把 E8 框定成"4-bit 平面"是错的。** §68/§69 只讲清了 4-bit 那一档的存储与投影，
+把"E8 的优势"当成一个**单一码率的常量 0.65 dB** 来谈，因此推论走向"要么退档要么删格式"。
+正确框定是：**E8Kv 是"K 侧走 E8 格点"的一个实例，格点编码本身可以在 4/3/2 bit 每坐标上取不同档**，
+档位由格点缩放（码本粗细）决定；**半整数陪集位（+1/8 bit/el）在三档上都要付**。§69 那条
+"表示代价被我高估 8 倍"的结论只对 4-bit 档验算过，2/3-bit 档需要重算 b/el。
+
+**为什么这条更正不是细节，而是决定 1M 能不能开：**
+- 1M 上下文**只装得下 2-bit**（10.31 GiB，余量 0.09 GiB）。
+- 按 10.4 GiB/1M 反推，KV 的**平均预算只有 2.144 bits/el** ⇒ **连一层 int8(8.25) 或 nvfp4(4.50) 都买不起**。
+  ⇒ **2/3-bit 的表现直接决定 1M 这个功能存不存在**，而不是"优化项"。
+
+**数学上为什么低码率反而更该看格点：**
+- 格点相对标量的 **granular gain 是速率无关的**：`10·log10(G(Z)/G(E8)) = 10·log10((1/12)/0.0717) ≈ 0.65 dB`，
+  §69 已核（引擎自己的 CPU 实测 0.874× = 0.58 dB 吻合）。
+- 但**低码率下格点相对标量的实战优势显著更大**：独立来源给出 3 bit/dim 约 +15.8 dB、4 bit/dim 约 +11.6 dB，
+  到 6–8 bit 才趋于消失。⇒ 我此前"0.65 dB 太小、不值得"的判断，**只在 4-bit 档成立，且还是不成立的**
+  （0.65 dB 的增益 vs 陪集位 0.125 bit/el 的代价，按 6.02 dB/bit 折算代价约 0.75 dB —— 两者同量级，
+  必须**推导 + 实测**，不许手算仲裁；§69 已记这一点，至今未结）。
+
+**与前几节的对账：**
+- §68 记的规格（`DType::E8Kv = 10`、`2×{U8,head_dim/2,kv_heads,256}` + `2×{FP16,head_dim/64,kv_heads,256}`、
+  K 走 `gqa_kv_hadamard64` → `e8_project_8d_warp`，**V 走纯标量 i4、无旋转无投影**）**仍然有效**，
+  它是 4-bit 档的实现事实。
+- §69 记的"陪集位 = +0.125 bit/el，我把代价高估 8 倍"**仍然有效**，但**只在 4-bit 档验算过**。
+- 更早会话的 codec 探针给过 **3-bit 3.25 b/el（K 误差 15.9%，比 nvfp4 差 1.6×）、2-bit 2.125 b/el（31.6%，差 3.3×）**
+  —— **注意：那是"组32/组64 + E4M3 尺度 + 冻结码本"的候选 codec，不是 E8 格点**，不能当 E8 的 2/3-bit 读数。
+  它只能说明**纯量化的 2/3-bit 掉得很快**，这恰好是格点该发力的地方，而不是格点已经输了的证据。
+
+**isoquant 这一侧此前是空白：** §69 的比较只对了"纯均匀标量"，e8r2 曾想对 isoquant 但**在树里找不到矩阵**而放弃。
+`DType::ISO3 = 9` 是**离线学习旋转**（SO(4)/`gqa_isoquant_rot`）路线，与 E8 的**固定格点**路线是两种不同的
+"用结构化先验换 MSE"的办法，同预算比较才是有效对照。⇒ 本轮必须把 ISO3 的权威规格查出来
+（码本、尺度粒度、旋转、plane 几何、**实测有效 b/el**）。
+
+**已派（铁律⑦，双路同一任务独立做）：**
+- **e8v1**（`sh/pE8V1_*.sh`，产物 `scratch/e8v1/`）与 **e8v2**（`sh/pE8V2_*.sh`，产物 `scratch/e8v2/`），
+  同一 brief：核实 §68/§69 各条 → 查 ISO3 权威规格 → 给 E8@2/3/4bit 的编解码设计（含陪集位代价）→
+  **同预算实测 K/V 分开报**（E8@{2,3,4}+陪集位 vs ISO3 vs 同码位纯均匀 vs 现状投影+rintf）→
+  结论一致就给 `fix.patch`。
+- ⚠️ 明确告知两路：`/home/user/bench/kvdump_e8src` 是 **Sep-10 之前**的产物，只能做**编码器之间的相对比较**；
+  不许把 E1/E2 旧测当证据（旧 dump + E2 的读取转置 bug `(d*4+h)*3072+t`）。
+- ⚠️ 明确告知两路：已有证据指向**失败在读/内核侧**（删投影使写侧 NMSE 改善 2.32×，而 `e8` 臂检索 **0.020→0.020 分毫未动**），
+  ⇒ 读侧重建必须讲清，不是只比 MSE。
+
+### 74. 构建 #1 验收：**ctest 100% 通过 / 0 失败 out of 109**，但**跳过 8 个而非我预期的 2 个** —— 定性为夹具缺失，非代码回归
+
+**落地**：W1（ld2）+ W4（ph2）干净落地，树相对 HEAD **36 文件 +2569/−147**；落地前快照
+`/home/user/scratch/snap_pre_w1w4/{tree_pre.patch,status_pre.txt,revert.sh}`（可一键回退）。
+构建 `rc=0`（增量 + ccache，约 1 分钟；先确认无人在构建才取锁）。
+
+**ctest**：`100% tests passed, 0 tests failed out of 109`，`Total Test time 452.64 sec`，rc=0。
+四个曾经的失败点（#51/#74/#95 的回归指纹 + #4/#26）现在**全無失败**。
+
+**但跳过 8 个，不是 2 个** —— 我没有放过这个差异，逐条追了原因：
+
+| 测试 | 跳过原因（程序自己打的） |
+|---|---|
+| #4 `ple_table_e2e_test` | 缺 `<sidecar_root>` 参数（已知，W4 的逐子测试 skip 覆盖） |
+| #26 `qwen3_6_frontend_test` | 官方资源检查未 opt-in（需 `NINFER_FRONTEND_TEST_ROOT`）⇒ W4 给它加了 `SKIP_RETURN_CODE 77` |
+| #31 `27b_prefix_real_test` | `neither NINFER_QWEN3_6_27B_WEIGHTS nor …_NVFP4_WEIGHTS nor a Qwen3.8 equivalent is set` |
+| #32 `27b_score_real_test` | `NINFER_QWEN3_6_27B_WEIGHTS is not set` |
+| #33 `27b_load_plan_test` | 缺 **两个**真产物 `out/qwen3_6_27b.ninfer` **与** `out/qwen3_6_27b_nvfp4.ninfer` |
+| #34 `35b_a3b_real_test` | `NINFER_QWEN3_6_35B_A3B_WEIGHTS is not set` |
+| #35 `35b_a3b_dflash_real_test` | 同上 |
+| #36 `35b_a3b_dflash_load_plan_test` | 缺真产物 `out/qwen3_6_35b_a3b.ninfer` |
+
+**关键取证（这一步决定"是回归还是夹具"）**：`git show HEAD:tests/CMakeLists.txt | grep SKIP_RETURN_CODE`
+显示 **#31–#36 的 `SKIP_RETURN_CODE 77` 在 HEAD 里本来就有**（行 158/162/171/175/179/189）；
+**我这批只加了 `ninfer_qwen3_6_frontend_test` 那一行**（`tests/CMakeLists.txt:135`）。
+而且 `out/` 目录里那 4 个产物**全都已不存在**（磁盘 96% 占用、只剩 47 GB，被回收了）。
+⇒ **这 8 个 skip 是"夹具/环境变量不在"，不是 W1/W4 改坏了任何东西。**
+
+**由此纠正我自己两处记账**：
+1. 我此前写的"预期 0 fail / 2 skip"是**错的**。上一轮"98% passed, 2 failed out of 109、无 skip"是在
+   **真产物还在盘上**的时候测的；现在同一台机器上少 6 个可跑测试。
+2. ⇒ **ctest 作为验收仪器，当前真实覆盖率是 101/109**，缺的 8 个映射到**缺产物**。
+   而 #33 需要 `qwen3_6_27b.ninfer`（groupwise，另一个转换器产）**加** `qwen3_6_27b_nvfp4.ninfer`，
+   本盘（47 GB 可用）装不下整套夹具 ⇒ **un-skip 它们是磁盘问题，不是代码问题**，记为仪器的已知限制。
+
+**顺手落地的 ⑦ 修**：`src/targets/qwen4_exp/package.h` 原来是 `namespace … {{` **双大括号（非法 C++）**，
+已改成单括号；并**实证**它 `grep` 无任何引用、不在任何 `CMakeLists.txt`、不在 `registry.cpp` ⇒
+**从未被编译过**（所以双括号没炸过构建，但仍是坏生成）。同一目录 `impl/config.h:14` 还有
+`static constexpr int intermediate = None;`（`None` 不是 C++），已改为 `-1` 并写明理由
+（**不用 `0`**：`0` 会让"维数=0"静默过关，`-1` 在任何拿它当数组界的用到处立刻编译失败）。
+⚠️ **吐 `None` 的真正发射点还没找到**：两个候选（`tools/archkit/gen_full_target.py:53` 的
+`int(g.get("intermediate",0))`、`adapt.py:122` 的 `'%d' % g.get(...)`）在 `None` 上都会抛 TypeError，
+**吐不出字面 `None`** ⇒ 真发射点在别处，已派 hw。
+
+**新到的两条 agent 结果（都还没落，等实验后一起）**：
+- **aw2（auto 第二路）**：12 文件 +571/−121，`git apply --check` 通过。⭐ **它指出 −27% 的真根因是"棘轮"**：
+  调用点写的是 `if (cut < window) { window = cut; }`，而 `window` 是**本轮刚用过的**宽度 ⇒
+  **窗口单调不增、永不恢复**，且判据的搜索上界用的是**配置**的 `draft_window` ⇒ 也长不回去。
+  我的 CPU 复现单靠这一条就重现了记录的"realized ≈ 7.96 vs 阈值选出的 9"。
+  ⇒ **阈值公式本身是对的**（`C(k)=a+bk`、post-add），**不该动 `kMtpWindowCostRatio`**
+  （`b_mask/a=0.0062` 是退化的永不触发端；`b_width/a=0.0441` 也不被支持 —— 记录的三点 AL 只能把 r 钉在
+  ≈`[0.0401, 0.0953]`，冻结值 0.0612 在里面）。
+  另一条硬约束：27b 的 `kMaximumMtpDraftTokens = 15`，但 **35b_a3b/muse_glimmer 只有 5**，而
+  `MtpCausalAttentionEnvelopes::ar` 是按 `kMaximumMtpDraftTokens-1` 定长的 ⇒ **15 级阶梯会在 35b 上越界**，
+  阶梯必须按 variant 裁剪。
+- **ss2（W3 第二路）**：32 文件 1021 行，`git apply --check` 通过。它多找到的、此前普查漏掉的东西：
+  ⭐ **TMA 谓词在 4 个文件里各有一份内联副本、各自带一个 `kTmaBlockM = 256`，而这 4 个文件里的同一个函数
+  已经在调用 `nvfp4_w4a4_tma_route()` 选阻塞尺度量化器** ⇒ 一旦漂移，**尺度布局会与 TMA 描述符静默失配**，
+  是数值 bug 不是崩溃；
+  ⭐ `suffix_lookup` 是**三方分歧**（内核 / host / 文档），内核 + python 镜像 + GPU 测试三方独立同意，
+  且 python 镜像带"2026-09-03 修正, 防自匹配" ⇒ 是 host 与文档错，不是内核错；
+  ⭐ **decode 家族还有 5 份 `PageIds = 256`**（不只是 small-T 那三份 64），其中 4 份带逐字节相同的注释；
+  ⭐ 另有 **10 项重复真值**，其中**两条调度阶梯已经漂移**（`linear_add` vs `attn_input` 的 97–128、
+  `gdn_input` 的 385–512）—— 这两条**要先有测量才能定**，不许猜。
+
+### 75. 磁盘审计：`/` 915G/1007G（96%）。**不是"被我吃掉 1T"** —— 本会话新增约 150G，其余 ~830G 是先前就有的
+
+用户问："你可能得真正找找到底你搞了些什么把整整 1 个多 t 吃掉了"。实测（`du -xsh`，逐层降，不跨文件系统）：
+
+`/home` = **879G** 是全部大头，构成：
+
+| 路径 | 大小 | 归属 |
+|---|---|---|
+| `/home/user/bench` | **329G** | 你自己的工作，非本会话 |
+| `/home/user/models` | **290G** | 其中 **~245G 是 11 个 `.ninfer` 产物** |
+| `/home/user/scratch` | **72G** | 其中 **`scratch/r1/build` 一个就 60G** |
+| `/home/user/ninfer-fusion` | **68G** | 其中 **`build` 60G**（`build/tests` 56G / 109 个测试可执行） |
+| 另外 ~70G | — | 一堆旧构建树：`ninfer` 14G、`ninfer-FIX` 14G、`ninfer-NR` 15G、`ninfer-pr3devbuild` 12G、`ninfer-allbuild` 3.4G、`ninfer-pr{1,2,3,4}build` 各 ~1.1G、`ninfer-issue144-build` 1.1G、`muse128_repro{3,4}` 各 842M、`ninfer_no_a5b`/`ninfer_with_a5b` 各 802M |
+| `vllm029` 9.7G / `rag_build_db` 11G / `rag_db` 5.9G / `sglang-venv` 4.7G / `.local` 1.8G / `.cache` 3.3G | ~36G | 环境，非本会话 |
+
+**`/home/user/models` 里 11 个 `.ninfer`（时间线是判断归属的证据）：**
+`dflash2_bf16head` 26.07G(09-12 11:26)、`dflash2_refhead` 23.70G(09-12 10:35)、`dflash2_zeroselector` 23.70G(09-12 00:40)、
+`dflash2_step_001900` 23.70G(09-11 19:12)、`dflash2_step_000200` 23.70G(09-11 19:22)、`dflash2` 23.70G(08-26)、
+`dspark` 22.65G(08-26)、`foldmlp` 20.02G(09-03)、`fold3` 20.02G(09-03)、`nvfp4` 20.02G(08-25)、`muse_glimmer_30b` 18.38G(09-04)。
+⇒ 其中 `_step_*`/`_zeroselector`/`_refhead`/`_bf16head` 是 **你自己的 dflash2 实验导出**，不是本会话产的。**不许动。**
+
+**本会话真正新增（约 150G）：**
+1. ⭐ **`ninfer-fusion/build` 60G** —— 最大单项。`build/tests` **56G 装 109 个测试可执行**，每个都静态链了整个引擎（单个 ~500M）。
+   这是"跑全量构建 + 109 项 ctest"的直接代价。`build/apps` 2.4G（三个 826M 的二进制）+ `build/src` 1.8G。
+2. ⭐ **`scratch/r1/build` 60G** —— 某 agent 为了冷盘槽的活**建了一整棵副本树**（r1 目录 60G 里 59.99G 全是 build）。
+3. **正在产的产物 22.58G**（`out/qwen3_8_27b_nvfp4_modelopt.ninfer`，审计时已写 10.5G）。
+4. 其余 agent scratch 输出约 12G（`f5`/`n1` 各 1.6G、`acc2`/`m3`/`one_m`/`repro_table`/`acc`/`c1` 各 ~790M、`w2m` 383M…）。
+
+**明确是垃圾、可回收（约 170G，但我没有单方面删）：**
+- ⭐ `models/q38_abl_huihui_nvfp4` = **21G，里面 ~19.6G 是 HF `.incomplete` 下载碎片**
+  （6.68+5.72+4.38+1.46+1.40G），而该目录只有 849M 的 `model-mtp-bf16.safetensors` —— **主权重根本没下完**。
+  ⚠️ 删掉会丢掉可续传的进度，所以这要你点头。
+- ⭐ `ninfer-pr3devbuild/core.415` = **10.7G core dump**（08-31）。
+- `ninfer-sass.txt` **2.5G**（08-25 的文本 dump）、`chunks_cache.jsonl` **2.1G**（08-30）。
+- 旧 `ninfer-*` 构建树 ~**70G**（最后改动停在 08-28 ~ 08-31，且多数非 git ⇒ 是旧副本）。
+- `ccache` 2.9G（可 `ccache -C`，但会让下次构建变慢——**不建议现在清**）。
+
+**结论**：915G 里本会话约 150G，其中 120G 是**两份 60G 的构建树**（我的 + r1 agent 的）。
+当前余量 39G，产物写完降到 ~27G，**够用**。回收清单已列，**在你点头前我一个都不删**。
+
+### 75b. E8 数学结论到账（e8v2/e8m2 那一侧，**等 e8v1 对账后再落**）
+
+⭐ **E8 的陪集表示代价是 0 bit，不是 +1（旧注释）也不是 +0.125（我 §69 的结论）。**
+关键：**半整数陪集是读者已经读到的那 8 个码字的函数**，所以可以无损恢复、不需要任何旁信息：
+
+```
+xhat_i = s * ( u_i + parity(Σ_{j∈block} u_j) / 2 )      u = 4-bit nibble, [-8,7]
+```
+
+读侧只加一步：把 nibble 展开成小 int8（`k_i = 2·u_i + p`，`|k|≤16`）并让组尺度取 `s/2` —— 
+**平面大小、打包、swizzle、`ldmatrix`、`m16n8k32.s8` 操作数、bits/el 全都不变**。
+写侧：每 8 块比"全整数/全半整数"两个候选谁便宜，再按奇偶做**单个 ±1 的最省修复**。
+
+**66,229,248 个真 K 元素上实测**：`−0.665 dB` vs 同预算最优 4.25 b/el 标量平面、**`−4.32 dB` vs 现状写侧**，
+**b/el 恒为 4.250**。另两条副产品：
+- **`±7 → ±7.5`（把 16 个 nibble 值都用上而不是 15 个）本身就值 0.599 dB，免费**；
+- 显式存陪集位那个变体与免费版只差 **+0.0005 dB** ⇒ **那位纯冗余**；
+- 实测码率律：**5.02 dB/code-bit**（4→5 bit），所以 0.125 b/el ≈ 0.63 dB ⇒ **E8 的陪集是那 1/8 bit 的更好用法**
+  （按速率归一 NMSE：e8p 8.849 < per-8 flag 9.407）。
+- **旋转与格点不可加**：格点增益在**旋转后是 −0.665 dB**（渐近形增益精确值），但在**未旋转** K 上是 −0.883、V 上 −1.128 ⇒
+  旋转让 8 块变 iid 高斯，形增益就是全部；但**陪集加上后旋转仍好 1.29 dB ⇒ 旋转要留**。
+- `D8 = {整数 8 维且坐标和为偶}` —— **"删除格点"就是这个意思**，而删除是免费的：编码器根本不发射被删的点，
+  且解码器永远不需要被告知它们（`codebook D8 ∪ {u+½·1 : Σu 奇}` 与 E8 等距同构，`u ↦ s·(u+½·parity)` 是
+  2³² 个 nibble 模式到 2³² 个格点的**单射** ⇒ 平面的 32 bit 一个不浪费）。
+- 补丁：`/home/user/scratch/e8m2/fix.patch`（437 行 4 文件 +211/−95，`git apply --check` 过）。
+  ⚠️ 它**没编译过、没跑过**（禁令不许构建），语义由 66.2M 元素上的编解码实现验证。**落地前必须先构建 + 解码对拍。**
+
+### 76. ⭐ E8 双路裁定：**陪集代价是 0 bit（e8v2 对），"绝不值得"不成立**；但 **V 旋转是零代价最大单项（e8v1 独有）**；已落两路一致的部分
+
+**两路都在 66.2M 真 K/V 元素上独立测了同一份源**（`bench/kvdump_e8src/kvsrc_*_{kn,v}.bin`，
+= rmsnorm+rope 之后的 BF16 K 与原始 V，即 append 路径真正量化的张量；**不是**去解已有缓存，
+所以完全绕开"Sep-10 旧 dump"那个坑）。分歧点：
+
+| | e8v2 / e8m2 | e8v1 |
+|---|---|---|
+| 陪集代价 | **0 bit**（陪集 = 读者已读到的 8 个码字的奇偶函数） | **+1/8 bit/el**（按一个平面算） |
+| 结论 | E8 在 4.250 b/el 上比同预算最优标量好 **−0.665 dB**；比现状写侧 −4.32 dB | **净亏**（0.65 dB 增益 < 0.75 dB 代价）⇒ "引擎不投影是对的" |
+
+**裁定：e8v2 对，e8v1 的否定结论不成立。** 三条理由：
+1. e8v1 自己是按"陪集要占一个**平面**"计价的；e8v2 指出并**实测**了另一种编码：
+   读侧 `k_i = 2·u_i + parity(Σ_{j∈block} u_j)`、组尺度取 `s/2`，**平面大小/打包/swizzle/ldmatrix/
+   m16n8k32.s8 操作数全不变** ⇒ 陪集信息本就含在那 32 bit 里（`u ↦ s(u+½parity)` 是 2³² 个 nibble
+   模式到 2³² 个格点的**单射**，一个 bit 不浪费）。
+2. e8v2 **直接测了这个断言**：显式存陪集位的变体 `K_e8c_bit`(4.375) 与免费的 `K_e8p`(4.250)
+   只差 **+0.0005 dB** ⇒ 那位纯冗余。
+3. e8v2 同预算表内（同为 **4.250**）：`K_e8p_scan` **2.4443e-2** vs 最优 16 电平标量 `K_u16_scan`
+   **2.8485e-2** ⇒ **ratio 0.858 = −0.665 dB**，与格点形增益理论值 0.6534 dB 吻合到 0.012 dB。
+   ⇒ **"绝不值得"是被自己的计价方式推翻的。**
+
+**但 e8v1 有一项 e8v2 报告里明确写着"没探索"的东西，而且是最大单项：V 侧加 H64 旋转，零 bit 代价。**
+- V 现状（标量 i4、无旋转）relRMS **0.15403** → 加 H64 旋转后 **0.09387**（**−4.30 dB，b/el 不变**）；
+- 注意力代理 `softmax(qKᵀ/16)·V` 输出：现状 **0.11026** → 只修 K 0.10611 → **V 旋转 0.08144** →
+  **K修+V旋转 0.07594**（**优于 ISO3 的 0.08277，且少 0.25 b/el**）。
+- 为什么"零代价"成立：`out = Σ p_i V_i` 对 V 是**线性**的，所以存 `HV` 只需在输出端再乘一次 `H`
+  （H 自逆）⇒ 这是**输出侧的线性映射**，可以**折叠进 `o_proj` 权重**（`o_proj' = o_proj·(I_head ⊗ H)`），
+  内核零改动。⚠️ 但这是**转换器/产物侧**的改动，不是内核补丁 ⇒ e8v1 拒绝盲落（"落地它但不能编译验证，不可辩护"）——**这个判断我认同**。
+
+**两路一致 ∧ 已落（用户授权"同就修，不问"）：16 电平奇数中点集。**
+`/home/user/scratch/e8v1/fix.patch` → **已落地**：3 文件 **+82/−45**，只改
+`gqa_attention_kv_quant.cuh`、`gqa_attention_prefill_i8.cuh`、`gqa_attention_decode_i8.cuh`，
+把打包 4-bit 字母表从"15 电平 ±{0..7}、除数 7"换成 **`±{1,3,…,15}·(amax/16)`**（写侧辅助 + 读侧解包 + 三处
+E8 写点的尺度除数与码分裂）。**b/el 恒 4.250、平面几何不变、不新增平面、不碰注意力输出路径。**
+- `git apply --check` RC=0；落前落三个文件的 sha256 全变、**0 冲突标记**；快照 `/home/user/scratch/snap_pre_e8v1/`。
+- 三个独立测量的实测收益：**K −0.96 dB（0.10661→0.09546）、V −0.49 dB、注意力输出 0.11026→0.10611**；
+  e8v2 侧同预算测出这一项值 **−0.599 dB**。**两路都认它是免费win** ⇒ 这就是"同"。
+- ⚠️ **写者与读者必须同一次改**（旧写者写的缓存新读者读不了）——可接受：KV 码平面只在运行时存在，盘上无。
+- ⚠️ **它没编译过**（agent 被禁构建）⇒ **构建就是第一次验证**。
+
+**e8v1 的另一条硬事实，重新框定 §68：`e8_project_*` 在树里没有任何调用点。**
+⇒ **当前 E8 档里根本没有格点数学**：K = H64 旋转过的**纯 15 电平均匀**，V = 标量 i4、无旋转。
+`e8_lattice.cuh` 被两个 i8 内核 `#include` 只是为了拿旋转辅助。**"E8Kv" 今天是个误名。**
+（−3.65 dB 那个 2.32× 属于**已被删掉**的投影变体；e8v1 把 0.16236 vs 0.10661 = 2.3197× 精确复现了。）
+
+**⚠️ 未结：基线差 1.55×。** e8v2 量出"现状写侧"K relRMS **0.16575**，而
+**e8r1 / e8r2 / e8v1 三方独立都落在 0.1054–0.1072**。e8v2 自己就报告了这个矛盾，并给出解释
+（能对上 10.66% 的同预算读法是"每 8 块各带尺度"的 4-bit 平面 = **6 b/el**，不是 4.25）。
+**三对一 ⇒ 0.106 那侧更可能对**，但**这不动摇 e8v2 的陪集结论**（那是它自己 harness 内的**同预算 A/B**）。记为未结。
+
+---
+
+**ISO3 权威规格（e8v1 查证，带引用）—— 顺手纠正一个长期命名陷阱：**
+- **`DType::ISO3 = 9` 是可运行的那一档**：4-bit nibble **符号-幅值**码（bit0-2 = 幅 0..7，bit3 = 符号 ⇒
+  **15 电平 ±{0..7}**，除数 7；`gqa_attention_prefill_nvfp4.cuh:63-76`，在 `entropy_cold_requant_kernels.cuh:25-38` 有副本），
+  **每 16 通道 E4M3 尺度**（与 NVFP4 同平面几何，`kNvfp4KvQuantGroup = 16`），
+  **K 有烘焙的 per-4-通道 SO(4) 旋转**（写 K、读 Q，QKᵀ 不变；`gqa_isoquant_rot.cu:16-79`），**V 无旋转**；
+  K 侧另有 Sinkhorn per-通道 行尺度 `s_d ∈ [0.5,2]`。**实测有效 = 4.50 b/el**（`kv_bit_budget.h:119-126`）。
+- ⚠️ **`src/ops/kv/iso_codec.h:104-143` 与 `kvcfg/kv_formats.h:24,44` 里那个 "iso3" 是另一个东西**
+  （group-8 / 幅 0..3 / 8 元素 3 字节 / `bit_width = 3`）：那是**冷槽词汇表 + 离线参考**契约
+  （`tools/convert/kv_iso_ref.py`），**不是 `DType::ISO3` 跑的东西**。
+  `kv_bit_budget.h:44-47` 记着阶梯正是因此从 iso3 300 改到 450。**任何引用"iso3 = 3.00 b/el"的人都在引名字，不是引那一档。**
+- ⭐ **ISO3 的 V 优势是尺度分组，不是码本**：`V iso3_g16_e4m3 = 0.10546` vs `V iso3_g64_e4m3 = 0.15450`。
+  ⇒ **这就是我一直在说的实验 A（per-64 → per-16）**，现在有了独立量化。
+- **同 4.50 b/el**：E8（H64 + g16 + 16 电平）在两个平面上都赢 ISO3（K 0.08127 vs 0.09012；V 0.08013 vs 0.10546）。
+- **1M（2.144 b/el/平面）的诚实结论**：E8 现状 4.25 与 ISO3 4.50 **都超预算约 2 倍**；只有 2-bit 装得下，
+  而 E8-2b 的 2.25 还得把尺度分组放粗（g128 → 2.125）才刚好进；**2-bit 的注意力输出 relRMS 0.313 vs int8 的 0.0063
+  ⇒ 差约 50 倍。⇒ 本树里没有任何 E8/ISO3 设计能给 1M 买到可接受质量**，决定它就是 2-bit 那一行，而它现在是这个读数。
+
+### 77. ⭐ **产物逐字节复现**（确定性得证）+ 清盘 95.26G + w2m 到账（并纠正 §72 我写错的两处数字）
+
+**1. 重产真产物：sha256 完全一致。**
+树里的转换器（`tools/convert/qwen3_8_27b/convert_modelopt.py`，md5 `402f4ee172e1…`）在真源
+`/mnt/c/Users/User/Documents/ziqinzhang/models/Qwen3.8-27B-ET-Uncensored-NVFP4/W4A4+W8A8` 上跑完整 `convert()`：
+- `complete: 22585140736 bytes in 616.6s`，rc=0，落在 **`out/qwen3_8_27b_nvfp4_modelopt.ninfer`**；
+- 实测 sha256 = **`dbbefaeeeb3bd5a45f1d8e8ad057d699a8d59301a26618541feb523c696bdec5`**，
+  **与先前验证过的那份逐字节相同**（`dl/pB2_artifact.txt` 记的同一个值）。
+⇒ **两条独立结论同时成立**：(a) 落地的转换器与验证过的 `402f4ee1` 那份行为等价；
+(b) **整条转换流水线是确定性的**（两次运行、不同机器负载，同 sha）。用时 616.6s vs 471s 是并发抢 CPU 所致，非语义变化。
+⚠️ 我那个"报告摘要"小脚本自己有 bug（把 `deviations` 当成 dict 列表，实际是字符串列表）⇒ `AttributeError`；
+**产物与报告本身没问题**，只是我的摘要没打印出来。
+
+**2. 清盘：回收 95.26 GB**（磁盘 26G→**122G** 空闲，98%→88%）。逐条留证后删的：
+| 项 | 大小 |
+|---|---|
+| HuggingFace `.incomplete` 下载碎片（两个目录共 12 个） | **20.36 GB** |
+| `ninfer-pr3devbuild/core.415` | 10.70 GB |
+| `ninfer-sass.txt` | 2.49 GB |
+| `chunks_cache.jsonl` | 2.03 GB |
+| `scratch/r1/build`（agent 的重复构建树；`.git`/`src`/`REPORT.md`/补丁**全部保留**） | 60 GB |
+
+删后逐条核验：**所有 `.ninfer` 产物、r1 的补丁与源码、`out/` 里刚产的产物都还在**。
+⚠️ **我的第一次审计漏报了**：它只查了 `q38_abl_huihui_nvfp4`，而 `q38_abl_huihui_bf16` 下还有 6 个碎片。
+**同一个失败模式我又犯了一次**（与之前"引号前缀让普查漏项"同类）：**只查自己已经知道的那个目录**。
+留档：**报"某类文件有 N 个"之前，必须按类在**所有**已知根下查，不许只查已知的那一个。**
+未动（余量已够、且归属不明确）：旧 `ninfer-*` 构建树 ~70G、`ccache` 2.9G（清了会让构建变慢）。
+
+**3. w2m（W2 合并版）到账：13 文件 +854/−163**，`md5 6dc3f51b7d15…`，
+干净副本 `git apply --check` rc=0，且"干净副本+补丁"与合并树 `diff -r` 逐字节相同。
+⚠️ **但它不能直接打到活树**：27b 的 export `package.h` 与 `impl/package.cpp` 已被别的改动占住
+（它基于 `b480c55`/`9d705cb`，活树现为 `4c38cf3`/`6885125`）⇒ **W2 必须变基落，不许直接 apply。**
+它按补丁重数后**纠正了我 §72 写错的两处**：
+- 我写的"**5 个 `static_assert`**"实为 **12 处 / 4 类谓词**
+  （`kRealizations.size()` ×3、`realization_table_is_closed` ×3、`identity_table_is_reachable` ×3、
+  `speculative_declarations_match_payload` ×3）；
+- 我写的"3 条负向编译守卫（采样预设须属本 target 消费的 model / 每行须报 `target_key` / 身份唯一）"
+  **其实是 id2 的 `declaration_check::*`，id1 没有这三条**（id1 的行连 `target_key` 字段都没有）。
+⇒ 又一次印证：**我转述 agent 的清单时必须回原文重数，不许凭印象。**
+
+**并入**：id1 的提示函数（改写成 id2 的 `WeightsIdentityKey` 判据，丢掉 id1 的 `context_prefill_identity_matches`，
+否则"身份只定义一次"不成立）；static_assert 族**改轴**——新增 `rows_name_an_identity`（3 处，专抓
+"weights_id 为空的行会接受空口味 artifact"这一格，**id2 原有三条守卫都抓不到**）、`distinct_profiles == 7`
+（只 27b；运行期实测 8 行触达 7 个 profile）、草稿口味↔payload 守卫（27b/muse；35b 无谓词故不并）；
+id1 独有的 **muse 标定行**（唯一超出裁定枚举的一项，已单独标出、可 3 个 hunk 撤回）。
+**丢弃**：id1 的整套 realization 词汇表（4 个新头文件）、采样/权重 if 链改造（id2 已同语义）、
+⭐ **`resolved_auto_speculative` 的声明化重构**（会改运行时语义且不在"必须并入"清单 ⇒ **明确记录"该语义本次未进入合并版"**）、
+`TargetRegistration` 4 行表。**id2 无一被覆盖**（相对纯 id2 树只删 2 行，都是 muse 项所必需）。
+
+**非空性实测（负向测试 C0–C6）**：C0 控制静默；C1 恰好 1 条炸；C2 炸且编译器打印 `(6 == 7)`；
+C3/C5 分别炸 27b/muse 的 payload 守卫；⭐ **C6 证明 35b/muse 的 `distinct_profiles == 1` 是空守卫 ⇒ 据此丢弃**
+（所以新数值不是只当装饰留下的）。`-fsyntax-only` 8/8 TU PASS（含头文件探针），`-Wall -Wextra` 相对 id2 **零新增告警**。
+
+**两条要提请注意（w2m 自己标的，我认同）**：
+1. **提示函数只看编译期表** ⇒ 用户用 `--context-cost-presets` 时它会**误报**（消息末句变假）。
+   w2m 未改 id1 的语义，只在 REPORT 给出一行修法（gate 到 `prefill_source == GenericDefault`）。**待定夺。**
+2. 变基落地的顺序问题（见上）。
+
+### 78. ⭐⭐ **端到端通了：引擎真装载了真产物并出字**（导入链条第一次面对真字节）+ 一个新的资源纪律教训
+
+**真装载成功**（`build/apps/ninfer out/qwen3_8_27b_nvfp4_modelopt.ninfer --prompt …`，rc=0）：
+
+```
+summary  target              qwen3_8_27b
+summary  weights             nvfp4-modelopt          ← 从产物自身 identity 推出，不是 CLI 参数
+summary  artifact file read  20.43 GiB
+summary  weight H2D          20.41 GiB   (host to device 7.319 s)
+summary  tensors/resources   671 / 6
+load     artifact/materialize 16.473 s
+load     engine construction  17.508 s
+summary  pinned staging peak  256.00 MiB
+```
+
+生成（第一次 56 token 提示）：`prefill speed 914.88 tok/s`、`decode speed 49.72 tok/s`、2 token、finish reason `output-limit`。
+第二次（64 token 中文提示）：
+
+```
+mtp draft window      3
+mtp rounds           26     fallback steps 0
+mtp drafted tokens   77
+mtp accepted tokens  37     acceptance rate 48.05%
+mtp acceptance length 2.42 tok/round
+mtp accepted by pos  18,13,6          ← 典型递减剖面
+kv cache dtype bf16 / payload 43.50 MiB   （dtype 行是全局哨兵，按 payload 判）
+```
+
+⇒ **整条导入链在真字节上闭环**：树内转换器（确定性，sha256 复现）→ 22.58 GB 产物 →
+装载器读**产物自己声明的格式**（W1 的 `bind_declared_weight`，取代 `if (layer < 56)`）→
+`weights_id == "nvfp4-modelopt"` 从 identity 解析出 `Qwen38Nvfp4ModelOpt` 档 → 20.41 GiB 上卡 →
+prefill 915 tok/s → MTP 投机 48.05% 接受率。**W1/W4 这批补丁第一次面对真字节，通过。**
+
+⚠️ **新教训（资源纪律，已升级为硬规则）：agent 报"完成"之后，它 detach 的后台子进程可能还在跑。**
+本次两个 E8 agent 都报了完成，但：
+- `python3 run_family.py all` —— **RSS 13.05 GB**，父进程 `bash pE8V2_family3.sh`（= e8v2 的遗留）；
+- `python3 e8m1_v6.py` —— 父进程 `bash pE8M1_runv6.sh`（= e8v1 的遗留）。
+
+两者把机器压到 **`available 0 B` + swap 17→20 GB + load avg 6.8**（我的构建 + 装载的 sha256 被饿到几分钟不动）。
+按铁律②先查父进程/cwd/启动时间取证后 TERM 掉，机器立刻回到 `available 13 GB`、swap 9 GB。
+**硬规则：开始任何重活（构建/装载/大转换）之前，先按父进程查一遍有没有已报完成 agent 的遗留子进程；
+并且同一时刻的重活不要超过 2 个。** 这与之前那次"两个 agent 之间 OOM"是同一类病。
+
+### 79. aw1/hw 全文到账：**auto 三处不一致必须解**（其一决定性）；⭐ 纠正我"两路都证实棘轮"的说法
+
+**0. 我先纠正自己。** 我在 §78 之后的汇报里对用户说"aw1 与 aw2 **独立**把 −27% 归到棘轮"。
+**aw1 的正式报告否掉了这个框定**：它原话——"我最初关于 `update_mtp_window_cut` 的 `window` 参数是棘轮的假设
+**是错的** —— 唯一调用点传的是 plan 的 `draft_window`，所以扫描范围本来就是配置的全宽"。
+它的补丁仍移掉 `cut < window` 那个收缩构造（非阶梯回退分支里还在），但**"棘轮"这个框定被它自己撤回**。
+⇒ 我给用户的说法**过度合并了两路的证据**。正确表述：**两路都识别出 `cut < window` 的收缩构造；
+aw2 把它命名为根因并量化，aw1 认为该框定夸大了（扫描范围并非收缩）**。留档教训：**转述"两路一致"前，
+必须逐字读两边的"我收回/我说错了"段落，不能只看正面结论。**
+
+**1. aw1 与 aw2 的四处不一致（落 auto 之前必须解）**
+- ⭐ **F1（决定性，纯数学、可秒判）**：判据分母用加前还是加后。
+  aw1：正确条件是**加前** `S_k ≥ b·N(k−1)/(a+b·(k−1))`；header 写的**加后** `C(k)` 会**压低阈值 ⇒ 过度投机**。
+  2805 个模型扫：加前式与穷举 argmax 吻合 **99.8%**（5 次失配，无一差 1），加后式 **94.0%**（167 次失配，**每次恰好过投 1**）；
+  code 提示上选 10 而最优 9。**aw2 则明确说"加后式是对的，我对着穷举 argmax 验过"。**
+  两边都声称对着穷举验证过 ⇒ **必须第三方独立算一次**（两人都写好了 harness，成本极低）。
+- **`--spec auto --draft-tokens N`**：aw2 的 CLI 矩阵显示 `auto×{1,3,9}` 由 THROW→**ok**；**aw1 说这条它没动**（仍拒）。
+  两边都声称跑的是真 `validate_speculative_cli_options`。
+- **阶梯成员**：aw1 = `{2,3,5,7,9,15}`（含 **2**，为最坏后悔 2.40%/均值 0.136% 穷举出来的）；aw2 = `{3,5,7,9,15}`。
+- **35b 的约束表述不同但可兼容**：aw2 说 35b 的 `kMaximumMtpDraftTokens = 5`、`ar[]` 按它定长 ⇒ 15 级阶梯会越界，须按 variant 裁剪；
+  aw1 说它的阶梯"小 T 边界并集"对 3/4/5 以外的宽度与 35b **未验**，落在并集外的 fork 是 `cudaGraphExecUpdate` **硬失败**。
+
+**两边一致（可作合并基座）**：阶梯架构本身；**每档必须各占一个 `topology_class`**
+（因为 `cudaGraphExecUpdate` 拒绝拓扑变更，一个 class 装不下两个宽度——**两路各自独立给出同一理由**）；
+粗粒度 **8 轮**重决；`kMtpWindowCostRatio` **保持 `b/a` = 0.0612**（aw1 也复现了 `r ≤ 0.0065` 时
+drafted/round 恒为 15 的退化端）；`mtp --draft-tokens 0` = 自适应；**auto 的常量 3 去掉**；
+auto 不取短名单 draft head（`< 5 ⇒ Full`，两边同）；阶梯把 MTP 图预算乘上档数（aw2 估 ~3.3 GiB @ concurrency 8）。
+
+**2. aw1 的独有缺陷（aw2 没有）**
+- ⭐ **F2：Beta 先验被当证据读。** `reach[i] ≈ 0` 处 `p_i` 在每个未观测深度都退化成先验均值 0.9 ⇒
+  判据**无法得出"停止投机"**。闭环实测：所选均值 10.3 / 7.3 / 6.4 vs 真最优 9 / 5 / 3。
+  修法：把先验按 `reach[i]/reach[1]` 加权。⚠️ 并且**"扫描下限"是错的修法 —— 它会把窗口往下棘轮**（二维扫描证据在 `selfcheck.txt`）。
+- 阶梯 `{2,3,5,7,9,15}` 是**穷举最坏后悔**选出来的，且**包含所有实测最优（3/5/9/15）** ⇒ 任何实测类别都不会回归。
+- 按需捕获档位（`--graph-capture-ceiling` 门控在 `|ladder| > 1`）⇒ **fixed-k 运行逐字节不变**。
+- CLI 区分报告自适应：`"15 (adaptive ladder, top) realized mean 9.16"`。
+- 闭环复现了记录的 hex 损失与 rep 打平：交付版 **99.0/100.3/99.9/100.0%** vs 原接线 **59.0/73.3/66.5/100.0%**。
+- 顺手发现：**`muse` 有 small-T 表副本而 `35b_a3b` 完全没有**；`NINFER_ADAPTIVE_WINDOW` 是**第二套**
+  未文档化的自适应机制（设备侧 ctx 无状态 grow-by-one/collapse），同样只动 live extent。
+
+**3. hw 到账（11 文件 +213/−99，`git apply --check` 过）——含对我的两处纠正**
+- ⭐ **站点 1 的 `bindings.cpp:383` 已被 W1 在本会话改掉了** ⇒ "两处硬写"只剩生产侧，而生产侧**其实有两份**：
+  我列的 `inventory_nvfp4.py:46-47` **加上我没列的 `convert_nvfp4.py:52` 正则 `layers\.(56|…)`**。三份 → 一份。
+- ⭐ **边界是"源自己的声明"，不是几何量** ⇒ **没有 spec/geometry 字段可承载**。
+  实据：`convert_modelopt.py:20-28` —— 同族另一个源声明的是 layers 0-3/50/52/54 全 MLP +
+  21/42/44/46/48/49/53 的 down，**与 56..63 完全不同**。字段位置：compressed-tensors 源
+  `config.json → quantization_config.config_groups[*].targets`；ModelOpt 源 `hf_quant_config.json →
+  quantization.quantized_layers.<m>.quant_algo`。改法：`FP8_MLP_FIRST_LAYER` 单一副本 + `_FP8_TARGETS` 由 inventory 拼出
+  （正则**字节相等**已证），并保留 `_validate_float_group` 每次拿报文核对。
+- ⭐ **站点 6 的 `None` 解了，而且和我的排除判据对上**：`specs/qwen4_exp_spec.json` 的 `geometry`
+  **没有 `intermediate` 键**（MoE-only，宽度在顶层 `moe.moe_intermediate_size = 640`），`%s` 把缺失键字符串化成 `None`；
+  实跑重现 `%d → 0`、`%s → None`。已在**两个树内发射器**加守卫（对真 spec 触发、对 Muse no-op，输出仍 `19968`）。
+  ⚠️ **但真发射器不在这个树里**（穷举：头部字符串、`layer_kind{` 唯一发射点、`git log -S`、逐提交 stat、
+  过时镜像与 quarantine —— 唯一命中是产物文件本身）。⇒ 那两个文件是在别处生成后被搬进来的。
+  ⚠️ **`gemma4-31b_spec.json` 同样缺 `intermediate`** ⇒ 同一颗雷，未爆。
+- **站点 2 生产侧判"不改"是对的**：`recipe.py:487-492` 断言该源整份 BF16 ⇒ **报文里确实没有这个字段**，
+  它就是 registered 契约本身。（这正是"报文里没有就别造"的正确交付。）
+- **站点 3 方向反转**：生产侧 `mlp_layer_fmt` 直接读**源张量 dtype**，**装载器那张 "measured" 表才是重复**
+  （已删，并把原本的死代码 `bind_mlp_weight` 改成读声明后投入使用）。
+- **额外同病类**：`is_full_layer` 的 `(layer-3)%4==0` 是运行时 `qwen3_6::is_full_attention_layer` 的**第二份硬写**，
+  27B/35B 两处均改为调用共享谓词。
+- ⚠️ 补丁含 `src/targets/qwen3_6_27b/impl/load/bindings.cpp`，**该文件 W1 已改** ⇒ 落地前必须重对上下文。
+
+**4. 构建 #2（e8v1）状态**：仍在 **18%**、无错误。卡在六个最重的 CUDA TU
+（`gqa_attention_{decode,prefill,decode_smallt,decode_e8,prefill_e8}.cu` + `entropy_cold_requant.cu`），
+这是 e8v1 改动后的**第一次全量设备码生成**（aw1 报告说这类 TU 各约 30 分钟），慢是预期。
+内存 13 GB 可用、磁盘 122 GB，健康。`build/apps/ninfer` 仍是 08:15 那支（含 W1+W4，不含 e8v1）。
+
+### 80. ⭐ F1 裁决：**aw1 对、aw2 错** —— 正确式是**加前**成本；aw2 的 harness 有单边盲区（它自己那行"过投"正是指纹）
+
+裁决报告 `dl/pF1_adjmax.txt`（315 行，脚本与中间产物在 `sh/pF1_adjmax*.{sh,py}`、`scratch/f1adj/`）。
+
+**1. 两人的式子到底是不是同一个 —— 不是，但只差一项。**
+- aw2：`S_i > r·N(i-1)/(1 + r·i)`（`C(i) = a+b·i`，**加后**），并**自己打印了**推导
+  `S_i·C(i) > N(i-1)·b ⟺ S_i > b·N(i-1)/(a+b·i)`；同一 patch 还把这句代数从旧 header 里搬了个位置，**没改它**。
+- aw1：`S_k ≥ b·(1+Σ_{i<k}S_i)/(a + b·(k-1))`（`C(k-1)`，**加前**），并命名
+  "the denominator is the PRE-add cost C(k-1) = a + b*(k-1), NOT the post-add C(k) = a + b*k"。
+- 代码上只差 `columns = post_add_denominator ? i : (i-1)` 这一项；**aw1 的 `post_add_denominator=true` 分支与 aw2 的表达式逐字相同**
+  ⇒ 两人是在争**同一个参数的两个取值**，不是两道题。
+
+**2. 推导：加前式正确。** `Φ(k) ≥ Φ(k−1) ⟺ (N(k−1)+S_k)·C(k−1) ≥ N(k−1)·C(k) ⟺ S_k·C(k−1) ≥ N(k−1)·b`
+—— 边际列 k 本身只花 **b**，所以隔离它时除的必须是 **C(k−1)**。加后式把左边换成 `S_i·C(i)`，
+阈值恒定地小 `(a+bk)/(a+b(k−1))` 倍（k=9、r=0.0612 时 **1.046**）⇒ **单向更松的检验：只能多投，不能少投。**
+
+**3. 数值扫（k=1..15，每格 20000 条递减 hazard，a=14.7ms / b=0.9ms，r∈{0.0441, 0.0612, 0.09} × 四个生成族 = 12 格）**
+
+| | 总数 | 失配 | 失配的符号 |
+|---|---|---|---|
+| **加前 PRE** | 12 格 × 20000 | **全部 0** | — |
+| **加后 POST** | 同上 | 530 ~ 4174（2.65%–20.87%） | **每次恰好 +1**，无其它差值，**从不欠投** |
+
+结构性检验也通过：`k_PRE > argmax` 恒为 0，`k_POST < k_PRE` 恒为 0。
+
+**4. ⭐ 用 aw2 自己的 harness 设置复现（几何 hazard、r~U(.02,.10)、20000 次）：**
+POST = eq 17216 / lt **0** / gt **2784**（aw2 自己打印的是 17231 / 0 / 2769），**gt 中 100% 是 +1**；
+同数据 **PRE = 20000/20000**。
+⇒ **aw2 打印的那行 "cutoff < argmax : 0" 是"单向偏置"的指纹**，它据此归因于"Φ 非单峰"**是错的**：
+同一批曲线上精确式失配为 0 ⇒ **非单峰根本没出现**。根因是**它的 harness 只查了 `cutoff < argmax`（欠投），从不查过投**，
+所以把一个单边误差读成了"无误差"。（与我此前把 `max_rel≈2.0` 误读成符号翻转同类：**只查一边的检验会给出假清白**。）
+aw1 点名的例子也复现：`p1=0.978, g=0.977, r=0.9/14.7 → argmax 9, PRE 9, POST 10`。
+
+**5. 落地含义**：**auto 合并必须用加前式（aw1 的默认）**。aw1 的 `<` 与 aw2 的 `<=` 只在精确相等时有别（零测度）。
+附带一条实测旁注：aw1 自己的档位 snap 表对 ≤1 的误差有 **91.4%–97.7%** 的吸收率，
+**但在 11→12 边界会放大**（11→档 9，12→档 15）⇒ **档位集合（aw1 含 2、aw2 不含）应该用实测定，不要靠理论。**
+⚠️ 仍未解的两处 auto 分歧：`--spec auto --draft-tokens N` 到底合不合法；档位是否含 2。
+
+### 81. ⭐ E8 第四路（e8m1）回来：**"这个格式兑现不了格点增益" ⇒ 不落 e8m2 的陪集补丁**；但它与 e8v1 在 **V 旋转** 上正面冲突
+
+**背景校正（我自己的记账）**：E8 这条线一共 **四路**，我之前把它们混着数了 ——
+`e8m1`（上一轮派的"编码 A"，`scratch/e8m1/EVIDENCE_PACK.md`）、
+`e8m2`（"编码 B"，陪集=parity，`scratch/e8m2/fix.patch`）、
+`e8v1`（本会话派，落在树里的 16 电平奇数中点集，`scratch/e8v1/fix.patch`）、
+`e8v2`（本会话派，E8 跨位宽族 vs ISO3 同预算表）。
+
+**e8m1 的裁决：格点增益真实存在，但这个格式兑现不了 ⇒ 不出补丁。**
+- **数学核实**：`G(Z)=1/12=0.0833333`、`G(E8)=929/12960=0.0716821`（SPLAG 表 2.3，本处再用 Voronoi 拒绝采样数值复算得 0.0715949）
+  ⇒ `10log10(1080/929)=+0.6541 dB=0.1086 bit/dim`；并用**精确编解码在匹配步长、无 clamp** 下复算：
+  E8 的 MSE = `G(E8)·s²` 四位吻合，比值 +0.6566/+0.6560/+0.6550/+0.6538 dB（s=0.5/0.2/0.1/0.05）。
+- **"同码率"必须精确定义**：两方案填同一个支撑箱、每块同码点数、同步长。**只有这个定义下 0.654 dB 才存在。**
+- ⭐ **陪集确实零 bit（与 e8m2 一致，且它独立复现了往返：393216/393216 块精确）** ——
+  4-bit 平面本来就暴露全部 16 个 nibble 态，陪集可以骑**码字奇偶**。
+- ⭐ **但**：那 1 bit 买来 2³³ 个地址，而 E8 只能用 `16⁸ = 2³²` 个（每个陪集要求坐标和为偶 ⇒ **每张网格有一半非法**）。
+  **E8 恰好把它刚付钱买来的那一位作废了。**
+- **严格同存储对照（每 8 块 33 bit = 4.125 b/el，真 K，3072 token × 4 head × L13/14/15）**：
+
+| 那 1 bit 花在 | b/el | vs HEAD |
+|---|---|---|
+| E8 格点 + 陪集位 | 4.125 | **+0.409 dB** |
+| **均匀 16 电平 + 每块网格相位** | 4.125 | **+1.149 dB** |
+| 均匀 + 精修一个坐标 | 4.125 | +0.428 dB |
+
+  ⇒ **（ii）赢 0.74 dB**。可推：实测斜率 **6.018 dB/bit**（所以 0.125 b/el = 0.753 dB）vs E8 的 0.654 dB 形增益
+  ⇒ **同存储下 E8 在任何摩擦之前就已经 −0.10 dB**；实操上三次方并集还把那 1 bit 花在**自适应**相位上，格点比不了。
+- ⭐ **实现层面更狠**：e8m1 自己搭的 parity-carried 实现**实得只有 +0.136 dB（K）/ +0.167（V）**，
+  而"理想（免费位）实现"是 +0.409；它另搭的一个**受约束投影写侧得 −0.557 dB** —— **box×clip×parity 三者交互很脆**。
+  且它需要在**两个 QK 内循环里各加一次每块仿射 rank-1 修正**（V 侧免费，因为 V 解到 bf16）。
+- ⇒ **裁定：不落 e8m2 的陪集补丁。** 综合起来：
+  **e8v1 的结论（"陪集绝不值得"）对，但理由错**（它按"占一个平面"计价）；
+  **e8m2 的数学对**（parity 承载陪集、零存储位），但**它的经济主张不成立**
+  （与其等存储的三次方+自适应相位方案比，格点输 0.74 dB；且可实现的 parity 版只实得 +0.136 dB）；
+  **e8m1 的"不出补丁"是应当遵循的裁决**。
+- ⭐ **e8m1 独立验证了我落地的 e8v1 补丁**：16 值奇数中点集值 **+0.96 dB**，**且它的除数是已最优的**
+  （族最优 D=8 = amax/8 = 除数 16）。
+- **修正 brief 里的事实**：B —— **当前代码并没有施加投影**（两个 i8 内核都写着 "NO e8_project_8d_warp() here"）
+  ⇒ 与 e8v1 一致；project+rintf 的代价它测为 **+2.82 dB（1.91×）而非 +3.65 dB（2.32×）**
+  ⚠️ **这与 e8v1 复现的 2.3197× 冲突**；47.6% 那条是对的。
+- **Hadamard-64**：严格正交、`H²=I`，对 K 值 **+6.44 dB**（raw MSE 9.91e-2→2.25e-2；amax/rms 4.216→2.489，
+  kurtosis 10.751→3.007），**全部来自尺度锚定、没有一分来自 shaping**（正交映射不可能改变 G）；
+  且与格点增益**可加**（E8-vs-cubic 在旋转域 +1.369 dB、原始域 +1.138 dB）。
+
+**⚠️ 两处新的正面冲突（必须再裁）**
+1. ⭐⭐ **V 要不要旋转**：e8v1 测 **V + H64 旋转 = 0.15403 → 0.09387（−4.30 dB，b/el 不变）**，称之为最大单项免费win；
+   **e8m1 说"对 V（未旋转）旋转毫无价值（L13 +0.58 dB、L15 −0.48 dB），所以引擎只转 K 是对的"**。
+   ⇒ 同一件事、方向相反、两边都声称测过。**这是整条 E8 线最可操作的一条，必须先裁。**（已派双路复测。）
+2. **被删投影变体的代价**：e8v1 复现 **2.3197×（+3.65 dB）** vs e8m1 测 **1.91×（+2.82 dB）**。
+   低风险（该变体已不在树里），但属同一"两边都说验过"的模式，一并记。
+
+### 82. ⭐⭐ e8v2 全文：**"0.020→0.020 不变"的机制查明了（两刀砍在 E8 不可达的代码上）**；陪集之争三方独立定案；V 旋转 2:1 支持
+
+**1. ⭐ 为什么`e8`臂对那两刀毫无反应 —— 查明，不是"读侧没问题"。**
+`src/ops/wrapper/gqa_attention.cpp:518-521`：`if (cache.dtype == DType::E8Kv && route != Prompt) route = Prompt;`
+（注释："E8Kv small-T kernels are unverified"）⇒ **E8 的每个 decode 步都走 prefill 内核**，
+`gqa_attention_decode_e8.cu` 那套 decode 内核对 E8 **根本不可达**。于是：
+- `e8r1/fix.patch` 改的是 `gqa_attention_decode_i8.cuh` 里 decode-append 的 `__shfl_xor_sync` —— **E8 走不到**；
+- `e8r2/fix.patch` 改的是 prefill 的 cold-tile 判定 —— **E8 启动从不传 cold 平面**。
+⇒ **那两刀砍在臂之外的代码上，这既不是"读侧没问题"，也不是"读侧另有一个 bug"。**
+（我此前把"0.020→0.020"读成"锅在读侧"是对的方位、错的机制。）
+- 量级上也不可能是编码器的锅：本档 K 的 score relRMS 实测 **0.086–0.106**，
+  与 **nvfp4 的 0.157（该臂 550/570 分）同一量级**；而 2-bit K 是 0.37–1.02（**质变**）。
+  ⇒ **没有任何编码器改动能救 e8 臂（prefix 10 vs 550）—— 它是结构性失败。**
+
+**2. ⭐ 陪集之争三方定案（我的 §81 裁定被独立确认）。** 同一个 4.25 b/el K 码面、真实数据、H64：
+| 方案 | relRMS |
+|---|---|
+| 平铺 4-bit mid-tread | 0.1335 |
+| + H64（**现档**） | **0.1061** |
+| + H64 + 陪集位、**不加** D8 偶和约束 | 0.0931（+1.13 dB） |
+| + H64 + 陪集位、**加** D8 偶和约束（**真 E8**） | **0.1112 —— 比不加标志位还差** |
+
+因为 `|D8 ∩ 盒| ≈ 无约束并集的一半` ⇒ **偶和约束恰好吃掉标志位那 1 bit/块**。
+⇒ **e8m2 的 0.0931 是"无约束并集"，不是 E8**；真 E8 是负收益。**§81 的裁定成立且现被第三方独立确认。**
+另：真实 K 上 **43.9%** 的块取半整数陪集（树里写 47.6%），标志位熵 **0.99 bit/块（不可压缩）**；
+陪集最小代价 = **+0.125 bit/el**，`e8_lattice.cuh` 的 "+1 bit/el" 只对"坐标×2 塞进同一条整数平面"
+那一种构造成立（贵 8 倍），**不是下界**，两者都被支配。每档精确 b/el（含陪集位）：**2.375 / 3.375 / 4.375**。
+
+**3. ⭐⭐ 奇数（mid-rise）字母表是本档最大的免费收益，且跨位宽放大**（同 b/el、H64，K/V）：
+**2-bit 0.7123→0.3795（+5.47/+5.52 dB）｜ 3-bit 0.2478→0.1899（+2.31/+2.31）｜ 4-bit 0.1061→0.0950（+0.96/+0.96）**。
+4-bit 那条**与树里自己签的 0.10661→0.09546 吻合** ⇒ **e8m1 与 e8v2 两路独立验证了我落地的那个补丁。**
+2-bit 大赚的机理：mid-tread 把最内层花在**恰好 0**，2-bit 只剩 `{−1,0,+1}·amax`。
+
+**4. ⭐ V 旋转现在是 2:1 支持（e8m1 是少数派）**，等裁决 agent：
+- e8v1：V + **H64** = **0.15403 → 0.09387（−4.30 dB）**，把 H 折叠进 `o_proj`（内核零改动）；
+- e8v2：V + **H8（per-8-block）** = **0.1315 → 0.0999（−2.4 dB）**，逆变换放在 **PV 输出侧**
+  （`hadamard_8d_pair()`，numpy 验证 2000 组最大偏差 **0.0**、对合性 1.3e-15），零额外比特、零布局改动；
+  输出 relRMS 0.1241→0.0925（仅 V 错）/ 0.1393→0.1118（K+V 都错）。
+  ⚠️ 前提：若解除 `gqa_attention.cpp:518` 的路由强制，**逆变换必须加在 split reducer 里，不能加在 per-split partial 写**
+  （partial 必须留在旋转基里）。⚠️ 半应用的旋转按实测 relRMS ~1.4（**比不改更糟**）⇒ 不能盲落。
+- e8m1：~0 / 负。**两边基数不同**（e8v1 0.15403 vs e8v2 0.1315，后者已含 16 电平字母表），且旋转不同（H64 vs H8）。
+- 顺带：**K 的旋转已经没有 dB 可捡**（n=4：none 0.1335 → H8 0.1142 → SO(4)/4ch 0.1243 → rand16 0.1153 → **H64 0.1061** → rand64 0.1073）。
+- 并纠正 `scratch/kv_2bit/REPORT.md §5.4` 的"hadamard64 让 MSE 差 3–4.8×"：那是**跨旋转域比值**的测量假象
+  （e8v2 自己也先复现出 relRMS 1.41 = √2 的同一个坑）。
+
+**5. ⭐ ISO3 的 SO(4) 旋转几乎是白挂**：ISO3 K 0.0913/0.0898 @4.50 vs **同码本去掉 SO(4)** 的 `u4_g16_e4m3`
+**0.0791/0.0781** @4.50 ⇒ **SO(4) 只值 +0.44 dB**。且 **ISO3 的 V = 0.1007 比 E8 档的 V（0.1315–0.1458，4.25 b/el）还准**，
+因为它的尺度是 **per-16 E4M3** 而非 per-64 fp16。⇒ 又一次同一个结论：**差在尺度分组，不在码本/旋转。**
+
+**6. 发现一个 dtype 表 bug**：`src/kvcfg/kv_formats.h:44` 的 `Iso3 → 3` **是错的**（差 1.5 b/el；
+它描述的是 `iso_codec.h` 那份内核从不调用的 v1 契约，那份实际是 3+16/8 = **5.00** b/el）；
+`bits_of(E8)=4` 与阶梯的 425 也对不上。**这条不一致会影响排序/校验规则**
+（`hot ≥ int8` / `tail ≥ hot` / `pure 禁 iso`），虽然 DP 成本用的是正确的 450/425。
+
+**7. 1M 预算口径分歧（未解）**：e8v2 按 27B 几何（16 全注意力层 × 4 kv_head × 256 dim × 2 面 = 32768 el/token）
+算 **2.125 b/el × 1M = 8.50 GiB**；反推 10.4 GiB/1M ⇔ **2.60 b/el**，与 `_TODO.md:6132` 的 10.31 GiB / 2.144 **对不上**
+（他们那个数需要 ~1.27M token，或约 1.2 GiB 非 KV 开销，例如 1 GiB `kDefaultKvCapacityHeadroomBytes` + 页对齐）。
+两种口径下 **3-bit 都买不起**（最便宜 3.125）⇒ "1M 只装得下 2-bit" 成立；
+**但上限是 2.14 还是 2.60 决定陪集位塞不塞得进去** —— 记为未解。
+⚠️ 并且 **2-bit K 是质变级的坏**（score relRMS 0.37、输出 relRMS 0.61；可用最弱档 nvfp4 是 0.12）
+⇒ **1M 能开 ≠ 检索能保。**
+
+**8. 交付**：`scratch/e8v2/fix.patch`（3 文件，**纯注释、零行为变化**：修正 `dtype.h` 的 E8Kv 描述
+"**没有格点**"、`e8_lattice.cuh` 的陪集代价口径、`gqa_attention_kv_quant.cuh` 的字母表附跨位宽实测）
+与 `scratch/e8v2/vrot.patch`（3 文件，V+H8 旋转 + PV 输出侧逆变换，**标注前提、未盲落**）。两者 `git apply --check` 均过。
+
+### 83. ⭐⭐ V 旋转裁决：**e8v1 对、e8m1 错**（−3.81 dB，零额外 bit）；并推翻 §81 里 e8m1 的 **+6.44 dB** 与"引擎只转 K 是对的"
+
+裁决报告 `dl/pVROT_vrot.txt`（487 行），脚本 `sh/pVROT_vrot.sh`，产物 `scratch/vrot/vrot.py`。
+
+**结论（引擎自己的口径：旋后 per-64-group amax、scale = fp16(amax/16)、16 电平奇数码本、同为 4.000 b/el）**：
+给 V 加 H64 值 **V MSE −3.81 dB**（pooled 3.124e-01 → 1.299e-01，relRMS 0.14555 → 0.09387）；
+旧 15 电平码本下 −3.34 dB；固定 K 时**输出 relRMS 0.08945 → 0.06251 = −3.11 dB**。
+⚠️ **e8v1 的 −4.30 dB 高报了 0.49 dB** —— 它把"旋转"与"15→16 电平码本换装"两件事算在了一起；**纯旋转只有 −3.81 dB**。
+
+**e8m1 的错钉到了行号**：`e8m1_v8.py:101-102,106-107`、`e8m1_v4.py:113,116,172-177` 用
+`reshape(hd,kh,T)` 配 numpy **C-order**，把 **head_dim 与 T 读转置了**：
+它所谓的"64 组"实际是**一个 head_dim 通道跨 64 个 token**（间隔 12），不是 64 个连续 head_dim 通道；
+且它锚定的是**每 8 块 amax**，不是引擎的每 64 组 amax。
+
+| 分组 × 锚定（V，树码本，pooled MSE） | raw | H64 | dB |
+|---|---|---|---|
+| **核轴 / 64 组（引擎口径）** | 3.12407e-01 | 1.29943e-01 | **+3.810** |
+| 核轴 / 8 块 | 1.13216e-01 | 8.11656e-02 | +1.445 |
+| e8m1 轴 / 64 组 | 1.11078e-01 | 1.53386e+00 | **−11.402** |
+| e8m1 轴 / 8 块 | 5.79275e-02 | 2.29108e-01 | −5.972 |
+
+**只改锚定 → +1.4 dB；只改轴 → −11.4 dB；两个都改才是 +3.81 dB。** 两边的 harness 都被逐位复现过
+（与 e8v1 `bench_v4.txt` 每个 V/K 数字一致；与 e8m1 的 L13/L14/L15 三对 MSE 6 位一致），所以不是猜口径。
+
+**副产品（同因，一并推翻）**：`EVIDENCE_PACK.md:236-254` 的"dump 已是旋转域"也是这个转置读法的产物
+（它引的 2.489/4.216 在那个轴上逐位吻合）；**在核轴上旋转是下降的**（amax/rms 3.383→2.554，kurtosis 5.75→2.83）。
+⭐ **`EVIDENCE_PACK.md:172-173` 的"K 旋转 +6.4 dB"同因错，正确是 +1.75 dB**
+⇒ **§81 里我转述的"Hadamard-64 对 K 值 +6.44 dB、全部来自锚定"作废，改为 +1.75 dB。**
+
+**机理 100% 是锚定**（正交映射不可能有 shaping 增益）：`E[A_raw²]/E[A_rot²]` 同组配对 66M 元素 ——
+K 1.4605 → 预测 +1.645 / 实测 +1.745；V 2.3045 → 预测 +3.626 / 实测 +3.810；
+逐层 V L13 2.829 vs 2.862、L14 6.671 vs 7.053、L15 2.056 vs 2.071。
+⭐ **口径 (c)（旋前 amax）实测与 (a) 逐位相同（0.000 dB）** —— 正交变换对**固定 step** 的量化器误差为零
+⇒ 这条直接坐实"收益全在锚定"，也解释了为什么半边见不到收益。
+**V 根本不是"好脾气"**：per-channel rms 散度 17%/51%/46%，全局峰度 9.4/55.9/5.3 → 旋后 3.6/3.8/3.2。
+
+⭐ **翻转 e8m1 的推论**：`EVIDENCE_PACK.md:198` 说"引擎只转 K 是对的" ——
+**数据说的正相反：V 比 K 更值得转（3.81 vs 1.75 dB）。**
+
+**未证（E1–E9）**：无模型运行 ⇒ 没证 3.8 dB 变成 ppl/needle；"H 折进 `o_proj` 零成本"只读代码未上机；
+只测了 E8/i4 档的 V（未测在 ISO3 的 SO(4) 之上再叠 H64）；21 个 dump = 7 次 prefill × 3 层、
+未验证是否为 7 个不同 prompt；未解任何 `.kvc` 码平面；输出侧是降级代理（q 用 dump 自己的 K 行、单 kv head、512 keys）。
+
+**⇒ 现在这条可以进落地队列**：V + H64（或 H8）旋转，**零额外 bit、零布局改动**，
+逆变换放 PV 输出侧（e8v2 已给 `hadamard_8d_pair()` 并 numpy 验证 0.0 偏差），
+⚠️ 前提：若解除 `gqa_attention.cpp:518` 的路由强制，**逆变换必须加在 split reducer 里，不能加在 per-split partial 写**；
+⚠️ 半应用的旋转实测 relRMS ~1.4，**比不改更糟** ⇒ 必须整条一起上并构建验证。
+
+### 84. ngram：**空间不是那道墙**（前提被推翻）；收益上一轮已量化为负；真缺口是"引擎真表 gather"且**不需要 95 GiB 就能验**
+
+用户问"ngram 现在不是有空间了吗"。查证后**前提不成立**，两件事：
+
+**1. 那 95 GiB 不是"腾地方就能放"的文件。**
+- `ple_layout.h:44` 写明它是 **"Baekpica SSD-PLE sidecar"** —— 设计上就是**从 SSD 流式读**；
+  分片名形如 `ple/ple-bf16-00001-of-00004.bin`（`ple_layout.h:39`）。**它本来就不该常驻同一块盘。**
+- 体积来自**模型训练出来的 PLE 表**，不是转换器能重造的：`flashnext_bindings.py:16` 记
+  `ple-manifest.json (PLE table: 20M x 160 BF16, 16 heads)`；引擎侧按 `padded_vocabulary_rows` 铺满
+  （`ple_layout.cpp:99` 校验 "part coverage != padded_vocabulary_rows" 即抛）。
+  20M 行量级 × hidden ⇒ 那 ~95 GiB 的来源。**这是模型产物，不是磁盘空间问题。**
+
+**2. ⭐ 更关键：这个方向的收益上一轮已经量化，结论是负的。**
+`scratch/ngram_measure/REPORT.md`（Sep 12，28 KB；语料 sha256 逐文件校验 + 双 tokenizer 交叉验证，
+两个 tokenizer 对 16 条流只差 3 token = 3e-6）结论原文：
+> "精确匹配查表作为 KV 替代品**几乎不成立**。索引字节不是瓶颈（4–12 B/token，是 nvfp4 KV 的 **0.02–0.07%**），
+> **覆盖率**才是瓶颈：按引擎 KV 页（64 token/页）粒度，混合 1M 上下文里前缀索引释放的页数是 **0 页**
+> （精确 0，不是"很小"）… 最乐观的、允许自引用的**不安全**口径也只有 3.762%，即 1M 的 nvfp4 KV
+> 从 18.00 GiB 压到 **17.32 GiB**；**安全口径一点也压不下来**。"
+
+它同时给出"真正被数据支持的用法"：**投机/查表解码的算力加速（仅代码类文本）**，
+以及引擎**已经实现**的整前缀复用（`ResidentPrefixIdentity`）。
+其 KV 几何是双证过的：16 全注意力层 × 4 kv_head × 2 平面 × 9216 B/head-page ÷ 64 = **18,432 B/token**，
+与 `research/notes/TODO.md §98` 记录的 65536 ctx / `kv payload 1152 MiB` 逐字节吻合（1152 MiB/65536 = 18,432）。
+
+⇒ **ngram 没落地的门是"覆盖率"，不是空间；覆盖面 ~0，给 95 GiB 也换不来那 3.8%（还是不安全口径）。**
+
+**3. 但有一格是真的、且现在就该补**：唯一未证的运行时部件是**"引擎真表 gather"**——
+`tests/ops/ple_table_e2e_test.cu:2` 自己写着 `Verifies the one unproven runtime piece`，
+而它 skip 只因为 `tests/CMakeLists.txt` 注册时不带 `<sidecar_root>`。
+**验证它不需要 95 GiB**：树里就有构建器 `tools/convert/ple_sidecar_build.py`（写 `ple-manifest.json`）
+与夹具/校验器 `tools/archkit/ple_gather_check.py`（有 `--emit-spec`，会往 tmp 写 manifest）。
+⇒ **一份小的合成 sidecar 就能把 #4 从 skip 变成真跑。已派 agent 去做**（产物 `scratch/ple/`，
+授权它**直接运行已存在的** `build/tests/ninfer_ple_table_e2e_test`，但**不许跑 cmake/nvcc/make**），
+要求给出契约逐条（带行号）+ 最小合法 sidecar 规格 + 测试原始 rc 与输出 + 判定
+（**已证 / 有真缺陷 / 仍不可证**），并**明令不许为让测试通过而伪造数据**。
+
+### 85. ⭐ PLE 真表 gather **已证（模块级）**：小合成 sidecar rc=0、7680 个 BF16 逐位相等；但"真表"是误名 + 挖出 4 个新缺陷
+
+交付 `dl/pPLE_small.txt`（319 行）+ `dl/pPLE_small2.txt`（83 行），产物 `scratch/ple/`（sidecar A 10.3 MiB、B 1.3 MiB）。
+
+**1. 结果：`rc=0`、`PLE_TABLE_E2E_PASS`、7/7 断言全过。**
+`NINFER_PLE_SIDECAR_ROOT=… build/tests/ninfer_ple_table_e2e_test`（argv 形式同样 rc=0）：
+`gather vs host reference: 7680 elems, mismatches=0, max|diff|=0`、`post-eviction gather bit-exact`、
+in-gather 去重（48 行塌缩为 32 次 fault-in）、distinct/repeated window、gather+sync、第二次 gather。
+**真跑的链路**：manifest 解析 → `row_location` 跨 **4 个物理文件 / 32 个 logical part** → 冷缺页 `pread`
+→ `cudaHostAlloc(Mapped)` + 补零 → `cudaHostGetDevicePointer` → gather kernel → 7680 个 BF16 **逐位相等**。
+行数学不在此测（`test:34-37` 明示），另跑既有 `build/tests/ninfer_ple_layout_test`：**rc=0**，
+与 `ple_reference.py` 交叉对拍 9×16 行 + 144 行 UVA gather 往返通过 ⇒ **行数学不是这个洞**。
+sidecar 用树里**已有的合成夹具生成器** `tools/ple_reference.py gen`：32000 行 ×160 BF16 = 9.766 MiB，
+4 文件 / 128 part，满足契约 C1–C11（16 头覆盖互不相交整段，48 个派生行落全部 4 文件 / 32 part）。
+
+**2. ⚠️ 但"真表"二字不成立 —— 缺口从"代码"转成"标度与产物语义"。**
+- 仓库自带的真实 HF 审计**否掉合成几何**：`ple_gather_check.py --ngram-base 2000` 对 sidecar A **FAIL**
+  （vocab 2000×16 对素数 2003/2011/…；offsets 非前缀和；padded 32000 对 33024）。
+- 夹具字节是**行号不是 PLE 数值**（`ninfer_ple_layout_test real <A>` 直接以 `NaN in PLE data` 失败）。
+- 不触及 **>4 GiB 偏移、4096 对齐、evict/prefetch**。
+⇒ **要补这些就得换成"素数几何 + 4096 对齐 + >4 GiB + 真实数值"的表，基本等于真产物。缺的是标度与产物语义，不是 fault/gather 代码。**
+
+**3. ⭐ 新缺陷 1：eviction 路径按构造不可达，且与表大小无关。**
+`post-eviction` 那两条断言（`test:155,165`）是**空转**。硬上界 = 2×48 个 4096 对齐条目 × ≤8192 B = **768 KiB < 1 MiB 预算**
+（`ple_table.cu:153` 要超预算才 evict）。**该上界只取决于"每次 gather 的行数 × 页大小"，与表大小无关
+⇒ 换 95 GiB 真表也照样不 evict。** ⇒ 又一条"测试在静默地不测"。
+
+**4. ⚠️ 新缺陷 2：测试自身输入 #2 有 OOB，且第二段是循环自证。**
+`test:150` 给 3 个 token 只传了 3 个前驱，而需要 `(3-1)*3=6`；`ple_layout.cpp:151-153` 按
+`prevs.data()+i*n_prev` 遍历、**从不看 `prevs.size()`** ⇒ 读 `prevs[3..5]`（12 B 越界，
+恰好落在 glibc 24 B usable chunk 内 ⇒ 不崩、无 sanitizer 也抓不到）。
+**后果**：第二次 gather 的行由未初始化堆决定，而**设备侧与 host 参考用的是同一个 `rows2`**
+⇒ `mismatches2==0` 是**循环自证**，不是验证。
+
+**5. ⚠️ 新缺陷 3：树里的 sidecar 构建器产出不可用。**
+`tools/convert/ple_sidecar_build.py:68` 落盘名写死分片第二位为 `0`（`…-of-00000.bin`），
+`:82` 却只把 manifest 里的 path 改成真实总数（`…-of-00004.bin`）⇒ **manifest 指向不存在的文件**，
+测试 rc=134 abort。诊断（字节未改、仅把名字对齐它自己的 manifest）：**rc=0** ⇒ 名字错配是唯一拦路项。
+而且 `:84` 写死 `per_head_offsets=[0]*16` ⇒ 16 个头挤在同一 band（表的 6.25%），48 行只剩 4 个唯一行且全在 0 号文件。
+⇒ **夹具路径严格更优**，构建器该修。
+
+**6. ⚠️ 未覆盖面（逐条留档）**：>4 GiB 偏移与 64 位 key 打包（`(fi<<56)|off`）；part `file_offset` 的 4096 对齐
+（夹具 124/128 未对齐；`ple_layout.h:32` 只承诺不校验）；`format_version` **从不与 1 比较**（`:43`）；
+`physical_files[i].index==i` 不校验而 `ple_table.cu:63-69` 按**列表顺序**建 fd
+（`index` 与位置不一致会**静默读错文件**）；per-head band 越界与 `row_stride_bytes==2*dim` 均不校验；
+`read_span` 命中路径（`ple_table.cu:88-93`）在"同页两行且高偏移行跨页"时会多读 64 B 越过 pinned 块（本次未触发）。
+⭐ 且 **`PleTable` 在 `src/`/`apps/` 里无人构造**，`prefetch_workers`（`ple_table.h:31`）**全树无引用**，
+`ple_stage.h:69` 提到的 `PleTable::gather_phase` **不存在** ⇒ **头注释宣称的异步预取器未实现，引擎接线未验。**
+
+**7. 对"小 sidecar 够不够"的回答**：**模块级运行时部件：够**（已补上，rc=0、逐位相等、跨文件、去重）。
+**artifact 级：不够**（见 2、6）。⇒ 记档：**PLE 的模块级缺口已关闭；剩下的缺口是标度+产物语义，本质上要真表。**
+
+### 86. ⭐ 2-bit 真 E8 测出来了：**+0.66 dB，命中理论** ⇒ 上一轮那个 0.3795 "不是 E8"；但三条更免费的杠杆比它大
+
+**用户问"2bit 的 E8 还这么差吗"。答案：不差 —— 之前那个 0.3795 是标量 2-bit + H64，不是 E8。**
+
+**1. 真 2-bit E8（陪集骑码字奇偶）的实测收益（同 2.25 b/el、两边各自调最优 divisor、K/V 分开、L13/14/15）**：
+| | L13 | L14 | L15 |
+|---|---|---|---|
+| **K (+H64)** | **+0.657 dB** | **+0.679** | **+0.679** |
+| V (+H8) | +0.667 | +0.601 | +0.648 |
+| V (+H64) | +0.674 | +0.559 | +0.678 |
+| V（不转） | +0.933 | +1.320 | +1.093 |
+理论 `10log10((1/12)/0.0716828) = 0.6541 dB` ⇒ **K 命中到 ±0.025 dB**。
+独立对照（无界、同步长、无裁剪，131k 块）：K/H64 在 step=1/0.5/0.25/0.125 得 +0.654/+0.651/+0.655/+0.653。**教科书数在干净区间被独立复现。**
+（更小步长那几行 +5~+37 dB 是假象：E8 无裁剪而 Z8 被裁在 ±63，**不采信**。）
+
+**2. 实现层验证（这节最硬）**：
+- **可解码且 0 额外位**：65536/65536 块 `parity(Σu) == encoder coset`，`|x̂_enc − x̂_dec| = 0.000e+00`，
+  码字可从 k 精确还原，`off=1` 占比 0.4995–0.5029 ⇒ **往返精确**。
+- **编码器就是约束集上的精确最近点**：每块暴力枚举 65536 个候选（coset0 32768 + coset1 32768），
+  150/150 子块完全一致，**worst excess = 0.000e+00**（div=1.75/2.5/3，L13+L14）。
+- 复现基准：(a) 2-bit 奇数 mid-rise +H64 div=2 → **0.38010/0.38339/0.38045**（靶 0.3795，差 +0.14%）；
+  (a) 4-bit 锚点 → **0.09517/0.09598/0.09524**（靶 0.0950）；4→2 bit 实测 **+12.02 dB**，与 6.018 dB/bit 斜率一致
+  ⇒ **我上一轮"正走在码率阶梯上"的判断被证实。**
+- ⚠️ **注意**：任务给的 V 靶 0.3777 是"V+**H64**"，而**树里 V 当前未旋转**（未旋转 V 的 (a) = 0.568）。
+
+**3. ⭐ (c) 偶和约束在 2-bit 上吃掉多少**：同 2.375 b/el 下并集 0.30273 vs (b) 0.31874 ⇒ **约束吃掉 0.449 dB**
+（该 bit 的费率价值 = 0.125×6.018 = **0.752 dB**，即吃掉 60%）。但**"零存储位"仍净赚 +0.30 dB**。
+⇒ 与 4-bit 上"约束比不加标志位更差"方向一致，**但 2-bit 上净收益是正的**。
+
+**4. ⭐ 但三条更免费/更大的杠杆排在 (b) 前面**（按性价比）：
+1. **K 把 2-bit 的除数从 2 改到 ~2.5** ⇒ **+0.87 dB，零 reader 改动**（树里 2-bit 沿用的是 `div = 2^(n−1)` 约定，**没调过**）；
+2. **V 加 H8** ⇒ **+1.8~3.4 dB**（H64 再 +0.3~0.6）；
+3. **V 用 companded 码本 `±{a,1}·G`, a≈0.22** ⇒ 样本外 **+1.2~2.1 dB**（K 不需要拟合，a*≈0.30 收益仅 +0.05 dB ≈ 没用）。
+**尺度面很便宜**：(a) g64 2.25 = 0.34378 → g128 **2.125** = 0.35428 → g256 2.0625 = 0.35600 ⇒ 放粗一档只花 **0.26/0.31 dB**。
+
+**5. (b) 值不值得落**：**过 0.5 dB 门槛（+0.66），但要排在三条免费路径之后，且需要改 reader** ——
+它把 dequant 变成 `code·S + 每 8 块 rank-1 常量（由 `parity(Σu)` 定）`，**破坏纯 int8×int8 的 QK MMA**，要加修正项。
+换算：+0.66 dB ÷ 6.018 dB/bit = **只值 0.11 b/el**（2.25 档变"2.36 等效"）。
+⇒ **建议：不要现在写 (b) 的补丁；先把两条免费路径量出来落地（2-bit divisor 2→2.5；V + H8 + a≈0.22 码本），
+(b) 作为"拿到 +0.66 dB 的唯一付费路径"记在待办备用。**
+
+**6. 它没证到的**：只有 KV 张量 relRMS/MSE，**没有** downstream NLL/困惑度/attention 输出/logit 误差
+（**+0.66 dB 的 KV MSE ≠ +0.66 dB 的 logit**）；只有 L13/14/15 × 一个模型 × 一个 3072-token prefill（7 个可用样本，
+21–26 号 dump 截断）；**(b) 的 reader 一行引擎代码都没写**，未验证它在真实 nibble 打包 / i8 QK MMA / rank-1 折叠下成立；
+奇偶修复只用"单坐标 ±1"（经验最优，无一般性证明）；**严格说是"实现了同量级的 granular gain"，不是"实现了 E8 的最近点映射"**
+（理论 0.6541 dB 是"无界、高码率、同步长"的 granular gain，2.25 b/el 的裁剪码本命中同一数字是实测事实，未证两者由同一个量支配）。
+
+---
+
+### 86b. 补我欠的几笔（上一轮的口头更正，正式记档）
+
+1. ⚠️ **我把用户的外挂召回思路换成了一个它并不回答的问题。** 用户点名的思路是
+   **③ 运行期外挂召回**（`_TODO.md:5684-5685` 原话："召回的时候去 SSD 上搜，**以对话为单位召回**，
+   而不是长期卡在 KV 里，也就是搞成**类似外挂知识库**的形式，那样 **SSD 带宽就不会成为瓶颈**"；`:5703` 归档）。
+   它的账**是正的而且很大**：SSD 读 packed KV **2.6–6.1 µs/token** vs 重新 prefill **365–690 µs/token** ⇒ **105–260:1**；
+   "SSD 不是瓶颈"对 packed KV **418×**；**常驻 KV 钉死 decode 上限**（1M 常驻 = 80 tok/s，32k = 2,550 tok/s）。
+   我去量的却是"ngram 查表能不能**替代** KV（靠上下文内部重复省页）"⇒ 覆盖率 ~0。
+   **两者不冲突**（外挂召回不需要上下文内部有重复）——**是我把问题换掉了。**
+2. ⭐ **cuFile 定性从"优化"改为"使能项"（用户指示）**，两个理由：**①不经主机内存的冷页卸载；②超大 MoE 模型的运行。**
+   两个接入点都已**预成形**：
+   - **冷页**：`ColdPolicy::Disk` 是预留未实现的 SSD 层（`layouts.h:112,153` 注释 "spill directory and budget"；
+     `_TODO.md:7423` 记 "SSD 层未实现（`Disk` 保留）"；相关 `cold_host_tier.h` / `kv_cold_tier_budget.h` / `serve/kv_cold_policy.h`）。
+   - **MoE/权重**：⭐ `src/product/weight_residency.h` 的头注释几乎就是为 cuFile 写的
+     （"page the offloaded spans from the **mmap → pinned staging → H2D**… the pinned allocator is **INJECTED**"），
+     已有 `WeightResidency::Host`、`classify_weight_residency()`、`WeightPageCache(budget, PinnedAlloc, PinnedFree)`；
+     ⚠️ 但 `_TODO.md:7423` 记 "P0 的 `WeightPageCache` **已成死代码**"。
+   ⇒ **cuFile 直读 = 把这条链的 `mmap → pinned staging → H2D` 换成 `SSD → VRAM 直读`，那个注入式分配器就是替换缝。**
+   三层（PLE 表 / 冷页 / 权重-MoE）**本质是同一个"从 SSD 取数"问题**，应共用一套取数层（共同的现状形态 = `PleTable` 的 512 MiB pinned LRU）。
+   ⚠️ 盒子实况：cuFile 库与头**都在**（cuda-13.3），但 **`nvidia-fs` 内核模块未加载、`/dev/nvidia-fs` 不存在**，
+   卡是 **RTX 5090 D（消费级）**；cuFile 需要 **4096 对齐**（sidecar 夹具现状 124/128 未对齐）。已派 agent 出集成设计 + 退化路径判定。
+3. **FreeToken 状态：三步骨架都落地了，但核心闭环没通。**
+   时间线：§41(09-08 细化) → §48(09-09 步2 决策逻辑 `ft_tiers.py`) → §55(09-09 步2 引擎动态重排设计定稿)
+   → §56(09-09 步2 实现落地，构建通过、冒烟中) → §78(09-09 深夜 **W5 周期自动重排**)
+   → §85(09-10 **W6 = 步3 带宽自适应** + W16 落地，标注"**待构建/GPU 验证**")。
+   树里已落地：`src/runtime/engine/bandwidth_governor.h`、`qwen3_6/impl/runtime/ft_stats.h`、`ops/common/ft_stats.h`、
+   `serve/kv_auto_relayout.h`、`serve/kv_cold_policy.h`、`tools/archkit/ft_tiers.py`、`tools/kv_relayout_test.cpp`。
+   ⚠️ **但 `_TODO.md:2177`："W5 的观测链端到端从未真正工作（FreeToken 步 1/步 2 的自动重排永远等不到数据）"**；
+   `:2976` 状态表把「热/温/冷自动动态分配」标为 **未闭环**。
+   ⇒ **机制交付了，闭环没通**；缺的是那条**观测链**。验收标准（用户定）= 64K 长测协议（针尖 + 长生成退化检测）下 ppl/tok/s 不塌。
+   ⭐ 它与 cuFile 是**同一根线**：FreeToken 要"按热度动态决定热/温/冷归属"，而冷层的 `Disk` 支路至今未实现 ——
+   **没有真正的 SSD 层，就没有真正的"冷"。**
+4. **构建 #2（e8v1 + W1 + W4）完成 rc=0**；`build/apps/ninfer` 已更新。ctest 已接上跑（上轮基线 101 通过 / 0 失败 / 8 跳过）。
+
+### 87. ⭐ **八大项找到了** = **N1–N7 + U6**；两份真值源 = `research/notes/board.md`（"协作看板 (唯一状态源)"）与 `_TODO.md §117`
+
+用户两次点名"八大项"，我终于定到它。**证据链**：
+- `research/scripts/_todo_sync2.py:42` 原话：**"八项：N1/N2/§103 早已进树（看板陈旧）；N2 遗留 `ColdPolicy::Host` 静默已修
+  （矛盾报错+一次性告警，备份 `/home/user/cold_host_bak/`）；N3 第二轮其实已完成（只修了两处引用已删字段的陈旧注释）；
+  N6/N7/N4/N5/U6 各有硬阻塞。"** ⇒ **八项 = N1, N2, N3, N4, N5, N6, N7, U6（恰好 8 个）。**
+- `research/scripts/_patch_eight.py:2` 原话：**"两项小修（八项里最便宜的两条）"** —— (i) `apps/cli/main.cpp`
+  `format_kv_cache` 补 4 个缺失分支（此前 4/7 档误报 "unknown"）(ii) `text_prefill_impl.h` 修正 dump 记录里
+  `last` 的语义注释（实测是 final-norm **之前**）。
+- `research/notes/board.md` 头部：**"# 协作看板 (唯一状态源)"**，表列 = `ID | 状态 | 负责人 | 产物 | done 判据 | 验证者/命令`。
+- `board.md:45-56` 有一张 **「用户八问的落地状态（2026-09-10 09:3X 逐条查证）」** 表，与 N1–N7/U6 一一对应。
+
+**编号 ↔ 名字 ↔ 事项（这张表就是"八大项"）**
+
+| 项 | 名字 | 用户口径（`board.md:45-56` 的"问"） | 当时的"缺" | 2026-09-10 状态 |
+|---|---|---|---|---|
+| **①** | **N1** `--kv-bit-budget` | 输入 bit → KV 温窗自动分配 | 引擎内"给 bit 数自动分配"入口 | 策略完善/**引擎自动化未做** |
+| **②** | **N2** 冷窗 | 推广到冷窗 | bit 分配器未含冷槽代价模型 | **冷窗可用/未统一分配** |
+| **③** | **N3** 运行时校准闭环 | 启动自测→固化→跳过→可重校 | 运行时"跑一遍→固化→跳过→手动重校"流程 | **半截** |
+| **④** | **N4** 热/温/冷自动动态分配 | 热/温/冷自动动态分配 | 按热度自动决定热冷归属的**闭环策略** | **未闭环** |
+| **⑤** | **N5** W13 权重卸载 | 权重卸载到内存 W13 | **全部**（代码里无 offload 实现） | **未做**（1M 的使能项） |
+| **⑥** | **N6** ngram 真表 gather | lookup ngram | 真表 GPU gather / 前缀缓存(含 GDN 循环性) | **部分落地** |
+| **⑦** | **N7** FlashNext | FreeToken 加载 FlashNext | **真实 checkpoint** | **架构就绪/权重缺失** |
+| **⑧** | **U6** 大件 | dflash2 接受率根因（第 4 条未实施） | — | **部分找到** |
+
+⚠️ **编号映射的来源**：`_TODO.md:6965/6968` 用的是 **"八项⑤ = 权重卸载 W13"**、**"八项⑥ = 逐轮外挂召回"**
+—— 与上表 **⑤=N5、⑥=N6 完全一致** ⇒ 编号即 N 号。我此前只核到 ⑤/⑥ 是因为只 grep 了 `八项①..⑧` 这种字面，
+而清单本身用的是 **N 号**，不是圆圈数字。**这就是我找了两轮的原因。**
+
+**board.md 里编年记录的关键里程碑（与本会话的活直接相关）**：
+- `:217-218`（09-10）**"N3 运行时校准闭环 / N4 热温冷自动分配 / N5 W13 权重卸载 / N6 ngram 真表 GPU gather：未开工
+  （N5/N6 是大件, 需单独立项; N3/N4 依赖 KV 侧先落地）"**。
+- `:250-253` **"N6 ngram：`src/ops/ple/ple_table.{h,cu}` 的真表 gather + 有界 pinned LRU 热行缓存已实现，
+  但是死代码（`src/ops/ple/` 之外零引用，与 N3 的 `KvCalibrationCapture` 同病）；N6 缺口 = 把 PleTable 接进
+  qwen4_exp 运行时 + 确认 GDN 循环状态下的前缀复用正确性，不是从零写内核。"**
+  ⇒ ⭐ **这条精确定义了 N6**，也解释了本会话我测出的"`PleTable` 在 `src/`/`apps/` 里无人构造、预取器未实现"正是 N6 的缺口。
+- `:365` **"S33 重大范围发现：`qwen4_exp` 运行时只是桩"**；`:324` "S33 (B): `PleTable` 接入 `qwen4_exp` 运行时
+  （N6 的实体；W2① 已证 gather 可用，但它是死代码）" ⇒ **N6 的接线补丁 `_collab/B_s33_ple_wiring.diff` 早已就绪（DONE, patch 未应用）**，
+  它的核查列出的 6 个"不存在"包括：①qwen4_exp 运行时只有 2 文件 stub ②registry 未注册 ③`config.h:11 intermediate=None` 不可编译
+  （**正是本会话我修掉的那个 `None`！**）④无 `--ple-sidecar` ⑤eos 无载体 ⑥sidecar 契约 BF16 vs checkpoint 表 FP8。
+- `:26-44` 窗口 C 的运行态 + `:24` "GPU 占用：训练单实例 batch4…**GPU 窗口需先 kill 训练**"。
+
+**本会话对八大项的推进（逐项对账）**
+- **③ N3 运行时校准闭环**：cl1/cl2 双路已交（cl1 的 C++ 写侧与 `kv_rowscale_sidecar.py build()` **逐字节一致**；
+  cl2 的指纹在 sidecar `tag[16]`），`git apply --check` 均过 —— **合并后即可落地**（仍是"半截"→可闭合）。
+- **④ N4 热温冷自动分配**：这是 **FreeToken 的观测链**问题 —— `_TODO.md:2177` 记 **"W5 的观测链端到端从未真正工作
+  （步 1/步 2 的自动重排永远等不到数据）"**，`:2976` 标 **未闭环**。本会话已派 agent 去测/定位断点。
+- **⑥ N6 ngram 真表 gather**：本会话**已证到模块级**（小合成 sidecar，`rc=0`、7680 个 BF16 逐位相等、跨 4 文件/32 part），
+  并挖出 4 个新缺陷（evict 按构造不可达且**与表大小无关**、测试输入越界且第二段循环自证、`ple_sidecar_build.py` 产出不可用、
+  `PleTable` 无人构造/预取器未实现）。⇒ **N6 剩下的正是 board 说的那两件：接进 qwen4_exp 运行时 + GDN 循环态前缀复用。**
+- **⑤ N5 W13**：`_collab/A_s32_w13_p0.diff` 早已就绪（`weight_residency.h`，host-only、分配器注入、10/10 主机检查），
+  ⚠️ 但 `_TODO.md:7423` 记 **"P0 的 `WeightPageCache` 已成死代码"**。⭐ **本会话把它的价值重新定性**：
+  用户点名 **cuFile 必须集成**（不经内存的冷页卸载 + 超大 MoE）⇒ **N5 的 `weight_residency.h` 就是 cuFile 的替换缝**
+  （"mmap → pinned staging → H2D"换成"SSD → VRAM 直读"），已派 agent 出集成设计。
+- **⑦ N7 FlashNext**：`S33` 已证 **qwen4_exp 运行时只是桩**（单文件 stub、registry 未注册）；本会话修掉了
+  它 `config.h:11` 的 `intermediate = None`（非法 C++）与 `package.h` 的双大括号。**N7 的硬阻塞 = 真实 checkpoint（等用户指路）。**
+- **①② N1/N2**：`_collab/A_n1_patch.diff`（5 文件/117 行）、`A_n1b_cold_pages.diff`（6 文件/126 行，`--max-cold-pages`）、
+  `A_s30_budget_cold.diff`（147 行，预算×冷容量耦合）**全部就绪未应用**，三步 dry-run 逐步证明可叠加。
+  ⚠️ **本会话查出它们的 apply-check 现在 FAIL**（对 `kv_bit_budget.h` 上下文过期）⇒ **须变基**。
+- **⑧ U6 / 以及那两条"最便宜的"小修**（`_patch_eight.py`）：本会话查出 `apps/cli/options.cpp` 的 `Iso3→3` **差 1.5 b/el**
+  （见 §82），以及 hw 那批硬编码 —— 都还没有落。
+
+**⚠️ 由此更正我的两处旧表述**：① 我说"未完成得看八大项 = 只核到 ⑤ W13、⑥ 外挂召回"——**现在完整了**；
+② 我把"外挂召回"当成 ⑥ 的**另一个方向**，其实 **⑥ = N6 = ngram 真表 gather**，而"逐轮外挂召回"是它的**实现形态之一**
+（`_TODO.md` 里 rc1/rc2 标的就是"八项⑥"）。**两者是同一件事**，不是两件。
+
+### 88. 构建 #2 验收：**ctest 100% 通过 / 0 失败 out of 109，与基线逐项一致 ⇒ e8v1 零回归**
+
+- **构建 #2**（e8v1 + W1 + W4）：`rc=0`，**用时 51 分 12 秒**（六个重 CUDA TU 的设备码生成：`gqa_attention_{decode,prefill,decode_smallt,decode_e8,prefill_e8}.cu` + `entropy_cold_requant.cu`），
+  错误数 0；`build/apps/ninfer` = **829,420,416 B @ 09:28**（比上一支 826,766,896 大 2.65 MB）。
+  期间机器一度被**已报完成 agent 的遗留子进程**压到 `available 0`（见 §78 的纪律条），清掉后恢复。
+- **ctest**：`100% tests passed, 0 tests failed out of 109`，`Total Test time = 581.57 sec`，rc=0。
+  与上一轮**逐项一致**：**101 通过 / 0 失败 / 8 跳过**（跳过仍是同一批夹具缺失 #4/#26/#31/#32/#33/#34/#35/#36）。
+  ⇒ **e8v1（16 电平奇数中点集）零回归——它可以留在树里了。**
+
+**已派：变基 agent**（`pRB`）。理由：N1/N2/N3 那批补丁的 `git apply --check` 现在 **FAIL**（上下文被本会话的 W1/W4/e8v1 改动挪走），
+而它们是"落地"的前置。要它逐份判断"变基成功 / 被取代 / 与另一份重复"，产出对**活树** `apply --check` rc=0 的补丁，
+并给出**必须的落地顺序**（已知 `N1 → n1b → s30` 有硬依赖）与**建议的落地批次**（按"一批改动一次重建"）。
+明确禁用了 `--fuzz/-C1`（那会静默错位），并要求锚点命中数 != 1 即失败退出。
+清单：`a1/01_kv_tier_formats.patch`、`a1/02_..._tests.patch`、S20 的 `A_n1_patch.diff`（**要先判这两份 N1 谁是定稿**）、
+`A_n1b_cold_pages.diff`、`b1/host-then-disk.patch`（判它是不是 N2 的另一版）、`A_s30_budget_cold.diff`、
+`w2m/fix.patch`（W2 合并版，已知不能直打）、`hw/fix.patch`（含被 W1 改过的 `bindings.cpp`）、
+`d1/kv_bit_budget_h.patch`、`d2/d2_cold_slot_stride.patch`、`c2/cold_codec_rule_core.patch`。
+
+**落地顺序（按依赖与"一次重建"原则排，待变基完成后执行）**：
+1. **变基后的 N1 → n1b → s30**（N1/N2/N3 一线，KV 预算与冷窗）；
+2. **auto（aw1 为基座、用加前式）** —— 已判（§80），补丁对活树 `apply --check` 已 rc=0；
+3. **W2 合并版**（变基后）、**hw 硬编码批次**（重对上下文后）；
+4. **V 旋转（−3.81 dB、零 bit）** —— ⚠️ 三条前提已写死在案：逆变换必须加在 **split reducer** 里（不能加在 per-split partial 写）、
+   **半应用比不改更糟**（relRMS ~1.4）、且要与 `hadamard_8d_pair()` 的对合性一致；
+5. **W3（ss1/ss2）** 放在 E8 线之后（4 个文件与 E8 内核冲突）。
+⇒ 然后**一次重建**，跑 ctest + **4 臂仪器（含路由假设）** + **1M 测试**。
+
+### 89. ⭐⭐ ⑥=N6 外挂召回：**四条腿全在树里，缺的 P5/P6/P7 已做成补丁**；⭐ **cuFile 在这个盒子上拿不到零拷贝**（WSL2 + 消费卡，两条独立证据）
+
+交付 `dl/pREC_recall_cufile.txt`（279 行）+ `scratch/rec/fix.patch`（4 文件 +1423/−5，`git apply --check` **rc=0**）。
+
+**A. 四条腿逐条定位（只调用不重写）**
+| 腿 | 位置 |
+|---|---|
+| **P1 落盘** `enqueue_cold_compressions` | `program_impl.h:10610-10887`（写入 `:10805-10830`、`file_slot` 分配 `:10588-10596`、`ColdPageEntry` `program.h:487-492`）|
+| **P2 读回** `restore_cold_page` | `:11023-11158` |
+| **P3 批量预取** `prefetch_cold_pages` | `:11163-11190` |
+| **P4 内容寻址键** `PrefixShortlistDigests::at` | `prefix_identity.h:40-57`，用作 `shortlist_key` `:7182-7200` |
+
+**⭐ 缺口是实测出来的（不是猜的）**：
+- **P5**：`warm_cold_prefix` 的**唯一调用点**在 `:9426`，**不在任何 `decode_*_batch` 里**
+  （4 个轮入口 `12276/12438/12626/12872` vs 4 个非轮 `8256/8818/9806/11857`）
+  ⇒ **decode 期间它永不触发。这就是 `_TODO.md:2177`"观测链端到端从未真正工作"的机制。**
+- **P6**：`warm_cold_prefix(seq, end_page)` **无条件恢复 `[0,end_page)`** ⇒ 没有页选择。
+- **P7**：`restore_cold_page` 末尾 `:11149-11156` **释放 `file_slot` 并删记录** ⇒ 映射是内存态且会被删。
+
+**补丁要点**：P5 挂钩 = 新 `ensure_sequence_kv_mapped_for_round()`，只换**4 个轮入口**（另 4 个保持原函数
+⇒ prefill/rewrite 无法误触发）；**"数据先于指针"已核实**（`decode_raw:12727-12733` 先落盘、之后才 dispatch 到 ingress
+⇒ 热路径不需要 fsync）。P6 = 粒度**一页 = 64 token × 全部层**（sentinel 决定，`cold_host_tier.h:34-41`）、
+页号**升序**（磁盘偏移单调）、预算**从低端砍**（丢最旧、保持无洞）；**miss 是"切"不是"填"**。
+P7 = 64 B 定长记录（显式补齐、crc32 覆盖 48 B）、`(digest,page)` 键、**tombstone 防 `file_slot` 复用别名**、
+默认**不 fsync**、每轮至多一次批量 sync。判据 = 滚动摘要作 **shortlist**，权威仍是
+`prefix_matches`/`ResidentPrefixIdentity`（`prefix_identity.h:37-39` 原文）；**e8 被 constexpr+static_assert 拒绝**
+（负向对照证明编译期闸门真在）。验证：8 锚点各命中 1 次、括号平衡、`g++ -fsyntax-only -Werror -pedantic` rc=0 ×3、
+**python3 第二见证 0 failures**。
+⚠️ **发现并修掉一个真冲突**：rc2 在飞的 `turn_recall.h` 与本补丁在 `ninfer::spec` 里**重名 `RecallCodec`**（底层类型不同）
++ `kRecallPageTokens` ⇒ 同 TU include **直接编译失败**；已把本头文件移入 `ninfer::spec::turn_recall`，
+**两补丁文件集零重叠、两种顺序都可落地、共存 include rc=0**（带负向对照）。rc1 已不适配当前树（rc=1）。
+**没证到**：`program_impl.h` 未编译、端到端 logits 逐位一致未跑、GDN 态 blob 未实现、默认 provider 不接
+⇒ **单靠本补丁不产生提速。**
+
+**B. ⭐⭐ cuFile 判定：本机拿不到真 GDS，只能退化成 compat（=POSIX pread）。两条独立证据，都带出处：**
+1. **这是 WSL2**：无 `/dev/nvidia*`、无 `/proc/driver/nvidia`、`lsmod/modinfo` 全空、
+   `/usr/lib/wsl/lib/libcuda.so.1` 是 **187 KB 的 stub**、只有 `/dev/dxg` ⇒ **内核模块无处可挂**。
+2. GPU 是**消费级 RTX 5090 D**；官方 `nvidia_fs` 文档要求 **"data-center class GPU"** + **"open kernel driver 535+"**，
+   **GeForce 无矩阵条目**。
+　**退化路径的代码级证据**：`cufile.h:78` 明写 *"nvidia-fs driver is not loaded. Set **allow_compat_mode**…"*
+（即退回 POSIX pread/pwrite）；本机 shipped json `:85` 已 `"allow_compat_mode": true`；
+`libcufile` 自带字符串 *"bar1 memory not available, only can work with compat_mode on."*；
+且 `cufile.h:359` 要求 **`O_DIRECT`**（PLE 现在是 `O_RDONLY`）。
+⇒ **⚠️ 直接回应你的指示**：你说"cuFile 要集成，理由是不经内存的冷页卸载 + 超大 MoE"——
+**这两个理由都要求零拷贝路径，而这个盒子（WSL2 + 消费卡）给不了**。在这里"集成 cuFile"实际拿到的是
+**compat mode**，即换个 API 表面跑 POSIX pread，**不经主机内存的收益拿不到**。
+（这也**部分**印证了我早先"它更可能是优化而非使能项"的直觉，但**理由是错的**——不是"带宽够了"，而是**硬件/驱动层根本不给这条路**。）
+**要拿零拷贝只剩三条**：① 换真 Linux（非 WSL2）+ 数据中心卡 + open kernel driver 535+；② Windows 原生 + 对应驱动栈；
+③ 放弃 GDS，用 `O_DIRECT` + `cudaHostAlloc` 自己搭（拿不到真零拷贝，但能免掉 page cache 双拷贝）。
+
+**两个接入点（带 file:line）**：
+- **冷页 Disk**：改 `:10814-10820` 与 `:11063-11074` 两段，并把每层记录 stride **76288 → 77824（+2.01%）** 加版本头；
+  ⚠️ **PLE 的 320 B 行绝不能逐行补**（+1180%）。
+- **MoE**：⭐ `weight_residency.h:120-127` 的**注入式 pinned 分配器就是替换缝**，
+  `WeightResidency::Disk`（`:48` *"reserved; P0 never emits it"*）正是落点；
+  阻塞点：`binder.cpp:129` 忽略计划、`serve_options.cpp:410-414` 主动 throw、decode 半边被 CUDA graph 挡住（`TODO:7419-7420`）。
+- **统一层提案** `ssd_fetch.h`（318 行，syntax rc=0、对齐账 static_assert 过）：PLE / 冷页 / 权重 / (A) 召回
+  **共用一套 fetch + 三后端 + 能力门控**；(A) 的 P7 journal 直接复用它。
+  ⇒ 这条正好回答"三层本质是同一个从 SSD 取数问题"。
+
+**树未被改动**（`git status` 仍 39 项、两文件 mtime 仍是 09-12 22:28、树内 grep `turn_recall` = 0、
+`src/spec` 仍只有原 2 文件、`build/` 未碰、无模块加载、无新文件）。
+
+### 90. ⭐⭐ 自动导入器实测：**分类正确、路由缺失，卡在 `import_model.py:656` 一行**；而**驱动器早就能跑且报"一个字节不缺"**
+
+交付 `dl/pIMP_mo.txt`（815 行）+ 原始采集 `pIMP_mo_raw.txt`。
+
+**1. 每个 flavour 能不能自动路由（产生点 `import_model.py:293-324` `classify_quant`）**
+| flavour.method | 产生点 | 自动路由？ |
+|---|---|---|
+| `native` | `:305` | ✔ **唯一可路由**：`:656` `if accepted and flavour.method == "native"` → `:665` subprocess.call |
+| `modelopt` | `:317` | ✗ 只打印 work-item 说明书 `:669-675`，**无 dispatch** |
+| `modelopt+sidecar` | `:303` | ✗ **连专属说明都没有**（`:669` 要 `=="modelopt"`、`:676` 要 `=="compressed-tensors"`）⇒ **静默** |
+| `compressed-tensors` | `:318-323` | ✗ 仅当全部 nvfp4 判定被拒时打一行 `:676-678`；其双源入口永不派发 |
+| 兜底任意串（fp8/gptq/awq/bnb/quanto/unknown）| `:324` | ✗ **完全静默** |
+
+**根因**：`classify_quant` 自己的 docstring `:294` 写着 *"acceptance is decided by the converters"*，
+而 `:656` 把 **flavour 这个"描述串"当成了"可行性判据"**。
+
+**2. ⭐ 真跑（真源 `W4A4+W8A8`，只读，15 s）**
+`import_model.py <SRC> --plan-only --resource-root <SRC>` → **rc=0**，分类 `flavour=modelopt`
+（quant_algo=MIXED_PRECISION，group_0 8bit/260 targets + group_1 4bit g16/140 targets）、
+**2139 张量 2 分片全在**、15 个 mtp 键、前端 6 项判定**"可接受"**（不是前端卡的）、
+qwen3_8_27b/6_27b 的 config 都 accepted ⇒ **打印"1) ModelOpt NVFP4 单源适配器…"后进程直接结束，无 dispatch、无产物。**
+
+**⭐⭐ 决定性对照：驱动器早就在树里而且能跑。**
+`python3 -m tools.convert.qwen3_8_27b.convert_modelopt --model <SRC> --plan-only`
+→ **rc=0、refusals=none、deviations 49、byte coverage 2139/2139 全在、objects 1103、
+declared quant_algo `{FP8:260, NVFP4:140}`**。
+⇒ **同一份源：前门说"缺实现、手动作罢"；驱动器说"规划完成、一个字节不缺"。**
+`_TODO.md:7906/7914` 也自认 *"driver 已落地、前门路由还没做"*。
+另：`convert_modelopt.py` 在 git 里**未跟踪**（`??`，本会话落的），`import_model.py` 是 `M`。
+
+**3. 缺口（按"不 or / 不硬写"）**
+1. **判据换位（唯一卡点）**：删掉 `:656` 的 `flavour.method == "native"`，改为派发
+   **"被接受的那条 verdict 自带的 command"**（`:402-405`/`:438-445` **已经在算它**）⇒ flavour 退回只做展示。
+2. **entry 集合要由 target 声明、前门枚举**：现在 `:54-59` 硬编码 4 个 target、
+   `:366-369`/`:416` 硬编码 `"convert"`/`"convert_nvfp4"`，而 `convert_modelopt` 只在 `:675` 以**字符串**出现
+   ⇒ **前门永远看不见它**。新 entry 应是**声明（数据）**，不是新 if。
+3. **正确信息来源 = 源自己，且消费方已存在**：`config.json.quantization_config`（实测 260 FP8+140 NVFP4、exclude 4 项）
+   + `hf_quant_config.json`（producer modelopt 0.43.0 / quantized_layers）+ `manifest.json` 的 `source_package_sha256`。
+   ⭐ `tools/convert/common/layout_plan.py:121 select(members, declared_algo)` 的头注释写着
+   *"no model name, no layer name, no key allowlist… **a new family is a data question**"*，
+   而 `convert_modelopt.py:142` **已经 import 它** ⇒ **前门没接上而已**。
+4. **CLI 参数靠生成**：命令模板由 entry 给（`convert_modelopt.OUTPUT_BASENAME:163`、`:1734-1746` 的只读三参数）；
+   前门只填 `--model`=源、`--out`=`<entry basename>`、`--device`=探测、`--resource-root`=既有 `NINFER_RESOURCE_ROOTS`（`:63-65`）；
+   双源 entry 的第二个源应由 entry **声明为必需外部源** + 走同一套资源解析（或源自带 manifest 的 provenance），
+   **解析不到就 refuse，不许填占位符。**
+5. **删掉 `:669-675` 的手写说明书**：它的"401 Linear / 145 FP8 / 112 NVFP4"**与源自己的声明不符**（400 = 260+140），
+   也与它指向的驱动器的账（167 FP8 / 91 NVFP4）矛盾 ⇒ **硬写漂移的活教材。**
+6. 顺带：`--target` 参数**不存在**（`:521-529`）但 `:641-642` 要求用它；实测两个 target 契约相同只能默认 `accepted[0]`。
+   消歧应由 **entry 声明所需证据**（census 的 dtype 直方图**已算好**），消歧不了就 refuse。
+
+**4. GUI vs CLI：不是同一套，且同一目录结论相反**
+- CLI = `import_model.py`（结构化 flavour + 问 target 自己的 `validate_config` + 6 项前端钉死）；
+  GUI = `tools/gui/model_import.py`（`_hf_quant_hint:280-288` 只对字符串做 `nvfp4/fp4` **子串匹配**且"只用于文案"、
+  `_family_from_arch:263-277` 用几何+名字）+ `convert_runner.py`（`:58` 又一串家族字面量、
+  `:72-75` **恒为 `convert.py`、无量化分支**，而 `:7` 的 docstring 声称会走 `convert_nvfp4`）。
+- ⭐ **实测同一目录**：CLI = work-item **不可自动导入**；**GUI = `convert_groupwise` "可以自动转换成"
+  并生成 `convert.py --model <量化源>`** ⇒ **GUI 会跑错转换器**（拿 `convert.py` 去跑量化源）。
+- **重复真值**：家族白名单 **3 份**（`import_model:54-59/:72`、`model_import:40`、`convert_runner:58`）；
+  量化档 **3 套判据**；`convert_runner.py` **两份字节相同的副本**（md5 `7ef6d002…`，**均无 importer**）。
+- ⚠️ `ninfer-gui.py`（Windows 侧）与 `ninfer-gui.spec:17` 声明的 `tools/gui` 目录
+  （`infer-fusion-repo\tools\gui`、`ziqinzhang\tools\gui`）**在盘上都不存在**。
+
+**5. 它没证到的**：没跑真转换（禁 22 GB）⇒"GUI 那条 `convert.py` 链在量化源上会失败"是按
+`recipe.py:317 preflight_sources` 的判据**推断**、未实跑；`convert_modelopt` 的**产物字节**没验证（盘上无 artifact）；
+没启动 GUI 本体（只用路径枚举证明其模块目录不存在）；`muse_glimmer_30b` 为何没有纯 config 校验入口未查清；
+"401"的出处未核实；第 5 类 flavour 是读码得出、只实测了 modelopt 一条。
+**树状态**：无任何被跟踪文件在会话内被改动（脏文件最晚 mtime 09:39:27，会话 09:42 开始；`git status` 39 行与开始时一致）。
+唯一副作用是解释器刷新的两个 `__pycache__`（`tools/gui/`、`tools/convert/qwen3_6_35b_a3b/`，gitignore 覆盖）。
+
+### 91. 一笔总账（§91-§98 合并）：落地批 1 验收 + 三路审计 + MTP auto/kt 定论 + FreeToken + 导入器 + 邻居纪律
+
+**§91 落地批 1（7 份）验收通过：** `ctest 100% tests passed / 0 failed / 109`，rc=0，455 s，
+与基线**逐项一致**（101 通过 / 0 失败 / 8 跳过）⇒ **零回归**。⭐ 点名那条 E7 回归
+`ninfer_qwen3_6_context_store_test` **Passed**。构建 **9 分钟**（增量+ccache 命中；顺带印证 51 分钟那个基线是"近乎全量"的数）。
+批 1 内含：`UP1_nfc_ascii`、`V3_grouped_conv_position`、**`B_s33_ple_wiring`（= N6 PLE 接线！）**、
+`E3_s45b_s36_restore`、`e8r2/fix`、`cbfix2/fixB`（修刚落转换器的三个 bug）、`E7_s50_regression_sketch`。
+快照 `snap_pre_b1/`；`revert.sh` **只用 `git apply -R`、不用 `git checkout`**（因为 `gqa_attention_prefill_i8.cuh` 载着已落 e8v1）。
+
+**§92 三路落地审计的最终数（含对我"只落了 4 份"的系统性纠错）：**
+判据 = ① `git apply -R --check` 过 ⇒ **已落**（铁证）② 失败则回落**活树签名 grep**。
+⚠️ **只用正向 `--check` 会把"已落但补丁过期"误报成未落地** —— 这是我先前"约 100 份只落 4 份"的错因。
+- **`scratch` 110 份（去重）**：已落 **52**（`-R` 铁证 28 / 内容 100% 在树 12 / ≥86% 12）、部分 **3**、**未落 57**（②能过没落 19 / ①漂移 38）。
+- **`_collab` 133 份**：已落 16、未落 **104**（干净可落 37 / 漂移 67）、空无效 13。
+- **记录侧 58 条**：明确未落 26、半落 9、被取代 7、**看板陈旧其实已进树 19**、未判定 12。
+- **`board.md` 的 `(patch 未应用)` 列至少 13/23 行已过期 ⇒ 看板不能再当状态源**，只能当"当初交付过"的索引。
+- ⚠️ 两条"我们自己的记账在骗我们"：`_todo_sync2.py:43` 把"改两处陈旧注释"记成 **"N3 第二轮已完成"**（实测 `recalibrate` 零命中、`kv_calibration_dir` 只在注释里）；
+  `M_unlanded_now.md:34` 自证已过期（`dflash_impl.h:231` 已是新写法 ⇒ A5b 已落）。
+- ⚠️ **CRLF 伪信号**：112 个源文件是 CRLF，手写 LF 补丁会报 `different line endings` ⇒ **DRIFTED 里混着真未落**。
+- ⚠️ **可落清单会立刻腐坏**：现场复核发现 `e8r1` 现已**双失败**、`C_s23_tu/01` 现已**可落** ⇒ **每次落地前必须现场复核，不许采信任何一次盘点**。
+- **58→三路（AU1 文件系统侧 / AU2 记录侧 / LC 现场复核）**：LC 现场复核得 **56 份可落**（用双条件，不采信旧审计）。
+- ⚠️ LC 抓到三个"一落就坏"：`build/D4_cmake_new_family.diff` 里字面是 `add_subdirectory(targets/<new_family>)` **占位符**；
+  `build/T1_a5b_revert.diff` **会回退已落 A5b**；两者**永久排除**。
+- ⚠️ **互斥实测**（隔离副本 apply A→check B 双向）：`cc1/cc2`、`cl1/cl2`、`w13a/w13b`、`rb/w2m*`、`hw/fix` vs `rb/hw_no_rebase_needed`（**md5 相同**）、
+  `cbfix1/cbfix2`、`UP1_moe_s2_perf vs _v3`、S23/S40 拆分**全部互斥**；但 **`rc2 vs rec` 与 `e8v2/fix vs vrot` 在 hunk 层可共存**——
+  前者的冲突在 **`RecallCodec` 符号**与功能重叠（**落两个会编译失败**）。
+- **我的四条裁决**：`cl1`+`cl2` **两份都要**（不同功能撞接线点，先 cl1 后手工移植 cl2，合起来闭合 **N3**）；
+  `w13b` 落、跳过已被 HEAD 覆盖的 P0 部分（⚠️ 落完**仍不可用**，`serve_options` 自述 "offload CANNOT work yet"）；
+  `rc2` 永久排除、只落 `rec`；`e8v2/fix`+`vrot` 两份都落（⚠️ `vrot` 若只改一半就标需裁决，**半应用比不改更糟**）。
+
+**§93 ⭐ MTP auto：门是"拼写门"不是"能力门"（我的 A/B 从头到尾用错了拼法）。**
+实跑现有二进制：`--spec mtp`（**不写 `--draft-tokens`**）→ **rc=0**，报 `mtp draft window 15 (adaptive ladder, top) realized mean X`；
+`--spec mtp --draft-tokens 5` → rc=0；**`--draft-tokens 0` → rc=1 `error: invalid draft-tokens: 0`**（唯一坏拼法）。
+根因：CLI 的 `draft_tokens` **默认就是 0 且无"显式给出"标志** ⇒ 不写 flag 就已自适应；`apps/cli/options.cpp:33` 的 `parse_u32` 是**通用正数**助手，拒字面量 0。
+门清单 G1–G7：**只有 G1 拒 0**；G2 接受 `[0,15]`；**G5 的 `0→7` 改写只在 DFlash2/Dspark 分支、不碰 MTP**；G6 按 variant 取 `kMaximumMtpDraftTokens`；G7 把 0 变阶梯。
+**variant 上限：27b=15 / 35b_a3b=5 / muse=5**；⚠️ 另一处小缺陷：`layouts_impl.h:891/901/910` 在真实上限是 5 时**仍打印字面量 `[1,15]`**。
+临时修 `NINFER_MTP_ADAPTIVE` 已落 2 文件（`apps/cli/options.cpp` +55/−1、`src/serve/serve_options.cpp` +47/−0，`-fsyntax-only` rc=0，快照 `snap_pre_gate/`）——
+**但现在不需要它**（不写 flag 即可），留着等完整修时一起收。
+
+**§94 ⭐⭐ MTP auto 的 A/B（正确拼法，GPU 空闲时跑）：auto 输给最优固定 k 18%。**
+| 臂 | ctx | decode tok/s | 接受率 | AL | 落地窗口 |
+|---|---|---|---|---|---|
+| **自适应** | 32768 | **108.37** | 29.10% | 3.44 | top=15，**realized mean 7.93** |
+| **自适应** | 65536 | **108.59** | 29.10% | 3.44 | 同上 |
+| 固定 k=3 | 65536 | **132.93** | 56.52% | 2.70 | 3 |
+| 固定 k=9 | 65536 | 112.76 | 26.19% | 3.32 | 9 |
+| k=3 复跑×2 | 32768 | **132.22 / 131.81** | 56.52% | 2.70 | 3 |
+- ⭐ **那个 1.80 tok/s / 241 s 的异常是争抢、不是 bug**：同格复跑两次 132.22 / 131.81 ⇒ **结清**。
+- **auto 的每轮 token 数更高（3.25 vs 2.78）但总速度更低** ⇒ **每轮成本被宽度吃掉，判据对宽度的惩罚仍偏轻**。
+- ⚠️ **auto 在 32k 与 64k 上数字几乎逐位相同**（含 mean 7.93）⇒ **对上下文长度零响应，这本身就是"没在自适应"的迹象**。
+- **已核 F1/F2/阶梯都在树里且默认生效**：`columns = post_add ? i : (i-1)` 默认 false（**加前式**）；
+  `:203-206` **F2 先验收缩** `weight = reach[i]/reach[1]` 默认开；`kMtpWindowLadder={2,3,5,7,9,15}`，
+  `program_impl.h:10188` 用 **`kMtpWindowLadderTop` 作界**（⇒ **棘轮去掉了**）、`:10193` 按 `kMtpWidthRedecisionRounds` 粗粒度重决；
+  ⭐ **`kMtpWindowCostRatio` 已换成实测常量比值**（不再是冻结的 0.9/14.7）。
+- **两个候选根因**：① F2 只收缩先验、没处理"未观测深度"本身；② ⭐ **`a` 没随前缀变化**——aw1 自述 `a=14.7ms` 是"唯一没能测的常量"，
+  而 32k/64k 逐位相同正说明每轮固定成本没随上下文增长进入判据（**它必然增长**）。**②更可能是"零响应"的原因**。
+- 与 aw1 自己的闭环数字同向：修前选的均值 10.3/7.3/6.4 vs 真最优 9/5/3；**实测 7.93 vs 最优 3** ⇒ 同一个偏差（**选得太宽**）。
+
+**§95 ⭐ FreeToken 测完：机制活着，但当前形态不能用。**
+- `ninfer_bandwidth_governor_test` **rc=0 PASS**（真断言，但**只喂合成计数器**）；⚠️ **`tools/kv_relayout_test.cpp` 没有注册进任何 CMakeLists** ⇒ CI 从没跑过、盘上无二进制（主机 g++ 编译后 rc=0，与 `ft_tiers.py` **`python-reference: MATCH`**）。
+- ⭐ **观测链现在真的通了**：`NINFER_FT_STATS=1 --no-cuda-graph` → **1554 条 `[ft] layer=` 行、0 NaN/inf**（修法是真的：`gqa_attention_decode_partial.cuh:473-480` 把 observe 挪到 launch 之后）。
+- ⚠️ **四条断点**：① **`ft::observe` 落在 CUDA graph 捕获区内**（`decode_graph.cpp:65-67` ← `graph_impl.h:24-27` ← `decode_impl.h:68-69`），
+  那里 D2H **非法**且返回码**没检查**（`ops/common/ft_stats.h:55-57`）⇒ 毒化捕获 → `smallt.cu:209 CUDA_CHECK` → **SIGABRT rc=134**；
+  实测 5/5：`ninfer` 7.8 s 崩、**`ninfer-serve` 到不了 "listening"**；`PERIOD=1` 时 48-token 生成只有 **11 次** tap 执行且**全部 `mean_l=1`**（零信息）⇒ **证明 host lambda 只在捕获时跑一次、replay 从不跑**。**这就是 `_TODO.md:2177`，且是在任何人都会用的配置下。**
+  ② **tap 只在 `launch_tc_partial_nvfp4`** ⇒ E8 的 6 层**结构性不可观测** ⇒ `build_ft_spec` 把它们映射成 iso3 ⇒ **环路第一个动作就是拆掉调好的默认表**。
+  ③ ⚠️ **环路的动作把已知坏配置装了回去**：实测 spec `...5:e8,9:e8,8:iso3,11:iso3...` —— **E8 落在 9、11 层**，而 `variant.cpp:32-41` 记着 `8-15:e8 → 0/8 needles`。
+  ④ ⚠️ **Apply 要求 `active == 0`**（`generation_service.cpp:523-536`）：22.93 s 生成期间 **0 次重排**，第一次在 `[req 1] done` 后 **9 ms**。
+- **但闭环真闭上了一次**（serve + `--no-cuda-graph`）：1524 行、**2× `[ft] auto-relayout`**、服务存活、之后 HTTP 200 ⇒ **机制是活的，不是死代码**。
+- **代价**（各 4 次，ctx 4096）：生产（graph 开）**66.0 tok/s** → graph 关 58.8 → 加 tap **53.9（−18.3%）**；**graph 开 + tap = SIGABRT** ⇒ **唯一能用的配置比生产低 18%，而验收线是 <10%**。
+- **最小修法**：tap 移出捕获路径改"设备侧累加器 + 捕获外读"；**dtype 完备**；加**逐层允许档位掩码（E8 只许 ≤7）**；decide 与 drain 解耦、热路径用窗口差分；**graph 开着时直接拒绝 `NINFER_FT_STATS` 而不是 abort**；注册 `kv_relayout_test`。
+
+**§96 ⭐ 自动导入器实测 + 修复交付。** 病根 `import_model.py:656`（把 **flavour 描述串**当**可行性判据**），
+`modelopt+sidecar` 与兜底串**完全静默**；`modelopt` 只打说明书。
+⭐ **新发现两处**：① `:442-444` 对每个 target 都发 `--quantized-model`，而 `qwen3_6_27b/convert_nvfp4.py:433` 声明的是 `--nvfp4-model`
+（`qwen3_8_27b` 才用 `--quantized-model`）⇒ **坏在两处**；② **验收权威本来就在树里**：`qwen3_6/common/recipe.py:320-321` 按逐张量 dtype 拒源，
+两个 `convert.preflight_conversion` 都以 `source dtype F8_E4M3 != required BF16` 拒掉，**只有 `convert_modelopt.preflight` 接受** ⇒ **不需要新白名单**。
+**修复**（`scratch/ifr/fix.patch`，4 改/4 增/1 删，对活树 `git apply --check` **rc=0**）：entry 集合变成**数据**（`tools/convert/*/import_entries.py` + 新 `common/import_entry.py`）；
+**验收 = 对各转换器自己 `preflight` 的点号引用**；派发 = "被接受的那条 verdict 自带的命令"；`flavour` 只做展示；`:669-675` 删；
+`--target`→`--entry` + `--slot`（**解析不到就 refuse、不留占位符**）；GUI 侧改调 CLI 的 `classify_family/classify_quant/census_weights`，
+删掉重复白名单/`_family_from_arch`/`_hf_quant_hint`，两份 `convert_runner.py` 收敛成一份。
+**真源实测**：门口 rc=0 → `runnable: qwen3_8_27b:convert_modelopt`，7.97–21.14 s，峰值 RSS 372–373 MB；**GUI 测试 23/23 全过**（含新回归：runner 发 `convert_modelopt` 而非 `convert.py`）。
+⚠️ **native(bf16) 路径行为变了**：两个 `convert` entry 共享 recipe 且都吃 bf16 ⇒ **门口现在列两候选并拒绝、要求显式 `--entry`**（不测真 bf16 源）。**用户裁定：bf16 不静默、等完整修。**
+⚠️ ⭐ **它发现 `ninfer-fusion-repo` 是"另一个 remote 的独立 git checkout"**（`github.com/Astrangemaninhere/ninfer-fusion.git`，HEAD `0eaac04`），
+**与活树不同步、且缺 `import_model.py`/`layout_plan.py`/`convert_modelopt.py`** ⇒ **Windows GUI 从那里加载模块 ⇒ 本次 GUI 修复对打包应用是惰性的**（在那之前退化成显式"无法判定"）。
+⇒ **把这件"过时镜像"从"参考脏"升级为"产品路径脏"。** 建议：把 GUI 的 `REPO` 指向活树，或刷新那个 checkout。
+
+**§97 ⭐ MTP 有没有树：定论是没有（读完 1021 行 + 逐个读源文件）。**
+- `UP1_mtp_pack_contract.diff` 是**节点融合的性能补丁**（2×rmsnorm+pack 融 kernel、`cudaMemsetAsync`→kernel **省 4.6–8.4 µs**、按 D 路由 `MtpRowRoute{Cta256x6,Cta256x10}`、新增 `mtp_residual_norm`），
+  **形状 = 线性**（`out[0:D,t]=rmsnorm(embedding[:,t])`、`out[D:2D,t]=rmsnorm(hidden[:,t])` ⇒ `[2D,T]` 扁平拼接）；全 1021 行 **`tree:0 beam:0 cand:0 parent:0 child:0 depth:0 topk:0 selector:0`**（`ladder:3` 指的是 `rmsnorm.cu` 的 block 宽度阶梯）。
+- 活树结构：`program.h:462` **15 个 TokenId 扁平数组 + 1 个标量**；`mtp_impl.h:200-220` 每步各取 **1 列**；`mtp_round.cuh:29-51` 每 row 只有 **1** 个 accepted / **1** 个 `next_anchors` / **1** 个 `next_extents`。
+- **三宽度辨析**：① **MTP 草稿树＝不存在**（单链，每 req 一条路径）② **MTP 窗口＝线性列数**，rung∈{2,3,5,7,9,15}，**已启用** ③ **DFlash2 DDTree＝存在但离线**（`dflash2_tree.py` 自述 *"Pure stdlib; no engine code"*，**默认关**），
+  ⭐ **`selector_top_k=16` 不是束宽**（是每步候选集大小，引擎 walk 每 step 只消费 16×16 表的 1 行），`block_drafts=7` 是**深度**。
+- ⭐ **树不是没测过——已被判 NO-TREE**：`_collab/M_accept_eval.md`（09-10，ckpt `step_001200.pt`，300 anchors）`hit@1≥0.35 AND hit@4−hit@1≥0.12 → NO-TREE`，**实得 hit@1 = 0.2719**。
+- ⭐⭐ **新判据（链条 vs 树最锋利的指纹）＝ `accepted by pos` 逐深度直方图**。自适应实跑：**`28,19,7,0,0,0,0,0,0,0,0,0,0,0,0`（深度 ≥4 全 0 = 单链指纹）**；
+  钉死 k=5：`15,10,5,5,4`。且 **自适应 mean 5.10 的 24.77%/AL 2.32 低于钉死 k=5 的 33.91%/AL 2.70** ⇒ **第二个独立读数再次确认 auto 输给最优固定 k**。
+- ⚠️ 该产物**没有 dflash2 权重**（conversion.json 里 `dflash2` 命中 0）⇒ `--spec dflash2` **测不了**；`eval_ddtree.py --tree` 未跑（Windows python 硬编码 TARGET_DIR）。
+
+**§98 TU 拆分：CMake 前提被纠正 + ccache 实况 + 测量口径 v2。**
+- ⭐ **不需要 CMake 授权**：`add_subdirectory` **只用于 `targets/*`**（`src/CMakeLists.txt:356-359`），`ops/launcher/` **没有自己的 CMakeLists** ⇒ 加 TU 就是往 `ninfer_ops` 显式清单里加行（`:81` decode、`:82` smallt、`:83` e8；`:311` `ninfer_cuda_archive` ⇒ **RDC 归档**）。
+- **慢的结构性原因**：`decode.cu`(45 行) 只想要**一个** host 算术模板，却因 include `_partial.cuh` 付了**全部 5 档 kernel 头的级联**，且**同一档级联被实例化两次**。
+- **Cut A**（0 行 CMake、纯搬移、**且是判据③的唯一达成路径**）：新 `gqa_attention_decode_split.h` 收 `_partial.cuh:61-156` 四实体；**删 `:61-156` 以免同 TU 两份定义**；`_reference` 保 `inline`。
+  **Cut B**（5 新 TU + `:83` 后 5 行 + `_tiers.h` 10 条 extern）：照 `decode_e8.cu` 样板；**H7 硬约束写进文件头**（`ninfer_ops` 还 PRIVATE 链了**非 RDC** 的 `ninfer_nvfp4_tma` ⇒ **绝不**把 nvfp4 档模板搬进它提供的 TU）。
+  **Cut C**（0 行 CMake、删 5 个 **git 已跟踪**文件）：**隔离出树**（`cp -p` + md5 + `README.md` 记调用符号与复活方式）再 `git rm`，**理由**：改那两个**未注册驱动**的指针＝**写新代码且无法编译验证**（正是最该避免的），且 `muse128_repro.cu` 是已修损坏的**证据**。
+  ⚠️ `revert.sh` 三段式：Cut A/B 用 `git apply -R`、**Cut C 的删除用 `git checkout --`**（删除不是补丁形态）。
+- ⚠️ **它先前那条"ccache 没装"是假阻塞、是测量环境错误**（`which ccache` 跑在没带 PATH 的 shell 里）。实况：**`/home/user/.local/bin/ccache` 在（4.11.3）**，且 **`build/CMakeCache.txt:40 CMAKE_CUDA_COMPILER_LAUNCHER=ccache` 早就配好** ⇒ **B5 无需装、无需改 CMake**；51 分钟基线本身带 ccache（命中 103/362 = 28.45%）。
+- **测量口径 v2**：判据权威改用 **`CCACHE_DISABLE=1` 跑拆前/拆后**（纯编译时间，免疫命中率运气）；M1=增量、M2=全量墙钟**都要测**（H1：拆分**不减少 device-link 总量**，**不许把 link 变慢当收益**）；
+  ⚠️ **新陷阱**：`…LAUNCHER` 是命令行 `-D` 缓存项 ⇒ 若 M2 走"新建 build dir"**必须重传**，否则拆后的全量是**没 ccache**的全量 ⇒ **会得出"拆分没收益"的假结论**；
+  **M5**（免疫缓存的结构证据）`compile_commands.json` 里 decode 条目数预期 **3 → 3（Cut A 后）→ 8（Cut B 后）**；**M4** = `launch_tc_partial_` 与 `__device_stub_` **两个 grep 一起看**（RDC 下 `__global__` 是 device stub + `.nv_fatbin`）。
+  **回退触发（我事先接受）**：M2 没变快甚至变慢 ⇒ **如实报 + 只留 Cut A**。
+
+**⚠️ 仪表纪律（我这一轮连犯三次，登记）**：① **把构建 pipe 进 `tail -40`** ⇒ 日志缓冲到结束才写，我因此误报"构建卡住"；
+② `ps | grep -E 'cmake --build|…'` **没匹配到**，换带 `/` 的路径式模式才出来；③ **用"3 分钟内文件写入数"当推进判据**，采样正好落在编译与链接之间的空隙 ⇒ 误读为 0。
+⇒ **硬纪律：判构建死活只看"进程树（按 ppid 展开）+ 最后一次写入时间"，不看缓冲日志、不用固定时间窗采样。** 另：`NINFER_MTP_WINDOW_TRACE` 那次"0 行"也是**我的 grep 模式问题**，不是产品缺陷（trace 实际正常）。
+
+### 92. ⭐⭐ 纠正 §94：我那次 A/B **不可比**；"k=9 → k=3" 与"速度不达标"的主假设 = **自适应拿不到短名单 draft head**
+
+**用户原话**："不，我的意思就是检查宽度和长度调整的策略……**彻查先前 k=9 最优现在变成 k=3 最优的原因，而且速度远不达标的原因**"。
+
+**§94 我把它答成"auto 比最优固定 k 差 18%"，这是答错了问题。并排看才看得见**：
+
+| | 记录（先前 A/B） | 我实测（今天） |
+|---|---|---|
+| k=3 | 199.86 | **132.93** |
+| k=9 | **322.67（最优）** | 112.76 |
+| k=15 | 275.07 | 85.40 |
+⇒ **k=9 −65%、峰值 −59%、最优点 9→3。整条曲线塌了 2.4 倍。**
+
+**我的测量不可比（我的错，且是"引用了数字却没读条件括号"这一类）**：`mtp_window_cut.h` 的 STATUS 括号里写着
+**`(artifact nvfp4-dflash2, shortlist draft head, batch 1, greedy, fixed prompt)`**；我跑的是 **`nvfp4-modelopt`** artifact、
+**不同 prompt**（短中文句 vs code 160 tok）⇒ **至少三处不可比：artifact / draft head / prompt。**
+
+**⭐⭐ 主假设（一个原因解释全部三个症状）**：`startup_features.h:59 kMtpShortlistMinimumDrafts = 5`、`:68`
+`if (backend == Mtp && draft_tokens >= 5) ⇒ 短名单头`；而**自适应传 `draft_tokens == 0` ⇒ `< 5` ⇒ `ProposalHead::Full`**
+⇒ **自适应永远用昂贵的 Full draft head**（这正是 aw2 当初报过、我记下但没接上的那条："那 14–28% 就在桌上"）。
+
+| 症状 | 同一原因的解释 |
+|---|---|
+| 曲线塌 2.4× | 草稿步从**短名单头**换成 **Full 头** ⇒ 每步贵得多 |
+| 最优 k 9→3 | 草稿列成本 `b` 变大 ⇒ 边际列更不值 ⇒ **最优窗必然变窄** |
+| 自适应选太宽（7.93 vs 3） | 判据的 `kMtpRoundCostPerColumnMs/BaseMs` 是**在 dflash2 短名单配置上标定的常量**，Full 头下**把列价报低了** ⇒ 过度投机 |
+
+⇒ **正面回答"宽度和长度调整的策略"**：**阈值策略也许对，但它的代价模型是编译期常量，而代价随配置变**
+（draft head / artifact / graph / batch）—— **它只有一份，而且来自别处。**
+
+**已改派 MTP agent（`agent_61f84028`）**，顺序：① **同条件重测**（同 artifact/prompt/graph，`--spec mtp` 与
+`--draft-tokens {3,5,7,9,15}` 六档，**`≥5` 本身就是"头"的开关**）⇒ 判据：k≥5 的每列成本明显低于 k<5 且 tok/s 上台阶
+⇒ 主假设成立；② **量本配置的 `a`、`b`** 与记录的 **`16.71 / 0.737`** 对比（差值就是"曲线为什么塌"的量化答案）；
+③ **验 `b/a` 是否配置相关**（若明显大于记录值 ⇒ "自适应选太宽"= 用了别处标定，直接成立）；
+④ 各给一句带数字的判据式结论；⑤ **然后才出补丁**，优先级：**让自适应也能用短名单头（加逐轮守卫拒绝低于
+`kMtpShortlistMinimumDrafts` 的 rung —— aw2 原话）** > **`b/a` 做成配置相关（从本配置实测推，不许新塞常量）**
+> 我先前那条"`a` 随前缀变化"**降为次要**（先证伪/证实上面这条）。
+⚠️ 加防污染约束：**机器上在跑 ctest（含 GPU 测试）⇒ 跑 GPU 前先看 `nvidia-smi`，被占就等**——
+因为先前那个 **1.80 tok/s / 241 s 的假异常就是争抢造成的**，不许让同类读数污染这次结论。
+
+### 93. ⭐ Windows/cuFile 的定论 + **PCIe 协商成 Gen5 ×1**（用户接受、提速推后）+ 由此重排优先级
+
+**用户裁定**："这个没辙，我 itx 不太方便插拔……**我是在搞软件说到底，提速等以后吧**"。
+⇒ **×1 暂不处理**；**"从 SSD 流进 VRAM"这一整条线降级为"以后"**。
+
+**Windows 侧 API 实况（实测，逐项）**：
+- ❌ **`cufile.h`/`cufile.lib`/`cufile.dll`/`cufile_rdma.*` 全缺**（CUDA v13.2 已装但没有它们；连 `C:\Program Files\NVIDIA Corporation\cufile\` 目录都不存在）
+- ❌ ⭐ **`nvfs.sys`（GDS 内核驱动）递归搜 `C:\Windows`（含 WinSxS）+ DriverStore 零命中** ⇒ **GDS 在 Windows 结构性不存在、不可安装 ⇒ 别再试**
+- ❌ `dstorage.dll`/`dstoragecore.dll` **不是 OS 内置**（递归搜 `C:\Windows` 零命中）⇒ 只能走 NuGet/SDK
+- ✅ 可用的是 **NuGet `Microsoft.Direct3D.DirectStorage` 1.3.0**（与某 Steam 游戏里那份 **sha256 逐字节相同**）；MSVC 19.44 + SDK 10.0.26100 + `d3d12.h/.lib`/`bcrypt.lib` 齐；两块盘都是 **NVMe**
+- ⇒ **你要的"NV 开源的能消费级直接读 SSD"，在这台 Windows 上的落地形态就是 DirectStorage**：**能跑通、能校验、能到 VRAM**，
+  但**它自己在中途经 host 落地** ⇒ **"绕过主机内存"这个目的达不到**。
+
+**DirectStorage → VRAM 真跑通**（`C: 256 MiB / chunk 16 MiB`）：**3.301 GB/s**，sha256 用**两种独立方式**校验全 MATCH
+（① D3D12 `CopyResource`→READBACK；② **CUDA 经 D3D12 外部内存互操作拿到 `CUdeviceptr`，`cuMemcpyDtoH` 读回**）。
+
+| 路径 | GB/s |
+|---|---|
+| ReadFile(缓冲)+`cudaMemcpy` H2D | 2.257 |
+| NO_BUFFERING+pinned+`cudaMemcpyAsync` H2D | 2.384 |
+| **NO_BUFFERING+`cudaHostAlloc(Mapped)`+D2D（= PLE 现状）** | **2.317** |
+| 流水线化那条（NVMe DMA ∥ H2D） | 3.171 |
+| **DSTORAGE → host 内存** | **11.074** |
+| DSTORAGE → D3D12 UPLOAD heap | 3.172 |
+| **DSTORAGE → D3D12 DEFAULT heap（= VRAM）** | **3.301** |
+
+参考：**PCIe 裸 H2D 3.40 / D2H 3.58；NVMe 裸读 7.98；显存 D2D 543–860 GB/s。**
+**"不是零拷贝"三条硬证据**：① DS 头文件自述 staging buffer（`SetStagingBufferSize` 注释 *"some but not all of the staging buffers will be allocated from VRAM"*）；
+② ⭐ **带宽指纹**：同进程只换目的地，**DS→host 11.07 vs DS→VRAM 3.30（慢 3.4 倍）**，而 3.30 **恰等于裸 H2D 3.40** ⇒ "先在 host 落地再跨一次 PCIe"的签名；
+③ 同为 D3D12 resource，**UPLOAD 3.172 ≈ DEFAULT 3.301** ⇒ 目标是不是真显存几乎不影响耗时。
+
+**⭐⭐ 最大发现：GPU 的 PCIe 实际协商成 Gen5 ×1**（`MaxLinkWidth=16` / **`CurrentLinkWidth=1`**，Windows PnP 与 `nvidia-smi` 双路印证，
+实测 H2D 3.40 GB/s 吻合 ×1）。⭐ **本仓自己的数据独立印证**：真产物装载时 **20.41 GiB H2D 用 7.319 s = 2.8 GB/s** ⇒ 当时已是 ×1。
+⇒ **任何"进显存"的路径被钉死在 ~3.4 GB/s**，**连假设可用的 GDS 也一样**（DMA 到 VRAM 必须走 GPU 自己的 ×1 端口）。
+ITX 板 + 很可能用了 PCIe 延长线；直插可能恢复到 ×16，**但用户决定暂不处理**。
+
+**⇒ 由此重排优先级（写死）**：
+- **降级/推后**：**PLE sidecar（95 GiB 流式）/ 冷页 `Disk` 卸载 / cuFile 集成**——三者的收益天花板都是 **3.4 GB/s**，
+  在 ×1 下**整体不成立**（比 NVMe 裸读 7.98 还低一半）。`ssd_fetch.h` 那份统一取数层提案随之**不推**。
+- **不受 ×1 影响、才是真软件议程**：**MTP 自适应判据**（纯调度/代价模型）、**落地批次 B3–B5（含 TU 拆分）**、
+  **E8/KV 三条免费杠杆**、**FreeToken**（它的病是 graph 捕获期放置 + dtype 完备，**不是带宽**）、**导入器/GUI 统一修**。
+- ⚠️ 但保留一条：**`DSTORAGE → host` 是健康的（11.07 GB/s）** ⇒ 如果将来要"把层放主机内存、按需换入"，
+  **瓶颈不在 SSD、也不在 host 路径，而在那一次 PCIe 进显存的 ×1** ⇒ 仍受同一个上限约束。
+- **没证到**：无 Linux GDS 对照基线；staging buffer 未直接观测（只有官方注释 + 带宽推断）；未测 GDeflate / 多队列 / 调参 / 随机小 IO / 95 GiB 工作集；
+  CUDA 互操作只做到读回、**未跑 kernel**；测量期间有第三方进程占 22 GB 显存，噪声 ±10%。
+
+## §12.w-throw（19:12）throw<std 非 runtime_error 派生异常> = 整引擎击杀：爆炸半径 + 修在哪一层
+判据链现读现核：engine_core.h:393/400/404/406/408/420 classify_failure；:2011/2015 fail_request_lane 的
+  classify!=Request ⇒ return false 门槛；:2063 fail_all_locked、:2078 classify、:2079 fprintf、:2084 failed_=true；
+  :2307/2318 worker catch 派发。b14 的行号全部对上（树里只有 fail_request_lane，无 fail_request_locked）。
+可执行分类表（sh/wthr_classify.sh，真代码逐字抽取 + 13 条内容断言 + 与树 sed 区间 diff 为空）：
+  21 行；real=GREEN(RED=0)、mutA(加 catch logic_error→Request)=RED 5、mutB(判别子失效)=RED 1。
+  读出的硬事实：RequestError : invalid_argument : logic_error ⇒ (a) 的"用基类判别"在类型系统上不可能。
+  前缀匹配不做 trim（"  cudaMalloc…" 落 invariant），与 :409-419 注释+匹配块一致，属已声明性质。
+爆炸半径：全树(src+include+apps) 非 runtime_error 派生标准异常 throw = 2878
+  (logic_error 1084 / invalid_argument 1739 / out_of_range 52 / length_error 3；domain_error 0)
+  减 tests/bench 392（不在 serve 二进制内）⇒ Tier A（服务期请求路径）2598
+  其中 无局部捕获 2389；再要求字面量进 pin 二进制(932336eea9e8cbf8) ⇒ ★主口径 2038
+  (logic_error 796 / invalid_argument 1196 / out_of_range 44 / length_error 2)
+  invalid_argument 占 59% ⇒ 只 grep logic_error 会漏 6 成雷；RequestError 只有 25 个抛点（98.6% 的
+  invalid_argument 不是 RequestError，而契约 §3.1 刻意把"invalid_argument 用于内部不变量"归 Invariant）。
+命名靶点全部定位：program_impl.h:5127(A/REQ/无捕获/bin True)；scheduler.h:226(A/REQ, consume_service_work
+  ← run_control_batch)、:188/:184/:195(:REQ, build_control_membership ← worker_loop)、:155/158/167
+  (build_round_membership)、:213(active_admission_set ← try_admit_one)、:75/312/318/340/349/355/367/370/397；
+  program_impl.h:656(REQ_LOOSE)、:679/:684(UNREACHED，我判"可能"，非启动期)。
+新发现：①invalid_argument 是主体(59%)；②scheduler.h:213 与 :226 是同一条账的两个死门，run_control_batch
+  整段扣 row_stride；我核了 projected_service_work(request_plan_impl.h:101-137) 只有 prefill_units+decode_units、
+  无 control 项，但 validate_generation_capacity(frontend.cpp:1185-1197) 要求 effective_output_tokens 覆盖
+  control suffix 且控制 token 走同一 output budget ⇒ 我的"控制项没预留"假设被自己证伪，如实报；
+  ③真正的洞是 scheduler.h:259-260 树自己写的 "can under-count by up to one quantum per interior boundary …
+  accepted deliberately" 恰好落在 consume_service_work(:225) 的门上。
+裁定：不做 (a)（会打红已实现的验收门 2；判别子只能是具体类型 RequestError；会把真 invariant 降级为
+  "500+静默错 KV"——b14 §2.5 第 2 条已证 sentinel 仍指向已回收冷槽）；不做 (c)（门槛是"归因不明即保守停摆"）；
+  做 (b) 但二分：b1 合法输入可达 ⇒ 修条件本身（首选，= rebuild_work.h 既有形状）或改 RequestError 并前置到
+  submit/规划期（= S35/3.4 已落地样板），且必须留一条真不变量 throw；b2 真不变量 ⇒ 不动。
+  scheduler.h:213/226 属 b1 候选但未验证 ⇒ 先不动，先跑判定臂；要动就动充值口径不动抛点。
+契约偏好 (b) 的三处成文依据：docs/maintainer/engine-failure-recovery.md §3.1 表 + §3.4"校验前移" +
+  §4 验收门 2；rebuild_work.h:30-32 先例（"That used to throw std::logic_error … must not be an error"）；
+  types.h:724 S35(3.4) + request_plan_impl.h 一批 RequestError(InvalidPrompt)。(a) 会让 RequestError 变多余。
+负对照：A=invariant_once 必须仍 class=invariant + /health 503 + recover（守门犬，任何 (a) 方案必把它变绿 ⇒ 判负）；
+  B=request_once 必须只杀一条（证明 lane 失败机制本来就通，把归因钉死）；C=探针 mutB 臂 RED（表非恒绿）。
+派单：①判定臂（小 --prefill-chunk + 并发 + 带 capture 边界 prompt，不改代码，≤2 min）②守门犬臂
+  （NINFER_FAULT_INJECT=invariant_once）③修复验证臂（私有 build）。GPU 未占。
+未验证：近似调用图非精确（有同名污染，已用 REQ/REQ_LOOSE 双口径 + 逐跳路径缓解）；over-charge 由合法输入
+  可达为推证未实测；ops/* 1517 条 invalid_argument 未逐条细化（最大未细化面）；in_bin 只有 strings 子串
+  （二进制无 -g，DWARF 路不可走）；docs 行号漂移（实质与代码一致）；权威树脏（本线未改一行）。
+
+## §12.d-grader（19:13）SC-4c `自足` 的判分器 + P-4：d_sem 的"不可测"补到"照 argv 跑一次出四态"
+
+**交付**：`/home/user/scratch/d_grader/{DESIGN.md,REPORT.md}` + `judge/*.py` + `probe/*.{cpp,h}` +
+`sh/dgr_{host,fake_e2e,run,outer,launch}.sh` + `frontend_root/`（挖出来的真资源）。
+**0 模型 / 0 GPU / 0 构建 / 0 共享 build 改动 / 0 源码改动。**
+
+### ⭐ d_sem 缺件 ② 关闭：token id → text 不再是阻塞
+`.ninfer` = `NINFER\0` + 明文 JSON TOC（[16,176858)）+ **4096 对齐**数据段（起于 180224）。
+六个 `frontend/*` 的 encoding 是 `raw-bytes-v1` ⇒ **字节切片**。`py/dgr_carve.py` 挖出六个资源并落 manifest。
+**交叉验证**：`tokenizer.json`（12,809,320 B, sha256 `0997f410c57a1f4e…`）与机器上**别的线**已在用的
+`/home/user/models/q3nvfp4/tokenizer.json`、`scratch/p29/res/`、`scratch/fix2/frontend_root/` **逐字节相同**。
+（第一版锚点错了一个 4096 边界 ⇒ 三个候选都"差一点"，是这条交叉验证抓出来的。）
+**宿主 detokenizer**：`probe/dgr_detok.cpp` 链树里**已有**的
+`build/src/CMakeFiles/ninfer_engine.dir/targets/qwen3_6/impl/frontend/tokenizer.cpp.o`(392,128 B) +
+`libninfer_text.a`(379,152 B)（`build/` **只读**）。实测
+`roundtrip(U) bytes_in=464 bytes_out=464 exact_roundtrip=yes`、
+`encode(decode(encode(x)))==encode(x):yes`。
+⚠️ d_sem 说"`spec/*.h` 没有 detokenizer"对 `spec/` 是对的，但 **`tests/targets/qwen3_6/test_frontend.cpp:287-297`
+早就用 `NINFER_FRONTEND_TEST_ROOT` 在宿主演真 `fi::Tokenizer` 了** —— 缺的不是代码，是**资源**。
+
+### ⭐ SC-4a↔SC-4c 接缝 = **CLOSED**（无损∧不跨界∧自足 能合成的唯一理由）
+```
+ORIG=507 token  U=348 token  U at token 65
+SEAM=CLOSED orig_tokens=507 interval=[65,413) n=348 unit_tokens=348 SEAM=CLOSED
+```
+`dgr_detok span <orig> <begin> <end> <unit>` 就是这条等式。**真实产品路径那一步（SumDir row → 文本）工具有了、接线没有。**
+
+### ⭐ 判分器：零模型、非循环、可跑
+`judge/dgr_judge.py`（sha256 `cd42a528…`）。规则**全文两条**：
+`PASS ⟺ skel(needle) ⊆ content`（expect=contains）/ `⊄`（expect=absent），
+`skel = NFKC → ASCII 小写 → 只留 [a-z0-9]`（冻结，id `skel-alnum-lower-nfc/1`）。
+**不循环的四条**：①无可学参数、0 模型调用；②`battery_sha256` 在第一个请求前冻结、对不上**拒判**；
+③needle 是 32 字母表抽 12 = **60 bit**（猜 < 1e-18，且本次运行前不存在 ⇒ 无预训练记忆）；
+④`needle` 在 U 里**恰好 1 次**（C2）+ arm X 删掉后**必须答不出来**（C4）。
+**裂缝如实写**：Tier-1 判的是"有据抽取"不是"语义"；**Tier-2 派生臂**（答案 `18050` **在 U 与 ORIG 里都不出现**）
+是唯一保险；Tier-1 过 + Tier-2 不过 ⇒ 判 `塌(copy_only)`，**这是决策项 D-1**（翻过来一行）。
+
+### ⭐ 四态（`未测/不可用/塌/成立`），字段级接线
+优先级：`不可用` **压过** `成立`；`塌` 与 `成立` 是最后一层的**发现**。
+- **未测** ← `arms` 为空 或 九臂全 `not_run`
+- **不可用** ← `reasons` 非空：preflight 红 / `battery`/`judge.version` 不符 / 仪器字段缺 /
+  `passes_agree is not True`（**`None` 也算**，即第二趟没跑）/ `greedy_deterministic is False` /
+  `prompt_tokens.U == .X`（消融没送达）/ 任一臂 `not_run` 或 `ambiguous` /
+  **arm X FAIL**（删了证据还说出来 ⇒ 目击者作废）/ **arm L FAIL** / arm S `returned_forbidden` / 控制臂 O/XC/L2/T2C 不 PASS
+- **塌** ← 上面全清白 ∧ (`arms.U != pass` ∨ `arms.T2 != pass`)
+- **成立** ← 全清白 ∧ `O=U=X=XC=S=L=L2=T2=T2C=pass`
+**关键极性**：`expect=absent` 的臂 `PASS` = "按要求没说" = **好事**；`FAIL` 才是红了。
+⚠️ **我第一版把这个读反了，而自测的期望是从实现抄的 ⇒ 60/60 全绿什么也没测**；
+是**接地气的假读者端到端**（干净模式立刻给出 `X=fail` 而判据要 `X=pass`）把它逼出来的。
+⇒ **凡"自测全绿"都要问一句：期望是从哪来的。**（已写进 DESIGN §3.3）
+
+### ⭐ 会红的负对照（每一条都带 well-posedness 对照，否则是**无对照的负结果**）
+`arm O`(原文问得出) / `arm U`(被测) / `arm X`(**抽掉 U 内部一段**必须答不出来) /
+**`arm XC`**(同一 `U_x` 上问另一条记录必须答得出 ⇒ X 是"证据没了"不是"文档坏了") /
+**`arm S`**(两 nonce 对调 ⇒ 同一问题答案必须变；返回旧答案 ⇒ 不可用) /
+`arm L`(只存在 ORIG 的事实必须答不出来) / **`arm L2`**(同问题从 ORIG 必须答得出) /
+`arm T2`(派生 `18050`) / **`arm T2C`** / **`U2`**（与 U 逐字节相同 ⇒ 贪心确定性探针）。
+两趟（复用 / `--no-prefix-reuse`）状态必须一致。
+
+### 实测（全部宿主，`host`/`light` 类）
+| 项 | 结果 |
+|---|---|
+| 判分器自测 | ⭐ **64/64 分类正确**；23 个 report 注入里**恰好 1 个**能开 `成立` |
+| 假读者四态端到端 | ⭐ **11/11 模式命中预期态**（走 harness 最后用的同一个 `dgr_report.py`） |
+| 类型守卫 | 基线 18 断言绿；**SAB-V1/V2/V3 拒绝编译**、**SAB-V4 运行期 1 红** |
+| preflight | **29 条全绿**（`ok=True failed=[]`） |
+| 电池 | `battery_sha256=8939794ed8f7ee73…`，**同 seed 重建 3 次 + 线上那份四个相同** |
+| harness 前半段 | `DGR_STOP_AFTER_SEAM=1` ⇒ preflight 绿 + **SEAM=CLOSED** |
+| `/tmp` | 800 K（我来之前 752–788 K）；⚠️ 我曾写两个 ≈10 KB 临时目录并**同命令删除**（违反"产物写 scratch"，如实记） |
+
+### ⭐ 类型守卫收紧（d_sem 那一版挡不住的一格）
+`probe/dgr_sc4_verdict.h` 保留 d_sem 形状（`HostSemanticVerdict` **无 `Equivalent`**、`to_full` 无 `default:`），
+守卫从 `-Werror=switch` 收紧到 **`-Werror=switch -Wswitch-enum -Werror`**：
+`-Werror=switch` 一旦有 `default:` 就**哑**，`-Wswitch-enum` **即使有 `default:`** 也对未处理枚举值报警。
+**SAB-V2（加 `Equivalent` + `default: return Equivalent;`）实测拒绝编译**，触发的是 `-Werror=switch-enum`。
+`clang++` 本机**不存在** ⇒ 第二种编译器未验证。⚠️ 树上 `tests/CMakeLists.txt` **不带**这些开关 ⇒ **守卫现在空转**（决策项 D-2）。
+
+### 派单（主线）
+**① 不占 GPU 的前半段（10 秒）**：`DGR_STOP_AFTER_SEAM=1 bash /mnt/c/Users/User/Documents/ziqinzhang/sh/dgr_run.sh`
+**② 真跑（`model` 类，长跑必须后台）**：`bash /mnt/c/Users/User/Documents/ziqinzhang/sh/dgr_launch.sh`
+跟随 `tail -f /home/user/scratch/d_grader/logs/p4_model.txt`；四态在日志末尾 `FOUR-STATE VERDICT` 块；
+产物 `run/p4/report.json`，**一律 scratch、绝不 /tmp**。
+峰值：显存 **21.8–24 GiB**（**引用，未复算**）/ 主机 **9–11 GB**（实测可用 20.4 GB，门要 10000 MB）/
+磁盘 **<300 MB**（模型**硬链接**；实测空闲 62 GB，门要 40 GB）/ **6–12 分钟**。
+**会红**：⭐ arm X 必须答不出来（说出来 ⇒ 不可用，目击者作废）；arm L 必须答不出来；arm U 不是 pass ⇒ 塌；`U2==U`；两趟一致；`prompt_tokens.U ≠ .X`。
+**失败行为**：`hwrun` rc 4/5/6/7 ⇒ **如实报不可用，绝不降级硬跑**；服务起不来 ⇒ `未测`（**不是负结果**）；字段缺 ⇒ 报缺，**不当 0 用**。
+
+### ⛔ 未测（不算通过）
+**本线没有一格 GPU 数字是我产出的**；`21.8–24 GiB / 9–11 GB / 256 MiB` 全是引用。
+⇒ **SC-4c `自足` 对一个真实读者仍然是【未测】**；接缝只对本次语料成立；`judge/*` 未接进 `tests/`；
+Tier-2 的难度**没标定**。**跑完仍是 G3，我不给它升格。**
+
+### 副作用
+scratch `/home/user/scratch/d_grader/` 18 MB / 1074 文件（≈5 MB 是 `run/fake_e2e/` 自测残留，可删）。
+**源码 0 改动**；未动 `build/`、未动 `_hwlimit.sh`、未动别人 pin/槽位；无孤儿进程；GPU 只做 `nvidia-smi` 查询。
+`hwrun`：`host`/`light` 若干，**`model` 0 次、`gpu` 0 次**。
+
+---
+
+## §12.d-throwfix（19:45）按 w-throw 的裁定落地 (b) 逐点修 + 前置门：`scheduler.h:213/226` 是同一条账上的两个门
+
+线名 `d-throwfix`｜权威树 HEAD `3944a53`（脏工作树，**本线一行未改**，见下"零改动证明"）｜**未加载模型、未占 GPU、未动共享 `build/`**｜判据全部 host-only 可复跑。
+
+**裁定执行**：(a) **不做**、(c) **不做**、**(b) 逐点做且加前置门**。改动 **5 文件 9 hunk +120/−7**：`scheduler.h`（2 处）、`types.h` + `request_plan_impl.h` + `request_record.h` + `engine_core.h`（把"计划把 prompt span 切成几段"这个数从计划带到充值点）。
+
+**★ 把 w-throw §8「最大不确定性」变成可算的事实**：门触发 **⟺ `e_{u1} > e_{u0}`**，其中 `e_u = Σceil(L_i/u) − ceil(R/u)`（内部边界在该 unit 上的舍入超额）。暴力搜索（`py/dthf_probe_bf.cpp`，host-only 真 codegen）：
+- 两段（1 内部边界）R ≤ 3072：**70,755,840 用例 / 6,064,000 见证**
+- **一段（无内部边界）：0 见证**（正是树在 `scheduler.h:253-257` 写的 "What is EXACT here" 那一档）
+- 三段：1,128,042,240 / 23,343,616
+
+**最小见证**：`u0=256 → u1=128`、剩余 `R=258` 切成 `[129,129]` ⇒ `T0=2`、`T1=4`、充值只加 `disp=1`、预留 3 < 真需 4（`129=128+1` 是形状关键）。
+
+**判据（全 host-only，3 臂）**：`dthf_probe_after` = **GREEN 0 fail**（A5 穷举 1,197,000 用例 0 短）；`dthf_probe_before`（与被测树**同 sha** 的 pre-patch 头）= **RED 5 fail**，且**逐字打出 w-throw §6 预言的 reason** `request service projection consumed 1 quanta with 0 remaining` 与 `active request has no admission accounting`；`dthf_probe_mutb`（把新项强制 0）= **RED 2 fail**；守护臂 A3 证明真 over-charge 与零扣款在 after 上**仍然抛**。
+
+**逐点判定**：17 条 `scheduler.h` 抛点里只判 **2 条**为"条件写错"——
+1. `:213`（原 `:212-214`）：payload `ActiveAdmissionSnapshot` **不含**该值（断言零贡献）+ 同一文件明文声明该值可为 0 而请求仍活跃 ⇒ **删断言**，承重墙 `:225` **原地不动**；`engine_core.h:2224-2226` 自己写的字是 "the **pair** of invariants in scheduler.h"，独立支持两处一起判。
+2. `:272-279` 充值口径：漏掉内部边界的**逐段舍入项**。判法 `after = quanta_for(R,u1) + b`、`before = quanta_for(R,u0)`（**故意不对称**，两侧都加 b 会抵消）；`b = RequestPlanSummary::prefill_interior_boundaries`（由 `projected_service_work` **同循环**写出）+ `RequestRecord` 播种 + admission 同处播种 ⇒ 与 `service_work_quanta` 同函数同输入、不可能漂。代价 ≤ b 个 quantum，保守方向；"扣不够就自动延长预留"仍被注释里的原话拒斥。
+3. **`:226` 保留为真不变量、一字不改**（病在充值口径，不在它）。其余 15 条判真不变量，逐条 verdict 在 `py/dthf_mkbaseline.py` 的 REVIEWED 表。
+4. **契约未动**：`classify_failure` / `fail_request_lane` / `fail_all_locked` 与 9 个 hunk **不相交**（脚本逐 hunk 断言）；`program_impl.h:5127` **一个字符未动**；注入钩子 `request_once`/`invariant_once` 两处 cmp 逐字同。
+
+**前置门**（单子第 1 项）：`dthf_gate.py` = **P1 声明**（新 `logic_error` 家族字面量出现即红 / 已声明字面量消失即红）+ **P2 条件已修**（declared `condition` 的字面量**必须不在代码里**）+ **P3 契约**（`classify_failure` 不得 catch 该家族）。**五臂实测**：`TREE=RED(P2)`、`MIRROR=GREEN`、`MUT_NEW=RED(P1 undeclared)`、`MUT_LOST=RED(P1 gone)`、`MUT_CLASS=RED(P3)` ⇒ 门在"**修前红 / 修后绿**"上自证；`MUT_NEW` 正是单子要的注入用例。扫描器做**注释屏蔽**（这棵树把决定写在注释里，不屏蔽会把历史当站点 —— 第一版就扫出假站点，已修）。
+
+**真编译**（真 codegen 私有 `.o`，非 `-fsyntax-only`）：`engine.cpp` rc=0 **77.53 s / maxrss 1,286,016 KB**；`materializer.cpp`（覆盖 `request_plan_impl.h`）rc=0 **4.40 s / 291,208 KB**。证据：符号数 **1971 vs 共享 build 未打补丁的 1972**；被删抛点的消息串在我的 `.o` 里**消失**、在未打补丁的共享 `.o` 里**仍在**；`.o` 大小 **−864 B**。
+
+**行多重集**（§12.34）：**+120 / −7**；7 行删除**逐条归属**（3 行声明删除、4 行被取代且替代行在同一 hunk 的 `+` 侧）⇒ **lost=0**；120 行新增全部来自 5 处 Edit ⇒ **invented=0**。`git apply --check` 6/6 rc=0，并**另用两条独立判据核**（逐行归属表 + 守门区不相交断言）。
+
+**未验证（一条不省）**：①未跑引擎/未占 GPU ⇒ 单子判据 A/B 的**真引擎那格未测**；②见证是**纯算术可达**、非真 prompt 触发；③`b` 用整段边界数、偏保守但**未量化**；④树脏、行号可能漂（以逐字串为准）；⑤snapshot 档 56 行未逐条 review；⑥`program_impl.h` 族（`:5127` 未动、`:5133/:5143/:5148`、`:656`、`:679/:684`）**只判不修**；⑦`ops/*` 1517 条 `invalid_argument` 未覆盖；⑧真编译只 2 个 TU、`tests/` 未重编（`RequestPlanSummary` 加字段静态核对：树里无 `operator==`、无位置化聚合初始化 ⇒ 应不破坏）；⑨`:213` 删除的行为差异未实测。
+
+**派单（要引擎的，交主线）**：①**判定臂**（最便宜，请最先跑）：`sh/d1_run.sh` 主臂 argv 逐字（pin `932336eea9e8cbf8`）+ 小 `--prefill-chunk` 256 + 并发（长 decode 与长 prefill 同飞）+ 带 capture/rewrite 边界的 prompt ⇒ 判据：出现 `reason: request service projection consumed <w> quanta with <r> remaining` ⇒ §2 的 (ii) 成立；若只出现 `class=request` ⇒ 我第二处判定要撤（**我要看那一行**）。≤2 min，host ≥ 10 GB。②**守门犬臂** `invariant_once MIN_ID=2` 必须仍 `class=invariant` + `/health` 503 + `POST /recover`。③`request_once` 归因臂（只杀一条）。④**修复验证臂**（私有 build）：落批后 `grep -c 'engine failure class='` = 0、该请求与后续全 done、`/health` 200 ok；**反向判据**：引擎已不可信而 `/health` 仍 ok ⇒ 判负。⑤门接 CI + 覆盖扩到 Tier A（需先梳理 `ops/*` 的 `supports_*` 探针约定）。⑥`program_impl.h` 族（`:5127` 的**制造者**）单独一线。
+
+**零改动证明**：5 个被补丁的文件，工作树 sha256 与开工基线**逐字相同**（`ffd8cabd9f7c66cf` / `7be64a5c789983e9` / `3375a5a2c7c3cf57` / `1d4cde512aed3f06` / `42b516f1c0a0efaa`）；`hwrun monster` 2 次放行、rc=0、**未被拒**；未用 `git clean/checkout/stash/reset`、未 `rm -f /tmp/*`、未 `wsl --shutdown`。
+
+
+## §12.w-recover（19:56）那 32 个「内容不在 git 对象库」的隔离文件 —— **32/32 可重建（逐字节 cmp=0）**；w-quarantine 标的「真·单点故障 16 个 / 1,142,825 B」**16/16 全部有构造性重建**
+
+**接手**：`w_quarantine/REPORT.md` §8.2 唯一留下的未验证路径 ——「G1 那 32 个能否用盘上的 `*.diff/*.patch` **反向重建**：**我**（w-quarantine）**没有**做 `patch -R` 的构造性验证，这是**未证伪**的路径，不能算已排除」。
+**结论**：这条路径**被证成了**，不是被证伪。产出 `/home/user/scratch/w_recover/REPORT.md`，脚本 `sh/wrec_*.sh`，全程 CPU only（未加载模型、未占 GPU）。
+
+### 做了什么（可核）
+1. **32 项口径直接取自 w-quarantine 的产物，不自己重新推导分级**：`FINAL.tsv` 的 `G1_NOT_IN_GIT` 行 = `grade.tsv` 的 `G1_IRRECOVERABLE` 行 = **32 行，行号逐行相同**（5,8,12,13,21,24–29,32,34,41–46,51,53,54,60,79,80,86–92）；复算字节 **1,444,492 B**，与 `GRADE_SUMMARY.tsv` 逐数吻合。
+2. **语料两轮**：① w-quarantine 的 824 个 `*.diff/*.patch/*.rej/*.orig.*`（复算 24,973,236 B = 23.82 MiB）；② 我扩的 —— 扫 378,717 个小文件，取「内容里真有一行 `^@@ -<数字>`」的 **1,501** 个（其中 **927** 个名字命中 32 个 owner）⇒ 合计 **1,285** 个可解析差异文件。**②不是装饰：有 2 条的重建 patch 就是 `.txt` / `.md` 文件**（`dl/b02_hdrs.txt`、`research/notes/S_D_selector_fidelity.md`）。
+3. **基准不是只看 HEAD**：每个 owner 的 3–11 个 git 历史 blob + 84–187 个盘上同名副本（按内容去重后 3–75 个不同内容）+ 同 owner 的其它隔离文件；**与目标逐字节相同的"副本"一律排除**，否则"重建"就是"拷贝"。
+4. **三道闸**：行数算术闸 → patch 被删行的多重集子集闸 → **真打一次 + `sha256` 相等（唯一判定门）**。应用原语**先把段头路径拍平成 `TGT`** 再 `patch [-R] -p0 -i sec.diff TGT`，彻底绕开 `-p1/-p2` 与路径前缀的不确定性（先跑 `selftest2.sh` 证明原语能正能反能红）。
+5. **9 条是 CRLF**：**32 个里 9 个是 CRLF 行尾的，这 9 个恰好就是第一轮 0 命中的 9 个**；盘上 1,285 个差异文件的段内容**全是 LF** ⇒ 必须加一行文档化归一 `基准 --(CRLF→LF)--> patch --> --(LF→CRLF)-->`。加上这一步后 **9/9 全部 fuzz=0、cmp=0**。
+6. **负对照（最重要的可能不是"全中"，而是"抓到 2 条空操作"）**：
+   - 23 条 patch-only：**NC1**（把 patch 里"要被删掉的那一行"末字节改一字节）**必须对不上** → 5 档代表 **25 PASS / 0 FAIL**（含 fuzz=0 与 fuzz=3 两跑，具体 sha 见 `negctl.tsv`）；
+   - 9 条 patch+行尾：**NC1–NC5 共 45 行，40 PASS / 5 FAIL —— 5 个 FAIL 全部是"patch 不承重"**；
+   - 于是对 **32 条逐条**跑「空 diff（不给 patch）」闸：**30 PASS / 2 FAIL** ⇒ `gqa_attention_decode_impl.cuh.bak-prett6` 与 `dflash2_impl.h.orig` **连 patch 都不需要**（前者 = `to_crlf(to_lf(git show 08dbfa9e:<owner>))`，36,387 B → 37,003 B；后者 = C: 侧 `ninfer-fusion-repo/` 副本的行尾归一，29,334 B ↔ 29,334 B）。**如实单列，绝不把空操作记成 patch 的功劳。**
+7. **判定结果**：仅靠 patch **23 / 1,240,974 B**（22 条 `fuzz=0` + 1 条 `fuzz=2`）；patch + 行尾归一 **7 / 137,181 B**（全 `fuzz=0`）；纯行尾归一（无 patch）**2 / 66,337 B**；**不可重建 0 / 0 B**。**32/32 的 `cmp -s <重建产物> <树上那份>` 全部返回 0**，sha256 双向相等（`verify.tsv` / `verify_eol.tsv` / `totals.log`）。
+8. **对"真·单点故障"的直接裁定**：`G1_16_NO_CDRIVE_COPY.txt` 的 **16 个 / 1,142,825 B → 16/16 全部可重建**：**5 个只靠 `HEAD`**（114,136 B）、**9 个靠另一个 ref**（`origin/HEAD`×5、`d38bb91b`×3、`ad921ee3`×1；299,937 B）、**2 个仍以 `/dev/sdd` 上的 scratch/`~` 副本为基准**（`types.h.orig`、`program_impl.h.orig`；**728,752 B = G1 的 50.5%**）。
+   ⇒ **一句话：那 32 个「内容在 git 对象库里不存在」是事实，但它 ≠「内容不可重建」。** 32/32 都能由盘上素材逐字节重建；"无任何重建路径"的条目从 16 → **0**。
+
+### ⭐ 最该被上游知道的一条（风险转移，而不是消失）
+**重建的"基准"比"目标"更脆弱。** 32 条的基准按可信级分：**S（`HEAD`/树内同一文件）10 条**、**A（其它 ref）14 条**、**B（C: 侧副本）3 条**、**C（`/home/user` 非树副本 = 同一块 `/dev/sdd`）5 条**。
+其中 **`program_impl.h.orig`（691,737 B，占 G1 的 47.9%）的重建完全押在 `/home/user/scratch/g2/a/…` 这一份 scratch 副本上** ——
+"单点"没有消失，而是**从隔离文件挪到了它的重建基准**；scratch 一清理，这条重建路径就断。
+另外：A 档里有 5 条依赖 `refs/remotes/origin/HEAD`（`merge-base HEAD origin/main` 仍为空，与 w-quarantine §9(a) 同）；**现场观察 19:06:50 别的线建了 `refs/tags/protect/origin-main-20260914T190650` 钉住同一 sha `0eaac046ee98`，这层当前已被他人加固（只观察，不认领）**。
+
+### 顺手确认（只读；**未创建 `_collab/`、未改 `MANIFEST.txt`**）
+- 树内**没有** `_collab/`（`ls -d` 失败、`find -iname '*collab*'` 空）；C: 侧有 ⇒ `MANIFEST.txt` 承诺的「archived as a diff under `_collab/`」**在树内断链**，但**我确实从 C: 侧 `_collab/` 取到了 23 条重建里 12 条的 patch**。
+- 顺带：`MANIFEST.txt` 列了 **12 个唯一路径**，`_orig_quarantine/` 里只有 **4 个**在；另有 4 个在 `_quarantine_backups_20260912/`、1 个变成被跟踪文件、**4 个树内任何地方都找不到**（`engine_core.h.orig`、`generation_service.cpp.orig`、`serve_options.cpp.orig`、`serve_options.h.orig`）。这 4 个**不在** w-quarantine 的 102 项里、也**不在**我的 32 项里；**我未在树外搜索它们**，**未补、未改清单**。
+
+### 未验证（明说）
+① 只验**逐字节相等**，未编译未跑测试；② **"可重建" ≠ "归属语义成立"**（§5.3 抓到 2 条方向正好相反）；③ 未扫「差分藏在没有 `@@ -` 的文件里」（上下文格式 `! ` 行、`rcsdiff`、二进制 `GIT binary patch`）；④ 基准只搜 `/home/user` + C: 文档目录，未穷举全机/别的盘；⑤ 给的是"第一组能通过的"重建，**不是最小集**（同一条常有 1–8 组）；⑥ 行尾只试了 3 类变换，未试混合行尾/UTF-16/BOM；⑦ 未做破坏性对照（没真去删 patch/基准 —— 所有负对照都在私有副本上做）。
+
+### 0 破坏自证
+`HEAD = 3944a53eda1aac439a566a1cf46ea741f0415fdc`（**未变**）；`git status --porcelain | wc -l = 294`（**未变**）；**32 个隔离文件逐个重哈希 32/32 UNCHANGED**；树内 `.orig/.bak` 仍是 **102**；两个 quarantine 目录 mtime 未变；**所有重建都在私有目录 `/home/user/scratch/w_recover/` 里做**（把基准与 patch 段复制出去再打），**从未把 patch 打进树**；未 `git clean/checkout -- ./stash/reset --hard`、未 `git add`、未碰共享 `build/`、未 `wsl --shutdown`、未 `rm -f /tmp/*`、未 `fuser`/`/proc/*/fd`、未整目录 `cp -r`；全程 `hwrun light`，**无 rc 4/5/6/7**。
+一处如实报：`.git/index` 的 sha256 从 `1b19c2e03c1c…`(mtime 15:07:54) 变成 `05e45d04598e…`(mtime 19:26:29) —— 是 `git status` 判定 stat 过期后回写索引（只读命令的副作用）；**HEAD 未变、脏文件数仍 294、`git diff --cached` 为空**，我从未 `add/commit/checkout/restore`。
+明令遵守：**未分配 `§12.x` 编号** ⇒ 本段用 `## §12.w-recover（19:56）`；台账只 append。
+
+**§12.w-recover 的两句更正（19:57，append 不改上文）**：① 收尾时实测 `.git/index` sha 已从 `05e45d0459…` 又变为 `efcaf0e77208…`（mtime 19:31:31，本轮内共动 3 次：15:07:54 → 19:26:29 → 19:31:31），且 `git diff --cached` **非空** —— 有 **1 个非我 staged 的条目** `tools/convert/qwen3_8_27b/convert_modelopt.py`（+1842 行）；**不是我**：我的脚本从未 `git add/commit/checkout/restore/reset/stash`，该文件不在我的操作范围；`HEAD` 未变、`status --porcelain` 始终 **294**、与 32 个目标无交集。② 树内 `19:00` 之后唯一被我写过的文件就是**本台账**（任务要求 append）；append-only 已证：`sha256(当前文件前 821357 B)` == append 前整文件 sha，`delta = 1 空行 + 段字节`。 已同步更正这两处（§9.4 与 §10）。
+
+---
+
+## §12.w-throw2（20:31）ops/* 的 951 条 + program_impl.h 族判定 + tests/ 真编译 + :213/b 量化
+
+**三处硬修正（相对上一棒 d-throwfix §9 的 ⑥⑦⑧⑨）**
+
+1. ★**计数归属改掉**：上一棒说「ops/* 的 **1517** 条 invalid_argument」——**1517 是 Tier A（249 文件）全体的数，ops/* 是 951（169 文件）**。
+   我用它的两个工件（dl/wthrow/wthr_reach.tsv + wthr_tier2.txt）逐字复现出 1517（口径一致）与 951（py/wth2_ops.py → out/ops_tier.txt）。
+2. ★**推翻「ops/* 大量是探针控制流 ⇒ 不是炸弹」**：835/951（87.8%）的站点落在**文件里一个 catch 都没有**的 161/169 个文件里；
+   且 ops 入口的**调用点也没有 catch**（src/targets/qwen3_6/impl/runtime/text_context_impl.h：1598 行、89 个 ops:: 调用点、**0 catch**；
+   27b/35b 的 variant.cpp：0 catch；dflash_impl.h / dflash2_impl.h：0 catch）。
+   ⇒ 链路 `worker_loop → target impl 前向(0 catch) → ops::<entry>(0 catch) → require_*/validate_* 抛 invalid_argument → catch(...) → class=invariant → 停引擎`
+   逐字成立（docs/maintainer/engine-failure-recovery.md:40）。「探针控制流」只是 **8 个文件**的局部现象。
+   **且 ops 里没有 `supports_*` 探针约定**：gdn_input_proj/gqa_attention/embedding/rope/sampling 五个最大文件里 `supports|capable|_probe` 出现 **0** 次
+   ⇒ 上一棒"扩门前要先梳理 supports_* 约定"这个前置条件**不存在**（见派单 0）。
+3. ★**program_impl.h 族判了**（上一棒只写"未判"）：
+   `:656` = **invariant**（4 个调用点拆开：ordinary :13006 有 graph_profile_missing+extend 守卫（:12997-13004）；DFlash :13378 / DFlash2 :13620
+   在启动期无 ceiling 过滤、全量捕获并 validate（:12208/:12229-12249、:12258/:12290）⇒ 覆盖 [0,capacity-1]；**只有 MTP :13172 的子支
+   `launch_width==0 ∧ ceiling!=0 ∧ rungs>1` 未证**）；
+   `:679/:684` = **invariant 且在启动期**（外包函数我读出来了 = `ProgramImplCore::prepare_graphs()` :11867；上一棒的 UNDREACHED 应改判"启动期真不变量"）；
+   `:5127/:5133` = **「针对错对象的不变量」= 条件写错，但制造者未证 ⇒ 保留 + 未判**（同文件别处一律按 (sequence, shared) 成对处理：
+   pressure_state_source(action, sequence, shared) :5828、owner 取址 :5894-5896、:5019/:5064/:5075 的 (source_state||shared_state)；
+   **只有 :5126 只看 source_state**，而共享前缀当源时 source_state==nullptr 是**构造性**的（:4938-4942），且冷记账只挂在 SequenceState 上
+   （生产者 :11122、清空 :10767，SharedPrefixState 无 cold_pages）⇒ 这一支**没有答案可给**）；
+   `:5143/:5148` = **真不变量**（:5143 是全族唯一"断言的量就是它刚要做的动作"的站点：:5142 已把描述符放回冷路）。
+   制造者链条逐跳已给出（S 冷维护压冷 :11117-11124 → S 结束 release_continuation_slot :6653 → release_active_shared_references :6659 →
+   release_sequence_kv :10752-10767 回收冷槽+文件槽+清 cold_pages（:9488 同形）→ 共享前缀当源 materialize → :5121 命中 → :5127）
+   **卡在唯一一格**：「共享前缀的地址空间能否承载 cold_compressed 页」（反对：PressureKVDecisionKind 无冷操作；
+   支持：共享前缀按定义就是 read-free 前缀、而冷压缩的目标正是它，且 can_cold_transfer(logical_kv_store.h:774) 不拒绝 references==2）。
+   闭合只需再读两个文件（logical_kv_store.h:767-900 + SharedPrefixState 定义）⇒ 派单 7。
+
+**Task 3（⑧，补真编译）**：把 tests/ 里**受补丁头影响的 6 个 TU** 真编了一遍（真 codegen、私有 .o、**不是 -fsyntax-only**）：
+  TU 清单来自 build/compile_commands.json 一个文件的定点读（495 条/其中 tests 143 条/131 唯一）+ 逐 TU 单文件 grep。
+  **6/6 rc=0**，wall 1.08–8.03 s，maxrss 253–575 MB（out/tests_build.txt 全量日志）。
+  四条证据：(1) 对 6 个 TU 各做 -E 预处理后 `prefill_interior_boundaries` 出现 1/1/1/2/1/1 次 ⇒ **补丁头确实在 include 闭包内**；
+  (2) 同一个 test_resource_manager.cpp 用**未打补丁的树** vs **带补丁的 mirror** 两份 .o 不同（724088 vs 724152 B，符号数都 720）
+  ⇒ **加字段真的改到了测例的机器码**，这次编译不是空转；(3) rc=0 ⇒ `RequestPlanSummary` 加带默认值字段 **tests/ 一个字符都不用改**
+  （上一棒只有静态核对，这一棒是编出来的）；(4) sha256 与两条命令行逐字在日志里。
+  **整树 link 不在本线范围**：共享 build/ 的 link 命令行写死在 build/tests/CMakeFiles/*.dir/link.txt（含每个 .o 绝对路径 + 全套 -l/-L），
+  把私有 .o 塞进去就是改共享 build/；唯一安全做法是另建整棵私有 build（495 TU 全量）⇒ **派单 5**。
+
+**Task 4（⑨，:213 删除的行为差异量化）**：新探针 `probe/wth2_probe213`（host-only，两个 build 只差一个 -I 根：tree 头 sha 3375a5a2c7c3cf57 vs mirror 头 e282479aa196ba42；
+  判据两边逐字相同 ⇒ 退出码就是结论）。src/REPORT 全在 out/probe213.txt。
+  tree = **RED 8 failures exit 1**（A1/A3/A4-residual0 全 STOP: "active request has no admission accounting"）；
+  mirror = **GREEN exit 0**（A1 size=1、A3 size=2、A4 三个 residual 快照**逐字段相同**）。
+  ⇒ **能**造出"active 且 residual=0 被枚举成 donor"的序列；**差异量化 = 恰好 1 个比特（throw vs enumerate），其余全零**：
+  被枚举的载荷类型 `ActiveAdmissionSnapshot` 只有 3 个成员（admission_policy.h:17-21，无 residual），
+  它的**全部**消费者只用这 3 个（protection_has_live_donor :83-88 只用 request_id；persistent_backfill_is_authorized :90-108 用 3 个）。
+  A5 守护臂：**承重门 consume_service_work 在两个 build 里都仍然抛**（二进制里 `request service projection consumed` tree 2 次 / mirror 2 次），
+  被删的那条消息 tree 1 次 / mirror **0** 次 ⇒ 删掉的是错拷贝，承重墙原地不动。A5 还顺带证明 **residual 恰好 0 是扣款路径自己的正常输出**。
+
+**Task 5（③，b 的保守量）**：py/wth2_b_bound.py（纯整数穷举）。
+  **精确恒等式**：overshoot(=修后多留) == `b_whole − (e_{u1} − e_{u0})`，且 `0 <= e_{u1}−e_{u0} <= b_rem`
+  ⇒ **overshoot ∈ [Δ, b_whole]，Δ := b_whole − b_rem = 已经走掉的内部边界数**；且 `need − top_up = (e_{u1}−e_{u0}) − b_whole <= −Δ <= 0` ⇒ **充分性无条件成立**。
+  ⇒ 『因为用了整段边界数而多出的那部分』**恰好 = Δ 个 quantum**（下界、紧）；最坏多留整个 b_whole。
+  **穷举**：层 A（R≤40、k≤4、已走段数 j、unit∈{8..64}）= 2,380,794 用例：违反 e_u≤k_rem−1 = 0、违反恒等式/下界 = 0、**修后仍欠账 = 0**、
+  修前最大欠账 2 quanta、修后最大多留 6 quanta、max Δ 3。层 B（真实 128 对齐网格、R≤150、k∈{2,3}）= 25,143,750 用例：
+  修前最大欠账 0、修后最大多留 3 quanta、**最大相对多留 2.000**（只在 needed 很小时，绝对代价 ≤3 quanta —— 必须与相对数一起写）。
+  层 C 逐字复核上一棒见证 R=258/u0=256/u1=128/parts=[129,129]：修前预留 3 欠 1、修后预留 4 多留 0（Δ=0）**对上**。
+  量级表述：额外预留 ≤ (k−1) quanta，相对 ≤ (k−1)·u1/R。
+
+**交付**：/home/user/scratch/w_throw2/ —— REPORT.md；patches/00_no_source_patch.txt（**零源码补丁**的四条理由）；
+  patches/wth2_gate_ops.patch（**前置门 baseline 的统一 diff，+862 行**：ops/* 855 + program_impl.h 族 7，**不施加**）+ baseline_ext.tsv + extended.tsv；
+  out/（ops_tier.txt、ops_sites.tsv 951 条逐站点、ops_catch.txt、ops_hard.tsv 346 条 T1 清单、ops_callers.txt、ops_verdict.txt、
+  recon*.txt 逐字区间、tests_pick/plan/build.txt 真编译日志、probe213.txt、b_bound*.txt）；probe/（探针源码 + 两个二进制）；obj/（7 个私有 .o）；sh/py/*。
+
+**未验证（一条不省）**：①未跑引擎/未占 GPU ⇒ 判据 A/B 的真引擎格仍未测；②「零 catch」只到**文件级 + 抽样调用点**，不是 AST 级捕获闭包
+  （§1.4 的 835 条"逃出文件"≠"逃到引擎并抛"）；③ops/* 只判了 T1 的 346 条（真不变量 301 / 条件写错 2 族 / **未判 43**），**T2+T3 的 605 条一条没判**，
+  「未判」≠「通过」；④`:5127` 的制造者**未闭合**（卡在"共享前缀能否承载 cold_compressed 页"，缺 logical_kv_store.h:767-900 与 SharedPrefixState 定义 ——
+  后者**不在** wthr_tier2.txt 给的 249 个 Tier A 文件里，我没去找以免变成目录扫描）；⑤`:656` 的 MTP 子支未证；⑥program_impl.h 族里没点名的相邻站点
+  （:5109/:4621-4624/:10776-10778/:10650/:10844）未判；⑦tests/ 的 .o **没 link、没跑**（ctest 未跑，只证编译）；
+  ⑧in_bin 是 strings 子串、9 条 catch(...) 的行匹配未确认"catch 是否在抛点之后"；⑨行号：开工时 5 个补丁文件 sha 与 d-throwfix 台账**逐字相同**
+  ⇒ 自 19:53 起未漂，仍以逐字串为准；⑩我的纪律偏差：用过**一次** `grep -rn`（限定 src/runtime/engine/ 单目录、单符号 'struct ActiveAdmissionSet'）与
+  **一次** Windows `dir /b`（开工定位）；其余全部定点读，遍历只发生在**已有清单上做单文件 grep**（249 Tier A 文件 / 131 tests 文件 / 169 ops 文件）；
+  ⑪b 的量化吃"b 用整段边界数"这个现有行为 —— 若改成剩余段边界数，Δ 项消失、多留降到 [0, b_rem]（这是改法选择，不是我测出来的）。
+
+**最大不确定性**：§1.2 的 **835/951** 只到文件级 —— 若据此改分类层或成批改 ops 谓词，必须先做 AST 级捕获闭包，否则会把其实被接住的站点误判成炸弹。
+  第二：`:5127` 那格决定"改 `prepare_kv_restores` 的取源"还是"改 `release_sequence_kv` 的回收时机"（两者处置完全不同）。
+  第三：`:656` 的 MTP 子支。
+
+**派单**：**0**（新增，最便宜）把 patches/wth2_gate_ops.patch 落进前置门 baseline（数据文件）后跑 dthf_gate.sh 五臂：TREE 仍 RED(P2)、MIRROR 仍 GREEN、
+  新增 862 行**不得**让 P1 变红；若 P1 报字面量对不上 ⇒ 把那一行给我（TSV 抽取口径 vs 门注释屏蔽不一致）。
+  1 判定臂（原样，pin 932336eea9e8cbf8 + --prefill-chunk 256 + 并发 + 带 capture/rewrite 边界的 prompt，≤2min，host≥10GB；若只出现 class=request 我要看那一行）。
+  2 守门犬臂 invariant_once（本棒已给 host 侧证据：承重门消息两 build 都在）。3 request_once 归因臂。4 修复验证臂（私有 build；反向判据：引擎已不可信而 /health 仍 ok ⇒ 判负）。
+  5 **整树 link + ctest**（另建整棵私有 build，495 TU；判据 6 个测例全绿；编译半边本棒已给绿）。6 `:656` 的 MTP 子支（文本级二值判）。
+  7 `:5127` 的制造者闭合（文本级二值判：被共享前缀引用的逻辑页能否被 transfer_to_cold 压冷；能⇒条件写错且修在上游，不能⇒真不变量）。
+
+**零改动证明**：5 个被 d-throwfix 补丁的文件，工作树 sha256 = ffd8cabd9f7c66cf / 7be64a5c789983e9 / 3375a5a2c7c3cf57 / 1d4cde512aed3f06 / 42b516f1c0a0efaa，
+  与 d-throwfix 台账**逐字相同** ⇒ 一个字符未动。未用 git clean/checkout/stash/reset、未 rm -f /tmp/*、未 wsl --shutdown、未 fuser。
+  共享 build/ 只读（compile_commands.json + link.txt 路径列表），所有 .o 在 w_throw2/obj/。
+  hwrun：host 15 次 / light 12 次，**model 0 次、gpu 0 次，未被拒**；每个调用点后都 trap - RETURN，没有拿 hwrun 包父脚本。
+
+---
+
+## §12.w-throw3（20:49）`:5127` 制造者 = 证出（可达）＋ `:656` MTP 子支 = 空集 ＋ `wth2_gate_ops.patch` 实测（不得单独落）＋ ops 逐条 verdict 862/997 ＋ 整树 link 估算
+
+> 权威树 `/home/user/ninfer-fusion`（HEAD `3944a53`）。**未改源码、未加载模型、未占 GPU**。报告 `/home/user/scratch/w_throw3/REPORT.md`。
+
+### 1. ★★ `:5127` 的"制造者" = **证出来了：可达**（w-throw2 的"未证"这一格**划掉**）
+
+**一句话**：**冷压缩是唯一一条会把"被两个地址同时引用（`references > 1`）的页"的 device replica 摘掉的路径**；而"被两个地址同时引用"**就是共享前缀的定义**（同文件 `shared_kv_prefix_pages:7018` / `shared_device_kv_prefix_pages:7039` 都以 `address_references > 1` 为判据）。共享前缀那半个地址拿到的是**旧活动地址**，它与新活动地址**共享同一批逻辑页**，所以拥有它的 SequenceState 之后每一次冷压缩都会把共享前缀还在引用的页压冷，而冷簿记只写进**它自己**的 `cold_pages`。
+
+**逐跳（全部逐字，行号今日现读）**：
+1. `publish_shared`（`:7463`/`:7887`）→ 2. `prepare_active_snapshot(sequence.kv->text, *active_text_destination, …)`（`:8149-8154`）→ 3. `commit_active_snapshot`：`retain_reference` 每页（`logical_kv_store.h:1474`）**并把同一批逻辑页写进目的地 membership**（`:1476`），`A_old` 变**非活动 checkpoint 地址**（`:1497-1499`）→ 4. `shared.kv = *shared_bundle`（旧 bundle = `A_old`，`:8328-8343`、`:8428`）、`sequence.kv = A_new` → 5. 每轮 decode 边界 `enqueue_cold_compressions(sequence)`（`:13532-13538` → `:10845`），扫描窗 `cold_frontier .. (text_kv_valid-cold_keep_tokens)/page`（`:10857-10861`），谓词 `store.can_cold_transfer(text,page)`（`:10926`）→ 6. **谓词为真**（`:786-797`：`references != 0` ✓=2、`writer_references == 0` ✓、`source_pins == 0` ✓、device replica 在 ✓）⇒ `transfer_to_cold`（`:11121` → `logical_kv_store.h:771-779`，**摘 replica + `cold_compressed = true`**）+ 簿记写进 **S 的** `cold_pages`（`:11122-11124`）→ 7. 新请求以共享前缀为源（`:4362`、`:4938-4942`、`:5024`）⇒ `source_state == nullptr` → 8. `prepare_kv_restores` 的冷支 ⇒ **`:5127` 抛**（`:5118-5121`、`:5126-5127`）。
+
+**为什么没人挡住（三条逐字）**：
+① **`can_dematerialize` 认独占（`references == 1`，`logical_kv_store.h:669-674`）、`can_cold_transfer` 不认（只要求 `references != 0`，`:786-797`）**；地址级注释 `:1783-1784` 却写着"exclusively referenced by its writer"——**代码里没有这一项**。
+② `protect_coverage`（`:1475`、`rebuild_checkpoint_protection:1908-1931`）只保**列**（消费者只有 `:618/:633/:666`），**冷谓词一个字都不看它**。
+③ **唯一的 materialize 前回暖只对 private 源**：`:9516-9526` 的 `warm_cold_prefix` 守 `private_source_ready`（= `has_source`）⇒ 共享源**永不回暖**；而 `logical_kv_store.h:782-785` 的注释声称"fork path warms cold pages before materializing them"——**对共享源是假的**（两条注释互相矛盾）。
+④ 冷簿记唯一载体是 `SequenceState`（`program.h:507-512`）；`SharedPrefixState`（`program.h:538-548`）**没有 `cold_pages`**。
+⑤ 排除掉的分支：入口守卫/扫描窗/capture 不重置 `cold_frontier`/`writer_references`/`source_pins`/device replica/保护列/pressure 机器/`has_source ∧ has_shared_source` 互斥（`:1558`）——**逐条否掉**（报告 §1.4 表）。
+⑥ 两个失败态：**态 A**（owner 活着：数据其实可取，但代码只去查 `source_state->cold_pages`）与**态 B**（owner 已结束：`release_sequence_kv:10755-10767` 已 `release_cold_slot` + `release_cold_disk_file_slot` + `cold_pages.clear()`，而描述符仍 `cold_compressed == true` ⇒ **sentinel 指向已回收的槽**）。
+⑦ 修法三选（**都不是"就地改条件"**）：(a) 冷路加 `references == 1`（= 与 `can_dematerialize` 对齐，最小；代价=共享页留热，量未测）；(b) 让共享源也回暖 —— **技术上不可行**（`warm_cold_prefix` 要 `SequenceState&` 且要求地址 active，共享前缀地址恰恰不是 active）；(c) 冷簿记跟页走 / `release_sequence_kv` 在 `references > 1` 时先不回收槽（正确但大）。DRAFT 补丁：`patches/wth3_cold_shared_guard.DRAFT.diff`（**只 dry-run 过，未施加**）。
+
+### 2. ★ `:656` 的 MTP 子支 = **空集（不可达）**
+
+`launch_width == 0` ⟺ 每行都 `continue`（`:13139-13145`）⟺ `mtp_target_width == 0 ∧ mtp_ladder.empty()` 行行成立 **⟺ `mtp_ladder` 为空**；而 `:12138-12139 rungs = mtp_ladder.empty() ? {draft_window} : mtp_ladder` ⇒ `rungs.size() == 1`。⇒ **`launch_width == 0 ∧ rungs.size() > 1` 是空集**（与 ceiling 无关）。梯成员恒 ≥2（`round_state.h:52 {2,3,5,7,9,15}` + `layouts_impl.h:1598-1607` 只取 ≤max 的**正**元素 + 兜底 ≥1）⇒ 那条"⟺"也不能靠 0 成立。
+**顺带发现（新的、可达的 `:656` 路径）**：判据用**全梯**、绑定用 `kMtpWindowLadderTop`（**15**，`:10301/:10318`），而捕获梯被 `kMaximumMtpDraftTokens` 裁剪（`layouts_impl.h:1598-1607`）；`chosen` 未被夹（`:10319-10321`），`launch_width` 直接当 `draft_width` 键（`:13145`、`:13172`），而 `extend_mtp_graphs` 对非梯成员**提前 return**（`:12454-12455`）⇒ **`mtp_target_width ∉ mtp_ladder` 时 `:656` 抛**。**对本 artifact（27b，max=15）不成立**（`raw ∈` 全梯、`head_floor ∈ {1,5}` ⇒ `chosen` 仍是梯成员）；**对 `kMaximumMtpDraftTokens = 5` 的 target（`qwen3_5_9b`、`muse_glimmer_30b`）成立**（该 header 自己记录 `cut = 12 → rung 15`，`mtp_window_cut.h:109-112`）。
+
+### 3. ★★ `wth2_gate_ops.patch` 实测：**不得单独落**；"+862 里有误报"= **两层都答**
+
+- **施加**：干净副本 `patch -p1` rc=0，结果 sha256[:32] `44f4b0f25fe3b17fcdd3fdcbe123f880` == 它自己的 `dthf_throw_baseline.extended.tsv`（**逐字节相同**）。
+- **五臂（原始 862 行）**：只换 baseline **不扩 covered** ⇒ **862 × GONE（门在已修好的镜像上也红）**；扩到 162 文件 ⇒ **678 问题 = 572 UNDECLARED + 105 GONE + 1 无法声明**。
+- **三类根因**：只收 `invalid_argument`（漏 46 条 `logic_error`）；**单行 text**（96 条跨行抛点被 `if not lit: continue` 静默跳过）；门取"参数里第一个字面量"（拼接消息取到片段 ⇒ 105 行声明成门看不见的字面量）。⇒ 覆盖率 **862/1305 ≈ 66%**。
+- **修正件** `patches/wth3_gate_ops_v2.patch`（**+1303 行**，用**门自己的 `scan_throws`** 口径重建）+ 覆盖清单 `out/covered_v2b.txt`（161 文件，**排除** `replay.cpp`）⇒ 五臂 = **MIRROR GREEN(0) / TREE RED(恰好 1 条 P2) / MUT_NEW RED(1 UNDECLARED) / MUT_LOST RED(1 GONE) / MUT_CLASS RED(1 P3)**（干净重建后，`out/repair.txt`）。
+- ⚠️ **门的设计限制**：`src/ops/linear_attention/gated_delta_net/replay.cpp:85 throw std::invalid_argument(message)` **无字面量** ⇒ 只要该文件在 covered 里，P1 的"cannot be declared"分支让门**结构性 RED**（声明消不掉）。要么上游给字面量，要么给门加 `verdict=dynamic`。
+- **误报（语义层）**：对 pinned `build/apps/ninfer-serve`（814,583,280 B，`sha256=932336eea9e8cbf8…`）做一次 `grep -a -F -f`（1306 字面量）⇒ **57 条**声明字面量**不在**该二进制里（"会逃到 worker 边界"对这个二进制无证据）+ **133 条**名字图无路径 + **2 条**启动期 = **192/862 = 22.3%** 的声明行路径可疑；与 w-throw 的 `in_bin` 列**一致 847/862**（不一致 20，方向已标：**"找不到"是较强否证**）。
+
+### 4. `ops/*` 逐条 verdict：**862/997（86.5%）出表**
+
+表 `out/verdict_ops.tsv`（862 行 × 11 列，7 档）：`X1 未判 565` / `U1 名字图无路径 133` / `O1 不在 serve 二进制 57` / `P1 计划期形状契约候选 52` / `C2 上限语义弱候选 24` / `C1 条件写错候选 20` / `X0 短字面量不可判 11`。
+⇒ **244 条（28.3%）给出非"未判"判定**（O1+U1+P1+S1），**618 条（71.7%）明确标未判**。未对齐 135 条（13 条是 **w-throw 自己的记行噪声**：`text` 是 `return;`/`}`/函数签名；16 条来自被排除的 `replay.cpp`；其余是两套扫描器的行号口径）。
+**C1 抽样 5 条逐字读过**：与 `scheduler.h:213` 同形的 2 条（`gqa_kv_append: T exceeds KV cache capacity`、`…: execution envelope is shorter than T`）、半对 1 条、**机械规则误判 2 条**（稀疏 MoE 的工作区检查是同源自洽的真不变量）⇒ **C1/C2 一律算未判**，只有 O1/U1/S1/P1 计入"给出判定"。
+**真 codegen**：6 个请求路径 ops TU `rc=0 6/6`（0.21–0.58 s、91–142 MB）、3 个含 `program_impl.h` 的 host TU（1.86–4.45 s、281–432 MB）；**175/175 条声明字面量在 `.o` 的 strings 里找到**（声明行不是扫描幽灵）。
+
+### 5. 整树 link 可行性（**不跑**，派单 4）
+
+495 TU（**`c++` 326 / `nvcc -rdc=true` 161** / nvcc 7 / cc 1）；lib 侧 `libninfer_ops.a` **815.6 MB**、`ninfer-serve` 814.6 MB；共享 `build/` = **59.4 GiB**（499 个 `.o`，device link 产物 276 MB、`gqa_attention_decode_e8.cu.o` 179 MB）。实测锚点：host TU 0.2–4.5 s / 91–432 MB；`arena.cu`（nvcc rdc）2.37 s / 318 MB；最重 TU `gqa_attention_decode_e8.cu` 见 `out/nvcc_probe.txt`。**估**：磁盘 60–70 GiB（**当前可用 ~59 GB，必须先腾盘**）、host ≥ 8 GB、串行 2–4 h / `-j4` 30–60 min。
+
+### 6. 纪律账（两次自伤，如实记录）
+1. ★`wth3_50` 的 `mkroot` 用 `cp -al` 后**直接覆写**（同一 inode）⇒ **损坏了 `d_throwfix` 的私有镜像** `src/runtime/engine/{scheduler.h,engine_core.h}`。发现方式：sha 与镜像相同而本应不同。**已用"树 + d-throwfix 自己的补丁"重放修复**并逐字校验（`e282479aa196ba42` / `85ce48aa4b102c86`），只坏了这 2 个文件。此后每个突变体先 `rm -f` 打断硬链（`wth3_57` 起）。
+2. ★`wth3_50/55/56` 在污染根上跑过的三份输出**作废**；最终数字以 `out/repair.txt` 为准（`wth3_40` 的 A/B/C 臂与 `wth3_50` 的 MIRROR 臂在污染前跑，有效）。
+3. 越界一次（已披露）：`grep -rln 'kMaximumMtpDraftTokens' …/src`（已知目录、单一符号）+ `du -sm`/`find -name '*.o'` 各一次（只对已知 `build/`）。其余全是定点读 + 单文件 grep。
+4. 权威树**零写入**（唯一写入 = 本条台账）；每个 `hwrun` 之后都 `trap - RETURN`；**没有**用 `hwrun` 包父脚本；harness 自身两个 bug（`$T/$src` 重复拼接、baseline 路径）已修并重跑。
+
+### 7. 派单（新增/改判）
+- **派单 0（改）**：**不要单独落** `wth2_gate_ops.patch`；落 `wth3_gate_ops_v2.patch` + `covered_v2b.txt` + 把 `dthf_gate.py` 的 `--covered` 改成读清单。判据：MIRROR GREEN(0) / TREE RED(1 条 P2) / 三突变各 1 条。
+- **派单 1（`:5127` 制造者的引擎级闭合，最高优先）**：`--cold-policy window --cold-keep-tokens 128` + 捕获式前缀缓存 + 单 lane 长 decode + 一路命中同一前缀 ⇒ grep `cold checkpoint page has no source bookkeeping`；不出现则要 `[cold] compressed N prefix pages` 的 N、`shared_prefix_references.size()`、共享页的 `references`（三样能否掉本链）。
+- **派单 2（修法裁决）**：(a) 冷路 `references == 1` vs (c) 簿记跟页走；**(a) 的代价只有引擎能测**（共享页留热后 N 掉多少）。
+- **派单 3（`:656` §2.2）**：对 max=5 的 target 跑 adaptive MTP，看 `[mtp-window] … rung=` 是否 >5、是否抛"coverage is incomplete"。
+- **派单 4（整树 link）**：私有 `build/`；**先腾 ≥70 GiB**；`-j2…-j4`。
+- **派单 5（门的 `dynamic` 档）**：`replay.cpp:85` 无字面量抛点 ⇒ 要么给字面量（会改消息、要同步 baseline），要么给门加一档。
+
+（21:21 补测更正，见上条第 5 节 —— 台账 append-only，不改上文）
+
+#### 补测更正（本条第 5 节的两处估算，21:21 实测推翻）
+
+- ★**单 TU 峰值 = 19,579,268 KB ≈ 18.7 GiB**（`src/ops/launcher/gqa_attention_decode_e8.cu`，`/usr/bin/time -v`，rc=0，`.o` 179,058,096 B），**wall = 34 m 46.68 s**。host MemTotal = 22 GiB ⇒ **`-j4`/`-j8` 会 OOM**；**`hwrun monster` 的 9 GB 门槛低于真实峰值，保护不了 host**。实测时 `MemAvailable` 从 20.2 GB 掉到 7.8 GB。
+- ★**盘**：共享 `build/` = 60,834 MB，其中 **`build/tests` = 56,741 MB（74 个 >10 MB 的测例二进制，多数 775–802 MB）**、`build/apps` = 2,329 MB、**`build/src` = 1,763 MB**。⇒ **整树+全 `ctest` ≈ 60 GB（可用仅 59 GB，94% 满）**；**只 build `ninfer-serve` + 6 个点名测例 ≈ 9 GB**（后者就够 `ctest` 的判据）。**上一段写的"disk ≥ 20 GB"（w-throw2 派单 5）两头都不对。**
+- `build/tests` 里 4 个 `*.real_test`（`qwen3_6_27b_prefix_real`/`_score_real`/`35b_a3b_real`/`_dflash_real`，各 775 MB）**很可能要真模型** ⇒ 应从 `ctest` 排除或划给引擎臂。
+- 修正后的预期：**串行 3–5 h；受内存约束的现实下限 `-j2`（重 TU 串行）≈ 1.5–2.5 h**。

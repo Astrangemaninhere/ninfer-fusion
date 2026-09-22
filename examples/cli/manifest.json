@@ -624,6 +624,70 @@
           "six SELECT queries"
         ]
       }
+    },
+    {
+      "name": "long_niah_real_260k",
+      "messages": "messages/long_niah_real_260k.json",
+      "messages_sha256": "340e270c7a45ac36c2d107e7216a9a4aedd33239b5f41e8d3103467b90a6a6d8",
+      "kind": "long_context_niah",
+      "thinking": false,
+      "prompt_tokens": 260270,
+      "prompt_tokens_measured": true,
+      "needle_depth_percent": 10,
+      "needle_depths_percent": [
+        10,
+        50,
+        90
+      ],
+      "needle_oracles": [
+        "RELAY-KESTREL=J7-4402",
+        "RELAY-QUARTZ=M2-9137",
+        "RELAY-THISTLE=R9-5806"
+      ],
+      "needle_note": "Three needles IN the haystack at 10/50/90 percent of the document; the question names the stations only and never contains a code. Every oracle occurs exactly once in the file and its byte offset is recorded in dl/niahreal/REPORT.md section 7c.",
+      "max_context": 262144,
+      "max_new": 128,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "facts",
+        "facts": [
+          "RELAY-KESTREL=J7-4402",
+          "RELAY-QUARTZ=M2-9137",
+          "RELAY-THISTLE=R9-5806"
+        ]
+      }
+    },
+    {
+      "name": "long_niah_real_600k",
+      "messages": "messages/long_niah_real_600k.json",
+      "messages_sha256": "da031daaaed594df00e31dea7fc1b3f1f0f1be480365180e28c1a1d7fcdbfd9d",
+      "kind": "long_context_niah",
+      "thinking": false,
+      "prompt_tokens": 599846,
+      "prompt_tokens_measured": false,
+      "needle_depth_percent": 10,
+      "needle_depths_percent": [
+        10,
+        50,
+        90
+      ],
+      "needle_oracles": [
+        "RELAY-KESTREL=J7-4402",
+        "RELAY-QUARTZ=M2-9137",
+        "RELAY-THISTLE=R9-5806"
+      ],
+      "needle_note": "Three needles IN the haystack at 10/50/90 percent of the document; the question names the stations only and never contains a code. Every oracle occurs exactly once in the file and its byte offset is recorded in dl/niahreal/REPORT.md section 7c. GATE ARTIFACT: does not fit the card today (-4.8 GiB) and needs the windowed cold-host tier; do not run it before that lands.",
+      "max_context": 1048576,
+      "max_new": 128,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "facts",
+        "facts": [
+          "RELAY-KESTREL=J7-4402",
+          "RELAY-QUARTZ=M2-9137",
+          "RELAY-THISTLE=R9-5806"
+        ]
+      }
     }
   ],
   "text_corpus_sources": {

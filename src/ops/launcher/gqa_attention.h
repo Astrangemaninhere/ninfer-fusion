@@ -31,6 +31,9 @@ enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 
 struct GqaSmallTInvocation {
     const Tensor* valid_columns = nullptr;
+    // M1: per-column ancestor bit masks (I64 [W,B]), or null for a chain round. Only the BF16
+    // partial kernel reads it; the other tiers never receive one (the wrapper refuses them).
+    const Tensor* column_masks  = nullptr;
     const Tensor* table_rows    = nullptr;
     std::int32_t full_width     = 0;
     std::int32_t column_begin   = 0;
@@ -51,7 +54,7 @@ const char* gqa_attention_route_name(GqaAttentionRoute route);
 
 void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& positions, const Tensor& valid_columns,
-                                  const Tensor& table_rows, float scale,
+                                  const Tensor& column_masks, const Tensor& table_rows, float scale,
                                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                                   std::int32_t column_begin, std::int32_t width,
                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
@@ -65,8 +68,8 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& position
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
-                                 const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream);
+                                 const Tensor& column_masks, const Tensor& table_rows, float scale,
+                                 PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream);
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);

@@ -45,6 +45,18 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 8192;
+    // def3: the model's own output ceiling, i.e. --max-context for this server. The engine
+    // clamps every request to `max_context - prompt_tokens + 1` and names the clamp
+    // (targets/qwen3_6/impl/runtime/request_plan_impl.h:207-213, engine_core.h:256-257), so a
+    // budget ABOVE this ceiling can never be honoured as written; validate_output_budget()
+    // refuses it by name instead of letting that clamp answer in silence (task book s4.B).
+    // mtplogfix: ZERO means "this caller named no ceiling", and that is now a REFUSAL, not a
+    // silent pass: validate_output_budget() answers a budget presented against it with a named
+    // 500 (code output_ceiling_unnamed), because the engine's clamp would otherwise be the
+    // only answer. Every HTTP front end sets this from ServeOptions::max_context
+    // (openai_chat_http.cpp:29, anthropic_messages_http.cpp:43, openai_responses_http.cpp:248
+    // and :394); the schema-level harnesses name it too.
+    std::uint32_t max_context = 0;
 };
 
 enum class ContentKind {

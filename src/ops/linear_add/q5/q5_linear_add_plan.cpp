@@ -20,23 +20,27 @@ struct ColsSet {
     }
 };
 
-struct SupportSpec {
-    std::int32_t rows;
-    std::int32_t k;
-    std::int32_t padded_k;
-};
-
 struct RouteSpec {
     ColsSet cols;
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 2> kSupports{{
-    {5120, 6144, 6144},
-    {5120, 17408, 17408},
-}};
+using RouteTable = std::array<RouteSpec, 6>;
 
-constexpr std::array<RouteSpec, 6> kK6144Routes{{
+// One registration row per admitted exact geometry, and the row NAMES the route table that
+// geometry resolves through.  The k -> routes binding is therefore data in this table rather than
+// a comparison inside the resolver: a k that was never registered can no longer silently inherit
+// another k's routes, and a geometry that reuses an existing route set costs exactly one row here
+// (plus, only when that set names the small-column kernel, the matching template instantiation in
+// this op's own launchers).
+struct SupportSpec {
+    std::int32_t rows;
+    std::int32_t k;
+    std::int32_t padded_k;
+    const RouteTable* routes;
+};
+
+constexpr RouteTable kK6144Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
@@ -45,13 +49,35 @@ constexpr std::array<RouteSpec, 6> kK6144Routes{{
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
-constexpr std::array<RouteSpec, 6> kK17408Routes{{
+constexpr RouteTable kK17408Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+}};
+
+// The 4096-wide GDN-hybrid text stack's two admitted geometries (rows = hidden 4096;
+// k = 4096 for the projections that write the residual, k = 12288 for the MLP down projection).
+// Both resolve through the same route set: the only geometry-specific kernels this op has are the
+// 1-column GEMV (exact-shape instantiations) and the small-column split2 exact kernel (exact-k
+// instantiations); every wider column tile is the k-generic MMA set. Both sets are instantiated
+// in this op's own launchers -- nothing here points at a kernel body it did not already use.
+constexpr RouteTable kK4096K12288Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
+    {{2, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+}};
+
+constexpr std::array<SupportSpec, 4> kSupports{{
+    {5120, 6144, 6144, &kK6144Routes},
+    {5120, 17408, 17408, &kK17408Routes},
+    {4096, 4096, 4096, &kK4096K12288Routes},
+    {4096, 12288, 12288, &kK4096K12288Routes},
 }};
 
 template <std::size_t N>
@@ -65,17 +91,18 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcep
            expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
+static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes) &&
+                  catalog_is_closed(kK4096K12288Routes),
               "Q5 LinearAdd routes must be exact, contiguous, and closed");
 
-bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
+const SupportSpec* find_support(const Q5LinearAddProblem& problem) noexcept {
     for (const SupportSpec& support : kSupports) {
         if (problem.rows == support.rows && problem.k == support.k &&
             problem.padded_k == support.padded_k) {
-            return true;
+            return &support;
         }
     }
-    return false;
+    return nullptr;
 }
 
 } // namespace
@@ -99,21 +126,19 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
 }
 
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    return find_support(problem) != nullptr && problem.cols >= 1;
 }
 
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
-    if (!q5_linear_add_admits(problem)) {
+    const SupportSpec* support = find_support(problem);
+    if (support == nullptr || problem.cols < 1) {
         throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
     }
 
-    const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
-        for (const RouteSpec& route : routes) {
-            if (route.cols.contains(problem.cols)) { return {route.schedule, 0}; }
-        }
-        throw std::logic_error("q5 linear_add: admitted problem has no covering route");
-    };
-    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
+    for (const RouteSpec& route : *support->routes) {
+        if (route.cols.contains(problem.cols)) { return {route.schedule, 0}; }
+    }
+    throw std::logic_error("q5 linear_add: admitted problem has no covering route");
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,

@@ -853,6 +853,18 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "int8-group64";
     case KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
+    // NAMED, every one of them returning the same "unknown" the trailing `return` already
+    // gave.  This is a bench-only short vocabulary (bf16 / int8-group64 /
+    // fp8-e4m3-row256) and it stays that way; what changes is that a FUTURE KvCacheStorage
+    // enumerator is still reported by -Wswitch at this switch instead of being absorbed.
+    // The canonical engine-side table is core/device_capabilities.h:247 kv_storage_name().
+    case KvCacheStorage::Nvfp4Group16:
+    case KvCacheStorage::Fp8Group16:
+    case KvCacheStorage::Iso3Group16:
+    case KvCacheStorage::E8Group64:
+    case KvCacheStorage::Dropped:
+        return "unknown";
+        return "fp8-e4m3-row256";
     }
     return "unknown";
 }
@@ -862,6 +874,14 @@ std::string proposal_head_name(ProposalHead head) {
     case ProposalHead::Full:
         return "full";
     case ProposalHead::Optimized:
+        return "optimized";
+    // NAMED, same "unknown" answer as the trailing return.  ProposalHead::Auto is resolved
+    // before the planner or the logger sees it (types.h:200-205; registry.cpp:105-110), and
+    // the SHIPPED logger maps anything that is not Optimized to "full"
+    // (src/serve/request_log.cpp:139-141) -- this bench helper deliberately keeps its own
+    // two-name vocabulary, so the closure is the enum label and nothing else.
+    case ProposalHead::Auto:
+        return "unknown";
         return "optimized";
     }
     return "unknown";

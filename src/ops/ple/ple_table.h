@@ -11,6 +11,7 @@
 // cache. See RESEARCH-FLASHNEXT.md for the full contract.
 
 #include "ops/ple/ple_layout.h"
+#include "ops/ple/ple_stage.h"
 
 #include <cuda_runtime.h>
 
@@ -55,6 +56,26 @@ public:
     void gather(const std::int32_t* rows, std::size_t n_tokens, void* dst,
                 cudaStream_t stream);
 
+    // The phase-aware entry point. It derives and gathers only the columns
+    // the phase actually owes (ple_phase_window, ops/ple/ple_stage.h):
+    // Prefill/Draft take every column, Decode/Verify take the last one only,
+    // because a Verify pass discards every earlier proposal column before the
+    // residual reaches the next layer. dst receives window.tokens * n_heads
+    // rows laid out exactly like gather() (token-major, head-minor), so a
+    // Verify caller that passed T columns must read dst as
+    // [n_heads * row_dim, 1].
+    //
+    // This is the only place a phase enters the PLE path; callers must not
+    // re-derive the window themselves.
+    void gather_phase(std::span<const std::int32_t> tokens,
+                      std::span<const std::int32_t> prevs, std::int32_t eos,
+                      PlePhase phase, void* dst, cudaStream_t stream);
+
+    // Host-side counters (relaxed atomics; a few adds per gather). A wired
+    // stage that never gathers is indistinguishable from an unwired one
+    // without these -- print them under NINFER_PLE_STATS=1.
+    [[nodiscard]] const PleForensics& forensics() const noexcept { return forensics_; }
+
 private:
     struct CacheEntry {
         std::uint64_t file_index : 2;
@@ -75,6 +96,13 @@ private:
     PleLayout layout_;
     PleTableOptions options_;
     std::vector<int> file_fds_; // 4 open sidecar files
+#if defined(_WIN32)
+    // The Windows arm's handles for the SAME four sidecar files. A HANDLE is
+    // pointer-sized and does not fit the int above, and this class is not willing to
+    // assume that truncating a handle is safe, so the Windows path keeps its own vector
+    // and file_fds_ is left empty there (POSIX builds never see this member).
+    std::vector<void*> file_handles_;
+#endif
 
     // Pinned cache (LRU, bounded by options_.cache_bytes).
     std::mutex cache_mutex_;
@@ -85,6 +113,10 @@ private:
     // exempt from eviction until that gather has finished (UVA pointers are
     // captured before the kernel launch).
     std::uint64_t gather_epoch_ = 0;
+
+    PleForensics forensics_;
+    // Host scratch for gather_phase: window.tokens * n_heads row ids.
+    std::vector<std::int32_t> phase_rows_;
 };
 
 } // namespace ninfer::ops::ple

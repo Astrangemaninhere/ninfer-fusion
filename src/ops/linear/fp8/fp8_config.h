@@ -152,9 +152,7 @@ struct Fp8VocabularyA16SmallTMmaProductionSchedule {
                                            : ActiveTokens <= 32 ? 32
                                            : ActiveTokens <= 40 ? 40
                                                                 : 48;
-    // UNIFY-A: kKWarps is the split-K width (a reduction-order axis). T=1..8 used 16 and
-    // T=9..16 used 8; pinned so every T in [1,16] reduces K over the same 16 partials.
-    static constexpr int kKWarps         = ActiveTokens <= 16 ? 16 : (ActiveTokens <= 24 ? 8 : 4);
+    static constexpr int kKWarps         = ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4);
     static constexpr int kMinBlocksPerSm = kKWarps == 16 ? 1 : 2;
     using Type = Fp8A16SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocksPerSm>;
 };
@@ -303,18 +301,27 @@ struct Fp8LinearDecodeProductionSchedule<Fp8MuseMlpDownGeometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 1, Fp8CodeCache::Default, 2, 2>;
 };
 
-// UNIFY-A: T=1 rides the same small-T family as T in [2,16].
-inline constexpr std::int32_t kFp8FirstSmallT = 1;
+inline constexpr std::int32_t kFp8FirstSmallT = 2;
 inline constexpr std::int32_t kFp8LastSmallT  = 24;
 
 template <class Geometry>
 inline constexpr std::int32_t kFp8LinearSmallTMax = 0;
 
+// widebw: 11 -> 16 == the batch-1 verify width ceiling (kVerifyWidthCeiling = 16, the same
+// number fp8_attn_input_plan.cpp:25 and fp8_linear_add_plan.cpp:26 already use). This
+// constant is BOTH the A16 small-T launcher-table ceiling AND the runtime token CHUNK of
+// the A16 launchers, and each chunk re-reads the whole weight matrix; at width 16 a
+// ceiling of 11 made the attention input projection (14336x5120, 16/round, 73.40 MB)
+// read its weights twice (+1.1744 GB/round).
 template <>
-inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8AttnInputGeometry> = 11;
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8AttnInputGeometry> = 16;
 
+// widebw: 10 -> 16, same reason as the AttnInput entry above. The GDN projection is
+// 16384x5120, 48/round, 83.89 MB per launch -- 4.0265 GB/round, the second-heaviest weight
+// family in the engine -- and at width 16 a ceiling of 10 made it read its weights TWICE
+// (+4.0265 GB/round).
 template <>
-inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8GdnInputGeometry> = 10;
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8GdnInputGeometry> = 16;
 
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MlpGateUpGeometry> = 4;
@@ -397,11 +404,7 @@ template <int ActiveTokens>
 struct Fp8LinearSmallTProductionSchedule<Fp8GdnInputGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kFp8FirstSmallT);
     static_assert(ActiveTokens <= kFp8LinearSmallTMax<Fp8GdnInputGeometry>);
-    // UNIFY-A: kValuesPerLane picks the per-lane K split, i.e. it is an *arithmetic*
-    // axis: the 8-value lane used at T=5,6 grouped the K reduction differently from the
-    // 16-value lane used at every other T in [1,16]. Pinned to 16 so the whole family
-    // sums K identically.
-    static constexpr int kValuesPerLane     = 16;
+    static constexpr int kValuesPerLane     = ActiveTokens >= 5 && ActiveTokens <= 6 ? 8 : 16;
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Fp8SmallTActivationAccess::SharedPhase
                                                   : Fp8SmallTActivationAccess::TokenPacked;

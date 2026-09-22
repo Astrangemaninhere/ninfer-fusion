@@ -45,6 +45,15 @@ int q6_a16_conformance() {
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6g64_f16s_weight,
                           {1152, 1536, 197U, Comparison::Sampled, false, kN1152K1536Large});
 
+    // The 4096-wide GDN-hybrid text stack's vocabulary matrices -- token embedding and output
+    // head, both [248320, 4096].
+    constexpr std::array kN248320K4096{
+        a16(1), a16(4), a16(5), a16(6), a16(7), a16(8), a16(9), a16(16), a16(17), a16(18),
+        a16(24), a16(25), a16(26), a16(32), a16(33), a16(34), a16(48), a16(49), a16(50), a16(128),
+    };
+    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6g64_f16s_weight,
+                          {248320, 4096, 239U, Comparison::Sampled, false, kN248320K4096});
+
     return failures;
 }
 

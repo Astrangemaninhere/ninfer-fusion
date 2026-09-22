@@ -41,17 +41,21 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 template <class Geometry>
 constexpr auto make_launchers() {
     return make_launchers<Geometry>(
-        std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+        std::make_index_sequence<kNvfp4SmallTCount>{});
 }
 
 constexpr auto kResidual6144Launchers  = make_launchers<Nvfp4Residual6144Geometry>();
 constexpr auto kResidual17408Launchers = make_launchers<Nvfp4Residual17408Geometry>();
 
+static_assert(kResidual6144Launchers.size() == kNvfp4SmallTCount);
+static_assert(kResidual17408Launchers.size() == kNvfp4SmallTCount);
+
 } // namespace
 
 void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                      cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
+    const std::size_t index = static_cast<std::size_t>(
+        nvfp4_small_t_index<kNvfp4LastSmallT>(x.ne[1], "nvfp4 linear_add small_t"));
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
     case Nvfp4Problem::Residual6144:
         kResidual6144Launchers[index](x, weight, residual, stream);

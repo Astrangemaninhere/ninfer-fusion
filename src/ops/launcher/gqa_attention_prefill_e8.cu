@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -19,6 +20,12 @@ template <typename Geometry, typename Metadata>
 void attention_e8_for(const Tensor& q, const Tensor& positions, float scale,
                       const PagedKVBatchLayerView& cache, const Metadata& metadata, Tensor& out,
                       cudaStream_t stream) {
+    if constexpr (Geometry::HeadDim != kGqaKvQuantHeadDim) {
+        throw std::invalid_argument(
+            "E8 prefill requires head_dim=256 but this geometry has " +
+            std::to_string(Geometry::HeadDim) +
+            "; the E8 prompt kernels are not ported to 128; use bf16 KV");
+    }
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     const Tensor& cache_k_scale = cache.k_scale_pages;
@@ -41,6 +48,12 @@ template <typename Geometry, typename Metadata>
 void append_e8_for(const Tensor& k, const Tensor& v, const Tensor& positions,
                    const PagedKVBatchLayerView& cache, const Metadata& metadata,
                    cudaStream_t stream) {
+    if constexpr (Geometry::HeadDim != kGqaKvQuantHeadDim) {
+        throw std::invalid_argument(
+            "E8 prefill requires head_dim=256 but this geometry has " +
+            std::to_string(Geometry::HeadDim) +
+            "; the E8 prompt kernels are not ported to 128; use bf16 KV");
+    }
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     const Tensor& cache_k_scale = cache.k_scale_pages;

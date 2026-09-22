@@ -104,6 +104,19 @@ using Q4GemvR1W8DirectSchedule =
                            Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
                            Cache::ca, 80, 1>;
 
+// The same GEMV with the group count left to the kernel: StaticGroupsPerRow == 0 makes it derive
+// groups_per_row from the activation's k (k / kGroupK) at launch instead of reading 80 -- which is
+// k=5120's group count and only k=5120's. Q4GemvR4W1DirectSchedule above is spelled this way
+// because it serves more than one k, and that is the rule: StaticGroupsPerRow is a *shape*, so an
+// alias that serves several k must not carry one. At k=5120 this alias partitions the row exactly
+// as the static form does (10 groups per warp either way), so relaxing it changes no arithmetic
+// where 80 was right.
+using Q4GemvR1W8RuntimeSchedule =
+    Q4RowSplitGemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct,
+                           Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
+                           Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
+                           Cache::ca, 0, 1>;
+
 template <class Schedule, Q4GemvScaleAccess ScaleAccess = Schedule::kScaleAccess>
 struct Q4GemvTileStorage;
 

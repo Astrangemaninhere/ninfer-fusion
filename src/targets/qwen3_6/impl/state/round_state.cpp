@@ -4,6 +4,7 @@
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
+#include <cstdio>
 
 namespace ninfer::targets::qwen3_6 {
 namespace {
@@ -134,6 +135,9 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         layout.mtp->draft_tokens     = i32(drafts, "MTP prefill draft tokens");
         layout.mtp->target_input_ids = i32(columns, "MTP prefill target input ids");
         layout.mtp->target_positions = i32(columns, "MTP prefill target positions");
+        // Appended last on purpose: the MTP prefill frame's earlier offsets must not move.
+        layout.mtp->lattice_ids = i32(static_cast<std::int32_t>(kMtpTreeProposalEntries),
+                                      "MTP prefill proposal lattice ids");
 
         layout.mtp_decode.emplace();
         MtpDecodeStateLayout& decode = *layout.mtp_decode;
@@ -217,7 +221,8 @@ MtpPrefillState::MtpPrefillState(DeviceSpan backing, const MtpPrefillStateLayout
     : position(layout.position.bind(backing)), ar_hidden(layout.ar_hidden.bind(backing)),
       draft_tokens(layout.draft_tokens.bind(backing)),
       target_input_ids(layout.target_input_ids.bind(backing)),
-      target_positions(layout.target_positions.bind(backing)) {}
+      target_positions(layout.target_positions.bind(backing)),
+      lattice_ids(layout.lattice_ids.bind(backing)) {}
 
 DFlashPrefillState::DFlashPrefillState(DeviceSpan backing, const DFlashPrefillStateLayout& layout)
     : produced_count(layout.produced_count.bind(backing)) {}
@@ -253,8 +258,15 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
         ingress_tensor(offsetof(MtpDecodeIngress, current_extents), DType::I32, {batch});
     target_valid_columns =
         ingress_tensor(offsetof(MtpDecodeIngress, target_valid_columns), DType::I32, {batch});
+    target_column_masks =
+        ingress_tensor(offsetof(MtpDecodeIngress, target_column_masks), DType::I64, {width, batch});
+    target_column_depths =
+        ingress_tensor(offsetof(MtpDecodeIngress, target_column_depths), DType::I32, {width, batch});
     current_drafts =
         ingress_tensor(offsetof(MtpDecodeIngress, current_drafts), DType::I32, {drafts, batch});
+    target_chain_rope_positions =
+        ingress_tensor(offsetof(MtpDecodeIngress, target_chain_rope_positions), DType::I32,
+                       {width, batch});
     target_rope_positions = ingress_tensor(offsetof(MtpDecodeIngress, target_rope_positions),
                                            DType::I32, {width, batch});
     text_kv_table_rows =
@@ -278,6 +290,20 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    // --draft-tree L,d (L > 1): the round's proposal lattice. Bound FLAT because its entries are
+    // indexed by (depth, rank, lane) with the rank stride equal to the round's batch, which is only
+    // known at launch -- see kMtpTreeProposalDepthStride and
+    // detail::mtp_tree_proposal_index, which the host reader uses to decode this same buffer. A
+    // round with draft_tree_paths <= 1 never touches it.
+    next_proposal_ids =
+        egress_tensor(offsetof(MtpDecodeEgress, next_proposal_ids), DType::I32,
+                      {static_cast<std::int32_t>(kMtpTreeProposalEntries)});
+    accepted_columns =
+        egress_tensor(offsetof(MtpDecodeEgress, accepted_columns), DType::I32, {batch});
+    chain_sources =
+        egress_tensor(offsetof(MtpDecodeEgress, chain_sources), DType::I32, {width, batch});
+    tree_commit_flags =
+        egress_tensor(offsetof(MtpDecodeEgress, tree_commit_flags), DType::I32, {batch});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);
@@ -378,6 +404,18 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (layout.mtp_decode) {
         mtp_decode.emplace(backing, *layout.mtp_decode, layout.spec.batch_capacity,
                            layout.spec.draft_window);
+        // --draft-tree L,d is a property of the configured plan, not of the frame layout (the
+        // ingress/egress arrays are already sized for the widest tree), so it is carried on the
+        // state instead of in a layout region -- no constructor signature changes.
+        // TREE-FIX-LAND 打印点 C（HOST ONLY，只读；整块删除即回退）：帧构造现场。
+        std::fprintf(stderr, "[roundspec] spec_dtp=%u spec_dtd=%u spec_dw=%u\n",
+                     layout.spec.draft_tree_paths, layout.spec.draft_tree_depth,
+                     layout.spec.draft_window);
+        mtp_decode->draft_tree_paths = layout.spec.draft_tree_paths;
+        mtp_decode->draft_tree_depth = layout.spec.draft_tree_depth;
+        std::fprintf(stderr, "[roundframe] frame_dtp=%u frame_dtd=%u spec_dtp=%u <- equal?\n",
+                     mtp_decode->draft_tree_paths, mtp_decode->draft_tree_depth,
+                     layout.spec.draft_tree_paths);
     }
     if (layout.dflash_decode) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,

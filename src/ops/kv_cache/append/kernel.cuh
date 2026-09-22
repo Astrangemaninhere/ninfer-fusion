@@ -3,6 +3,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 
@@ -14,16 +15,14 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kKVCacheAppendFullHeadDim = 256;
-
-template <int KVHeadsValue>
-struct KVCacheAppendFullGeometry {
-    static_assert(KVHeadsValue == 4 || KVHeadsValue == 2);
-    static constexpr int KVHeads = KVHeadsValue;
-};
-
-using KVCacheAppendD256Kv4 = KVCacheAppendFullGeometry<4>;
-using KVCacheAppendD256Kv2 = KVCacheAppendFullGeometry<2>;
+// kKVCacheAppendFullHeadDim and KVCacheAppendFullGeometry<K> were DEFINED HERE and are now
+// included from ops/kv_cache/append/geometry.cuh, which held a byte-identical copy
+// (geometry.cuh:3-14 == this file's former :17-26, verified with diff). The two copies made
+// this header and geometry.cuh mutually un-includable: nvcc 13 answered
+//   error: variable "ninfer::ops::kKVCacheAppendFullHeadDim" has already been defined
+//   (previous definition at line 5 of .../geometry.cuh)
+// on any TU that reached both -- which the narrow e8 append arm does, since it includes
+// geometry.cuh while launch.cu includes this header. One definition, in geometry.cuh.
 
 struct KVCacheAppendDirectMetadata {
     const std::int32_t* table;

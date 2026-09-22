@@ -1,0 +1,529 @@
+﻿<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<title>NInfer — 大模型本地运行器</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1a2332;--mut:#6b7686;--acc:#3b82f6;
+      --line:#e5e8ee;--ok:#16a34a;--bad:#dc2626;--warn:#b45309}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);
+     color:var(--ink);display:flex;justify-content:center;padding:24px 12px}
+.wrap{width:940px;max-width:100%}
+h1{font-size:21px;display:flex;align-items:center;gap:10px}
+h2{font-size:15px;margin-bottom:8px}
+.sub{color:var(--mut);font-size:12px;margin:2px 0 14px}
+.tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
+.tab{border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 16px;
+     font:inherit;font-weight:600;color:var(--mut);cursor:pointer}
+.tab.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+      padding:16px 18px;margin-bottom:14px;box-shadow:0 1px 3px rgba(20,30,50,.05)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.metric{background:#f8fafc;border:1px solid var(--line);border-radius:12px;padding:9px 12px}
+.metric .k{font-size:11px;color:var(--mut)}
+.metric .v{font-size:19px;font-weight:650;font-variant-numeric:tabular-nums}
+.metric .v.ok{color:var(--ok)} .metric .v.warn{color:var(--warn)}
+.row{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.row label{width:128px;color:var(--mut);font-size:13px;flex:none}
+select,input[type=text],input[type=number]{border:1px solid var(--line);border-radius:10px;
+      padding:7px 10px;font:inherit;flex:1;min-width:90px;outline:none}
+button{border:0;border-radius:10px;padding:9px 20px;font:inherit;font-weight:600;cursor:pointer}
+.btn-primary{background:var(--acc);color:#fff}
+.btn-danger{background:var(--bad);color:#fff}
+.btn-ghost{background:#e2e8f0;color:#334155}
+.badge{font-size:11px;padding:2px 10px;border-radius:999px;font-weight:600}
+.badge.idle{background:#eef2f8;color:var(--mut)}
+.badge.run{background:#fef3c7;color:var(--warn)}
+.badge.done{background:#dcfce7;color:#166534}
+pre.log{background:#0f172a;color:#cbd5e1;border-radius:12px;padding:11px 13px;
+        height:230px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;
+        white-space:pre-wrap}
+/* 新手结果卡 */
+.verdict{border-radius:14px;padding:14px 16px;margin-top:10px;display:none}
+.verdict.ok{background:#dcfce7;border:1px solid #86efac;display:block}
+.verdict.warn{background:#fef3c7;border:1px solid #fcd34d;display:block}
+.verdict.bad{background:#fee2e2;border:1px solid #fca5a5;display:block}
+.verdict h3{font-size:15px;margin-bottom:4px}
+.verdict p{font-size:13px;margin:2px 0}
+.verdict li{font-size:13px;margin-left:18px}
+.env-item{display:flex;gap:10px;align-items:baseline;padding:6px 0;border-bottom:1px dashed #eee}
+.env-item .st{font-weight:700;width:150px;flex:none}
+.env-item.ok .st{color:var(--ok)} .env-item.bad .st{color:var(--bad)}
+.env-item.unknown .st{color:var(--mut)}
+.env-item small{color:var(--mut)}
+iframe.tool{width:100%;height:760px;border:1px solid var(--line);border-radius:14px}
+.help{color:var(--mut);font-size:12px}
+.q{display:inline-block;width:16px;height:16px;border-radius:50%;background:#dbeafe;
+   color:#1d4ed8;text-align:center;font-size:11px;line-height:16px;cursor:help;flex:none}
+</style></head><body><div class="wrap">
+<h1>🧠 NInfer 大模型本地运行器
+  <span id="gpuBadge" class="badge idle">检测中…</span></h1>
+<div class="sub">本地跑大模型的一站式工具:识别模型 → 转换/直跑 → 对话服务。参数不懂就把鼠标放在上面看讲解。</div>
+
+<div class="tabs">
+  <button class="tab on" data-t="home">🏠 新手首页</button>
+  <button class="tab" data-t="serve">⚡ 模型服务</button>
+  <button class="tab" data-t="train">🎓 微调训练</button>
+  <button class="tab" data-t="collect">📦 语料采集</button>
+  <button class="tab" data-t="rag">📚 RAG 语料管理</button>
+  <button class="tab" data-t="convert">🔄 模型转换</button>
+</div>
+
+<!-- ================= 首页: 环境自检 ================= -->
+<section id="t-home">
+<div class="card"><h2>① 这台电脑准备好了吗?</h2>
+  <div id="envlist">正在检查…</div></div>
+
+<!-- ================= 首页: 导入向导 ================= -->
+<div class="card"><h2>② 把你的模型交给它</h2>
+  <div class="row"><label>模型路径</label>
+    <input type="text" id="import_path" placeholder="粘贴模型文件/文件夹完整路径, 例如 C:\models\qwen3.8-27b.gguf">
+    <button class="btn-ghost" onclick="browseInto()">📂 浏览</button></div>
+  <div class="row" id="browseRow" style="display:none">
+    <label>当前位置</label>
+    <div style="flex:3">
+      <div id="browsePath" class="help"></div>
+      <select id="browseSel" size="8" style="width:100%"></select>
+      <div class="btnrow" style="margin-top:6px">
+        <button class="btn-ghost" onclick="browseUp()">⬆ 上一级</button>
+        <button class="btn-ghost" onclick="browsePick()">✅ 选这个</button>
+      </div>
+    </div>
+  </div>
+  <div class="row"><label>运行上下文</label>
+    <input type="number" id="import_ctx" value="8192" min="512"></div>
+  <div class="btnrow">
+    <button class="btn-primary" onclick="doImport()">🔍 检查这个模型</button>
+  </div>
+  <div id="verdict" class="verdict"></div>
+</div>
+
+<!-- ================= 首页: 快速运行 ================= -->
+<div class="card"><h2>③ 启动对话服务</h2>
+  <div class="row"><label>模型文件</label>
+    <select id="smodel"><option value="">刷新中…</option></select>
+    <button class="btn-ghost" onclick="refreshModels()">刷新</button>
+    <span id="sbadge" class="badge idle">idle</span></div>
+  <div class="row"><label>上下文长度</label><input type="number" id="sctx" value="8192" min="512"></div>
+  <div class="row"><label>投机解码</label>
+    <select id="sspec"><option value="">自动(none)</option><option value="mtp">mtp</option>
+      <option value="dflash">dflash</option><option value="dflash2">dflash2</option></select>
+    <span style="color:#64748b;font-size:12px">draft tokens</span>
+    <input type="number" id="sdt" value="3" style="max-width:70px"></div>
+  <div class="row"><label>查表加速 LABD</label>
+    <select id="slabd" disabled><option value="">规划中(引擎下一版)</option></select>
+    <span class="help">历史查表/ngram 链草稿 —— 大幅加速代码补全/复述类对话</span></div>
+  <div class="row"><label>冷存储(SSD 外挂)</label>
+    <select id="scold"><option value="">off 不用</option><option value="disk">disk 用 SSD</option>
+      <option value="window">window 滑动窗</option></select>
+    <span style="color:#64748b;font-size:12px">热窗保留 tokens</span>
+    <input type="number" id="scoldkeep" value="0" style="max-width:80px"
+      placeholder="0=128"></div>
+  <div class="row" style="padding-left:138px">
+    <span style="color:#64748b;font-size:12px">目录</span>
+    <input type="text" id="scoldpath" value="" style="max-width:200px"
+      placeholder="留空=引擎默认"></div>
+  <div class="row" style="padding-left:138px">
+    <span style="color:#64748b;font-size:12px">SSD 上限(GB, 0=自动)</span>
+    <input type="number" id="scoldgb" value="0" style="max-width:90px">
+    <span class="help">热窗 = 最近 N 个 token 保热在 GPU(精确格式), 更早的按冷策略
+      压缩/外挂; 0 走引擎默认 128</span></div>
+  <div class="btnrow">
+    <button class="btn-primary" onclick="serveStart()">▶ 启动</button>
+    <button class="btn-danger" style="display:none" id="sstop" onclick="serveStop()">⏹ 停止</button>
+    <button class="btn-ghost" onclick="smoke()">🔊 试说一句话</button>
+  </div>
+  <pre class="log" id="sres" style="height:110px;margin-top:8px">—</pre>
+</div>
+</section>
+
+<!-- ================= 服务 tab ================= -->
+<section id="t-serve" style="display:none">
+<div class="card"><h2>模型服务(OpenAI 兼容 API, 端口 8000)</h2>
+  <div class="row"><label>模型文件</label>
+    <select id="smodel2"></select><button class="btn-ghost" onclick="refreshModels()">刷新</button></div>
+  <div class="row"><label>上下文</label><input type="number" id="sctx2" value="8192"></div>
+  <div class="row"><label>投机方案</label>
+    <select id="sspec2"><option value="">none</option><option value="mtp">mtp</option>
+      <option value="dflash">dflash</option><option value="dflash2">dflash2</option></select>
+    <span style="color:#64748b;font-size:12px">draft</span>
+    <input type="number" id="sdt2" value="3" style="max-width:70px"></div>
+  <div class="row"><label>冷存储策略</label>
+    <select id="scold2"><option value="">off</option><option value="disk">disk (SSD)</option>
+      <option value="window">window</option><option value="host">host (内存)</option></select>
+    <span style="color:#64748b;font-size:12px">热窗 tokens</span>
+    <input type="number" id="scoldkeep2" value="0" style="max-width:70px" placeholder="0=128">
+    <span style="color:#64748b;font-size:12px">SSD 路径</span>
+    <input type="text" id="scoldpath2" value="" style="max-width:220px" placeholder="引擎默认">
+    <span style="color:#64748b;font-size:12px">上限 GB</span>
+    <input type="number" id="scoldgb2" value="0" style="max-width:80px">
+    <span class="help">热窗长度可自定义: 最近 N token 保热在 GPU, 更早的走
+      window/host/disk 冷化; 0 = 引擎默认 128</span></div>
+  <div class="row"><label>KV 分层格式</label>
+    <input type="text" id="sktiers" value="" style="max-width:300px"
+      placeholder="hot=bf16,tail=fp16,cold=iso3">
+    <span class="help">热/尾/冷三层各自量化(bf16/fp16/int8/int4/iso4/iso3/e8),
+      组合自由; 契约已定, 引擎接入后自动启用</span></div>
+  <div class="row"><label>逐层 KV 自定义</label>
+    <input type="text" id="skvlayer" value="" style="max-width:300px"
+      placeholder="0-15:e8,16-31:iso3,32-63:nvfp4 (或 all:bf16)">
+    <span class="help">透传 --kv-layer-storage; 留空=跟随 NVFP4 模式默认。
+      层号/区间:格式, 逗号分隔; 可用 bf16/int8/fp8/nvfp4/iso3/e8</span></div>
+  <div class="row"><label>NVFP4 模式</label>
+    <select id="snvfp4mode"><option value="fusion">fusion (融合版全特性)</option>
+      <option value="pure">pure (纯 NVFP4 基线对照)</option></select>
+    <span class="help">pure 只允许经典 KV 格式, 用于对照归因</span></div>
+  <div class="row"><label>CUDA Graph</label>
+    <select id="sgraph"><option value="on">开 (低开销稳态解码)</option>
+      <option value="off">关 (--no-cuda-graph 排障)</option></select>
+    <span class="help">默认开; 关闭后走 eager 路径, 吞吐下降但数值排障直观</span></div>
+  <div class="row"><label>LABD 查表</label>
+    <select id="slabd2" disabled><option value="">规划中(引擎下一版)</option></select>
+    <span class="help">历史后缀查表草稿 — 与 ngram-SSD 外挂同批落地</span></div>
+  <details id="sallparams" style="margin:8px 0">
+    <summary style="cursor:pointer;color:#3b82f6;font-size:13px">
+      全部引擎参数 (56+ 项, 分组折叠 — 空值=引擎默认)</summary>
+    <div id="sparamsbody" style="margin-top:6px"></div>
+  </details>
+  <div class="btnrow">
+    <button class="btn-primary" onclick="serveStart()">启动</button>
+    <button class="btn-danger" style="display:none" id="sstop2" onclick="serveStop()">停止</button>
+    <button class="btn-ghost" onclick="smoke()">冒烟测试</button></div>
+  <pre class="log" id="sres2" style="height:300px;margin-top:8px">—</pre>
+</div></section>
+
+<!-- ================= 训练 tab ================= -->
+<section id="t-train" style="display:none">
+<div class="card"><div class="grid">
+  <div class="metric"><div class="k">Step</div><div class="v" id="m_step">-</div></div>
+  <div class="metric"><div class="k">Loss</div><div class="v" id="m_loss">-</div></div>
+  <div class="metric"><div class="k">LR</div><div class="v" id="m_lr">-</div></div>
+  <div class="metric"><div class="k">steps/s</div><div class="v" id="m_sps">-</div></div>
+  <div class="metric"><div class="k">GPU</div><div class="v" id="m_gpu">-</div></div>
+  <div class="metric"><div class="k">VRAM</div><div class="v" id="m_vram">-</div></div>
+</div>
+<span id="tbadge" class="badge idle">idle</span></div>
+<div class="card"><h2>微调参数(不懂就保持默认)</h2>
+  <div class="row"><label>训练脚本</label>
+    <select id="script"><option value="train_dspark.py">train_dspark.py (DSpark head)</option>
+      <option value="train_dflash2.py">train_dflash2.py (DFlash2 head)</option></select></div>
+  <div class="row"><label>steps 步数</label><input type="number" id="steps" value="6000"></div>
+  <div class="row"><label>batch 批大小</label><input type="number" id="batch" value="4"></div>
+  <div class="row"><label>anchors 起点数</label><input type="number" id="anchors" value="1"></div>
+  <div class="row"><label>max_ctx 上文</label><input type="number" id="ctx" value="2048"></div>
+  <div class="row"><label>lr 学习率</label><input type="text" id="lr" value="1e-4"></div>
+  <div class="row"><label>resume 续训</label><input type="text" id="resume" placeholder="留空或 step_XXXX.pt 路径"></div>
+  <div class="row"><label>DDTree</label>
+    <span class="help">□ 树状思维(勾选=训练多个可能的接龙分支)</span>
+    <input type="checkbox" id="ddtree" style="flex:none"></div>
+  <div class="btnrow">
+    <button class="btn-primary" id="tstart" onclick="trainStart()">▶ 启动微调</button>
+    <button class="btn-danger" id="tstop" style="display:none" onclick="trainStop()">⏹ 停止</button>
+  </div></div>
+<div class="card"><h2>实时日志</h2><pre class="log" id="log">等待日志…</pre></div>
+</section>
+
+<!-- ================= 采集 tab ================= -->
+<section id="t-collect" style="display:none">
+<div class="card"><h2>语料采集(WSL HS dump) <span id="cbadge" class="badge idle">idle</span></h2>
+  <div class="grid">
+    <div class="metric"><div class="k">packs</div><div class="v" id="c_packs">-</div></div>
+    <div class="metric"><div class="k">size</div><div class="v" id="c_size">-</div></div>
+  </div>
+  <div class="row"><label>rag 条数</label><input type="number" id="c_rag" value="800"></div>
+  <div class="row"><label>qa 条数</label><input type="number" id="c_qa" value="400"></div>
+  <div class="row"><label>code 条数</label><input type="number" id="c_code" value="200"></div>
+  <div class="row"><label>输出目录</label><input type="text" id="c_out" value="hs_cache2"></div>
+  <div class="btnrow">
+    <button class="btn-primary" onclick="collectStart()">▶ 开始采集</button>
+    <button class="btn-danger" onclick="collectStop()">⏹ 停止</button></div>
+  <pre class="log" id="cprog" style="height:140px">—</pre>
+</div></section>
+
+<!-- ================= rag / convert tab ================= -->
+<section id="t-rag" style="display:none"><div class="card">
+  <h2>RAG 语料管理 <button class="btn-ghost" onclick="openTool('rag')">打开</button></h2>
+  <div id="ragFrame"><p class="help">点击"打开"后此处会嵌入工具窗口。</p></div>
+</div></section>
+<section id="t-convert" style="display:none"><div class="card">
+  <h2>模型转换工具 <button class="btn-ghost" onclick="openTool('convert')">打开</button></h2>
+  <div id="convertFrame"><p class="help">把下载的模型转成 ninfer 格式。点击"打开"后此处会嵌入工具窗口。</p></div>
+</div></section>
+
+<script>
+const $=id=>document.getElementById(id);
+let TIPS={};
+async function api(p){const r=await fetch(p);return r.json();}
+function setBadge(el,s){el.textContent=s;el.className='badge '+(s==='running'?'run':
+  (s==='done'||s==='ok'?'done':(s==='bad'?'bad':'idle')));}
+
+/* ---- tab 切换 ---- */
+document.querySelectorAll('.tab').forEach(b=>b.onclick=async()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x===b));
+  document.querySelectorAll('section').forEach(s=>s.style.display='none');
+  $('t-'+b.dataset.t).style.display='';
+  if(b.dataset.t==='rag'||b.dataset.t==='convert')openTool(b.dataset.t);
+});
+
+/* 给每个输入框加 title 提示; 在其左侧 label 后补 "?" 讲解圈 */
+async function loadTips(){
+  const r=await api('/api/tips');TIPS=r.tips||{};
+  document.querySelectorAll('.row input[id], .row select[id]').forEach(inp=>{
+    const t=TIPS[inp.id];if(!t)return;
+    inp.title=t;
+    const lab=inp.previousElementSibling;
+    if(lab&&lab.tagName==='LABEL'&&!lab.querySelector('.q')){
+      const q=document.createElement('span');q.className='q';q.textContent='?';q.title=t;
+      lab.append(' ',q);
+    }
+  });
+}
+
+/* ---- 环境自检 ---- */
+async function refreshEnv(){
+  const r=await api('/api/env');const el=$('envlist');el.innerHTML='';
+  if(r.gpu&&r.gpu.present){setBadge($('gpuBadge'),'ok');
+    $('gpuBadge').textContent='显卡就绪: '+r.gpu.name+' · '+r.gpu.vram_total_gb+'GB';
+  }else{setBadge($('gpuBadge'),'bad');
+    $('gpuBadge').textContent='未检测到 NVIDIA 显卡';
+    el.innerHTML+='<div class="env-item bad"><span class="st">⚠ 显卡</span>'+
+      '<span>没检测到 NVIDIA 显卡 —— 本软件必须要 NVIDIA 显卡才能跑。</span></div>';}
+  for(const it of r.env){
+    const d=document.createElement('div');
+    /* THREE STATES. it.ok is true / false / null, and null means NOT MEASURED -- it must not
+       be rendered as a pass and must not be rendered as a failure either, because "this card
+       cannot run it" is a verdict too and is just as unmeasured as its opposite. The
+       GPU-generation row is null today: it is a route PLAN, and only the engine's own
+       capability probe turns it into a measurement. */
+    const st=it.ok===true?'ok':(it.ok===false?'bad':'unknown');
+    const glyph=it.ok===true?'✔':(it.ok===false?'✖':'?');
+    d.className='env-item '+st;
+    d.innerHTML='<span class="st">'+glyph+' '+it.name+'</span><span>'+
+      (it.detail||'')+(it.fix?' <small>→ '+it.fix+'</small>':'')+'</span>';
+    el.appendChild(d);
+  }
+}
+
+/* ---- 目录浏览(新手选路径) ---- */
+let browsePath='';
+async function browseInto(){
+  const r=await api('/api/browse?path='+encodeURIComponent($('import_path').value||''));
+  if(!r.ok){alert(r.err);return;}
+  browsePath=r.path;renderBrowse(r);
+}
+async function browseUp(){
+  const r=await api('/api/browse?path='+encodeURIComponent(
+    $('import_path').value||browsePath)); if(!r.ok){alert(r.err);return;}
+  browsePath=r.parent;renderBrowse(r);
+}
+function renderBrowse(r){
+  $('browseRow').style.display='';$('browsePath').textContent=r.path;
+  const s=$('browseSel');s.innerHTML='';
+  for(const e of r.entries){
+    const o=document.createElement('option');
+    o.value=e.name;o.textContent=(e.dir?'📁 ':'📄 ')+e.name+(e.dir?'/':'');
+    s.appendChild(o);
+  }
+  s.focus();
+}
+function browsePick(){
+  const s=$('browseSel');if(!s.value)return;
+  const joined=(browsePath.replace(/\\$/,'')+'\\'+s.value);
+  $('import_path').value=joined;
+  if(s.selectedOptions[0].textContent.includes('📁')){browsePath=joined;
+    api('/api/browse?path='+encodeURIComponent(joined)).then(r=>{if(r.ok)renderBrowse(r);});}
+}
+
+/* ---- 导入向导 ---- */
+async function doImport(){
+  const r=await api('/api/import?path='+encodeURIComponent($('import_path').value)+
+    '&ctx='+$('import_ctx').value);
+  const v=$('verdict');if(!r.ok){alert(r.err);return;}
+  const d=r.verdict;v.className='verdict '+d.level;
+  v.innerHTML='<h3>'+d.title+'</h3><p>'+d.detail.replace(/\n/g,'<br>')+'</p>'+
+    (d.tips.length?'<ul>'+d.tips.map(t=>'<li>'+t+'</li>').join('')+'</ul>':'');
+  if(r.scan&&r.scan.model_id)v.innerHTML+='<p class="help">识别结果: '+
+    r.scan.model_id+' · '+(r.scan.quant_name||'')+'</p>';
+  // 不支持架构/未知格式 -> 提供"生成接入规格"(ARCHKIT 流水线)
+  if(d.action==='unsupported_arch'||d.action==='unknown'||d.action==='unsupported_quant'){
+    v.innerHTML+='<div class="btnrow"><button class="btn-ghost" onclick="archkitSpec()">'+
+      '🛠 生成接入规格(ARCHKIT)</button></div>';
+  }
+  if(d.action==='run'&&r.models&&r.models.length){fillModels(r.models);}
+  // 全自动适配: 受支持家族 -> 转换 -> 发布 -> 启动 serve
+  if(d.action==='convert_groupwise'){
+    v.innerHTML+='<div class="btnrow"><button class="btn-primary" id="btnAutoConv">'+
+      '⚙ 自动转换并运行</button></div>'+
+      '<pre id="convLog" style="font:11px/1.5 ui-monospace,monospace;'+
+      'white-space:pre-wrap;color:#475569;max-height:180px;overflow:auto">—</pre>';
+    $('btnAutoConv').onclick=async()=>{
+      $('btnAutoConv').disabled=true;$('btnAutoConv').textContent='转换中…';
+      const path=$('import_path').value.trim();
+      const s=await api('/api/import_convert?path='+encodeURIComponent(path));
+      if(!s.ok){alert(s.err||'start failed');return;}
+      const poll=setInterval(async()=>{
+        const st=await api('/api/import_job?id='+s.job);
+        if(st.job&&st.job.log)$('convLog').textContent=st.job.log.join('\n');
+        if(st.job&&st.job.state==='done'){
+          clearInterval(poll);
+          $('convLog').textContent+='\n✅ 完成,发布到 WSL 并启动 serve…';
+          refreshModels();
+          setTimeout(async()=>{ await refreshModels();
+            if($('smodel').options.length){ await serveStart(); } }, 800);
+        }else if(st.job&&st.job.state==='failed'){
+          clearInterval(poll);
+          $('btnAutoConv').disabled=false;$('btnAutoConv').textContent='⚙ 自动转换并运行';
+          $('convLog').textContent+='\n❌ '+(st.job.error||'失败');
+        }
+      },1500);
+    };
+  }
+}
+async function archkitSpec(){
+  const path=$('import_path').value.trim();
+  const cfg=(path.endsWith('config.json'))?path:path.replace(/[\\\/]$/,'')+'\\config.json';
+  const r=await api('/api/archkit_spec?config='+encodeURIComponent(cfg));
+  const v=$('verdict');
+  if(r.ok){v.innerHTML+='<p class="help">✅ 接入规格已生成:<br>spec: '+
+    r.spec+'<br>config.h: '+r.config_h+'</p>';}
+  else{alert('生成失败: '+(r.err||'?'));}
+}
+
+/* ---- serve ---- */
+function syncModels(m){const a=$('smodel'),b=$('smodel2');if(!a.options.length||m){
+  for(const s of[a,b]){s.innerHTML='';for(const x of(m||[])){
+    const o=document.createElement('option');o.value=x;o.textContent=x;s.appendChild(o);}}}
+  if(m&&m.length&&!b.options.length)fillModels(m);}
+function fillModels(m){for(const s of[$('smodel'),$('smodel2')]){
+  s.innerHTML='';for(const x of m){const o=document.createElement('option');
+    o.value=x;o.textContent=x;s.appendChild(o);}}}
+async function refreshModels(){const r=await api('/api/models');syncModels(r.models||[]);}
+async function serveStart(){
+  const use=document.querySelector('.tab.on').dataset.t==='serve';
+  const pick=(home,adv)=>use?$(adv):$(home);
+  const body={model:pick('smodel','smodel2').value,
+    ctx:pick('sctx','sctx2').value,
+    spec:pick('sspec','sspec2').value,dt:pick('sdt','sdt2').value,
+    cold:pick('scold','scold2').value,
+    cold_keep:pick('scoldkeep','scoldkeep2').value,
+    cold_path:pick('scoldpath','scoldpath2').value,
+    cold_gb:pick('scoldgb','scoldgb2').value,
+    kv_tiers:pick('sktiers','sktiers').value,
+    kv_layer:pick('skvlayer','skvlayer').value,
+    nvfp4_mode:pick('snvfp4mode','snvfp4mode').value,
+    graph:pick('sgraph','sgraph').value,
+    extras:collectExtras()};
+  const r=await api('/api/serve?cfg='+encodeURIComponent(JSON.stringify(body)));
+  if(!r.ok)alert(r.err||'start failed');
+}
+async function serveStop(){await api('/api/serve_stop');}
+/* ---- 全参数面板: 注册表驱动渲染 (vllm-studio 式分组折叠) ---- */
+const PGROUP_CN={core:'核心',kv:'KV 与冷存储',speculative:'投机解码',sampling:'采样',
+  thinking:'思考模式',media:'多模态',perf:'性能',network:'网络',diagnostics:'诊断',
+  advanced:'高级',ungrouped:'其他'};
+const SKIP=new Set(['host','port','model','api-key','model-id','max-context','kv-capacity',
+  'kv-dtype','spec','draft-tokens','cold-policy','cold-keep-tokens','vision',
+  'no-cuda-graph','lm-head-draft']);   // 已有专属控件的不重复渲染
+async function loadServeParams(){
+  try{
+    const r=await api('/api/serve_params');
+    if(!r.ok||!r.registry)return;
+    const reg=r.registry,host=$('sparamsbody');host.innerHTML='';
+    const render=(gname,items)=>{
+      if(!items||!items.length)return;
+      const d=document.createElement('details');
+      d.style.cssText='margin:4px 0;padding:4px 8px;border:1px solid #e5e8ee;border-radius:8px';
+      const s=document.createElement('summary');
+      s.style.cssText='cursor:pointer;color:#64748b;font-size:12px';
+      s.textContent=(PGROUP_CN[gname]||gname)+' ('+items.length+')';
+      d.appendChild(s);
+      for(const f of items){
+        const name=f.flag.slice(2);
+        if(SKIP.has(name))continue;
+        const row=document.createElement('div');row.className='row';
+        const lab=document.createElement('label');lab.textContent=name;
+        lab.style.cssText='width:180px;color:#64748b;font-size:12px;flex:none';
+        let inp;
+        if(f.type==='bool'){
+          inp=document.createElement('select');
+          inp.innerHTML='<option value="">默认</option><option value="true">开</option>'+
+            '<option value="false">关</option>';
+        }else{
+          inp=document.createElement('input');inp.type='text';inp.placeholder=
+            (f.default?('默认 '+f.default):'引擎默认');
+          inp.style.cssText='flex:1;max-width:220px;border:1px solid #e5e8ee;'+
+            'border-radius:8px;padding:6px 10px;font:inherit';
+        }
+        inp.dataset.flag=name;
+        row.appendChild(lab);row.appendChild(inp);
+        if(f.arg){const u=document.createElement('span');
+          u.style.cssText='color:#94a3b8;font-size:11px';u.textContent=f.arg;row.appendChild(u);}
+        d.appendChild(row);
+      }
+      host.appendChild(d);
+    };
+    for(const g in reg.groups)render(g,reg.groups[g]);
+    render('ungrouped',reg.ungrouped);
+  }catch(e){}
+}
+function collectExtras(){
+  const ex={};
+  document.querySelectorAll('#sparamsbody [data-flag]').forEach(el=>{
+    const v=el.value.trim();if(v)ex[el.dataset.flag]=v;
+  });
+  return ex;
+}
+async function smoke(){const r=await api('/api/smoke');if(!r.ok)alert(r.err||'smoke failed');}
+async function refreshServe(){
+  const r=await api('/api/serve_status');
+  setBadge($('sbadge'),r.serve);
+  $('sstop').style.display=r.serve==='running'?'':'none';
+  $('sstop2').style.display=r.serve==='running'?'':'none';
+  if(r.models&&r.models.length&&!$('smodel').options.length)fillModels(r.models);
+  if(r.res){const cur=document.querySelector('.tab.on').dataset.t==='serve';
+    $(cur?'sres2':'sres').textContent=r.res;}
+}
+
+/* ---- 训练 / 采集 ---- */
+async function trainStart(){
+  const body={script:$('script').value,steps:+$('steps').value,batch:+$('batch').value,
+    anchors:+$('anchors').value,ctx:+$('ctx').value,lr:$('lr').value,
+    resume:$('resume').value,ddtree:$('ddtree').checked};
+  const r=await api('/api/start?cfg='+encodeURIComponent(JSON.stringify(body)));
+  if(!r.ok)alert(r.err||'start failed');
+}
+async function trainStop(){await api('/api/stop');}
+async function collectStart(){
+  const cfg={rag:+$('c_rag').value,qa:+$('c_qa').value,code:+$('c_code').value,out:$('c_out').value};
+  const r=await api('/api/collect?cfg='+encodeURIComponent(JSON.stringify(cfg)));
+  if(!r.ok)alert(r.err||'collect failed');
+}
+async function collectStop(){await api('/api/cstop');}
+async function refresh(){
+  try{
+    const s=await api('/api/status');
+    setBadge($('tbadge'),s.state==='running'?'running':(s.state==='done'?'done':'idle'));
+    setBadge($('cbadge'),s.cstate==='collecting'?'running':(s.cstate==='done'?'done':'idle'));
+    $('c_packs').textContent=s.cpacks;$('c_size').textContent=s.csize;
+    $('cprog').textContent=s.cprog;
+    $('m_step').textContent=s.step;$('m_loss').textContent=s.loss;
+    $('m_lr').textContent=s.lr;$('m_sps').textContent=s.sps;
+    $('m_gpu').textContent=s.gpu;$('m_vram').textContent=s.vram;
+    const lg=$('log');const at=lg.scrollHeight-lg.scrollTop-lg.clientHeight<40;
+    lg.textContent=s.log_tail;if(at)lg.scrollTop=lg.scrollHeight;
+    $('tstart').style.display=s.state==='running'?'none':'';
+    $('tstop').style.display=s.state==='running'?'':'none';
+  }catch(e){}
+}
+
+/* ---- 工具 iframe (rag/convert) ---- */
+async function openTool(name){
+  const r=await api('/api/tool?name='+name);if(!r.ok){alert(r.err);return;}
+  const box=$(name+'Frame');
+  if(!box.querySelector('iframe')){
+    const f=document.createElement('iframe');f.className='tool';f.src=r.url;
+    f.title=name;box.innerHTML='';box.appendChild(f);}
+}
+
+/* ---- 循环刷新 ---- */
+loadTips();refreshEnv();refreshModels();refreshServe();loadServeParams();
+setInterval(refresh,1500);setInterval(refreshServe,3000);
+</script></body></html>

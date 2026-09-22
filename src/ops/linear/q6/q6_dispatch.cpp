@@ -21,6 +21,21 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q6_mma_r64_c128;
         }
         break;
+    case 4096:
+        // The 4096-wide text stack's vocabulary geometry: [248320, 4096]. It reuses the k = 5120
+        // arms' launches, whose k is a runtime value in both the SIMT and the MMA kernels.
+        if (n == 248320) {
+            if (t <= 4) { return launch_q6_simt_r8_c4; }
+            if (t == 5) { return launch_q6_simt_r8_c5; }
+            if (t == 6) { return launch_q6_simt_r8_c6; }
+            if (t == 7) { return launch_q6_simt_r8_c7; }
+            if (t <= 16) { return launch_q6_mma_r64_c16_k128; }
+            if (t <= 24) { return launch_q6_mma_r64_c24_k128; }
+            if (t <= 32) { return launch_q6_mma_r64_c32_k128; }
+            if (t <= 48) { return launch_q6_mma_r64_c48_k128; }
+            return launch_q6_mma_r64_c128;
+        }
+        break;
     case 2048:
         if (n == 248320) {
             if (t <= 3) { return launch_q6_simt_r8_c4; }
@@ -71,6 +86,17 @@ Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
         break;
     }
     throw std::invalid_argument("q6 linear: unsupported policy");
+}
+
+// Non-throwing spelling of the registry lookup, defined in terms of the selector itself so the
+// two can never disagree.
+bool q6_a16_shape_registered(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
+    try {
+        (void)select_q6_a16_launch(n, k, t);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void q6_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

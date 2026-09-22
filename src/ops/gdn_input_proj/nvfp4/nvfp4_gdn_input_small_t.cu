@@ -39,13 +39,15 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 }
 
 constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+    make_launchers(std::make_index_sequence<kNvfp4SmallTCount>{});
 
 } // namespace
 
 void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
+    nvfp4_small_t_launcher<kNvfp4LastSmallT>(kLaunchers, x.ne[1],
+                                           "nvfp4 gdn input small_t")(
+        x, weight, qkv, z, stream);
 }
 
 } // namespace ninfer::ops::detail

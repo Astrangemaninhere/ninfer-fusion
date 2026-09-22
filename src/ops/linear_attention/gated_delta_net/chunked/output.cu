@@ -1,14 +1,26 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/chunked/output.cuh"
 
+#include "core/device_sm_count.h"
+
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
 
 namespace kernel = output;
 
-constexpr std::int64_t kRtx5090SmCount = 170;
+// Grid sizing is a tuning decision, and the device is asked for its own SM count
+// (core/device_sm_count.h). It used to be the constant kRtx5090SmCount = 170:
+// an unverifiable claim about the hardware, and one that silently changes which
+// kernel template a launch takes when the card differs -- kSmCountFallback is
+// reached only when the device cannot be queried at all.
 constexpr std::int64_t kCtasPerSm      = 4;
-constexpr std::int64_t kTargetCtas     = kRtx5090SmCount * kCtasPerSm;
+constexpr std::int64_t kSmCountFallback = 170; // RTX 5090; used only if the query fails
+
+[[nodiscard]] std::int64_t target_ctas() noexcept {
+    const DeviceSmCount device = current_device_sm_count();
+    return static_cast<std::int64_t>(device.measured ? device.sm_count : kSmCountFallback) *
+           kCtasPerSm;
+}
 
 template <bool MULTI_JOB>
 cudaError_t launch_fixed(const chunk_output_config& cfg, dim3 grid, head_map qk_map, int chunks) {
@@ -40,10 +52,11 @@ cudaError_t launch_output(const chunk_output_config& cfg) {
     const auto qk_map     = head_map::of((int)cfg.H_qk, (int)cfg.H_v);
     const std::int64_t NT = cfg.L / BT;
 
-    // Keep at most one resident RTX 5090 wave and distribute chunks evenly
+    // Keep at most one resident wave of THIS device and distribute chunks evenly
     // across it. Small grids retain one logical job per CTA.
+    const std::int64_t ctas           = target_ctas();
     const std::int64_t logical_jobs   = NT * cfg.H_v;
-    const std::int64_t jobs_per_block = (logical_jobs + kTargetCtas - 1) / kTargetCtas;
+    const std::int64_t jobs_per_block = (logical_jobs + ctas - 1) / ctas;
     const std::int64_t grid_chunks    = (NT + jobs_per_block - 1) / jobs_per_block;
     NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(grid_chunks, cfg.H_v));
 

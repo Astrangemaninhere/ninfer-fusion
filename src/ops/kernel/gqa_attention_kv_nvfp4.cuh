@@ -68,9 +68,15 @@ __device__ __forceinline__ float gqa_kv_nvfp4_e2m1_to_f32(std::uint8_t code) {
     return (code & 0x08u) != 0 ? -magnitude : magnitude;
 }
 
-// Round-to-nearest-even E4M3FN byte. Values below the smallest normal roll up
-// through the denormal mantissa; zero stays zero.
-__device__ __forceinline__ std::uint8_t gqa_kv_nvfp4_fp32_to_e4m3(float x) {
+// ---- E4M3FN lattice ------------------------------------------------------
+//
+// `gqa_kv_nvfp4_e4m3_magnitude_bits` is the magnitude lattice. It is a verbatim
+// lift of what the SCALE encoder has always computed, so that every existing
+// consumer of an E4M3 scale plane (nvfp4, iso3, cold-i8, entropy requant, and
+// the fp8 scale plane itself) keeps byte-identical behaviour: the scale path
+// treats 0x7F as "saturated scale" and reads it back through
+// `gqa_kv_nvfp4_e4m3_to_f32` as ldexpf(1.875f, 8) = 480.0f.
+__device__ __forceinline__ std::uint8_t gqa_kv_nvfp4_e4m3_magnitude_bits(float x) {
     if (!(x > 0.0f)) { return 0; }
     const std::uint32_t bits = __float_as_uint(x);
     const std::uint32_t sign = (bits >> 24) & 0x80u;
@@ -98,11 +104,92 @@ __device__ __forceinline__ std::uint8_t gqa_kv_nvfp4_fp32_to_e4m3(float x) {
     return static_cast<std::uint8_t>(sign | (exponent << 3) | mantissa);
 }
 
+// Round-to-nearest-even E4M3FN byte. Values below the smallest normal roll up
+// through the denormal mantissa; zero stays zero.
+// SCALE PLANE ONLY -- the "positive scale path". Two of its properties are
+// load-bearing for every packed tier's scale plane and are therefore frozen:
+// (a) any x <= 0 encodes to 0x00, and (b) the top octave saturates to 0x7F,
+// which its matching reader below decodes to 480.0f. Data planes use
+// gqa_kv_nvfp4_data_fp32_to_e4m3 / gqa_kv_nvfp4_data_e4m3_to_f32 instead.
+__device__ __forceinline__ std::uint8_t gqa_kv_nvfp4_fp32_to_e4m3(float x) {
+    return gqa_kv_nvfp4_e4m3_magnitude_bits(x);
+}
+
 __device__ __forceinline__ float gqa_kv_nvfp4_e4m3_to_f32(std::uint8_t byte) {
     const int exponent = (byte >> 3) & 0x0F;
     const int mantissa = byte & 0x07;
     if (exponent == 0) { return static_cast<float>(mantissa) / 512.0f; }
     return ldexpf(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+}
+
+// ---- DATA plane: a real E4M3FN pair --------------------------------------
+//
+// Two defects made the data plane unusable, and they were a MATCHED PAIR:
+//   (1) the writer was the scale encoder above, whose first line is
+//       `if (!(x > 0.0f)) { return 0; }`: every K/V element with x <= 0 was
+//       stored as +0. Measured on 176 real .kvc frames, token-weighted K NMSE
+//       is 0.55 for that writer (about "half the elements annihilated").
+//   (2) the reader took the exponent as `(byte >> 3) & 0x0F`, so bit 7 never
+//       participated: decode(0x80 | b) == decode(b) for 256/256 bytes. Fixing
+//       only (1) therefore makes things WORSE -- the writer starts emitting
+//       0x8X and the reader flips it to a positive -- measured host NMSE
+//       0.5605 (as written) -> 2.6090 (writer only) -> 0.1212 (both, top
+//       octave still private). The two halves must change in one edit.
+//
+// The data lattice is also the FULL E4M3FN top octave: 448 (0x7E) is the
+// largest finite value, the encoder admits [256,448] instead of clamping at
+// 248 (the size of that error band: the group peak is clamped for 22-24% of
+// the groups in the real corpus, and the clamped byte used to read back as
+// 480.0 = 1.07x..1.94x the group's own amax), and 0x7F / 0xFF are the
+// format's NaN codes, which this writer never emits and this reader never
+// returns: a stored byte must not be able to inject a NaN into attention.
+__device__ __forceinline__ std::uint8_t gqa_kv_nvfp4_data_fp32_to_e4m3(float x) {
+    if (x != x) { return 0; }               // a NaN must not become a large FINITE value
+    const std::uint32_t bits = __float_as_uint(x);
+    const std::uint32_t sign = (bits >> 24) & 0x80u;
+    const float ax           = fabsf(x);
+    const std::uint32_t abits = __float_as_uint(ax);
+    int exponent = static_cast<int>((abits >> 23) & 0xffu) - 127 + 7;
+    std::uint32_t code;
+    if (exponent >= 16) {
+        code = 0x7Eu;                       // |x| >= 512: saturate to the format max, 448
+    } else if (exponent <= 0) {
+        // Same 2^-9 denormal grid as the scale path, but ties-to-even: the
+        // scale path uses roundf() (ties away from zero), which contradicts
+        // the "Round-to-nearest-even" contract the normal branch honours.
+        int mantissa = static_cast<int>(rintf(ax * 512.0f));
+        if (mantissa <= 0) { code = 0x0u; }
+        else if (mantissa >= 8) { code = 0x08u; }        // 2^-6, the smallest normal
+        else { code = static_cast<std::uint32_t>(mantissa); }
+    } else {
+        std::uint32_t mantissa = (abits >> 20) & 0x7u;
+        const std::uint32_t guard  = (abits >> 19) & 1u;
+        const std::uint32_t sticky = abits & 0x7ffffu;
+        if (guard && (sticky || (mantissa & 1u))) {
+            mantissa += 1;
+            if (mantissa > 7) {
+                mantissa = 0;
+                exponent += 1;
+            }
+        }
+        if (exponent >= 16) { code = 0x7Eu; }
+        else {
+            code = (static_cast<std::uint32_t>(exponent) << 3) | mantissa;
+            if (code >= 0x7Fu) { code = 0x7Eu; }         // 0x7F is a NaN code: clamp to 448
+        }
+    }
+    return static_cast<std::uint8_t>(sign | code);
+}
+
+__device__ __forceinline__ float gqa_kv_nvfp4_data_e4m3_to_f32(std::uint8_t byte) {
+    const std::uint32_t mag = byte & 0x7Fu;              // bit 7 IS the sign here
+    const int exponent = static_cast<int>((mag >> 3) & 0x0Fu);
+    const int mantissa = static_cast<int>(mag & 0x07u);
+    float value;
+    if (exponent == 0) { value = static_cast<float>(mantissa) / 512.0f; }
+    else if (exponent == 15 && mantissa == 7) { value = 448.0f; }   // NaN code -> format max
+    else { value = ldexpf(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7); }
+    return (byte & 0x80u) != 0u ? -value : value;
 }
 
 template <typename Geometry>

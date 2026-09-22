@@ -3,11 +3,11 @@
  "family": "qwen38",
  "hf": {
   "source": "gguf",
-  "file": "C:\\Users\\User\\Documents\\ziqinzhang\\models\\ornith-1.5-9b\\Ornith-1.5-9B-Q4_K_M.gguf"
+  "file": "/mnt/c/Users/User/Documents/ziqinzhang/models/ornith-1.5-9b/Ornith-1.5-9B-Q4_K_M.gguf"
  },
  "geometry": {
   "hidden": 4096,
-  "layers": 33,
+  "layers": 32,
   "query_heads": 16,
   "kv_heads": 4,
   "head_dim": 256,
@@ -48,7 +48,6 @@
   "linear_attention",
   "linear_attention",
   "linear_attention",
-  "full_attention",
   "full_attention"
  ],
  "knobs": {
@@ -61,8 +60,12 @@
  },
  "multimodal": false,
  "notes": [
-  "spec 由 GGUF 元数据生成 (gguf_spec.py); 权重转换需 qwen35 GGUF recipe"
+  "spec 由 GGUF 元数据生成 (gguf_spec.py); 权重转换需 qwen35 GGUF recipe",
+  "nextn/draft 块: blk.32 被排除在主栈之外 (block_count=33 含草稿块, 主栈 32 层); 该块的张量属于 MTP 头, 不是第 33 层解码层。"
  ],
+ "mtp": {
+  "mtp_num_hidden_layers": 1
+ },
  "quant_formats": {
   "Q6_K": 35,
   "F32": 184,

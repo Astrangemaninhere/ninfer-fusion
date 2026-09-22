@@ -22,25 +22,33 @@ enum class Nvfp4LinearSwiGluRoute {
     TmaFusedW4A4,
 };
 
-constexpr std::int32_t kTmaBlockM = 256;
-
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear_swiglu admits only A16 or A4");
     }
     if (policy == LinearPolicy::A16Only) {
-        // UNIFY-A: T=1 joins the same small-T family as T in [2,16].
-        if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
+        if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
+        if (tokens <= kNvfp4LinearSwiGluA16Ceiling) {
+            return Nvfp4LinearSwiGluRoute::SmallTFusedA16;
+        }
         throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
     }
-    // UNIFY-A: the NINFER_T1_W4A4 switch used to put T=1..4 on the A16 family (gemv decode
-    // / small_t) and T in [5,48] on FusedW4A4 - a precision-tier and reduction-order split
-    // exactly between plain decode (T=1) and dflash2 verify (T=W=8). One tier for all.
+    // GRAVESTONE, NOT A KNOB. `NINFER_T1_W4A4` does not exist anywhere in this tree: measured,
+    // `git grep -n --untracked NINFER_T1_W4A4` returns only research/notes/S_E_shape_kernels.md,
+    // research/notes/UNIFY_A_report.md, research/notes/UNIFY_B_report.md and this comment. The
+    // only getenv spellings in the whole tree are THREE quotations of the old code inside those
+    // markdown notes; there is no getenv in any compiled file, no declaration and no reader.
+    // Setting it in the environment does nothing. It used to put T=1..4 on the A16 family (gemv decode / small_t) and T in [5,48]
+    // on FusedW4A4 -- a precision-tier and reduction-order split exactly between plain decode
+    // (T=1) and dflash2 verify (T=W=8) -- and UNIFY-A deleted the switch, making it one tier for
+    // all. The A16 tier boundary a reader is probably looking for is the
+    // LinearPolicy::A16Only branch above, bounded by kNvfp4LinearSwiGluA16Ceiling; adding an env
+    // switch back here would be a new knob that nothing has measured.
     if (tokens <= 48) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
-    if (tokens >= kTmaBlockM && (tokens % kTmaBlockM) == 0) {
-        return Nvfp4LinearSwiGluRoute::TmaFusedW4A4;
-    }
+    // This fused route admits a single whole tile, so it asks the alignment half of the shared
+    // predicate (equivalent to "at least one tile" for positive T), not the >= 1024 crossover.
+    if (nvfp4_w4a4_tma_aligned(tokens)) { return Nvfp4LinearSwiGluRoute::TmaFusedW4A4; }
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
 }
 
@@ -97,9 +105,9 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 
     std::size_t maximum = 0;
     if (min_tokens <= 48) { maximum = fused_workspace_bytes(std::min(max_tokens, 48)); }
-    if (max_tokens >= kTmaBlockM) {
-        const std::int32_t largest_fused = max_tokens - (max_tokens % kTmaBlockM);
-        if (largest_fused >= std::max(min_tokens, kTmaBlockM)) {
+    if (max_tokens >= kNvfp4TmaBlockM) {
+        const std::int32_t largest_fused = max_tokens - (max_tokens % kNvfp4TmaBlockM);
+        if (largest_fused >= std::max(min_tokens, kNvfp4TmaBlockM)) {
             maximum = std::max(maximum, fused_workspace_bytes(largest_fused));
         }
     }
@@ -119,19 +127,18 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
                                   cudaStream_t stream) {
     const Nvfp4LinearSwiGluRoute route = resolve_route(policy, x.ne[1]);
     const std::int32_t tokens          = x.ne[1];
-    if (route == Nvfp4LinearSwiGluRoute::LinearW4A4Post && tokens >= 2 * kTmaBlockM) {
+    if (route == Nvfp4LinearSwiGluRoute::LinearW4A4Post && tokens >= 2 * kNvfp4TmaBlockM) {
         // A misaligned batch otherwise runs the whole column range on the baseline
         // (two separate linears). Split it so the bulk rides the fused TMA route
         // and only the sub-256 tail falls back; the workspace planner already
         // budgets the largest aligned fused prefix.
-        const std::int32_t head = tokens & ~(kTmaBlockM - 1);
+        const std::int32_t head = tokens & ~(kNvfp4TmaBlockM - 1);
         const std::int32_t tail = tokens - head;
         {
             auto scope                       = workspace.scope();
             const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, head);
             launch_nvfp4_w4a4_quantize(x.slice(1, 0, head), weight, scratch, true, stream);
-            const float alpha =
-                1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+            const float alpha = nvfp4_w4a4_alpha(weight);
             launch_nvfp4_linear_swiglu_w4a4_tma(
                 scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
                 static_cast<const std::uint8_t*>(weight.scales),
@@ -165,10 +172,11 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::TmaFusedW4A4: {
         auto scope                       = workspace.scope();
         const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
-        // Inside the TMA case, so this route always reads tile-contiguous scales. Note its own
-        // predicate admits every multiple of 256 from 256 up, which is wider than the shared one.
+        // Inside the TMA case, so this route always reads tile-contiguous scales. Its own
+        // predicate (nvfp4_w4a4_tma_aligned) admits every whole tile from one tile up, which is
+        // deliberately wider than the shared route predicate (nvfp4_w4a4_tma_route).
         launch_nvfp4_w4a4_quantize(x, weight, scratch, true, stream);
-        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+        const float alpha = nvfp4_w4a4_alpha(weight);
         launch_nvfp4_linear_swiglu_w4a4_tma(
             scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),

@@ -25,6 +25,41 @@
 
 namespace ninfer::ops::detail {
 
+// ---------------------------------------------------------------------------
+// PREVOLTA-ATTN: the staged copy, with an arch-guarded fallback -- the q4 twin of this block
+// (ops/linear/q4/q4_rowsplit_gemm_simt.cuh). `cp_async<>` was emitted UNGUARDED here, and its
+// below-floor arm is `unsupported_instruction_trap()` (ops/common/memory.cuh:73-76), so on every
+// rung below sm_80 this kernel built and then TRAPPED ON ITS FIRST LAUNCH, including on sm_70.
+// The fallback is the `cuda_pipeline` primitive set the tree's q5/w8 SIMT GEMMs already stage
+// through, which is synchronous-but-correct below sm_80. sm_80 and up is BYTE-IDENTICAL to
+// before: NINFER_MEMORY_HAS_CP_ASYNC is defined there, so the cp_async arm is taken.
+// ---------------------------------------------------------------------------
+template <int Bytes, Cache Policy = Cache::ca>
+__device__ __forceinline__ void q6_simt_copy(void* shared_dst, const void* global_src) {
+#ifdef NINFER_MEMORY_HAS_CP_ASYNC
+    cp_async<Bytes, Policy>(shared_dst, global_src);
+#else
+    pipe_copy<Bytes>(shared_dst, global_src);
+#endif
+}
+
+__device__ __forceinline__ void q6_simt_commit() {
+#ifdef NINFER_MEMORY_HAS_CP_ASYNC
+    cp_commit();
+#else
+    pipe_commit();
+#endif
+}
+
+template <int Groups>
+__device__ __forceinline__ void q6_simt_wait() {
+#ifdef NINFER_MEMORY_HAS_CP_ASYNC
+    cp_wait<Groups>();
+#else
+    pipe_wait<Groups>();
+#endif
+}
+
 template <int RowsPerCta_, int ColsPerTile_, int GroupsPerStage_, int PipelineStages_,
           Cache CodeCache_, int LaunchBoundsMinBlocks_>
 struct Q6RowSplitSimtGemmSchedule {
@@ -72,9 +107,9 @@ template <class Schedule>
 __device__ __forceinline__ void q6_simt_copy_code(uint4* shared_dst,
                                                   const std::uint8_t* global_src) {
     if constexpr (Schedule::kCodeCache == Cache::cg) {
-        cp_async<16, Cache::cg>(shared_dst, global_src);
+        q6_simt_copy<16, Cache::cg>(shared_dst, global_src);
     } else {
-        cp_async<16, Cache::ca>(shared_dst, global_src);
+        q6_simt_copy<16, Cache::ca>(shared_dst, global_src);
     }
 }
 
@@ -122,12 +157,12 @@ __device__ __forceinline__ void q6_simt_issue_stage(uint4* __restrict__ shared_c
     const int active_scale_pairs = FullStage ? kScalePairs : active_groups / 2;
     for (int pair = lane; pair < kScalePairs; pair += 32) {
         if (FullStage || pair < active_scale_pairs) {
-            cp_async<4>(&shared_scales[pair], stage_scales + static_cast<std::int64_t>(pair) * 4);
+            q6_simt_copy<4>(&shared_scales[pair], stage_scales + static_cast<std::int64_t>(pair) * 4);
         } else {
             shared_scales[pair] = 0u;
         }
     }
-    cp_commit();
+    q6_simt_commit();
 }
 
 template <class Schedule, bool FullStage, bool FullCols>
@@ -242,7 +277,7 @@ __global__ __launch_bounds__(
                                                  shared_scales[warp][prefetch], code_row, high_row,
                                                  scale_row, prefetch, active_groups, lane);
         } else {
-            cp_commit();
+            q6_simt_commit();
         }
     }
 
@@ -256,10 +291,10 @@ __global__ __launch_bounds__(
                 shared_codes[warp][buffer], shared_high[warp][buffer], shared_scales[warp][buffer],
                 code_row, high_row, scale_row, fetch, active_groups, lane);
         } else {
-            cp_commit();
+            q6_simt_commit();
         }
 
-        cp_wait<kPipelinePrefetch>();
+        q6_simt_wait<kPipelinePrefetch>();
         __syncwarp();
 
         const int active_groups = min(kGroupsPerStage, groups - stage * kGroupsPerStage);

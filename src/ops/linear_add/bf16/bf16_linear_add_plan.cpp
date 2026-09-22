@@ -14,9 +14,8 @@ Bf16LinearAddScheduleId bf16_linear_add_select(std::int32_t output_rows, std::in
     if (!bf16_linear_add_admits(output_rows, input_rows, tokens)) {
         throw std::invalid_argument("bf16 linear_add: unsupported exact problem");
     }
-    // UNIFY-A: the Decode gemv (T=1) and the small-T kernel (T<=4) grouped the K reduction
-    // differently from the MMA that T>=5 uses. The aggregate MMA route is one fixed
-    // schedule (UpTo32 for T<=32, kBlockCols=32), so the whole small-T family uses it.
+    if (tokens == 1) { return Bf16LinearAddScheduleId::Decode; }
+    if (tokens <= kBf16LinearAddSmallTDispatchEnd) { return Bf16LinearAddScheduleId::SmallT; }
     if (tokens <= kBf16LinearAddAggregateMmaEnd) { return Bf16LinearAddScheduleId::AggregateMma; }
     return Bf16LinearAddScheduleId::Mma;
 }

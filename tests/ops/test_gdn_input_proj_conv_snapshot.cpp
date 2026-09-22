@@ -988,11 +988,12 @@ int run_fp8() {
 } // namespace
 
 int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
+    // ⚠ rebuild1, 2026-09-22. Same unmasking as in the record sibling: the capacity blocks
+    // below are host-side arithmetic and need no device, so they run BEFORE the device gate
+    // (which now sits at the end of the FP8 block). Both GDN capacity tests read
+    // `***Skipped` on every recorded baseline from 2026-09-14 (build/ctest_full_wB.txt)
+    // through 2026-09-21 (dl/redctest/TRANSITIONS.txt); the FIX-C route change of 2026-09-17
+    // hid behind that skip.
     int failures = 0;
     const std::size_t q4_interval =
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
@@ -1031,18 +1032,57 @@ int main() {
     };
     const std::size_t fp8_a16_w4 = fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 4, 4);
     const std::size_t fp8_a16_w6 = fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 6, 6);
+    // ⚠ RE-PINNED (rebuild1, 2026-09-22). FIX-C (src/ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp,
+    // mtime 2026-09-17 16:08) deleted the batch-1 `AllowA8 && width >= 10 -> MaterializedA8`
+    // clause: the batch-1 chain-verify domain is width in [1,16] and on it the policy must not
+    // move the route, because A8 quantises the ACTIVATIONS to FP8 -- a different arithmetic
+    // from the batch-1 decode's A16, not a re-ordering of it. fp8_a8_w10 therefore reads 0 on
+    // the landed tree and read 256040 on the byte-exact pre-image, so it is asserted the other
+    // way round and the whole domain is pinned by the sweep below.
+    // MEASURED out of tree, byte-exact pre-image vs landed tree
+    // (dl/rebuild1/logs/s05_probe_A1.txt vs s05_probe_A0.txt):
+    //   fp8_a8_w10               pre-FIX-C 256040 | landed 0
+    //   snap(AllowA8,1,1,10)     pre-FIX-C 256040 | landed 122880  (it tracks the scan's
+    //                            largest materialized width, 6, so it equals snap(A16Only,1,6,6)
+    //                            -- NOT fp8_a8_w10; the first version of this patch left the
+    //                            original `== fp8_a8_w10` term in place and the freshly linked
+    //                            binary caught it: dl/rebuild1/logs/b04_land_and_test.log
+    //                            section G, "EXIT 1"/"***Failed 0.01 sec")
+    //   snap(A16Only,1,7,10)     pre-FIX-C 0      | landed 0     (FIX-C did not touch the
+    //   snap(AllowA8,1,7,9)      pre-FIX-C 0      | landed 0      fused band 1..3 + 7..10)
+    // Restoring the pre-FIX-C clause turns the `fp8_a8_w10 != 0` term and the sweep red again
+    // -- measured: arm A1 of dl/rebuild1/probe/build_probe.sh.
     const std::size_t fp8_a8_w10 = fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 10, 10);
     if (fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 1, 3) != 0 || fp8_a16_w4 == 0 ||
         fp8_a16_w6 <= fp8_a16_w4 ||
         fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 7, 10) != 0 ||
         fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 1, 9) != fp8_a16_w6 ||
         fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 11, 11) == 0 ||
-        fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 7, 9) != 0 || fp8_a8_w10 == 0 ||
-        fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 1, 10) != fp8_a8_w10 ||
+        fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 7, 9) != 0 || fp8_a8_w10 != 0 ||
+        fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, 1, 10) != fp8_a16_w6 ||
         fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 2, 5, 5) <=
             fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 2, 4, 4)) {
         std::cerr << "FP8 snapshot capacity did not preserve measured route witnesses\n";
         ++failures;
+    }
+    // The whole batch-1 verify domain must be policy-invariant: for every width in [1,16] the
+    // AllowA8 and A16Only capacity readings have to agree. B > 1 still splits on the policy
+    // (snap(AllowA8,2,5,5) is strictly above snap(AllowA8,2,4,4) above).
+    for (std::int32_t width = 1; width <= 16; ++width) {
+        if (fp8_snapshot_capacity(ops::LinearPolicy::AllowA8, 1, width, width) !=
+            fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, width, width)) {
+            std::cerr << "FP8 snapshot capacity: batch-1 width " << width
+                      << " takes a different route under AllowA8 than under A16Only\n";
+            ++failures;
+        }
+    }
+    if (failures != 0) {
+        std::cout << "FAIL gdn_input_proj_conv_snapshot\n";
+        return 1;
+    }
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
     }
     failures += run_q4_q5();
     failures += run_w8();

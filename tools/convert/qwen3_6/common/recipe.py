@@ -296,11 +296,37 @@ def source_requirements(
     return requirements
 
 
+def source_reader(model_dir: str | Path) -> ShardReader:
+    """A reader for either source layout, chosen from what is on disk.
+
+    ``ShardReader(model_dir)`` reads ``model.safetensors.index.json`` and raises
+    ``FileNotFoundError`` on a single-file source -- measured here on
+    ``/var/tmp/type41land/AFTER/full_q1`` (one 53.79 GB ``model.safetensors``,
+    no index) and on two more, with the frame chain
+    ``qwen3_6/common/recipe.py:303 -> common/safetensors.py:31``
+    (``dl/importer2/step2/probeA.txt``).  ``ShardReader.from_file`` is the
+    single-file constructor that already exists for exactly this case
+    (``tools/convert/common/safetensors.py:40-48``), so the layout is detected
+    instead of assumed.  The same decision is already made independently in
+    ``tools/convert/qwen3_6_27b/text_core.py:221-239`` and in
+    ``tools/convert/qwen3_6_35b_a3b/recipe.py:512-526``.
+    """
+
+    root = Path(model_dir)
+    if (root / "model.safetensors.index.json").is_file():
+        return ShardReader(root)
+    single = root / "model.safetensors"
+    if single.is_file():
+        return ShardReader.from_file(single)
+    raise FileNotFoundError(
+        f"{root} has neither model.safetensors.index.json nor model.safetensors")
+
+
 def preflight_sources(
     model_dir: str | Path,
     recipes: Sequence[TensorRecipe],
 ) -> SourcePreflight:
-    with ShardReader(model_dir) as reader:
+    with source_reader(model_dir) as reader:
         return preflight_source_reader(reader, recipes)
 
 
@@ -420,6 +446,7 @@ __all__ = [
     "preflight_source_reader",
     "preflight_sources",
     "source",
+    "source_reader",
     "source_requirements",
     "validate_recipe_coverage",
 ]

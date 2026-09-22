@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -62,10 +63,10 @@ int main() {
                           "--kv-tier-formats did not preserve its spec or consumed --port");
         bool rejected = false;
         try {
-            (void)parse({"ninfer-serve", "model.ninfer", "--kv-tier-formats", "cold=iso3",
+            (void)parse({"ninfer-serve", "model.ninfer", "--kv-tier-formats", "cold=iso4e",
                          "--nvfp4-mode", "pure"});
         } catch (const std::invalid_argument&) { rejected = true; }
-        failures += check(rejected, "the vocabulary's pure-vs-iso/e8 rule was not enforced at "
+        failures += check(rejected, "the vocabulary's pure-vs-iso/rk4v4 rule was not enforced at "
                                     "parse time");
     }
 
@@ -148,6 +149,34 @@ int main() {
                       "--draft-tokens did not preserve the DFlash window");
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
+
+    // --spec dspark is an alias of DFlash, not a fourth backend: the DSpark
+    // drafter is the DFlash (v1) runtime and the ARTIFACT's weights identity
+    // (weights_id=nvfp4-dspark) decides whether its Markov head is in play
+    // (targets/qwen3_6_27b/impl/load/bindings.cpp:902-905 +
+    // runtime/dflash_impl.h:455-476). The alias must therefore resolve to
+    // exactly the same options as --spec dflash and take the same gates.
+    const ServeOptions dspark = parse({"ninfer-serve", "model.ninfer", "--spec", "dspark",
+                                       "--draft-tokens", "15"});
+    failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DFlash,
+                      "--spec dspark did not resolve to the DFlash backend");
+    failures += check(dspark.speculative.draft_tokens == dflash.speculative.draft_tokens &&
+                          dspark.speculative.backend == dflash.speculative.backend,
+                      "--spec dspark and --spec dflash produced different options");
+
+    bool dspark_zero_width_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "0"});
+    } catch (const std::invalid_argument&) { dspark_zero_width_rejected = true; }
+    failures += check(dspark_zero_width_rejected,
+                      "--spec dspark accepted --draft-tokens 0 (DFlash's [1,15] gate)");
+
+    bool dspark_vision_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "15",
+                     "--vision"});
+    } catch (const std::invalid_argument&) { dspark_vision_rejected = true; }
+    failures += check(dspark_vision_rejected, "dspark and Vision were accepted together");
 
     bool dflash_vision_rejected = false;
     try {
@@ -376,6 +405,77 @@ int main() {
     }
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+
+    // Cold tier: the layered policy must be selectable from serve too, and every
+    // pre-existing token must keep its own meaning.
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--cold-policy", "host-then-disk"})
+                              .cold_policy == ninfer::ColdPolicy::HostThenDisk,
+                      "--cold-policy host-then-disk did not select the layered policy");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--cold-policy", "disk"})
+                              .cold_policy == ninfer::ColdPolicy::Disk,
+                      "--cold-policy disk no longer selects the disk policy");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--cold-policy", "host"})
+                              .cold_policy == ninfer::ColdPolicy::Host,
+                      "--cold-policy host no longer selects the host policy");
+
+    // FreeToken line (serve/kv_auto_relayout.h). Three properties, in the order
+    // they can break: the flags are opt-in (nothing is enabled by default), the
+    // flag values survive argv, and an explicit --ft-stats reaches the variable
+    // ft::enabled() actually reads (it caches NINFER_FT_STATS on first use, so
+    // the parser is the last place that can set it).
+    {
+        const auto deferred = parse({"ninfer-serve", "model.ninfer"});
+        failures += check(!deferred.ft_relayout_secs.has_value() && !deferred.ft_vram_axis.has_value() &&
+                              !deferred.ft_stats.has_value(),
+                          "the FreeToken line is no longer deferred by default");
+
+        const auto on = parse({"ninfer-serve", "model.ninfer", "--kv-auto-relayout", "60",
+                               "--ft-vram-axis", "off", "--ft-stats", "on", "--port", "8000"});
+        failures += check(on.ft_relayout_secs.value_or(-1) == 60 && on.port == 8000,
+                          "--kv-auto-relayout consumed the following token or lost its value");
+        failures += check(on.ft_vram_axis.has_value() && !*on.ft_vram_axis,
+                          "--ft-vram-axis off was not recorded");
+        failures += check(on.ft_stats.value_or(false), "--ft-stats on was not recorded");
+        failures += check(on.ft_vram_axis.has_value() && on.ft_stats.has_value(),
+                          "the FreeToken optionals were left unset by an explicit flag");
+        failures +=
+            check(parse({"ninfer-serve", "model.ninfer", "--kv-auto-relayout", "0"})
+                          .ft_relayout_secs.value_or(-1) == 0,
+                  "--kv-auto-relayout 0 is not an explicit disable (it must beat the env)");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--ft-vram-axis", "on"})
+                              .ft_vram_axis.value_or(false),
+                          "--ft-vram-axis on was not recorded");
+
+        const auto rejects = [](std::vector<std::string> args) {
+            try {
+                (void)parse(std::move(args));
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        failures += check(rejects({"ninfer-serve", "model.ninfer", "--ft-vram-axis", "yes"}),
+                          "the server accepted an unknown --ft-vram-axis mode");
+        failures += check(rejects({"ninfer-serve", "model.ninfer", "--ft-stats", "1"}),
+                          "the server accepted an unknown --ft-stats mode");
+        failures += check(rejects({"ninfer-serve", "model.ninfer", "--kv-auto-relayout", "-1"}),
+                          "the server accepted a negative --kv-auto-relayout");
+
+#if !defined(_WIN32)
+        const char* committed = std::getenv("NINFER_FT_STATS");
+        failures += check(committed != nullptr && std::string(committed) == "1",
+                          "--ft-stats on did not commit NINFER_FT_STATS=1");
+        (void)parse({"ninfer-serve", "model.ninfer", "--ft-stats", "off"});
+        committed = std::getenv("NINFER_FT_STATS");
+        failures += check(committed != nullptr && std::string(committed) == "0",
+                          "--ft-stats off did not commit NINFER_FT_STATS=0");
+        unsetenv("NINFER_FT_STATS");
+#endif
+
+        const std::string help = serve_usage_text("ninfer-serve");
+        failures += check(help.find("--kv-auto-relayout") != std::string::npos &&
+                              help.find("--ft-vram-axis") != std::string::npos &&
+                              help.find("--ft-stats") != std::string::npos,
+                          "serve help omits part of the FreeToken line");
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

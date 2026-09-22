@@ -10,6 +10,7 @@
 #include "targets/muse_glimmer_30b/impl/load/bindings.h"
 #include "targets/muse_glimmer_30b/impl/variant.h"
 
+#include <array>
 #include <stdexcept>
 #include <vector>
 #include <cstdlib>
@@ -47,36 +48,38 @@ LoadedModel::~LoadedModel() = default;
 namespace ninfer::targets::muse_glimmer_30b {
 namespace {
 
-constexpr ModelSamplingDefaults kMuseDefaults{
-    .thinking     = {.temperature       = 0.7F,
-                     .top_k             = 20,
-                     .top_p             = 0.80F,
-                     .min_p             = 0.0F,
-                     .presence_penalty  = 0.0F,
-                     .frequency_penalty = 0.0F},
-    .non_thinking = {.temperature       = 0.7F,
-                     .top_k             = 20,
-                     .top_p             = 0.80F,
-                     .min_p             = 0.0F,
-                     .presence_penalty  = 0.0F,
-                     .frequency_penalty = 0.0F},
-};
+// The declaration and the binder must agree about which profile carries a draft tensor group:
+// `detail::Variant::dspark_weights` / `dflash2_weights` (`impl/variant.h`) are the pre-existing
+// single source of truth for that, and `resolved_auto_speculative` below still keys on the same
+// profile value, so a row whose identity is repointed would otherwise take the draft dispatch with
+// it. Ported from id1's `speculative_declarations_match_payload`, which cross-checked the
+// speculative field of its realization table against these same two predicates. The two flavours
+// are named here and nowhere else on this package's resolution path.
+constexpr bool declared_draft_identities_match_payload() {
+    for (const targets::WeightsDeclaration<detail::WeightsProfile>& row :
+         Package::accepted_weights) {
+        const bool names_dspark  = row.identity.weights_id == "nvfp4-dspark";
+        const bool names_dflash2 = row.identity.weights_id == "nvfp4-dflash2";
+        if (names_dspark != detail::Variant::dspark_weights(row.profile)) { return false; }
+        if (names_dflash2 != detail::Variant::dflash2_weights(row.profile)) { return false; }
+    }
+    return true;
+}
+static_assert(declared_draft_identities_match_payload(),
+              "the declared draft identities must agree with the payload predicates");
 
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
-    if (model == model_id) { return kMuseDefaults; }
-    throw std::runtime_error("model '" + std::string(model) +
-                             "' has no sampling defaults in target package '" +
-                             std::string(target_key) + "'");
+    return sampling_presets().require(model).defaults;
 }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::MuseNvfp4;
-    }
-    throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
-                             "' is not supported by target '" + std::string(target_key) + "'");
+    return weights_declarations().require(identity.model_id, identity.weights_id).profile;
+}
+
+std::string_view Package::declare_identity(std::string_view model, std::string_view weights) {
+    return weights_declarations().require(model, weights).target_key;
 }
 
 EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,

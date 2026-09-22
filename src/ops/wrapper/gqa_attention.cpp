@@ -3,6 +3,7 @@
 
 #include "core/layout.h"
 #include "ops/launcher/gqa_attention.h"
+#include "ops/launcher/gqa_attention_route_contract.h" // FIX-WOS-1: gqa_attention_route_for (declared here, called at :450)
 
 #include <algorithm>
 #include <cmath>
@@ -77,8 +78,15 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if ((cache.dtype == DType::I8 || e8) && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8/E8 KV cache must use quant_group 64");
     }
+    // nvfp4, fp8 and iso3 are the packed-16 tiers: their scale plane is one entry per
+    // HEAD_DIM/16 channels and every kernel that reads them indexes it that way. The
+    // message names the value it was handed, because "must use quant_group 16" without
+    // the actual number leaves the reader guessing which side is wrong -- and this site is
+    // reached by fp8, not only by nvfp4.
     if (packed16 && cache.quant_group != kNvfp4QuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": packed KV cache must use quant_group 16");
+        throw std::invalid_argument(std::string(op) + ": packed (nvfp4/fp8/iso3) KV cache must "
+                                                  "use quant_group 16, not " +
+                                      std::to_string(cache.quant_group));
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -122,7 +130,13 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         const std::int32_t groups = cache.head_dim / kNvfp4QuantGroup;
         if (cache.k_scale_pages.dtype != DType::FP8_E4M3FN ||
             cache.v_scale_pages.dtype != DType::FP8_E4M3FN) {
-            throw std::invalid_argument(std::string(op) + ": invalid packed KV cache scale dtype");
+            throw std::invalid_argument(std::string(op) +
+                ": a packed (nvfp4/fp8/iso3) KV cache needs an E4M3FN scale plane on BOTH K and V; "
+                "this op was handed k-scale dtype " +
+                std::to_string(static_cast<int>(cache.k_scale_pages.dtype)) + " and v-scale dtype " +
+                std::to_string(static_cast<int>(cache.v_scale_pages.dtype)) +
+                " (DType enumerator order)");
+
         }
         require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
                       "cache k scale pages");
@@ -163,8 +177,15 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     if ((cache.dtype == DType::I8 || e8) && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8/E8 KV cache must use quant_group 64");
     }
+    // nvfp4, fp8 and iso3 are the packed-16 tiers: their scale plane is one entry per
+    // HEAD_DIM/16 channels and every kernel that reads them indexes it that way. The
+    // message names the value it was handed, because "must use quant_group 16" without
+    // the actual number leaves the reader guessing which side is wrong -- and this site is
+    // reached by fp8, not only by nvfp4.
     if (packed16 && cache.quant_group != kNvfp4QuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": packed KV cache must use quant_group 16");
+        throw std::invalid_argument(std::string(op) + ": packed (nvfp4/fp8/iso3) KV cache must "
+                                                  "use quant_group 16, not " +
+                                      std::to_string(cache.quant_group));
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -209,7 +230,15 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         const std::int32_t groups = cache.head_dim / kNvfp4QuantGroup;
         if (cache.k_scale_pages.dtype != DType::FP8_E4M3FN ||
             cache.v_scale_pages.dtype != DType::FP8_E4M3FN) {
-            throw std::invalid_argument(std::string(op) + ": invalid NVFP4 KV cache scale dtype");
+            // NOT "invalid NVFP4 ...": fp8 and iso3 arrive here too, and naming one of the
+            // three tiers sent readers after the wrong codec.
+            throw std::invalid_argument(std::string(op) +
+                ": a packed (nvfp4/fp8/iso3) KV cache needs an E4M3FN scale plane on BOTH K and V; "
+                "this op was handed k-scale dtype " +
+                std::to_string(static_cast<int>(cache.k_scale_pages.dtype)) + " and v-scale dtype " +
+                std::to_string(static_cast<int>(cache.v_scale_pages.dtype)) +
+                " (DType enumerator order)");
+
         }
         require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
                       "cache k scale pages");
@@ -327,6 +356,20 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     }
 }
 
+// M1 (per-column ancestor masks): shape/domain validation only. The VALUE contract -- bit i of
+// column j means "column j may attend column i", bit 0 always set -- is the caller's; a caller
+// that passes a mask the kernel cannot honor is refused below rather than silently exempted.
+void require_column_masks(const Tensor& column_masks, std::int32_t width, std::int32_t batch,
+                          const char* op) {
+    if (column_masks.data == nullptr) { return; }
+    if (column_masks.dtype != DType::I64) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": column masks must be I64 (uint64 bit sets)");
+    }
+    require_shape(column_masks, width, batch, 1, 1, op, "column masks");
+    require_contiguous_nonnull(column_masks, op, "column masks");
+}
+
 struct SmallTWorkspace {
     Tensor acc;
     Tensor m;
@@ -365,9 +408,9 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
 
 void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
-                            const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                            GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
-                            cudaStream_t stream) {
+                            const Tensor& column_masks, const Tensor& table_rows, float scale,
+                            PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                            WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
         const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
@@ -375,7 +418,8 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
             detail::gqa_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[0], q.ne[1], count, splits, q.ne[3]);
-        detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
+        detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, column_masks,
+                                             table_rows, scale,
                                              cache, envelope, begin, count, partial.acc, partial.m,
                                              partial.l, out, stream);
     }
@@ -398,18 +442,13 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
 
 namespace detail {
 
+// The rule itself lives in ops/launcher/gqa_attention_route_contract.h, so that a host test can
+// exercise the dispatcher's own decision without a GPU and without linking this library. This is a
+// forwarder, not a second copy of the rule: gqa_attention_route_for is the only spelling of it.
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                               std::int32_t batch_size,
                                               GqaExecutionEnvelope envelope) {
-    if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
-    if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
-    const std::uint32_t prompt_visible_keys =
-        width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
-    if (q_heads == 16 && width <= kMaximumVerifyTokens &&
-        envelope.max_visible_keys > prompt_visible_keys) {
-        return GqaAttentionRoute::ChunkedSmallT;
-    }
-    return GqaAttentionRoute::Prompt;
+    return gqa_attention_route_for(q_heads, width, batch_size, envelope);
 }
 
 const char* gqa_attention_route_name(GqaAttentionRoute route) {
@@ -494,9 +533,10 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim,
 }
 
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
-                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                   const Tensor& valid_columns, const Tensor& column_masks,
+                   const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
+                   GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                   cudaStream_t stream) {
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
@@ -511,6 +551,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_shape(v, cache.head_dim, kv_heads, width, batch, op, "v");
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
+    require_column_masks(column_masks, width, batch, op);
 
     auto scope = workspace.scope();
     detail::GqaAttentionRoute route =
@@ -519,9 +560,33 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     if (cache.dtype == DType::E8Kv && route != detail::GqaAttentionRoute::Prompt) {
         route = detail::GqaAttentionRoute::Prompt;
     }
+    // M1: a per-column ancestor mask makes each query's visible set a BIT SET instead of the
+    // causal prefix. The BF16 small-T kernels and the BF16 prompt body implement that; every other
+    // (route, KV tier) pair is refused by name here or in the launcher -- silently ignoring the
+    // mask would verify a chain and call it a tree.
+    if (column_masks.data != nullptr) {
+        if (cache.dtype != DType::BF16) {
+            throw std::invalid_argument(
+                std::string(op) +
+                ": per-column masks (MTP tree verify) are implemented for the BF16 KV tier "
+                "only; this call has a quantized KV tier");
+        }
+        // The prompt route carries the masks now (gqa_attention_prompt_launch applies them in the
+        // BF16 prompt body), so the blanket route refusal is gone. What stays refused here is the
+        // one shape that body cannot index: a round wider than the documented verify width. That
+        // bound is tighter than the launcher's own (one query block, kGqaPrefillBr) and is
+        // route-independent, so no caller has to know which route its (q_heads, width, batch)
+        // triple resolves to.
+        if (width > kMaximumVerifyTokens) {
+            throw std::invalid_argument(
+                std::string(op) + ": per-column masks (MTP tree verify) index at most " +
+                std::to_string(kMaximumVerifyTokens) +
+                " columns; this call has width " + std::to_string(width));
+        }
+    }
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
-        launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
+        launch_chunked_small_t(q, k, v, positions, valid_columns, column_masks, kv_table_rows,
+                               scale, cache, envelope, workspace, out, stream);
         return;
     }
     if (route == detail::GqaAttentionRoute::SmallT) {
@@ -529,13 +594,13 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
             detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[0], q.ne[1], width, splits, batch);
-        detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
-                                             scale, cache, envelope, 0, width, partial.acc,
-                                             partial.m, partial.l, out, stream);
+        detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, column_masks,
+                                             kv_table_rows, scale, cache, envelope, 0, width,
+                                             partial.acc, partial.m, partial.l, out, stream);
         return;
     }
-    detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream);
+    detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, column_masks,
+                                        kv_table_rows, scale, cache, out, stream);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,

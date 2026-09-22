@@ -11,6 +11,27 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include "ops/common/mma.cuh"   // mma_f16_m8n8k4 and unsupported_instruction_trap()
+
+// ---------------------------------------------------------------------------
+// Per-target gates for THIS file. It had none: `grep -c __CUDA_ARCH__` returned 0 here before
+// this block existed.
+//
+// WHAT THE ABSENCE COST, measured on nvcc 12.8 for -arch=sm_52 (dl/capor/r12_qpn_sm52.sh): this
+// file did not compile AT ALL below sm_70 -- 21 errors, the first being
+//     qpn_kernels.cuh(31): error: name must be a namespace name
+//       using namespace nvcuda;
+// because <mma.h> declares nvcuda::wmma only from sm_70 up. So the FFMA-only SIMT channel
+// (skinny_nvfp4_qpn_simt, this file) was unreachable below sm_70 for a reason that had nothing to
+// do with the SIMT channel: the translation unit died in the front end before ANY kernel was
+// emitted, so nothing in it reached a cubin.
+//
+// This is the q4/q6 recipe: gate the channels that cannot exist on that rung, KEEP their symbols,
+// and let them TRAP. A trap is a named failure at the call; a link error and a silently different
+// kernel are neither.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+#define NINFER_QPN_HAS_WMMA 1
+#endif
 
 namespace ninfer::ops::qpn {
 
@@ -28,7 +49,11 @@ namespace ninfer::ops::qpn {
 //                 (m16n16k16, fp32 accumulate) do the arithmetic.
 
 
+#ifdef NINFER_QPN_HAS_WMMA
 using namespace nvcuda;
+// <mma.h> declares nvcuda::wmma only from sm_70 up. Below that the name does not exist and this
+// `using` directive is itself the first error the compiler reports.
+#endif
 
 #define DEV_INLINE __device__ __forceinline__
 
@@ -327,6 +352,7 @@ __global__ void skinny_nvfp4_wmma(const uint8_t *__restrict__ codes,
   constexpr int NT = WN * 16, MT = WM * 16;
   constexpr int PW = KC + 16, PX = KC + 16;  // padded smem pitches (halfs)
   constexpr int NTHREADS = WN * WM * 32;
+#ifdef NINFER_QPN_HAS_WMMA
   constexpr int CSEG = NT * (KC / 16) / NTHREADS;  // code segs per thread
   constexpr int XSEG = MT * (KC / 8) / NTHREADS;   // x uint4s per thread
   static_assert(CSEG * NTHREADS == NT * (KC / 16), "code seg split");
@@ -441,6 +467,10 @@ __global__ void skinny_nvfp4_wmma(const uint8_t *__restrict__ codes,
 #endif
     if (gm < m_real) y[(size_t)gm * N + gn] = __float2half(cs[e] * gs_eff);
   }
+#else
+  (void)codes; (void)scales; (void)x; (void)y; (void)N; (void)K; (void)m_real; (void)gscale;
+  unsupported_instruction_trap();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -692,15 +722,13 @@ __global__ void skinny_nvfp4_mma8(const uint8_t *__restrict__ codes,
       for (int j = 0; j < 4; j++) {
         const half2 b0 = xrow[2 * j], b1 = xrow[2 * j + 1];
         const unsigned *A = reinterpret_cast<const unsigned *>(af[j]);
-        asm volatile(
-            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
-            "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
-            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]),
-              "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
-            : "r"(A[0]), "r"(A[1]),
-              "r"(*reinterpret_cast<const unsigned *>(&b0)),
-              "r"(*reinterpret_cast<const unsigned *>(&b1)));
+        // The same eight-register m8n8k4 form the inline asm spelled here, taken from the helper
+        // that now owns it (ops/common/mma.cuh, whose comment cites THIS site and the macro below
+        // as the form it was extracted from). Two reasons: the helper carries the sm_70 floor with
+        // it, and the tree then has one spelling of the instruction instead of two that can drift.
+        ::ninfer::ops::mma_f16_m8n8k4(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], A[0], A[1],
+                                      *reinterpret_cast<const unsigned *>(&b0),
+                                      *reinterpret_cast<const unsigned *>(&b1));
       }
     }
   }
@@ -741,6 +769,7 @@ __global__ void skinny_nvfp4_wmma_ks(const uint8_t *__restrict__ codes,
   constexpr int NT = WN * 16, MT = WM * 16;
   constexpr int PW = KC + 16, PX = KC + 16;
   constexpr int NTHREADS = WN * WM * 32;
+#ifdef NINFER_QPN_HAS_WMMA
   constexpr int CSEG = NT * (KC / 16) / NTHREADS;
   constexpr int XSEG = MT * (KC / 8) / NTHREADS;
   static_assert(CSEG * NTHREADS == NT * (KC / 16), "code seg split");
@@ -850,6 +879,10 @@ __global__ void skinny_nvfp4_wmma_ks(const uint8_t *__restrict__ codes,
     const int gm = wm * 16 + j, gn = nb + wn * 16 + i;
     if (gm < m_real) atomicAdd(&ypart[(size_t)gm * N + gn], cs[e]);
   }
+#else
+  (void)codes; (void)scales; (void)x; (void)ypart; (void)N; (void)K; (void)m_real; (void)k_slice;
+  unsupported_instruction_trap();
+#endif
 }
 
 // Config-selectable WMMA entry for tile sweeps: cfg indexes the
@@ -890,14 +923,11 @@ static void set_smem_opt(const void *kern, int smem) {
 // 1.28x at M=5, 1.69x at M=8, 1.29x at M=11, 1.22x at M=16 vs the
 // prior best incumbent on the 5-shape production set.
 // ---------------------------------------------------------------------------
+// Same instruction, same helper as the MMA8 site above; the helper is what carries the sm_70
+// floor (NINFER_MMA_HAS_M8N8K4_F16) and traps below it instead of failing at ptxas.
 #define MMA_8N8K4(C, A0, A1, B0, B1)                                        \
-  asm volatile(                                                             \
-      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "                    \
-      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "                     \
-      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"                                        \
-      : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]), "+f"(C[4]),         \
-        "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                                  \
-      : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
+  ::ninfer::ops::mma_f16_m8n8k4(C[0], C[1], C[2], C[3], C[4], C[5], C[6],   \
+                                C[7], (A0), (A1), (B0), (B1))
 
 template <int MT>
 __global__ void skinny_nvfp4_qpn(const uint8_t *__restrict__ qcodes,
@@ -1432,8 +1462,17 @@ __global__ void skinny_fp8_qpn8_mt2(const uint8_t *__restrict__ bcodes,
 void gemm_qpn_simt(const void* x_half, const void* codes, const void* scales, float gscale,
                    void* y_half, int m, int k, int n, cudaStream_t stream);
 
-// M-dispatch entry: simt M<=3, skinny_nvfp4_qpn<1> for M 4..8, <2> for M 9..16.
+// M-dispatch entry: simt M<=3, skinny_nvfp4_qpn<1> for M 4..8, <2> for M 9..16, in the
+// qpn_prepack layout. M >= 17 is served by its own entry (below) because the wide-M band
+// runs skinny_nvfp4_wmma and that kernel takes the checkpoint-native planes instead.
 void gemm_qpn(const void* x_half, const void* codes, const void* scales, float gscale,
               void* y_half, int m, int k, int n, cudaStream_t stream);
+
+// Wide-M band host entry: M 17..64 through skinny_nvfp4_wmma<2, 4, 128>, consuming the
+// CHECKPOINT-NATIVE codes[N][K/2] + scales[N][K/16] planes (the ones this header's
+// "Packed layout" comment describes, read without the prepack permutation).
+void gemm_qpn_wmma_native(const void* x_half, const void* codes, const void* scales,
+                          float gscale, void* y_half, int m, int k, int n,
+                          cudaStream_t stream);
 
 } // namespace ninfer::ops::qpn

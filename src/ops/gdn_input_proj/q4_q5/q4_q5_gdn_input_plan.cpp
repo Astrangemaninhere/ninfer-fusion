@@ -30,16 +30,57 @@ constexpr std::array<RouteSpec, 2> kRoutes{{
     {{17, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};
 
-constexpr bool catalog_is_closed() noexcept {
-    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
-           kRoutes[1].cols.last == kAnyCols;
+// The 4096-wide text stack's GDN input geometry: hidden 4096, key_dim 2048 (16 key heads x 128)
+// and value_dim 4096 (32 value heads x 128), so the split projection is qk [4096,4096] and
+// value_z [8192,4096] with qkv_rows 8192 = qk_rows + z_rows and z_rows = value_dim = 4096. Its
+// route set is the op's generic grouped-MMA schedule at every column count: IndependentDirect
+// carries the other stack's (qk, value, z) split as compile-time geometry
+// (q4_q5_gdn_input_independent.cu), so registering the generic route is what keeps this a
+// registration row rather than a second hand-instantiated kernel family.
+constexpr std::array<RouteSpec, 1> kK4096Routes{{
+    {{1, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
+}};
+
+template <std::size_t N>
+constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
+    std::int64_t expected = 1;
+    for (const RouteSpec& route : routes) {
+        if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
+        expected = static_cast<std::int64_t>(route.cols.last) + 1;
+    }
+    return routes.back().cols.last == kAnyCols &&
+           expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
+static_assert(catalog_is_closed(kRoutes) && catalog_is_closed(kK4096Routes),
+              "GDN input routes must be exact and closed");
 
-bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.qk_rows == 4096 && problem.value_z_rows == 12288 &&
-           problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
+struct GdnInputGeometry {
+    std::int32_t input_rows;
+    std::int32_t qk_rows;
+    std::int32_t value_z_rows;
+    std::int32_t qkv_rows;
+    std::int32_t z_rows;
+    std::int32_t padded_k;
+    const RouteSpec* routes;
+    std::size_t route_count;
+};
+
+constexpr GdnInputGeometry kGeometries[]{
+    {5120, 4096, 12288, 10240, 6144, 5120, kRoutes.data(), kRoutes.size()},
+    {4096, 4096, 8192, 8192, 4096, 4096, kK4096Routes.data(), kK4096Routes.size()},
+};
+
+const GdnInputGeometry* find_geometry(const Q4Q5GdnInputProblem& problem) noexcept {
+    for (const GdnInputGeometry& geometry : kGeometries) {
+        if (problem.input_rows == geometry.input_rows && problem.qk_rows == geometry.qk_rows &&
+            problem.value_z_rows == geometry.value_z_rows &&
+            problem.qkv_rows == geometry.qkv_rows && problem.z_rows == geometry.z_rows &&
+            problem.padded_k == geometry.padded_k) {
+            return &geometry;
+        }
+    }
+    return nullptr;
 }
 
 } // namespace
@@ -65,7 +106,7 @@ const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedu
 }
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    return find_geometry(problem) != nullptr && problem.cols >= 1;
 }
 
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem) {
@@ -74,7 +115,12 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
             "Q4/Q5 GDN input: exact problem or column count is not admitted");
     }
 
-    for (const RouteSpec& route : kRoutes) {
+    const GdnInputGeometry* geometry = find_geometry(problem);
+    if (geometry == nullptr) {
+        throw std::logic_error("Q4/Q5 GDN input: admitted problem has no geometry row");
+    }
+    for (std::size_t i = 0; i < geometry->route_count; ++i) {
+        const RouteSpec& route = geometry->routes[i];
         if (!route.cols.contains(problem.cols)) { continue; }
         return {route.schedule};
     }

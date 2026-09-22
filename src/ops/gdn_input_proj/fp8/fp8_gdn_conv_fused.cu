@@ -114,9 +114,11 @@ void fp8_gdn_snapshot_fused_launch(const Tensor& x, const Weight& weight, const 
     if (x.ne[2] != 1 || x.ne[1] <= 0 || x.ne[1] > kFp8LinearSmallTMax<Geometry>) {
         throw std::invalid_argument("fp8 GDN snapshot fused: unsupported B/W");
     }
-    // UNIFY-A: T=1 runs the same small-T conv/store kernel as T in [2,16] instead of the
-    // fp8 gemv decode kernel. Per token the conv epilogue only depends on the tokens before
-    // it in the same row, so both routes agree bit-for-bit once they share the family.
+    if (x.ne[1] == 1) {
+        launch_snapshot_decode(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
+                               snapshot_base_slot, query, key, value, z, stream);
+        return;
+    }
     kSnapshotLaunchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot, query,
         key, value, z, stream);

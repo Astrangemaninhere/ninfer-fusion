@@ -245,6 +245,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_context        = options_.max_context;
         request = parse_openai_responses_create_request(
             parse_json_body(req), limits, options_.auto_system_shared_prefix);
         validate_openai_model(request.prompt.model, public_model_id_);
@@ -390,6 +391,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_context        = options_.max_context;
         OpenAIResponsesPromptRequest request =
             parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
         validate_openai_model(request.model, public_model_id_);

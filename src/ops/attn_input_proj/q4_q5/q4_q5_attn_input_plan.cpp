@@ -30,16 +30,53 @@ constexpr std::array<RouteSpec, 3> kRoutes{{
     {{21, kAnyCols}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4},
 }};
 
-constexpr bool catalog_is_closed() noexcept {
-    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
-           kRoutes[1].cols.last + 1 == kRoutes[2].cols.first && kRoutes[2].cols.last == kAnyCols;
+// The 4096-wide text stack's attention geometry: hidden 4096, 16 query heads and 4 KV heads at
+// head_dim 256, so query_rows = 4096 and kv_rows = 1024. Its route set is the op's generic
+// grouped-MMA pair schedule at every column count: the ParentSplitFixed / R16C64S3 arms are the
+// other stack's measured small-T splits, and their kernels carry that split as compile-time
+// geometry (q4_q5_attn_input_small_t.cu). Registering the generic route instead of adding a
+// second compile-time split is what keeps this a table entry and not a new kernel body.
+constexpr std::array<RouteSpec, 1> kK4096Routes{{
+    {{1, kAnyCols}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4},
+}};
+
+template <std::size_t N>
+constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
+    std::int64_t expected = 1;
+    for (const RouteSpec& route : routes) {
+        if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
+        expected = static_cast<std::int64_t>(route.cols.last) + 1;
+    }
+    return routes.back().cols.last == kAnyCols &&
+           expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(), "attention input routes must be exact and closed");
+static_assert(catalog_is_closed(kRoutes) && catalog_is_closed(kK4096Routes),
+              "attention input routes must be exact and closed");
 
-bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.query_rows == 6144 && problem.kv_rows == 1024 &&
-           problem.padded_k == 5120;
+struct AttnInputGeometry {
+    std::int32_t input_rows;
+    std::int32_t query_rows;
+    std::int32_t kv_rows;
+    std::int32_t padded_k;
+    const RouteSpec* routes;
+    std::size_t route_count;
+};
+
+constexpr AttnInputGeometry kGeometries[]{
+    {5120, 6144, 1024, 5120, kRoutes.data(), kRoutes.size()},
+    {4096, 4096, 1024, 4096, kK4096Routes.data(), kK4096Routes.size()},
+};
+
+const AttnInputGeometry* find_geometry(const Q4Q5AttnInputProblem& problem) noexcept {
+    for (const AttnInputGeometry& geometry : kGeometries) {
+        if (problem.input_rows == geometry.input_rows &&
+            problem.query_rows == geometry.query_rows && problem.kv_rows == geometry.kv_rows &&
+            problem.padded_k == geometry.padded_k) {
+            return &geometry;
+        }
+    }
+    return nullptr;
 }
 
 } // namespace
@@ -57,7 +94,7 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
 }
 
 bool q4_q5_attn_input_admits(const Q4Q5AttnInputProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    return find_geometry(problem) != nullptr && problem.cols >= 1;
 }
 
 Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& problem) {
@@ -66,7 +103,12 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
             "Q4/Q5 attention input: exact problem or column count is not admitted");
     }
 
-    for (const RouteSpec& route : kRoutes) {
+    const AttnInputGeometry* geometry = find_geometry(problem);
+    if (geometry == nullptr) {
+        throw std::logic_error("Q4/Q5 attention input: admitted problem has no geometry row");
+    }
+    for (std::size_t i = 0; i < geometry->route_count; ++i) {
+        const RouteSpec& route = geometry->routes[i];
         if (!route.cols.contains(problem.cols)) { continue; }
         return {route.schedule};
     }

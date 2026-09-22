@@ -43,7 +43,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
     constexpr int PVNt    = D / 8;
     constexpr int PVKs    = Bc / 16;
     // The YaRN-extended 1,010,000-key maximum envelope spans at most 186 pages in one 27B split.
-    constexpr int PageIds       = 256;
+    constexpr int PageIds       = paged_kv_page_ids(kCausalAttentionMaximumVisibleKeysYarn);
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     constexpr int QkvRows       = 2 * Bc;
@@ -131,28 +131,26 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
     const int window = last_pos + 1;
     // Fixed split grid (split_units > 0): split s owns the keys
     // [s*split_units, min((s+1)*split_units, window)). Its interior boundaries are
-    // launch constants, so the partial a split contributes for a key range -- and the
-    // fp32 addition order it used to build it -- no longer move when the launch covers
-    // a different number of tokens. The live window still clips every range (no split
+    // launch constants, so the partial a split contributes for a key range -- and the fp32
+    // addition order it used to build it -- no longer move when the launch covers a
+    // different number of tokens. The live window still clips every range (no split
     // addresses a key past the last valid one) and split_units == 0 keeps the legacy
     // window-driven partition.
-    int active_split_count = 0;
-    int split_start        = 0;
-    int split_limit        = 0;
-    if (split_units > 0) {
-        active_split_count = gqa_small_t_split_active(window, split_units, split_count);
-        split_start        = split * split_units;
-        split_limit        = split_start + split_units;
-    } else {
-        active_split_count =
-            gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
-        const int logical_tiles = div_up(window, Bc);
-        const bool tile_split   = logical_tiles >= active_split_count;
-        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
-                                               : div_up(window, active_split_count);
-        split_start = split * units_per_split * (tile_split ? Bc : 1);
-        split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    }
+    //
+    // The count and the tiling come from gqa_small_t_split_range, the family's one
+    // definition of "which keys does split s own" (ops/kernel/gqa_attention_decode.cuh).
+    // With NINFER_VERIFY_EXACT=1 the token tile cannot reach either of them: with a pinned
+    // split_units the range is [s*split_units, ...) outright, and the legacy branch derives
+    // its tiling from `window` alone because the active count does. At one and the same
+    // window, and for one and the same dtype, the tiling and the count are therefore
+    // identical for TokenTile == 1 and TokenTile == 6 (item 3 of the fix), and the KV dtype
+    // no longer moves the lossless-region bound (item 1 / H39).
+    const GqaSmallTSplitRange split_range =
+        gqa_small_t_split_range<Geometry, false>(window, split_count, split_units, TokenTile,
+                                                  Bc, split, gqa_verify_exact_mode());
+    const int active_split_count = split_range.active;
+    const int split_start        = split_range.start;
+    const int split_limit        = split_range.limit;
     if (split >= active_split_count) { return; }
 
     const int split_end = (split_limit < window) ? split_limit : window;
@@ -164,6 +162,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+    // Contract: page_count is bounded by PageIds =
+    // paged_kv_page_ids(envelope) for every split a launcher can dispatch.
+    // Without this check a larger envelope would run off the end of shared
+    // memory silently instead of declining the split.
+    if (page_count > PageIds) {
+        write_neutral();
+        return;
+    }
     for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
@@ -210,7 +216,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
                     physical_page, kv_head, page_off, group * 16 + lane * 4);
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    cache_k[base + j] = gqa_kv_nvfp4_fp32_to_e4m3(kx[j] / kscale);
+                    cache_k[base + j] = gqa_kv_nvfp4_data_fp32_to_e4m3(kx[j] / kscale);
                 }
             }
             if (lane == 0) {
@@ -233,7 +239,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
             if (lane < 16) {
                 const std::int64_t base = paged_kv_element_offset<Geometry::HeadDim, Geometry::KVHeads>(
                     physical_page, kv_head, page_off, group * 16 + lane);
-                cache_v[base] = gqa_kv_nvfp4_fp32_to_e4m3(v0 / vscale);
+                cache_v[base] = gqa_kv_nvfp4_data_fp32_to_e4m3(v0 / vscale);
             }
             if (lane == 0) {
                 cache_v_scale[gqa_kv_nvfp4_scale_index<Geometry>(physical_page, kv_head, group,
@@ -326,8 +332,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
                 unsigned k_packed[4];
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    const float x0 = gqa_kv_nvfp4_e4m3_to_f32(k_code[2 * i]) * k_scale;
-                    const float x1 = gqa_kv_nvfp4_e4m3_to_f32(k_code[2 * i + 1]) * k_scale;
+                    const float x0 = gqa_kv_nvfp4_data_e4m3_to_f32(k_code[2 * i]) * k_scale;
+                    const float x1 = gqa_kv_nvfp4_data_e4m3_to_f32(k_code[2 * i + 1]) * k_scale;
                     k_packed[i]    = pack_bf16x2(x0, x1);
                 }
                 store_vec(k_dst, make_int4(static_cast<int>(k_packed[0]),
@@ -344,8 +350,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_fp8_k
                 unsigned v_packed[4];
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    const float x0 = gqa_kv_nvfp4_e4m3_to_f32(v_code[2 * i]) * v_scale;
-                    const float x1 = gqa_kv_nvfp4_e4m3_to_f32(v_code[2 * i + 1]) * v_scale;
+                    const float x0 = gqa_kv_nvfp4_data_e4m3_to_f32(v_code[2 * i]) * v_scale;
+                    const float x1 = gqa_kv_nvfp4_data_e4m3_to_f32(v_code[2 * i + 1]) * v_scale;
                     v_packed[i]    = pack_bf16x2(x0, x1);
                 }
                 store_vec(v_dst, make_int4(static_cast<int>(v_packed[0]),

@@ -1,3 +1,15 @@
+#if defined(_WIN32)
+// Win32 file I/O for the arm further down: CreateFileW/ReadFile/CloseHandle plus
+// the HANDLE/DWORD/OVERLAPPED types. NOMINMAX is set before every other include so
+// <windows.h>'s min/max macros cannot reach this TU's C++. MEASURED on this SDK/UCRT:
+// MSVC has <fcntl.h>, <sys/stat.h> and <sys/types.h> but has NO <unistd.h> (C1083) and
+// no ssize_t, which is why unistd.h is the one include guarded below.
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
+
 #include "ops/ple/ple_table.h"
 
 #include <cuda_fp16.h>
@@ -11,7 +23,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unordered_map>
+#if defined(_WIN32)
+// No <unistd.h> in the Windows SDK/UCRT (MEASURED: fatal error C1083). The Windows
+// arm below reads with CreateFileW/ReadFile, so it needs nothing from this header.
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::ops::ple {
 namespace {
@@ -26,6 +43,30 @@ void check_cuda(cudaError_t err, const char* what) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
     }
 }
+
+#if defined(_WIN32)
+// Positional read: the same contract the POSIX arm gets from ::pread, built out of
+// ReadFile with an OVERLAPPED offset because Win32 has no pread. A synchronous handle
+// plus an OVERLAPPED offset is atomic and positional per call; it also advances the
+// handle's own file position, which this class never reads -- every offset is passed in
+// explicitly by the caller -- so that property is unused rather than relied on. That
+// measurement (FILE_POSITION_AFTER_ALIGNED_READ moved) and this argument are the ones
+// the artifact reader records for its own ReadFile-based read_direct.
+// A single call transfers at most 0xFFFFFFFF bytes, so a larger request is chunked by
+// the caller's loop; a short transfer is reported as short and the caller zeroes the
+// tail itself, exactly as it does for a short pread.
+std::ptrdiff_t read_at(void* handle, char* dst, std::size_t bytes, std::uint64_t offset) {
+    const DWORD chunk = static_cast<DWORD>(bytes > 0xFFFFFFFFull ? 0xFFFFFFFFull : bytes);
+    OVERLAPPED overlapped{};
+    overlapped.Offset     = static_cast<DWORD>(offset & 0xFFFFFFFFull);
+    overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    DWORD transferred     = 0;
+    if (!::ReadFile(static_cast<HANDLE>(handle), dst, chunk, &transferred, &overlapped)) {
+        return -1;
+    }
+    return static_cast<std::ptrdiff_t>(transferred);
+}
+#endif
 
 // Each thread copies one 160-column row (BF16) from a UVA-mapped pinned
 // address into the token-major output. row_ptrs holds the device-side
@@ -52,21 +93,48 @@ PleTable::PleTable(PleTableOptions options)
 }
 
 PleTable::~PleTable() {
+#if defined(_WIN32)
+    // file_fds_ is empty here -- open_files() fills file_handles_ instead -- and the
+    // fd loop below cannot compile on this side anyway: MSVC declares no ::close,
+    // because it has no <unistd.h> at all (MEASURED, C1083). Both vectors are still
+    // cleared on both sides; only the close call is per-OS.
+    for (void* handle : file_handles_) {
+        if (handle != nullptr) { ::CloseHandle(static_cast<HANDLE>(handle)); }
+    }
+    file_handles_.clear();
+#else
     for (int fd : file_fds_) {
         if (fd >= 0) { ::close(fd); }
     }
     file_fds_.clear();
+#endif
     cache_.clear();
 }
 
 void PleTable::open_files() {
     for (const auto& file : layout_.physical_files) {
         const std::filesystem::path path = options_.sidecar_root / file.path;
+#if defined(_WIN32)
+        // CreateFileW has no text mode, so a sidecar byte is a file byte -- the same
+        // guarantee the POSIX twin gets from open() on Linux having no text mode either.
+        // The share mode mirrors POSIX open(), which locks readers out of nothing; the
+        // default share mode of 0 would be STRICTER than POSIX and would refuse a second
+        // reader of an input file that is opened read-only here.
+        const HANDLE handle = ::CreateFileW(
+            path.wstring().c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error("PLE sidecar open failed: " + path.string());
+        }
+        file_handles_.push_back(handle);
+#else
         const int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) {
             throw std::runtime_error("PLE sidecar open failed: " + path.string());
         }
         file_fds_.push_back(fd);
+#endif
     }
 }
 
@@ -74,6 +142,30 @@ void PleTable::derive_rows(std::span<const std::int32_t> tokens,
                            std::span<const std::int32_t> prevs, std::int32_t eos,
                            std::int32_t* rows_out) const noexcept {
     layout_.derive_rows(tokens, prevs, eos, rows_out);
+}
+
+void PleTable::gather_phase(std::span<const std::int32_t> tokens,
+                            std::span<const std::int32_t> prevs, std::int32_t eos,
+                            PlePhase phase, void* dst, cudaStream_t stream) {
+    const std::uint32_t n_prev = layout_.ngram_size - 1;
+    if (prevs.size() != static_cast<std::size_t>(n_prev) * tokens.size()) {
+        throw std::invalid_argument(
+            "PLE gather_phase: prevs must hold (ngram_size-1)*n_tokens ids");
+    }
+    const PlePhaseWindow window = ple_phase_window(phase, tokens.size());
+    if (window.tokens == 0) { return; }
+
+    phase_rows_.resize(window.tokens * layout_.n_heads);
+    for (std::size_t i = 0; i < window.tokens; ++i) {
+        const std::size_t column = window.first_token + i;
+        layout_.derive_rows_one(tokens[column], prevs.data() + column * n_prev, eos,
+                                phase_rows_.data() + i * layout_.n_heads);
+    }
+
+    forensics_.tokens_offered.fetch_add(tokens.size(), std::memory_order_relaxed);
+    forensics_.gathers_by_phase[static_cast<std::size_t>(phase)].fetch_add(
+        1, std::memory_order_relaxed);
+    gather(phase_rows_.data(), window.tokens, dst, stream);
 }
 
 void* PleTable::read_span(std::uint32_t file_index, std::uint64_t offset,
@@ -89,10 +181,12 @@ void* PleTable::read_span(std::uint32_t file_index, std::uint64_t offset,
         auto it = cache_.find(key);
         if (it != cache_.end()) {
             it->second->last_use_seq = use_seq_++;
+            forensics_.cache_hits.fetch_add(1, std::memory_order_relaxed);
             return static_cast<char*>(it->second->pinned) + (offset - start);
         }
     }
 
+    forensics_.cache_faults.fetch_add(1, std::memory_order_relaxed);
     void* pinned = fault_in(file_index, start, len);
     return static_cast<char*>(pinned) + (offset - start);
 }
@@ -110,6 +204,20 @@ void* PleTable::fault_in(std::uint32_t file_index, std::uint64_t offset,
     // EOF; cudaHostAlloc does NOT guarantee zeroed memory, so zero the tail
     // explicitly (the padding rows must read as zeros, not stale heap).
     std::size_t done = 0;
+#if defined(_WIN32)
+    while (done < bytes) {
+        const std::ptrdiff_t got = read_at(file_handles_[file_index],
+                                           static_cast<char*>(mapped) + done, bytes - done,
+                                           offset + done);
+        if (got < 0) {
+            check_cuda(cudaFreeHost(mapped), "PLE cache free");
+            throw std::runtime_error("PLE sidecar read failed: Win32 error "
+                                     + std::to_string(::GetLastError()));
+        }
+        if (got == 0) { break; }
+        done += static_cast<std::size_t>(got);
+    }
+#else
     while (done < bytes) {
         const ssize_t got = ::pread(file_fds_[file_index], static_cast<char*>(mapped) + done,
                                     bytes - done, static_cast<off_t>(offset + done));
@@ -120,9 +228,11 @@ void* PleTable::fault_in(std::uint32_t file_index, std::uint64_t offset,
         if (got == 0) { break; }
         done += static_cast<std::size_t>(got);
     }
+#endif
     if (done < bytes) {
         std::memset(static_cast<char*>(mapped) + done, 0, bytes - done);
     }
+    forensics_.bytes_read.fetch_add(done, std::memory_order_relaxed);
 
     auto entry = std::make_unique<CacheEntry>();
     entry->file_index = file_index;
@@ -180,6 +290,9 @@ void PleTable::gather(const std::int32_t* rows, std::size_t n_tokens, void* dst,
         std::lock_guard<std::mutex> lock(cache_mutex_);
         ++gather_epoch_;
     }
+    forensics_.gathers.fetch_add(1, std::memory_order_relaxed);
+    forensics_.tokens_gathered.fetch_add(n_tokens, std::memory_order_relaxed);
+    forensics_.rows_derived.fetch_add(total, std::memory_order_relaxed);
 
     // Deduplicate rows so a hot n-gram span is faulted in once.
     std::vector<std::uint64_t> row_keys(total);
@@ -196,6 +309,7 @@ void PleTable::gather(const std::int32_t* rows, std::size_t n_tokens, void* dst,
         if (!layout_.row_location(row, fi, off)) {
             throw std::runtime_error("PLE row id out of range");
         }
+        forensics_.rows_resolved.fetch_add(1, std::memory_order_relaxed);
         file_idx[i] = fi;
         offsets[i] = off;
         row_keys[i] = (static_cast<std::uint64_t>(fi) << 56) | off;
@@ -208,6 +322,10 @@ void PleTable::gather(const std::int32_t* rows, std::size_t n_tokens, void* dst,
             unique_ids[i] = it->second;
         }
     }
+
+    forensics_.rows_unique.fetch_add(unique_rows.size(), std::memory_order_relaxed);
+    forensics_.rows_reused.fetch_add(total - unique_rows.size(),
+                                     std::memory_order_relaxed);
 
     // Fault every unique row in (sorted by file/offset for sequential SSD IO).
     std::vector<std::size_t> order(unique_rows.size());

@@ -452,6 +452,11 @@ struct FoldGeometry {
 
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
+// qwen3_5_9b (GGUF qwen35: 32 layers, full_attention_interval 4 -> 24 GDN layers) carries the
+// 35B-A3B planes -- qk_heads 16, value_heads 32, conv 8192, cap 128 -- on a 24-layer stack.
+// kLayers is only the z-extent bound of the fold grid (coordinates() takes layer = z >> 3), so
+// the same kernel serves it; without this alias the plan refuses the geometry outright.
+using FoldGeometry24x32 = FoldGeometry<24, 16, 32, 8192>;
 
 template <class Geometry>
 struct FoldAccess {

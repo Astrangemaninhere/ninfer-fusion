@@ -8,11 +8,19 @@
 
 namespace {
 
-std::filesystem::path artifact_path() {
+// `explicitly_configured` separates the two reasons the artifact can be absent:
+//   * the operator pointed us at an artifact and it is not there  -> misconfiguration, must fail
+//   * the artifact was never provisioned (env unset, default path absent) -> legitimate skip
+// Conflating them makes a typo in the environment variable indistinguishable from "not
+// provisioned", and because this target declares SKIP_RETURN_CODE 77 the whole plan check then
+// disappears from `ctest` with rc 0.
+std::filesystem::path artifact_path(bool& explicitly_configured) {
     if (const char* env = std::getenv("NINFER_QWEN3_6_35B_A3B_WEIGHTS");
         env != nullptr && *env != '\0') {
+        explicitly_configured = true;
         return env;
     }
+    explicitly_configured = false;
     return std::filesystem::path(NINFER_SOURCE_DIR) / "out/qwen3_6_35b_a3b.ninfer";
 }
 
@@ -28,8 +36,15 @@ ninfer::targets::qwen3_6::StartupFeatures load_features(bool dflash) {
 } // namespace
 
 int main() {
-    const std::filesystem::path path = artifact_path();
+    bool configured                  = false;
+    const std::filesystem::path path = artifact_path(configured);
     if (!std::filesystem::is_regular_file(path)) {
+        if (configured) {
+            std::cerr << "NINFER_QWEN3_6_35B_A3B_WEIGHTS was set to \"" << path
+                      << "\" but that is not a regular file; refusing to report a skip for an "
+                         "explicitly configured artifact\n";
+            return 1;
+        }
         std::cerr << "skip: real 35B artifact is unavailable at " << path << '\n';
         return 77;
     }

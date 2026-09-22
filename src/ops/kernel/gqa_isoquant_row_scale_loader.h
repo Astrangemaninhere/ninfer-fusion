@@ -259,4 +259,17 @@ bool kv_rowscale_sidecar_apply_spec(const std::string& spec,
     return true;
 }
 
+// ---- N3 runtime loop: the device row-scale DOMAIN readback ----
+//
+// The bake (product/kv_rowscale_bake.h) reproduces the kernels' pipeline, so it
+// needs two facts that only exist on the device: whether the SO(4) rotation gate
+// is on (kGqaIsoquantRotGeom[0], gqa_isoquant_rot.cu) and that matrix itself.
+// Both are READ BACK from the symbols the kernels use rather than duplicated in a
+// second copy that could drift, which is also why the bake fails closed when they
+// cannot be read. Definitions: gqa_isoquant_row_scale_loader.cu. Both throw on a
+// CUDA failure: a bake that silently lost its rotation domain would write a table
+// for the wrong basis.
+bool kv_rowscale_device_rotation_enabled();
+bool kv_rowscale_device_rotation_matrix(float* out_row_major_64x4x4 /* 64*4*4 floats */);
+
 }  // namespace ninfer::ops

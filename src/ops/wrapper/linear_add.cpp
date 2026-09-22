@@ -1,5 +1,6 @@
 #include "ninfer/ops/linear_add.h"
 
+#include "ops/generic/rowsplit_generic.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -105,8 +106,24 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_add workspace: Q5 admits only A16");
         }
-        return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows, input_rows,
-                                                              min_tokens, max_tokens);
+        try {
+            return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows,
+                                                                  input_rows, min_tokens, max_tokens);
+        } catch (const std::invalid_argument&) {
+            // The Q5 residual registry is an exact (N,K) list. A shape it does not carry is
+            // served by the generic decoder, which needs no transient storage.
+            if (detail::generic_rowsplit_shape_capable(output_rows, input_rows)) { return 0; }
+            throw;
+        }
+    }
+    if (qtype == QType::Q4G64_F16S || qtype == QType::Q6G64_F16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("linear_add workspace: Q4/Q6 admit only A16");
+        }
+        if (!detail::generic_rowsplit_shape_capable(output_rows, input_rows)) {
+            throw std::invalid_argument("linear_add workspace: invalid row-split problem");
+        }
+        return 0;
     }
     if (qtype == QType::NVFP4) {
         const bool supported = (output_rows == detail::Nvfp4Residual6144Geometry::kOutputRows &&
@@ -173,13 +190,35 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         }
         require_q5(w);
         const bool supported_shape = (w.n == 5120 && w.k == 17408) || (w.n == 5120 && w.k == 6144);
-        if (!supported_shape) { throw std::invalid_argument("linear_add: unsupported Q5 shape"); }
+        if (!supported_shape) {
+            // Not a user error: the Q5 residual registry simply has no entry for this geometry.
+            if (detail::generic_rowsplit_problem_ok(x, w, residual_out)) {
+                (void)ws;
+                detail::generic_rowsplit_linear_add_dispatch(x, w, residual_out, stream);
+                return;
+            }
+            throw std::invalid_argument("linear_add: unsupported Q5 shape");
+        }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
             !aligned_to(w.qdata, 16) || !aligned_to(w.qhigh, 16) || !aligned_to(w.scales, 16)) {
             throw std::invalid_argument(
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
         detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream);
+        return;
+    }
+
+    if (w.qtype == QType::Q4G64_F16S || w.qtype == QType::Q6G64_F16S) {
+        // No registered Q4/Q6 residual variant exists at all, so every Q4/Q6 problem that is well
+        // formed goes to the generic decoder. A malformed one still throws, below.
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("Q4/Q6 linear_add admits only A16");
+        }
+        if (!detail::generic_rowsplit_problem_ok(x, w, residual_out)) {
+            throw std::invalid_argument("linear_add: unsupported Q4/Q6 shape");
+        }
+        (void)ws;
+        detail::generic_rowsplit_linear_add_dispatch(x, w, residual_out, stream);
         return;
     }
 

@@ -77,12 +77,12 @@ std::uint8_t e2m1_code(float x) {
     return c;
 }
 
-float iso3_to_f32(std::uint8_t code) {
+float iso4e_to_f32(std::uint8_t code) {
     const float mag = static_cast<float>(code & 0x7);
     return (code & 0x8) != 0 ? -mag : mag;
 }
 
-std::uint8_t iso3_code(float value, float scale) {
+std::uint8_t iso4e_code(float value, float scale) {
     float mag = std::roundf(std::fabs(value) / scale);  // device uses roundf
     if (mag > 7.0f) { mag = 7.0f; }
     if (mag < 0.0f) { mag = 0.0f; }
@@ -138,8 +138,8 @@ struct PageValues {
     std::vector<float> values;
     std::vector<std::uint8_t> nvfp4_codes;
     std::vector<std::uint8_t> nvfp4_scales;
-    std::vector<std::uint8_t> iso3_codes;
-    std::vector<std::uint8_t> iso3_scales;
+    std::vector<std::uint8_t> iso4e_codes;
+    std::vector<std::uint8_t> iso4e_scales;
     std::vector<std::int8_t> int8_codes;
     std::vector<std::uint16_t> int8_scales;
 };
@@ -163,8 +163,8 @@ PageValues make_page(std::mt19937& rng) {
 
     page.nvfp4_codes.assign(static_cast<std::size_t>(kKvHeads) * kNvfp4CodeB, 0);
     page.nvfp4_scales.assign(static_cast<std::size_t>(kKvHeads) * kNvfp4ScaleB, 0);
-    page.iso3_codes.assign(static_cast<std::size_t>(kKvHeads) * kNvfp4CodeB, 0);
-    page.iso3_scales.assign(static_cast<std::size_t>(kKvHeads) * kNvfp4ScaleB, 0);
+    page.iso4e_codes.assign(static_cast<std::size_t>(kKvHeads) * kNvfp4CodeB, 0);
+    page.iso4e_scales.assign(static_cast<std::size_t>(kKvHeads) * kNvfp4ScaleB, 0);
     page.int8_codes.assign(static_cast<std::size_t>(kKvHeads) * kInt8CodeB, 0);
     page.int8_scales.assign(static_cast<std::size_t>(kKvHeads) * kPageRows * (kHeadDim / 64), 0);
 
@@ -182,7 +182,7 @@ PageValues make_page(std::mt19937& rng) {
                                   row * (kHeadDim / 16) + g] = kb;
                 const float ks = e4m3_to_f32(kb);
                 const std::uint8_t vb = e4m3_rne(std::fmax(amax / 7.0f, 0x1p-9f));
-                page.iso3_scales[static_cast<std::size_t>(head) * kNvfp4ScaleB +
+                page.iso4e_scales[static_cast<std::size_t>(head) * kNvfp4ScaleB +
                                  row * (kHeadDim / 16) + g] = vb;
                 const float vs = e4m3_to_f32(vb);
                 for (int i = 0; i < 16; i += 2) {
@@ -191,11 +191,11 @@ PageValues make_page(std::mt19937& rng) {
                         static_cast<std::uint8_t>(
                             e2m1_code(page.values[vrow + g * 16 + i] / ks) |
                             (e2m1_code(page.values[vrow + g * 16 + i + 1] / ks) << 4));
-                    page.iso3_codes[static_cast<std::size_t>(head) * kNvfp4CodeB +
+                    page.iso4e_codes[static_cast<std::size_t>(head) * kNvfp4CodeB +
                                     row * (kHeadDim / 2) + g * 8 + i / 2] =
                         static_cast<std::uint8_t>(
-                            iso3_code(page.values[vrow + g * 16 + i], vs) |
-                            (iso3_code(page.values[vrow + g * 16 + i + 1], vs) << 4));
+                            iso4e_code(page.values[vrow + g * 16 + i], vs) |
+                            (iso4e_code(page.values[vrow + g * 16 + i + 1], vs) << 4));
                 }
             }
             for (int g = 0; g < kHeadDim / 64; ++g) {
@@ -223,9 +223,9 @@ PageValues make_page(std::mt19937& rng) {
 
 void requant_oracle(const PageValues& page, int mode, std::vector<std::uint8_t>& out_codes,
                     std::vector<std::uint8_t>& out_scales) {
-    // mode: 0 = nvfp4 K source, 1 = int8 source, 2 = iso3 V source
-    const bool iso3_out = mode == 2;
-    const float scale_div = iso3_out ? 7.0f : 6.0f;
+    // mode: 0 = nvfp4 K source, 1 = int8 source, 2 = iso4e V source
+    const bool iso4e_out = mode == 2;
+    const float scale_div = iso4e_out ? 7.0f : 6.0f;
     out_codes.assign(static_cast<std::size_t>(kKvHeads) * kNvfp4CodeB, 0);
     out_scales.assign(static_cast<std::size_t>(kKvHeads) * kNvfp4ScaleB, 0);
     std::vector<float> dec(static_cast<std::size_t>(kKvHeads) * kPageRows * kHeadDim);
@@ -248,18 +248,18 @@ void requant_oracle(const PageValues& page, int mode, std::vector<std::uint8_t>&
                     for (int i = 0; i < 64; ++i) {
                         const int d = g64 * 64 + i;
                         const std::uint8_t byte =
-                            (mode == 0 ? page.nvfp4_codes : page.iso3_codes)
+                            (mode == 0 ? page.nvfp4_codes : page.iso4e_codes)
                                 [static_cast<std::size_t>(head) * kNvfp4CodeB +
                                  row * (kHeadDim / 2) + (d >> 1)];
                         const std::uint8_t nib =
                             (d & 1) != 0 ? static_cast<std::uint8_t>(byte >> 4)
                                          : static_cast<std::uint8_t>(byte & 0x0F);
                         const float s = e4m3_to_f32(
-                            (mode == 0 ? page.nvfp4_scales : page.iso3_scales)
+                            (mode == 0 ? page.nvfp4_scales : page.iso4e_scales)
                                 [static_cast<std::size_t>(head) * kNvfp4ScaleB +
                                  row * (kHeadDim / 16) + (d >> 4)]);
                         dec[(static_cast<std::size_t>(head) * kPageRows + row) * kHeadDim + d] =
-                            (mode == 0 ? e2m1_to_f32(nib) : iso3_to_f32(nib)) * s;
+                            (mode == 0 ? e2m1_to_f32(nib) : iso4e_to_f32(nib)) * s;
                     }
                 }
             }
@@ -283,8 +283,8 @@ void requant_oracle(const PageValues& page, int mode, std::vector<std::uint8_t>&
                         dec[(static_cast<std::size_t>(head) * kPageRows + row) * kHeadDim + d0];
                     const float v1 = dec[(static_cast<std::size_t>(head) * kPageRows + row) *
                                              kHeadDim + d0 + 1];
-                    const std::uint8_t lo = iso3_out ? iso3_code(v0, s) : e2m1_code(v0 / s);
-                    const std::uint8_t hi = iso3_out ? iso3_code(v1, s) : e2m1_code(v1 / s);
+                    const std::uint8_t lo = iso4e_out ? iso4e_code(v0, s) : e2m1_code(v0 / s);
+                    const std::uint8_t hi = iso4e_out ? iso4e_code(v1, s) : e2m1_code(v1 / s);
                     out_codes[static_cast<std::size_t>(head) * kNvfp4CodeB +
                               row * (kHeadDim / 2) + (d0 >> 1)] =
                         static_cast<std::uint8_t>(lo | (hi << 4));
@@ -309,9 +309,15 @@ int check(bool ok, const char* what, int& failures) {
 } // namespace
 
 int main() {
+    // No device: report the repository's skip code instead of letting cudaMalloc throw out of main()
+    // (pre-change: std::terminate, rc=134).
+    if (cuda_unavailable()) {
+        std::printf("SKIP: no usable CUDA device\n");
+        return 77;
+    }
     std::mt19937 rng(20260830);
     int failures = 0;
-    const char* tags[3] = {"nvfp4-g16 K", "int8-g64", "iso3-g16 V"};
+    const char* tags[3] = {"nvfp4-g16 K", "int8-g64", "iso4e-g16 V"};
 
     for (int mode = 0; mode < 3; ++mode) {
         PageValues page = make_page(rng);
@@ -336,9 +342,9 @@ int main() {
                 }
                 for (int g = 0; g < kHeadDim / 16; ++g) {
                     const std::vector<std::uint8_t>& codes =
-                        mode == 0 ? page.nvfp4_codes : page.iso3_codes;
+                        mode == 0 ? page.nvfp4_codes : page.iso4e_codes;
                     const std::vector<std::uint8_t>& scales =
-                        mode == 0 ? page.nvfp4_scales : page.iso3_scales;
+                        mode == 0 ? page.nvfp4_scales : page.iso4e_scales;
                     const float s = e4m3_to_f32(
                         scales[static_cast<std::size_t>(head) * kNvfp4ScaleB +
                                row * (kHeadDim / 16) + g]);
@@ -351,7 +357,7 @@ int main() {
                             (d & 1) != 0 ? static_cast<std::uint8_t>(byte >> 4)
                                          : static_cast<std::uint8_t>(byte & 0x0F);
                         stored[(static_cast<std::size_t>(head) * kPageRows + row) * kHeadDim + d] =
-                            (mode == 0 ? e2m1_to_f32(nib) : iso3_to_f32(nib)) * s;
+                            (mode == 0 ? e2m1_to_f32(nib) : iso4e_to_f32(nib)) * s;
                     }
                 }
             }
@@ -377,8 +383,8 @@ int main() {
             dsrc_codes.copy_from_host(page.nvfp4_codes.data(), dsrc_codes.bytes());
             dsrc_scales.copy_from_host(page.nvfp4_scales.data(), dsrc_scales.bytes());
         } else {
-            dsrc_codes.copy_from_host(page.iso3_codes.data(), dsrc_codes.bytes());
-            dsrc_scales.copy_from_host(page.iso3_scales.data(), dsrc_scales.bytes());
+            dsrc_codes.copy_from_host(page.iso4e_codes.data(), dsrc_codes.bytes());
+            dsrc_scales.copy_from_host(page.iso4e_scales.data(), dsrc_scales.bytes());
         }
 
         ops::entropy_cold_requant_raw(
@@ -386,7 +392,7 @@ int main() {
             static_cast<const std::uint8_t*>(dsrc_scales.data()),
             mode == 0   ? ops::EntropyColdRequantMode::Nvfp4G16
             : mode == 1 ? ops::EntropyColdRequantMode::Int8G64
-                        : ops::EntropyColdRequantMode::Iso3VG16,
+                        : ops::EntropyColdRequantMode::Iso4eVG16,
             kKvHeads, 1, static_cast<std::uint8_t*>(ddst_codes.data()),
             static_cast<std::uint8_t*>(ddst_scales.data()), nullptr);
         cuda_synchronize();
@@ -403,7 +409,7 @@ int main() {
         check(scales_ok, (std::string(tag) + " requant scales match oracle").c_str(), failures);
 
         double num = 0.0, den = 0.0;
-        const bool iso3_out = mode == 2;
+        const bool iso4e_out = mode == 2;
         for (std::size_t i = 0; i < stored.size(); ++i) {
             const int head = static_cast<int>(i / (static_cast<std::size_t>(kPageRows) * kHeadDim));
             const int row  = static_cast<int>((i / kHeadDim) % kPageRows);
@@ -417,7 +423,7 @@ int main() {
             const float s = e4m3_to_f32(
                 got_scales[static_cast<std::size_t>(head) * kNvfp4ScaleB + row * (kHeadDim / 16) +
                            (d >> 4)]);
-            const float out = iso3_out ? iso3_to_f32(nib) * s : e2m1_to_f32(nib) * s;
+            const float out = iso4e_out ? iso4e_to_f32(nib) * s : e2m1_to_f32(nib) * s;
             num += static_cast<double>(out - stored[i]) * (out - stored[i]);
             den += static_cast<double>(stored[i]) * stored[i];
         }

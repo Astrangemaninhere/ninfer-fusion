@@ -5,6 +5,8 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
+#include <array>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -428,6 +430,28 @@ runtime::ExecutionTiming Program<Variant>::append_forced_tokens(
 }
 
 template <>
+runtime::ExecutionTiming Program<Variant>::append_context_prefill(
+    SequenceHandle<Variant> sequence, std::span<const TokenId> tokens,
+    runtime::ExecutionTiming* failed_timing) {
+    // A pure forwarder, on purpose. Program's body for "extend a live sequence and prefill the
+    // extension" is append_forced_tokens, and it is the RIGHT body here: the difference between the
+    // two entries is entirely in the caller's accounting (the engine charges control-token
+    // bookkeeping in EngineCore::run_control_batch; this caller charges none), never in the
+    // sequence work. Extracting a second shared body would buy nothing that forwarding does not
+    // already give -- there is no copy to drift from -- and would move the edit into program.h /
+    // program_impl.h, which another line is editing concurrently.
+    if (tokens.empty()) {
+        throw std::invalid_argument("context-append token span is empty");
+    }
+    if (tokens.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("context-append token span exceeds the row-stride type");
+    }
+    const std::array<SequenceHandle<Variant>, 1> rows{sequence};
+    return impl_->append_forced_tokens(std::span<const SequenceHandle<Variant>>(rows), tokens,
+                                       static_cast<std::uint32_t>(tokens.size()), failed_timing);
+}
+
+template <>
 CommitResult<Variant> Program<Variant>::commit(PendingBatch<Variant>&& pending,
                                                std::span<const runtime::CommitDecision> decisions,
                                                runtime::CommitObservation observation,
@@ -483,6 +507,19 @@ PhysicalUsageSnapshot Program<Variant>::physical_usage() const noexcept {
     return impl_->physical_usage();
 }
 
+// mtplogxface: the facade forwarders for the two mtplogx counters. ProgramImpl derives from
+// ProgramImplCore (impl/runtime/program.h:1820), whose public accessors already exist, so the
+// forward is one call -- the same shape as physical_usage() immediately above.
+template <>
+std::uint64_t Program<Variant>::mtp_graph_extension_calls() const noexcept {
+    return impl_->mtp_graph_extension_calls();
+}
+
+template <>
+std::uint64_t Program<Variant>::mtp_graph_extension_nanoseconds() const noexcept {
+    return impl_->mtp_graph_extension_nanoseconds();
+}
+
 template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
@@ -491,6 +528,19 @@ MemorySummary Program<Variant>::memory_summary() const noexcept {
 template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
+}
+
+// W6: the prefill unit lives on the core (ProgramImplCore::prefill_chunk / _capacity); the public
+// wrapper is the only thing the engine holds, so it has to pass both through. Pure delegation, no
+// state, no policy -- the clamp that makes the write safe is ProgramImplCore::set_prefill_chunk.
+template <>
+void Program<Variant>::set_prefill_chunk(std::uint32_t chunk) noexcept {
+    impl_->set_prefill_chunk(chunk);
+}
+
+template <>
+std::uint32_t Program<Variant>::prefill_chunk_capacity() const noexcept {
+    return impl_->prefill_chunk_capacity;
 }
 
 template <>

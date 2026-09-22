@@ -29,8 +29,6 @@ struct RouteSpec {
     Q4LinearSwiGluScheduleId schedule;
 };
 
-constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
-
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     {{2, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
@@ -44,22 +42,51 @@ constexpr std::array<RouteSpec, 10> kRoutes{{
     {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
 }};
 
-constexpr bool catalog_is_closed() noexcept {
+// The 4096-wide text stack's geometry: gate_up_rows = 2 x intermediate 12288, output_rows =
+// intermediate, k = hidden 4096. It takes this op's generic Materialized route at every column
+// count -- a plain q4 linear into a scratch followed by silu_mul, both ops with their own
+// registered catalogues -- so a second geometry costs a registration row, not a kernel family.
+constexpr std::array<RouteSpec, 1> kK4096Routes{{
+    {{1, kAnyCols}, Q4LinearSwiGluScheduleId::Materialized},
+}};
+
+template <std::size_t N>
+constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
     std::int64_t expected = 1;
-    for (const RouteSpec& route : kRoutes) {
+    for (const RouteSpec& route : routes) {
         if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
         expected = static_cast<std::int64_t>(route.cols.last) + 1;
     }
-    return kRoutes.back().cols.last == kAnyCols &&
+    return routes.back().cols.last == kAnyCols &&
            expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(), "Q4 LinearSwiGLU routes must be exact, contiguous, and closed");
+static_assert(catalog_is_closed(kRoutes) && catalog_is_closed(kK4096Routes),
+              "Q4 LinearSwiGLU routes must be exact, contiguous, and closed");
 
-bool supported_shape(const Q4LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == kShape.gate_up_rows &&
-           problem.output_rows == kShape.output_rows && problem.k == kShape.k &&
-           problem.padded_k == kShape.padded_k;
+struct SwiGluGeometry {
+    std::int32_t gate_up_rows;
+    std::int32_t output_rows;
+    std::int32_t k;
+    std::int32_t padded_k;
+    const RouteSpec* routes;
+    std::size_t route_count;
+};
+
+constexpr SwiGluGeometry kGeometries[]{
+    {34816, 17408, 5120, 5120, kRoutes.data(), kRoutes.size()},
+    {24576, 12288, 4096, 4096, kK4096Routes.data(), kK4096Routes.size()},
+};
+
+const SwiGluGeometry* find_geometry(const Q4LinearSwiGluProblem& problem) noexcept {
+    for (const SwiGluGeometry& geometry : kGeometries) {
+        if (problem.gate_up_rows == geometry.gate_up_rows &&
+            problem.output_rows == geometry.output_rows && problem.k == geometry.k &&
+            problem.padded_k == geometry.padded_k) {
+            return &geometry;
+        }
+    }
+    return nullptr;
 }
 
 template <class Allocator>
@@ -94,7 +121,7 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
 }
 
 bool q4_linear_swiglu_admits(const Q4LinearSwiGluProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    return find_geometry(problem) != nullptr && problem.cols >= 1;
 }
 
 Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& problem) {
@@ -103,7 +130,12 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             "q4 linear_swiglu: exact problem or column count is not admitted");
     }
 
-    for (const RouteSpec& route : kRoutes) {
+    const SwiGluGeometry* geometry = find_geometry(problem);
+    if (geometry == nullptr) {
+        throw std::logic_error("q4 linear_swiglu: admitted problem has no geometry row");
+    }
+    for (std::size_t i = 0; i < geometry->route_count; ++i) {
+        const RouteSpec& route = geometry->routes[i];
         if (!route.cols.contains(problem.cols)) { continue; }
         Q4LinearSwiGluPlan plan{
             route.schedule,
@@ -135,13 +167,18 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
     (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, min_cols});
     (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, max_cols});
 
+    const SwiGluGeometry* geometry =
+        find_geometry({gate_up_rows, output_rows, k, padded_k, min_cols});
     std::size_t maximum = 0;
-    for (const RouteSpec& route : kRoutes) {
-        if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
-        const std::int32_t endpoint = std::min(route.cols.last, max_cols);
-        maximum                     = std::max(maximum, q4_linear_swiglu_resolve_plan(
-                                        {gate_up_rows, output_rows, k, padded_k, endpoint})
-                                                            .workspace_bytes);
+    if (geometry != nullptr) {
+        for (std::size_t i = 0; i < geometry->route_count; ++i) {
+            const RouteSpec& route = geometry->routes[i];
+            if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
+            const std::int32_t endpoint = std::min(route.cols.last, max_cols);
+            maximum                     = std::max(maximum, q4_linear_swiglu_resolve_plan(
+                                            {gate_up_rows, output_rows, k, padded_k, endpoint})
+                                                                .workspace_bytes);
+        }
     }
     return maximum;
 }

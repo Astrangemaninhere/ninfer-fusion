@@ -16,13 +16,17 @@ Per object the verdict is one of:
 ``structural``  format, layout, or shape differ, or one side is missing.
 
 Exit status is 0 only when nothing is ``divergent`` or ``structural``, so the
-tool doubles as a gate in a conversion pipeline.
+tool doubles as a gate in a conversion pipeline.  A pair that cannot be read at
+all is REFUSED by name with status 3, which is deliberately NOT the gate's 1: a
+caller that only reads the status must be able to tell a failed gate from a tool
+that never got as far as comparing anything.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,9 +34,20 @@ from typing import Any, Sequence
 
 import torch
 
-from tools.artifact import layouts as L
-from tools.artifact.container import Artifact, ResourceObject, TensorObject
-from tools.artifact.numeric import decode_e2m1_word
+# BOTH entry forms must work.  ``python3 tools/convert/artifact_diff.py a b`` --
+# the form its sibling tools support and the form a reader of this file's own usage
+# line types -- used to die with ``ModuleNotFoundError: No module named 'tools'``
+# before any comparison, so no verdict of this tool was reachable that way at all.
+# G1/MEASURED, dl/unreachable/logs/ad_abs.err.
+try:
+    from tools.artifact import layouts as L
+    from tools.artifact.container import Artifact, ArtifactError, ResourceObject, TensorObject
+    from tools.artifact.numeric import decode_e2m1_word
+except ImportError:  # run-by-path: python3 tools/convert/artifact_diff.py
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tools.artifact import layouts as L
+    from tools.artifact.container import Artifact, ArtifactError, ResourceObject, TensorObject
+    from tools.artifact.numeric import decode_e2m1_word
 
 
 DIRECT = frozenset(("BF16", "FP32", "I32"))
@@ -167,7 +182,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--list-divergent", action="store_true", help="逐个列出偏离/结构不同的对象")
     args = parser.parse_args(argv)
 
-    verdicts, summary = compare_artifacts(args.left, args.right, names=args.name)
+    try:
+        verdicts, summary = compare_artifacts(args.left, args.right, names=args.name)
+    except Exception as exc:                     # noqa: BLE001 - refusal, never a crash
+        # The exception class and its text are carried into the message, so turning an
+        # unreadable pair into a refusal loses no information about the cause.
+        print("REFUSED: %s: %s (nothing was compared)" % (type(exc).__name__, exc),
+              file=sys.stderr)
+        return 3
 
     if args.json:
         print(json.dumps({"summary": summary, "objects": [v.as_dict() for v in verdicts]},

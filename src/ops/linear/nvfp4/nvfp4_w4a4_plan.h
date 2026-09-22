@@ -55,8 +55,26 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
 // question, so the predicate lives here.
 inline constexpr std::int32_t kNvfp4TmaBlockM = 256;
 
-[[nodiscard]] inline bool nvfp4_w4a4_tma_route(std::int32_t tokens) {
-    return tokens >= 1024 && (tokens % kNvfp4TmaBlockM) == 0;
+// Below this many tokens the TMA path loses to the plain MMA ladder (measured crossover).
+// Fused routes that admit a single tile ask only the alignment half of the question; the
+// threshold is named so the two questions cannot drift apart into two invented literals.
+inline constexpr std::int32_t kNvfp4TmaMinTokens = 1024;
+
+// Whole [256, 16] activation tiles only: the TMA descriptor machinery cannot express a
+// partial tile.
+[[nodiscard]] inline constexpr bool nvfp4_w4a4_tma_aligned(std::int32_t tokens) {
+    return tokens > 0 && (tokens % kNvfp4TmaBlockM) == 0;
+}
+
+// The shared alignment + profitability predicate. Every route that shares
+// make_nvfp4_w4a4_tma_descriptors must ask this exact question.
+[[nodiscard]] inline constexpr bool nvfp4_w4a4_tma_route(std::int32_t tokens) {
+    return tokens >= kNvfp4TmaMinTokens && nvfp4_w4a4_tma_aligned(tokens);
+}
+
+// Single source of truth for the fp4 dequant scale consumed by every W4A4 launcher.
+[[nodiscard]] inline float nvfp4_w4a4_alpha(const Weight& weight) {
+    return 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
 }
 
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,

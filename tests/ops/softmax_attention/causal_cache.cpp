@@ -1601,17 +1601,31 @@ int verify_workspace_capacity_contract() {
 } // namespace
 
 int run_softmax_attention_causal_cache_tests() {
+    // The workspace-capacity contract is pure host arithmetic over
+    // ops::causal_softmax_attention_workspace_capacity_bytes. It is settled BEFORE the device
+    // gate so that a broken contract cannot be reported as a skip on a box with no device.
+    int host_failures = 0;
+    host_failures += verify_workspace_capacity_contract();
+
     if (cuda_unavailable()) {
+        if (host_failures != 0) {
+            std::cout << "FAIL causal_softmax_attention public-contract correctness"
+                      << " host_term=" << host_failures << " device_term=not-run\n";
+            return 1;
+        }
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
-    int failures = 0;
-    failures += verify_workspace_capacity_contract();
-    for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
-    failures += run_fp8_cases();
-    failures += run_batch_cases();
-    std::cout << (failures == 0 ? "PASS" : "FAIL")
-              << " causal_softmax_attention public-contract correctness\n";
-    return failures == 0 ? 0 : 1;
+    // The device half is NOT short-circuited by a red host half: both halves always run when a
+    // device is present, and the verdict line below prints both terms so that "the device half did
+    // not run" can never be read as green.
+    int device_failures = 0;
+    for (const Geometry& geometry : kGeometries) { device_failures += run_geometry(geometry); }
+    device_failures += run_fp8_cases();
+    device_failures += run_batch_cases();
+    std::cout << (host_failures == 0 && device_failures == 0 ? "PASS" : "FAIL")
+              << " causal_softmax_attention public-contract correctness"
+              << " host_term=" << host_failures << " device_term=" << device_failures << '\n';
+    return (host_failures == 0 && device_failures == 0) ? 0 : 1;
 }

@@ -1,13 +1,21 @@
 #include "options.h"
 #include "product/kv_options.h"
+#include "product/kv_plane_census.h"
+#include "product/kv_storage_dtype.h"
 #include "product/load_progress/load_progress.h"
+#include "product/kv_rowscale_persist.h"
 #include "product/prompt_input/prompt_input.h"
 #include "product/speculative_options.h"
+#include "product/kv_kv_bits.h"
+
+#include "core/arch_caps.h"
 
 #include "ninfer/engine.h"
 
 #include <chrono>
+#include <fstream>
 #include <cstdint>
+#include <ctime>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -94,24 +102,77 @@ std::string format_finish(ninfer::FinishReason reason) {
     return "unknown";
 }
 
+// The operator's "kv cache dtype" line -- the name an operator reads to confirm WHICH
+// TIER ACTUALLY RAN. DERIVED, not copied: it is product::kv_operator_token, the
+// canonical token of the one table the engine has for this enum.
+//
+// This function used to be a second, hand-written switch. It had drifted: SIX of the
+// eight rows it keyed off carried a pre-rename spelling, and it named only EIGHT of the
+// ten enumerators, so the two narrow rk4v4-family rows printed "unknown". A run
+// therefore reported a tier the engine was not running, and every measurement checked
+// against that line was ambiguous. The stale-to-canonical table is written out in full
+// in product/kv_storage_dtype.h (beside the function this now calls) and in
+// tests/test_kv_operator_name.cpp (check 1) -- NOT here, because the census in that
+// test reads THIS file as text and must be able to stay strict.
+//
+// It stays a named function (rather than an inlined call) because
+// tests/test_kv_operator_name.cpp asserts the CLI keeps routing this line through it.
+// The refusal is inherited: a storage code no enumerator names throws the canonical
+// lookup's std::invalid_argument instead of printing something that looks like a tier.
 std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8-group64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-row256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4-group16";
-    case ninfer::KvCacheStorage::Fp8Group16:
-        return "fp8-group16";
-    case ninfer::KvCacheStorage::Iso3Group16:
-        return "iso3-group16";
-    case ninfer::KvCacheStorage::E8Group64:
-        return "e8-group64";
+    return ninfer::product::kv_operator_token(storage);
+}
+
+// The RESOLVED per-layer KV store, compressed into
+// "0,1,3,4,6,7:rk4v4-g64 2,5,8-15:nvfp4-g16" (canonical tokens).
+// One tier across every full-attention layer keeps the old single-name form, so a
+// uniform run reads exactly as it did.
+std::string format_kv_layer_store(const ninfer::MemorySummary& memory) {
+    const std::uint32_t layers =
+        memory.kv_full_attention_layers < memory.kv_layer_storage.size()
+            ? memory.kv_full_attention_layers
+            : static_cast<std::uint32_t>(memory.kv_layer_storage.size());
+    if (layers == 0) { return format_kv_cache(memory.kv_cache); }
+    std::ostringstream runs;
+    bool uniform = true;
+    for (std::uint32_t first = 0; first < layers;) {
+        std::uint32_t last = first;
+        while (last + 1 < layers &&
+               memory.kv_layer_storage[last + 1] == memory.kv_layer_storage[first]) {
+            ++last;
+        }
+        if (first != 0) {
+            uniform = false;
+            runs << ' ';
+        }
+        runs << first;
+        if (last != first) { runs << '-' << last; }
+        runs << ':' << format_kv_cache(memory.kv_layer_storage[first]);
+        first = last + 1;
     }
-    return "unknown";
+    if (uniform) { return format_kv_cache(memory.kv_layer_storage[0]); }
+    return "per-layer " + runs.str() + " (" + std::to_string(layers) +
+           " full-attention layers)";
+}
+
+// The AGGREGATE of the same table format_kv_layer_store above prints run by run: how
+// many distinct codecs the store spans, and how many layers own no plane at all.
+//
+// It is a SEPARATE line rather than a suffix on the one above because the two answer
+// different questions and one of them cannot be read off the other. The run form tells
+// an operator WHICH codec sits on WHICH layer; it does not say whether the store is
+// MIXED, and reading that off the text means comparing every run by eye -- which is
+// exactly the reading that failed before this file carried a derived, total token table
+// (see format_kv_cache above). "mixed" is a named state of the store, and named states
+// are what a regex and a reader can both key on.
+//
+// The dropped count is printed even when it is 0, so "no layer was discarded" and "this
+// build does not report discard" cannot be confused. The census itself -- including the
+// refusal to count a DISCARDED layer as a codec -- lives in product/kv_plane_census.h,
+// NOT here: this function only adapts MemorySummary to it and names the caller.
+std::string format_kv_plane_census(const ninfer::MemorySummary& memory) {
+    return ninfer::product::kv_plane_census_line(
+        ninfer::product::kv_plane_census(memory, "kv planes"));
 }
 
 std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
@@ -214,7 +275,8 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                        std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
-    print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
+    print_metric("kv cache dtype", format_kv_layer_store(memory));
+    print_metric("kv planes", format_kv_plane_census(memory));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
@@ -231,7 +293,16 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         // as "mtp" and made the CLI acceptance summary unattributable.
         const std::string backend =
             ninfer::product::speculative_backend_name(speculative.backend);
-        print_metric(backend + " draft window", std::to_string(speculative.draft_window));
+        if (speculative.adaptive_window) {
+            // Adaptive runs must not look like a fixed k: draft_window is the ladder TOP (the
+            // widest captured rung), and the realized mean is what the criterion chose.
+            std::ostringstream window;
+            window << speculative.draft_window << " (adaptive ladder, top) realized mean "
+                   << std::fixed << std::setprecision(2) << speculative.mean_window;
+            print_metric(backend + " draft window", window.str());
+        } else {
+            print_metric(backend + " draft window", std::to_string(speculative.draft_window));
+        }
         print_metric(backend + " rounds", std::to_string(speculative.rounds));
         print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
         print_metric(backend + " drafted tokens", std::to_string(speculative.drafted_tokens));
@@ -267,6 +338,36 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        // --capability-report: the BUILD capability surface's own entry point, handled here
+        // for the same reason --kv-score-table is (below): it runs with NO model and NO prompt.
+        // The flag exists because the arch list this binary was compiled for had NO model-free
+        // surface at all -- the refusal report is reached only through artifact load
+        // (src/targets/registry.cpp, construct_target -> require_artifact_formats_supported).
+        // The text lives in src/core/arch_caps.h beside the refusal it is the sibling of, so the
+        // arch line both print has ONE home and the two cannot disagree. A model path given as
+        // well continues the run afterwards, exactly as --kv-score-table does.
+        if (cli.capability_report_requested) {
+            std::cout << ninfer::caps::render_build_capability_surface();
+            if (cli.artifact_path.empty()) { return 0; }
+        }
+
+        // --kv-score-table: the penalty table's OWN entry point, handled here so it runs
+        // with NO model and NO prompt. The action itself lives in
+        // product/kv_kv_bits.h (kv_score_table_run), shared with ninfer-serve, so the
+        // two front ends cannot disagree about what the entry does. When a model IS
+        // given the run continues afterwards, which is how "emit and consume" is proven
+        // in one go.
+        if (cli.kv_score_table_explicit) {
+            std::string error;
+            if (!ninfer::product::kv_score_table_run(cli.kv_score_table_spec,
+                                                     cli.kv_tier_scores, &error, std::cout,
+                                                     std::cerr)) {
+                std::cerr << error << "\n";
+                return 2;
+            }
+            if (cli.artifact_path.empty()) { return 0; }
+        }
+
         ninfer::PromptInput input =
             cli.messages_path.empty()
                 ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
@@ -291,6 +392,12 @@ int main(int argc, char** argv) {
         engine_options.max_context    = cli.max_context;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;
+        // Only when the operator named a mode: an unset mode defers to NINFER_FT_BW_GOV and then to
+        // Dynamic, and that resolution belongs to the engine (normalize_engine_options), not here --
+        // a front end that guessed would become a second reader of the same switch.
+        if (cli.prefill_chunk_mode.has_value()) {
+            engine_options.prefill_chunk_mode = cli.prefill_chunk_mode;
+        }
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
@@ -298,11 +405,27 @@ int main(int argc, char** argv) {
         engine_options.use_cuda_graph = cli.use_cuda_graph;
         engine_options.kv_cache_explicit = cli.kv_cache_explicit;
         if (cli.kv_layer_storage_explicit) {
-            const auto table = ninfer::product::parse_kv_layer_storage(cli.kv_layer_storage_spec);
-            for (std::size_t i = 0; i < table.size(); ++i) {
-                engine_options.kv_layer_storage[i] = table[i];
-            }
+            // Table AND mask. The mask is what makes `0-11:bf16` a real per-layer
+            // BF16 baseline: without it BFloat16 is the "unset" sentinel and every
+            // one of those layers silently inherits --kv-dtype instead (the old
+            // parse_kv_layer_storage() returns only the table).
+            const auto parsed =
+                ninfer::product::parse_kv_layer_storage_spec(cli.kv_layer_storage_spec);
+            engine_options.kv_layer_storage          = parsed.table;
+            engine_options.kv_layer_storage_set      = parsed.set;
             engine_options.kv_layer_storage_explicit = true;
+        }
+        if (cli.kv_residual_layers_explicit) {
+            // The per-layer NVFP4 residual planes: the ONLY handle in the tree that names
+            // a real plane SUBSET (4 -> 8 planes on an NVFP4 layer). Two fields, not one:
+            // the planner gates on kv_residual_explicit and reads the table only when it
+            // is set (layouts_impl.h make_sequence_planner_impl), so an unset flag has to
+            // stay "no opinion" -- an all-false table handed over unconditionally would
+            // read as "explicitly no residuals" on every other run.
+            const auto parsed =
+                ninfer::product::parse_kv_residual_layers_spec(cli.kv_residual_layers_spec);
+            engine_options.kv_residual_layers   = parsed.table;
+            engine_options.kv_residual_explicit = true;
         }
         if (cli.kv_tier_formats_explicit) {
             // Raw passthrough: the vocabulary is validated at parse time and landed on the
@@ -313,7 +436,7 @@ int main(int argc, char** argv) {
         }
         // SEPARATION: the three KV component switches. Explicit flags only: an
         // unset flag leaves the engine options at their pre-separation defaults
-        // (rotation on, row scale auto, V codec iso3), and none of the three
+        // (rotation on, row scale auto, V codec iso4e), and none of the three
         // uploads or allocates anything unless it names a non-default state.
         if (cli.kv_rotation_explicit) {
             engine_options.kv_rotation_off      = cli.kv_rotation_off;
@@ -339,14 +462,37 @@ int main(int argc, char** argv) {
         // the engine defaults, so an unset flag stays a no-op.
         engine_options.kv_quality_weight     = cli.kv_quality_weight;
         engine_options.kv_tier_scores        = cli.kv_tier_scores;
+        // The K/V bit-width entries (product/kv_kv_bits.h). Copied unconditionally
+        // like the two above: the cli defaults (0 / Split) are exactly the engine
+        // defaults, so an unset flag stays a no-op.
+        engine_options.kv_joint_bits         = cli.kv_joint_bits;
+        engine_options.kv_k_bits             = cli.kv_k_bits;
+        engine_options.kv_v_bits             = cli.kv_v_bits;
+        engine_options.kv_kv_bits_explicit   = cli.kv_kv_bits_explicit;
+        engine_options.kv_bits_mode          = cli.kv_bits_mode;
+        engine_options.kv_bits_mode_explicit = cli.kv_bits_mode_explicit;
+        engine_options.kv_k_tier_scores      = cli.kv_k_tier_scores;
+        engine_options.kv_v_tier_scores      = cli.kv_v_tier_scores;
+        // SLIDERWIRE: the candidate preference travels with the request (it is read by the
+        // joint fit and checked there to have been honoured).
+        engine_options.kv_codec_preference   = cli.kv_codec_preference;
         engine_options.cold_policy           = cli.cold_policy;
         engine_options.cold_keep_tokens      = cli.cold_keep_tokens;
         engine_options.cold_host_bytes       = cli.cold_host_bytes;
         // Cold-pool shape and the disk spill target used to be reachable only
         // through ninfer-serve, so the CLI could not size the offload pool at all.
         engine_options.max_cold_pages        = cli.max_cold_pages;
+        // The unload watermark reaches the Engine from this front end too, for the
+        // same reason as max_cold_pages above: the CLI must be able to arm the leg it
+        // is being measured on, or the acceptance run has to go through ninfer-serve
+        // purely to set one integer.
+        engine_options.unload_watermark_pages = cli.unload_watermark_pages;
         engine_options.cold_disk_bytes       = cli.cold_disk_bytes;
         engine_options.cold_disk_path        = cli.cold_disk_path;
+        engine_options.weight_host_offload_bytes = cli.weight_host_offload_bytes;
+        engine_options.weight_device_arena_bytes = cli.weight_device_arena_bytes;
+        engine_options.weight_prefetch_layers    = cli.weight_prefetch_layers;
+        engine_options.weight_span_floor_bytes   = cli.weight_span_floor_bytes;
         engine_options.graph_capture_ceiling = cli.graph_capture_ceiling;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
@@ -354,6 +500,114 @@ int main(int argc, char** argv) {
         engine_options.context_cache.host_state_slots       = 0;
         engine_options.context_cache.host_kv_capacity_bytes = 0;
         engine_options.load_progress                        = load_progress.callback();
+
+        // N3 runtime loop. The persisted row-scale table lives next to the
+        // artifact, and whether THIS run has to capture is decided here, before
+        // the engine exists: the calibration capture synchronizes the producing
+        // stream (illegal inside a graph capture), so the graph decision has to
+        // be taken before construction. The applicability gate itself runs at the
+        // row-scale commit point (targets/qwen3_6/impl/state/decoder_state.cpp),
+        // which is where the live KV geometry is known.
+        if (!cli.kv_row_scale_explicit ||
+            ninfer::product::kv_rowscale_spec_is_auto(cli.kv_row_scale_spec)) {
+            ninfer::product::KvRowScaleConfigKnobs knobs;
+            knobs.kv_cache_code       = static_cast<int>(cli.kv_cache);
+            knobs.kv_cache_explicit   = cli.kv_cache_explicit;
+            knobs.layer_storage_spec  = cli.kv_layer_storage_spec;
+            knobs.tier_formats_spec   = cli.kv_tier_formats_spec;
+            knobs.nvfp4_pure          = cli.kv_nvfp4_pure;
+            knobs.rotation_off        = cli.kv_rotation_off;
+            knobs.rotation_explicit   = cli.kv_rotation_explicit;
+            knobs.v_codec             = static_cast<int>(cli.kv_v_codec);
+            knobs.bit_budget_bits     = cli.kv_bit_budget_bits;
+            knobs.bit_budget_ranges   = cli.kv_bit_budget_ranges;
+            knobs.bit_budget_explicit = cli.kv_bit_budget_explicit;
+            knobs.quality_weight      = cli.kv_quality_weight;
+            knobs.tier_scores         = cli.kv_tier_scores;
+            // A K/V ceiling changes what the rotated K domain is quantized to, which
+            // is exactly the class of knob this fingerprint exists to catch
+            // (product/kv_rowscale_persist.h): a table baked under one K ceiling must
+            // never be reused under another.
+            knobs.joint_bits          = cli.kv_joint_bits;
+            knobs.k_bits              = cli.kv_k_bits;
+            knobs.v_bits              = cli.kv_v_bits;
+            knobs.kv_bits_mode        = static_cast<int>(cli.kv_bits_mode);
+            knobs.kv_bits_explicit    = cli.kv_kv_bits_explicit;
+            knobs.k_tier_scores       = cli.kv_k_tier_scores;
+            knobs.v_tier_scores       = cli.kv_v_tier_scores;
+            // SLIDERWIRE: the preference changes which per-layer dtype table the fit emits,
+            // i.e. what the rotated K domain is quantized to, so a table baked under one
+            // preference must not validate against another. Mixed in ONLY when set (see
+            // kv_rowscale_config_fingerprint), so no existing hash moves.
+            knobs.codec_preference    = [&] {
+                std::string text;
+                for (const std::int32_t slot : cli.kv_codec_preference) {
+                    if (!text.empty()) { text += ","; }
+                    text += std::to_string(slot);
+                }
+                return text;
+            }();
+            // ROPE REGIME: --yarn moves the frequencies the captured K was built with,
+            // i.e. the rotated domain the table is solved from.  It was the one
+            // operator-visible knob that reaches the capture and that this fingerprint
+            // did not carry, so a table baked without it validated under it.  Mixed in
+            // ONLY when it is not the default, so this line cannot invalidate a table
+            // baked by a run that used no --yarn.
+            knobs.rope_regime         = cli.yarn_enabled ? 1 : 0;
+            knobs.cold_policy         = static_cast<int>(cli.cold_policy);
+            knobs.max_cold_pages      = cli.max_cold_pages;
+
+            ninfer::product::KvRowScalePersistConfig persist;
+            persist.enabled        = true;
+            persist.artifact       = cli.artifact_path;
+            persist.table          = ninfer::product::kv_rowscale_table_path(cli.artifact_path);
+            persist.records        = ninfer::product::kv_rowscale_records_path(persist.table);
+            persist.fingerprint    = ninfer::product::kv_rowscale_config_fingerprint(knobs);
+            persist.recalibrate    = cli.recalibrate;
+            persist.graphs_enabled = cli.use_cuda_graph;
+            // One second of slack: the capture only has to out-date the PREVIOUS
+            // run's records, and filesystem timestamps can be coarser than that.
+            persist.run_start_unix = static_cast<std::int64_t>(std::time(nullptr)) - 1;
+            if (ninfer::product::kv_rowscale_persist_begin(std::move(persist)) ==
+                ninfer::product::KvRowScalePlan::Capture) {
+                // This is the one place where an offline work mode and CUDA graphs
+                // compete, so the trade is made explicit here rather than left to
+                // the Engine: NINFER_KVDUMP_DIR / NINFER_FT_STATS resolve the same
+                // conflict the same way (they are graphs-off modes too).
+                // GRAPH-ON DEFAULT (the defect this arm closes).  A row-scale calibration
+                // is one-shot and CANNOT be graph-capturable: it synchronizes the producing
+                // stream.  The two are therefore mutually exclusive, and which one this run
+                // buys is the operator's choice, not the loop's -- charging EVERY later run's
+                // graphs for a capture that only ever has to happen once is what made
+                // `--kv-row-scale auto` silently cost most of a decode's throughput.  When
+                // graphs are on and no calibration was asked for, the run KEEPS its graphs and
+                // decodes from the baked table; the commit point
+                // (src/product/kv_rowscale_persist.h, the `config.graphs_enabled` arm) then
+                // reports the opt-in instead of arming the capture.  The calibration itself is
+                // unchanged and still one command away: both `--no-cuda-graph` and
+                // `--recalibrate` take the else arm below.
+                if (cli.use_cuda_graph && !cli.recalibrate) {
+                    const bool decidable = ninfer::product::kv_rowscale_config_can_calibrate(
+                        knobs, cli.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16);
+                    std::cerr
+                        << "[kvrowscale] CUDA graphs left ON: the calibration capture "
+                           "synchronizes the producing stream, so it is deferred rather than "
+                           "paid for by every run"
+                        << (decidable
+                                ? "; re-run with --no-cuda-graph or --recalibrate to calibrate"
+                                : ", and this KV configuration cannot be calibrated at all "
+                                  "(no full-attention layer resolves to the NVFP4 tier the row "
+                                  "scale is read by), so the .skip note is written at the commit "
+                                  "point")
+                        << '\n';
+                } else {
+                    engine_options.use_cuda_graph = false;
+                    ninfer::product::kv_rowscale_persist_config().graphs_enabled = false;
+                    std::cerr << "[kvrowscale] CUDA graphs disabled for this calibration run "
+                                 "(the capture synchronizes the producing stream)\n";
+                }
+            }
+        }
 
         const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));
@@ -367,8 +621,26 @@ int main(int argc, char** argv) {
         ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
                                                             ninfer::OutputConsumerMode::Streaming);
         const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
+        // M21: arm the mid-run context append BEFORE wait(), so the engine services it at a round
+        // boundary that precedes this request's first decode round. The engine guarantees that
+        // ordering; [context-append] on stderr is the readback of what actually happened.
+        if (cli.append_context_explicit) {
+            const std::vector<ninfer::TokenId> append_tokens =
+                engine.tokenize_text(cli.append_context_text);
+            std::cerr << std::left << std::setw(12) << "context-append" << std::setw(26)
+                      << "armed (raw tokenizer)" << std::right << std::setw(12)
+                      << (std::to_string(append_tokens.size()) + " tok") << '\n';
+            engine.append_context_tokens(generation, append_tokens);
+        }
         const ninfer::GenerationResult result             = generation.wait(&sink);
         sink.finish_streams();
+
+        // N3 runtime loop: persist what the capture run measured (while the
+        // engine is still alive -- the bake reads the SO(4) matrix back from the
+        // device). It never throws: a bake that cannot be produced confidently
+        // must leave NO table behind, so the next run captures again, rather than
+        // leave a wrong one to be loaded.
+        ninfer::product::kv_rowscale_persist_finish();
 
         if (cli.print_token_ids) {
             std::cerr << std::left << std::setw(12) << "tokens" << std::setw(26) << "generated ids";

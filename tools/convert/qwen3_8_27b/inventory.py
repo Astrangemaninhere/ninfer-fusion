@@ -33,6 +33,15 @@ GDN_LAYERS = qwen3_6_inventory.GDN_LAYERS
 RESOURCE_SPECS = qwen3_6_inventory.RESOURCE_SPECS
 
 
+#: Both routes that produce a `qwen3.8-27b`/`groupwise-int` artifact must
+#: reach this override.  The registered (multimodal) route builds its plan from
+#: `TEXT_CORE_TENSOR_SPECS` below, so it reaches it.  The text-core route does
+#: not build from this module at all -- it builds from whatever module
+#: `tools/convert/qwen3_6_27b/text_core.py` is handed -- which is why
+#: `convert.py` passes THIS module as `specs_module` at both `text_core.convert`
+#: call sites.  An artifact produced without that argument carries Q6G64_F16S
+#: descriptors under a contract that requires W8G32_F16S, and the binder refuses
+#: it by name (`src/artifact/binder.cpp:50-54`).
 def _w8_vocabulary_endpoint(spec: TensorSpec) -> TensorSpec:
     if spec.name in ("text/token_embedding", "text/output_head"):
         return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, W8)

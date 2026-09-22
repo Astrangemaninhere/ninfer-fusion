@@ -42,6 +42,14 @@ public:
     bool bind();
     void attach(GenerationService& service);
     bool listen();
+    // def3: ACCEPT BEFORE LOADING. bind_to_port() binds the socket but does NOT listen (cpp-httplib
+    // httplib.h:6315 -> bind_internal:6709); the accept loop used to start only after the launch,
+    // so a probe saw http=000 for the whole load window and /health could not tell "still loading"
+    // from "crashed". These two replace that ordering: the loop starts in a background thread
+    // right after bind(), and every endpoint answers a NAMED loading state until attach().
+    void listen_in_background();
+    // Joins the accept loop and reports whether it stopped cleanly.
+    [[nodiscard]] bool wait_for_exit();
     void stop();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
@@ -73,7 +81,15 @@ private:
     void run_stats_reporter();
     void stop_stats_reporter();
 
+    void accept_loop();
+
+    // def3: written once by attach(), read by the accept thread, which is already running while
+    // the model loads. The POINTER alone would be a data race across the two threads, so the
+    // publish is a release store and every reader gates on an acquire load BEFORE touching it.
     GenerationService* service_ = nullptr;
+    std::atomic<bool> engine_ready_{false};
+    std::atomic<bool> accept_result_{false};
+    std::thread accept_thread_;
     ServeOptions options_;
     AnthropicThinkingSigner anthropic_thinking_signer_;
     std::string public_model_id_;

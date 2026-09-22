@@ -53,6 +53,22 @@ __global__ void cold_i8_slot_restore_kernel(const std::uint8_t* __restrict__ slo
                                             int kv_heads, std::int8_t* __restrict__ dst_codes,
                                             __half* __restrict__ dst_scales);
 
+// BF16-COLD-LAND A5: warm restore for a BF16 tier layer. The bf16 resident plane is raw
+// bf16, so the slot's E2M1 nibbles are decoded against their E4M3 group-16 scales and
+// written straight out as bf16. One block per (head, page); 256 threads split the 64 rows.
+__global__ void cold_i8_slot_restore_bf16_kernel(const std::uint8_t* __restrict__ slots,
+                                                 int kv_heads,
+                                                 __nv_bfloat16* __restrict__ dst_bf16);
+
+// BF16-COLD-LAND E5: the E8 tier's inverse. The codes are copied back VERBATIM (they
+// are already packed 4-bit and the cold record held them byte-for-byte) and the g64
+// fp16 scales are rebuilt from the E4M3 g16 tail's first byte of each group of four.
+// One block per (head, page); 256 threads split the 64 rows.
+__global__ void cold_i8_slot_restore_rk4v4_kernel(const std::uint8_t* __restrict__ slots,
+                                               int kv_heads,
+                                               std::int8_t* __restrict__ dst_codes,
+                                               __half* __restrict__ dst_scales);
+
 // Slot region accessors for producers.
 __device__ __forceinline__ const std::uint8_t*
 cold_i8_slot_scales(const std::uint8_t* slot) {

@@ -114,7 +114,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, const std::int32_t* draft_ids, const float* draft_probs,
-    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t k) {
+    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t k,
+    const std::uint64_t* column_masks, std::int32_t* accepted_columns) {
     const int tid                   = threadIdx.x;
     const int row                   = static_cast<int>(blockIdx.x);
     const int cols                  = k + 1;
@@ -126,27 +127,88 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     const __nv_bfloat16* row_logits =
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
-    const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties = cfg.allowed_tokens != nullptr || cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
     if (!(cfg.temperature > 0.0f) && !penalties) {
         if (tid == 0) {
-            int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
+            // The widest frame this accept can index (qwen3_6::kMtpDecodeMaximumWidth = 16). The
+            // wrapper already bounds K; this keeps the chain buffer honest anyway.
+            constexpr int kAcceptMaximumWidth = 16;
+            int a                = 0;
+            int t_star           = 0;
+            int take_col         = 0;
+            bool node_ok[kAcceptMaximumWidth]             = {};
+            std::int32_t node_depth[kAcceptMaximumWidth]  = {};
+            if (column_masks == nullptr) {
+                while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
+                t_star   = row_targets[a];
+                take_col = a;
+            } else {
+                // TREE ROUND. Node column j is accepted iff its own token (drafts[j-1], the token
+                // verify_ids feeds that column) equals the verifier's argmax at its PARENT column
+                // and its parent is accepted; the parent is the highest ancestor bit below j, and
+                // bit 0 (the committed anchor) is accepted by definition. A node's depth is
+                // popcount(mask) - 1 -- one bit per chain element plus the anchor -- so the
+                // accepted count is the deepest accepted node's depth and the COLUMN it sits in is
+                // what the KV history commit needs.
+                if (cols > kAcceptMaximumWidth) {
+                    // Refuse loudly: the host turns count <= 0 into "MTP batch returned invalid
+                    // row metadata" rather than verifying a width this kernel cannot index.
+                    licensed_counts[row]  = 0;
+                    accepted[row]         = -1;
+                    accepted_columns[row] = -1;
+                    return;
+                }
+                const std::uint64_t* row_masks =
+                    column_masks + static_cast<std::int64_t>(row) * cols;
+                for (int j = 0; j <= k; ++j) {
+                    node_ok[j]    = false;
+                    node_depth[j] = 0;
+                }
+                node_ok[0] = true;
+                int best   = -1;
+                for (int j = 1; j <= extent; ++j) {
+                    const std::uint64_t mask = row_masks[j];
+                    const std::uint64_t anc  = mask & ~(std::uint64_t{1} << j);
+                    const int parent =
+                        anc == 0 ? 0 : (63 - __clzll(static_cast<long long>(anc)));
+                    node_depth[j] = static_cast<std::int32_t>(__popcll(mask)) - 1;
+                    node_ok[j] = node_ok[parent] && (row_targets[parent] == row_drafts[j - 1]);
+                    if (node_ok[j] && (best < 0 || node_depth[j] > node_depth[best])) { best = j; }
+                }
+                a        = best < 0 ? 0 : node_depth[best];
+                take_col = best < 0 ? 0 : best;
+                t_star   = row_targets[take_col];
+            }
 
             for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            // Commit the verifier's own argmax rather than the draft array. The accept loop
-            // above already forced row_targets[i] == row_drafts[i] for i < a, so this is
-            // bit-identical today, but it makes the committed stream a pure function of the
-            // verifier's argmax and a: the draft head can then only change how many tokens a
-            // round commits, never which tokens, at any window size.
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_targets[i]; }
+            if (column_masks == nullptr) {
+                // Commit the verifier's own argmax rather than the draft array. The accept loop
+                // above already forced row_targets[i] == row_drafts[i] for i < a, so this is
+                // bit-identical today, but it makes the committed stream a pure function of the
+                // verifier's argmax and a: the draft head can then only change how many tokens a
+                // round commits, never which tokens, at any window size.
+                for (int i = 0; i < a; ++i) { row_tokens[i] = row_targets[i]; }
+            } else {
+                // The tree's committed stream is the ACCEPTED CHAIN's own tokens in depth order:
+                // depth i + 1 is the accepted node whose mask carries exactly i + 1 bits.
+                int placed = 0;
+                for (int j = 1; j <= extent && placed < a; ++j) {
+                    if (!node_ok[j] || node_depth[j] != placed + 1) { continue; }
+                    row_tokens[placed] = row_drafts[j - 1];
+                    ++placed;
+                }
+            }
             row_tokens[a] = t_star;
 
-            const int produced   = a + 1;
-            licensed_counts[row] = produced;
-            accepted[row]        = a;
-            anchors[row]         = t_star;
+            const int produced    = a + 1;
+            licensed_counts[row]  = produced;
+            accepted[row]         = a;
+            // A chain round may leave `accepted_columns` unbound (the wrapper requires it only
+            // when `column_masks` is bound) and nothing on that path reads it, so guard the store
+            // rather than dereferencing the null the caller then passes.
+            if (accepted_columns != nullptr) { accepted_columns[row] = take_col; }
+            anchors[row]          = t_star;
             lengths[row] += produced;
             if (cfg.token_counts != nullptr) {
                 for (int i = 0; i < produced; ++i) {
@@ -340,7 +402,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     if (col > extent) { return; }
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
-    const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties     = cfg.allowed_tokens != nullptr || cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
     if ((greedy && !penalties) || token_domain <= kSamplerTileItems) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
@@ -416,7 +478,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     if (token_domain <= kSamplerTileItems) { return; }
     const bool greedy    = !(cfg.temperature > 0.0f);
-    const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties = cfg.allowed_tokens != nullptr || cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
     if (greedy && !penalties) {
         if (tid == 0 && col == 0 && group == 0) {

@@ -86,7 +86,8 @@ target_include_directories(ninfer_context_cost_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/muse_glimmer_30b/export)
 target_compile_definitions(ninfer_context_cost_bench PRIVATE
   NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_context_cost_bench PRIVATE

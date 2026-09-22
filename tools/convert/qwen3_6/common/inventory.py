@@ -17,6 +17,12 @@ RESOURCE_ENCODING = "raw-bytes-v1"
 BF16 = "BF16"
 FP32 = "FP32"
 I32 = "I32"
+# Qwen3.8-Flash-Next's persistent-object contract (tools/convert/qwen3_8_flash_next/
+# inventory.py) declares one I64 object: the PLE per-head row metadata.  The name is
+# exported for that contract only.  FORMAT_NAMES and DIRECT_FORMATS are deliberately
+# left alone -- whether the artifact writer accepts an I64 object is a separate
+# decision, and widening the format set here would change other targets' behaviour.
+I64 = "I64"
 Q4 = "Q4G64_F16S"
 Q5 = "Q5G64_F16S"
 Q6 = "Q6G64_F16S"
@@ -148,6 +154,7 @@ __all__ = [
     "FORMAT_NAMES",
     "FP32",
     "I32",
+    "I64",
     "LAYOUT_NAMES",
     "LogicalAliasSpec",
     "LogicalRowViewSpec",

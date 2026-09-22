@@ -9,6 +9,7 @@
 #include "ninfer/engine.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
+#include <ninfer/targets/muse_glimmer_30b/package.h>
 
 #include <cuda_runtime.h>
 
@@ -25,6 +26,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -445,26 +447,58 @@ PromptInput image_prompt(int dimension) {
 
 } // namespace
 
+namespace {
+
+// The model ids this calibrator measures. The target key and the accepted weights flavours are
+// asked of each package's own declaration, so adding a model id here is a row and a new weights
+// flavour needs no change at all.
+struct CalibratedModel {
+    std::string_view model_id;
+    bool (*declares_model)(std::string_view model_id) noexcept;
+    // The target key the package reports for the identity; throws with the package's declared
+    // accepted set when the artifact declares a weights flavour the package does not consume.
+    std::string_view (*declare_identity)(std::string_view model_id, std::string_view weights_id);
+};
+
+constexpr std::array<CalibratedModel, 4> kCalibratedModels{{
+    {.model_id         = targets::qwen3_6_27b::Package::model_id,
+     .declares_model   = &targets::qwen3_6_27b::Package::declares_model,
+     .declare_identity = &targets::qwen3_6_27b::Package::declare_identity},
+    {.model_id         = targets::qwen3_6_27b::Package::qwen3_8_model_id,
+     .declares_model   = &targets::qwen3_6_27b::Package::declares_model,
+     .declare_identity = &targets::qwen3_6_27b::Package::declare_identity},
+    {.model_id         = targets::qwen3_6_35b_a3b::Package::model_id,
+     .declares_model   = &targets::qwen3_6_35b_a3b::Package::declares_model,
+     .declare_identity = &targets::qwen3_6_35b_a3b::Package::declare_identity},
+    // The third registered package (`src/targets/registry.cpp`): the engine loads muse artifacts,
+    // so the calibrator that produces this table's numbers must be able to price them too.
+    {.model_id         = targets::muse_glimmer_30b::Package::model_id,
+     .declares_model   = &targets::muse_glimmer_30b::Package::declares_model,
+     .declare_identity = &targets::muse_glimmer_30b::Package::declare_identity},
+}};
+
+} // namespace
+
 ArtifactProfile inspect_artifact(const std::filesystem::path& artifact_path) {
     const std::filesystem::path path = existing_input_path(artifact_path);
     ninfer::artifact::Reader reader(path);
     const ninfer::artifact::ArtifactIdentity& identity = reader.identity();
     ArtifactProfile result{
         .path = path, .model_id = identity.model_id, .weights_id = identity.weights_id};
-    if (identity.model_id == targets::qwen3_6_27b::Package::model_id) {
-        (void)targets::qwen3_6_27b::Package::resolve_weights(identity);
-        result.target_key = std::string(targets::qwen3_6_27b::Package::target_key);
-    } else if (identity.model_id == targets::qwen3_6_27b::Package::qwen3_8_model_id) {
-        (void)targets::qwen3_6_27b::Package::resolve_weights(identity);
-        result.target_key = std::string(targets::qwen3_6_27b::Package::qwen3_8_target_key);
-    } else if (identity.model_id == targets::qwen3_6_35b_a3b::Package::model_id) {
-        (void)targets::qwen3_6_35b_a3b::Package::resolve_weights(identity);
-        result.target_key = std::string(targets::qwen3_6_35b_a3b::Package::target_key);
-    } else {
-        throw std::invalid_argument(
-            "artifact model is not registered for context-cost calibration");
+    for (const CalibratedModel& model : kCalibratedModels) {
+        if (!model.declares_model(identity.model_id)) { continue; }
+        // Validates the declared identity and reports the declared target key in one call.
+        result.target_key =
+            std::string(model.declare_identity(identity.model_id, identity.weights_id));
+        return result;
     }
-    return result;
+    std::string declared_model_ids;
+    for (const CalibratedModel& model : kCalibratedModels) {
+        if (!declared_model_ids.empty()) { declared_model_ids += ", "; }
+        declared_model_ids += std::string(model.model_id);
+    }
+    throw std::invalid_argument("artifact model is not registered for context-cost calibration; "
+                                "calibrated model ids: " + declared_model_ids);
 }
 
 TransferSuiteResult measure_context_transfers(const MeasurementOptions& options) {

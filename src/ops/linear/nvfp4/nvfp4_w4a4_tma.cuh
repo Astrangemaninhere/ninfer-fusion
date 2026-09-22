@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arch_caps.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
@@ -136,6 +137,91 @@ struct Nvfp4W4a4TmaSharedStorage {
     alignas(8) std::uint64_t empty[Schedule::kStages];
 };
 
+// ---------------------------------------------------------------------------
+// THE HOST HALF OF THE ARCH DECISION, single-sourced for every TMA launcher in the tree
+// ---------------------------------------------------------------------------
+// The device guard above is keyed on __CUDA_ARCH__, which the HOST PASS cannot see (the
+// preprocessor runs once per pass and __CUDA_ARCH__ is defined only in the device pass), so a
+// compile-time test here would be answered about the wrong thing. The host half is therefore
+// a RUNTIME fact asked of the card in hand, and it asks the SAME question the device guard
+// encodes -- "does this target have the kind::mxf4nvf4 channel the pipeline's inner mma
+// needs?" -- off the measured capability table (src/core/arch_caps.h) rather than off a
+// number, because sm_100/sm_100a and sm_90/sm_90a are the traps this project has already paid
+// for four times.
+//
+// Cached, because this sits on the decode path and the answer cannot change in a process.
+// Every TMA launcher asks THIS function rather than carrying its own copy: the arms header
+// (launch_tma) and the fused swiglu arm both launch a kernel whose body the same guard
+// compiles out, so a second copy would be a second chance to disagree.
+[[nodiscard]] inline bool nvfp4_tma_rung_has_the_mxf4_channel() {
+    static const bool kHas = [] {
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) { return false; }
+        int major = 0;
+        int minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) !=
+            cudaSuccess) {
+            return false;
+        }
+        if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) !=
+            cudaSuccess) {
+            return false;
+        }
+        const caps::ArchRung* rung = caps::arch_rung(major * 10 + minor);
+        return rung != nullptr && caps::has_cap(rung->caps, caps::Cap::Mxf4Nvfp4BlockScale);
+    }();
+    return kHas;
+}
+
+// The refusal text both launchers use. Single-sourced for the same reason.
+[[nodiscard]] inline std::string nvfp4_tma_below_floor_refusal() {
+    return std::string(
+        "nvfp4 W4A4 TMA: this device has no kind::mxf4nvf4 block-scale channel, so the "
+        "warp-specialized TMA pipeline (mbarrier + cp.async.bulk.tensor + setmaxnreg, "
+        "sm_100a+ -- see the floor table in src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh) has no "
+        "instructions for it and its device body is compiled out of this binary. Refusing "
+        "instead of launching a kernel that can only trap: on such a card the CUDA routes are "
+        "the plain MMA ladder (launch_nvfp4_w4a4) or the fp16 fallback, and neither is "
+        "reachable from this launcher.");
+}
+
+// ---------------------------------------------------------------------------
+// THE ARCH FLOOR OF THIS FILE, MEASURED, AND WHY THE GUARD BELOW IS THE PREDICATE IT IS
+// ---------------------------------------------------------------------------
+// Every instruction this file is built on is Hopper/Blackwell-only, and the three families
+// do NOT share a floor -- which is why a naive `>= 900` guard would be wrong:
+//
+//   mbarrier.init / mbarrier.try_wait.parity / mbarrier.arrive.expect_tx   sm_80+
+//   cp.async.bulk.tensor, cluster scope, .op_restrict                       sm_90+
+//   setmaxnreg.dec / setmaxnreg.inc                                         sm_90a  <-- the FLOOR
+//   mma.sync.aligned.kind::mxf4nvf4.block_scale                            sm_100a+ (120a/121a)
+//
+// MEASURED, all six ninfer_nvfp4_tma TUs x five targets, `-cubin`, the tree's own include
+// set (FALLBACK m11_tma.sh, 2026-09-17): sm_75 fails first on `mbarrier.init requires sm_80`,
+// sm_86/sm_89 on `Feature '.op_restrict' requires .target sm_90 or higher`, and -- the
+// finding that fixes the guard -- PLAIN sm_90 is ALSO red, 3..9 errors per TU, on
+// `Instruction 'setmaxnreg.dec' / 'setmaxnreg.inc' not supported on .target 'sm_90'`. So the
+// floor is sm_90a, and a guard keyed on `.op_restrict`'s sm_90 would have LEFT sm_90 RED.
+//
+// The predicate below is the tree's own `a`/`f` feature-macro form, copied from
+// src/ops/common/mma.cuh:44-47, which is where the mxf4nvf4 channel this pipeline feeds is
+// itself gated. Single-sourcing the SEMANTICS (not the text) with mma.cuh matters: if the two
+// disagreed, one build could emit a kernel whose inner mma is a trap stub.
+//
+// It is a DEVICE-pass fact (`__CUDA_ARCH__` is not defined on the host pass), so the host
+// half of the same decision is the runtime check in nvfp4_w4a4_tma_arms.cuh's launch_tma,
+// which refuses on a device below sm_100 rather than launching a kernel whose body was
+// compiled out. Two halves, one decision, and neither is a silent degradation.
+#if defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL) ||                 \
+    defined(__CUDA_ARCH_FEAT_SM110_ALL) || defined(__CUDA_ARCH_FEAT_SM120_ALL) ||                 \
+    defined(__CUDA_ARCH_FEAT_SM121_ALL) || defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
+#define NINFER_NVFP4_TMA_DEVICE_ARCH 1
+#else
+#define NINFER_NVFP4_TMA_DEVICE_ARCH 0
+#endif
+
+#if NINFER_NVFP4_TMA_DEVICE_ARCH
+
 __device__ __forceinline__ void nvfp4_mbarrier_init(std::uint64_t* barrier,
                                                     std::uint32_t arrivals) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
@@ -183,6 +269,8 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                  : "memory");
 }
 
+#endif // NINFER_NVFP4_TMA_DEVICE_ARCH -- the four mbarrier helpers and the TMA copy above
+
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
@@ -191,6 +279,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
 
+#if !NINFER_NVFP4_TMA_DEVICE_ARCH
+    // FAIL CLOSED ON A RUNG THIS KERNEL HAS NO INSTRUCTIONS FOR. The body below is
+    // mbarrier/TMA/setmaxnreg/kind::mxf4nvf4, i.e. sm_100a+ (see the floor table at the top of
+    // this file), and ptxas rejects every one of those on sm_75/sm_86/sm_89/sm_90. Compiling
+    // the body out is what makes the five consumer TUs BUILD for those rungs at all -- before
+    // this guard they were the entire remainder of the 148-TU sweep's failures.
+    //
+    // The kernel is still DEFINED rather than removed, for one reason: the five arm TUs call
+    // it through launch_tma<>, so removing the symbol would turn a build-time wall into a
+    // LINK-time wall. A trap is the honest shape for "this binary has no code for this card",
+    // and it is unreachable in practice because launch_tma() refuses on the host first (see
+    // nvfp4_w4a4_tma_arms.cuh) and because the capability gate refuses the NVFP4 artifact on
+    // every rung below sm_100a (src/core/arch_caps.h, Cap::Mxf4Nvfp4BlockScale).
+    __trap();
+#else
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared          = *reinterpret_cast<Nvfp4W4a4TmaSharedStorage<Schedule>*>(shared_bytes);
     const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
@@ -373,6 +476,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
         output.store_vector(row_begin + row_vector * 8, token, values);
     }
+#endif // NINFER_NVFP4_TMA_DEVICE_ARCH
 }
 
 } // namespace ninfer::ops::detail

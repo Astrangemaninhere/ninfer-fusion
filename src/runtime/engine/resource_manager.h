@@ -1004,6 +1004,10 @@ public:
             context_stats_.pressure_maximal_fallback_selections;
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
+        // mtplogx: the on-demand MTP rung-capture counters live in the Program, not in the
+        // context accounting above.
+        out.mtp_graph_extension_calls       = program.mtp_graph_extension_calls();
+        out.mtp_graph_extension_nanoseconds = program.mtp_graph_extension_nanoseconds();
 
         const auto usage                     = program.physical_usage();
         out.device_state_occupied_slots      = usage.device_state_slots;

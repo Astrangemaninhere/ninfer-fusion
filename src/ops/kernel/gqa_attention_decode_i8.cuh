@@ -1,7 +1,8 @@
 #pragma once
 
 // ninfer::ops - split-KV GQA small-T attention, int8 KV-cache partial kernel.
-// Historical design: docs/archive/optimization-era/2026-07-08-gqa-decode-int8-kernel-redesign.md.
+// Historical design: docs/archive/optimization-era/2026-07-08-gqa-decode-int8-kernel-redesign.md
+// -- NOT in this tree and no copy reachable on this box; what follows is what survives of it.
 //
 //   * QK runs on native m16n8k32.s8 tensor cores. Q is quantized on-chip to int8
 //     per (row, 64-group); K stays int8 in the cache and is read straight into
@@ -78,7 +79,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t split_units,
-        float scale, float* partial_acc, float* partial_m, float* partial_l) {
+        float scale, float* partial_acc, float* partial_m, float* partial_l,
+        // i8win: the declared sliding window, in TOKENS, exactly as the nvfp4/iso3 siblings
+        // take it. DEFAULTED so that every call site compiled before this patch keeps full
+        // attention: 0 means "the field is not read", byte-identical to `window = last_pos + 1`.
+        std::int32_t sliding_window = 0) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -95,7 +100,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
     // The YaRN-extended 1,010,000-key maximum envelope spans at most 186 pages in one 27B split.
-    constexpr int PageIds         = 256;
+    constexpr int PageIds         = paged_kv_page_ids(kCausalAttentionMaximumVisibleKeysYarn);
     constexpr int ProducerThreads = RowTiles * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
     constexpr float Log2E         = 1.4426950408889634074f;
@@ -199,31 +204,38 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         return;
     }
 
-    const int window = last_pos + 1;
+    // i8win: THE WINDOW IS READ NOW. Before this line the INT8 decode path answered
+    // `last_pos + 1` unconditionally, i.e. full attention, which is why the field's readers
+    // were the census {NVFP4, ISO3} and why `--kv-layer-storage 0-15:int8` was refused by
+    // name on a windowed artifact (product/kv_component_switch.h, the domain refusal).
+    // The form below is the nvfp4 kernel's (gqa_attention_decode_nvfp4.cuh:381), including
+    // its max(0, ...) clamp: token_begin = max(0, window_full - sliding_window).
+    const int window_full = last_pos + 1;
+    const int token_begin =
+        (sliding_window > 0 && window_full > sliding_window) ? window_full - sliding_window : 0;
+    const int window = window_full - token_begin;
     // Fixed split grid (split_units > 0): split s owns the keys
     // [s*split_units, min((s+1)*split_units, window)). Its interior boundaries are
-    // launch constants, so the partial a split contributes for a key range -- and the
-    // fp32 addition order it used to build it -- no longer move when the launch covers
-    // a different number of tokens. The live window still clips every range (no split
+    // launch constants, so the partial a split contributes for a key range -- and the fp32
+    // addition order it used to build it -- no longer move when the launch covers a
+    // different number of tokens. The live window still clips every range (no split
     // addresses a key past the last valid one) and split_units == 0 keeps the legacy
     // window-driven partition.
-    int active_split_count = 0;
-    int split_start        = 0;
-    int split_limit        = 0;
-    if (split_units > 0) {
-        active_split_count = gqa_small_t_split_active(window, split_units, split_count);
-        split_start        = split * split_units;
-        split_limit        = split_start + split_units;
-    } else {
-        active_split_count =
-            gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
-        const int logical_tiles = div_up(window, Bc);
-        const bool tile_split   = logical_tiles >= active_split_count;
-        const int units_per_split = tile_split ? div_up(logical_tiles, active_split_count)
-                                               : div_up(window, active_split_count);
-        split_start = split * units_per_split * (tile_split ? Bc : 1);
-        split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    }
+    //
+    // The count and the tiling come from gqa_small_t_split_range, the family's one
+    // definition of "which keys does split s own" (ops/kernel/gqa_attention_decode.cuh).
+    // With NINFER_VERIFY_EXACT=1 the token tile cannot reach either of them: with a pinned
+    // split_units the range is [s*split_units, ...) outright, and the legacy branch derives
+    // its tiling from `window` alone because the active count does. At one and the same
+    // window, and for one and the same dtype, the tiling and the count are therefore
+    // identical for TokenTile == 1 and TokenTile == 6 (item 3 of the fix), and the KV dtype
+    // no longer moves the lossless-region bound (item 1 / H39).
+    const GqaSmallTSplitRange split_range =
+        gqa_small_t_split_range<Geometry, true>(window, split_count, split_units, TokenTile,
+                                                  Bc, split, gqa_verify_exact_mode());
+    const int active_split_count = split_range.active;
+    const int split_start        = split_range.start;
+    const int split_limit        = split_range.limit;
     if (split >= active_split_count) { return; }
 
     const int split_end = (split_limit < window) ? split_limit : window;
@@ -235,6 +247,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+    // Contract: page_count is bounded by PageIds =
+    // paged_kv_page_ids(envelope) for every split a launcher can dispatch.
+    // Without this check a larger envelope would run off the end of shared
+    // memory silently instead of declining the split.
+    if (page_count > PageIds) {
+        write_neutral();
+        return;
+    }
     for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
@@ -261,26 +281,46 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             kamax                   = warp_max(kamax, FullMask);
             vamax                   = warp_max(vamax, FullMask);
             if constexpr (E8) {
-                // E8 tier: K codes are 8-dim Hadamard-rotated then projected
-                // onto the E8 lattice (integer coords), packed 4-bit with a
-                // g64 scale = amax/7; V is scalar i4 with the same budget.
-                // The rotation runs BEFORE the max: it raises the group peak by
-                // 1.4-15x while the code range is only +-7, so a pre-rotation
-                // scale clipped the top of the range (_TODO.md 116/116b).
+                // E8 tier: K codes are 8-dim Hadamard-rotated, packed 4-bit with a
+                // g64 scale = amax/8 over codes [-8,7] (AMAXFIX; was amax/7 over
+                // [-7,7], measured 0.686 dB worse at identical bits); V is scalar i4
+                // with the same budget. Both the divisor and the K clamp range come
+                // from gqa_attention_kv_quant.cuh -- do not respell either here.
+                // The rotation runs BEFORE the max: a pre-rotation scale clipped the
+                // top of the range (_TODO.md 116/116b).
+                //
+                // The E8 LATTICE PROJECTION is deliberately not applied here.
+                // The code plane stores ONE integer per coordinate, but
+                // E8 = D8 U (D8 + 1/2): the nearest lattice point of 47.6% of the
+                // 8-blocks lies in the coset D8 + 1/2, i.e. all eight of its
+                // coordinates are half-integers, and the rint() that has to follow
+                // snaps each of them 0.5 step away. Measured over the 27 L13/L14/L15
+                // KV forensics dumps (66.2M K elements, e8verify.cpp in
+                // scratch/fixE1): projecting first costs 2.32x MSE (+3.65 dB) against
+                // plain rounding at identical bits/el -- K relRMS 10.66% without the
+                // projection vs 16.24% with it. Buying the 0.58 dB lattice gain
+                // instead would need a code plane able to hold 2*coordinate, i.e. 5
+                // bits at +-15, for +1 bit/el: strictly worse than spending the same
+                // bit on a finer uniform grid. Keep the rotation (it is exactly
+                // orthonormal and lowers the group amax: E[amax_rot^2]/E[amax^2] =
+                // 0.68), drop the projection.
+                // AMAXFIX: the "10.66%" quoted above is the plain-rounding arm AT THE
+                // OLD DIVISOR (amax/7, [-7,7]). The shipped rounded arm is now 9.8520%
+                // (amax/8, [-8,7]), so the 16.24% projection arm is 3.65 dB -> 4.34 dB
+                // WORSE than plain rounding. The conclusion is unchanged and stronger.
                 gqa_kv_hadamard64(kv0, kv1, FullMask);
                 float kamax_e = fmaxf(fabsf(kv0), fabsf(kv1));
                 kamax_e       = warp_max(kamax_e, FullMask);
-                const __half ksh = __float2half_rn(kamax_e > 0.0f ? kamax_e / 7.0f : 0.0f);
-                const __half vsh = __float2half_rn(vamax > 0.0f ? vamax / 7.0f : 0.0f);
+                const __half ksh =
+                    kv_scale_half(kamax_e > 0.0f ? kamax_e / kGqaKvI4ScaleDivisor : 0.0f);
+                const __half vsh =
+                    kv_scale_half(vamax > 0.0f ? vamax / kGqaKvI4ScaleDivisor : 0.0f);
                 const float ks   = __half2float(ksh);
                 const float vs   = __half2float(vsh);
                 const float k_inv = ks > 0.0f ? 1.0f / ks : 0.0f;
                 const float v_inv = vs > 0.0f ? 1.0f / vs : 0.0f;
-                float kv0_s = kv0 * k_inv;
-                float kv1_s = kv1 * k_inv;
-                e8_project_8d_warp(kv0_s, kv1_s, lane);
-                const int c0 = max(-7, min(7, static_cast<int>(rintf(kv0_s))));
-                const int c1 = max(-7, min(7, static_cast<int>(rintf(kv1_s))));
+                const int c0 = static_cast<int>(gqa_kv_quant_i4_code(kv0, k_inv));
+                const int c1 = static_cast<int>(gqa_kv_quant_i4_code(kv1, k_inv));
                 const int vc0 = static_cast<int>(gqa_kv_quant_i4_code(vv0, v_inv));
                 const int vc1 = static_cast<int>(gqa_kv_quant_i4_code(vv1, v_inv));
                 physical_page = __shfl_sync(FullMask, physical_page, 0);
@@ -288,11 +328,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 if ((lane & 1) == 0) {
                     const float k0n_nb = __shfl_xor_sync(FullMask, kv0, 1);
                     const float k1n_nb = __shfl_xor_sync(FullMask, kv1, 1);
-                    float k0n_s = k0n_nb * k_inv;
-                    float k1n_s = k1n_nb * k_inv;
-                    e8_project_8d_warp(k0n_s, k1n_s, lane);
-                    const int c0n = max(-7, min(7, static_cast<int>(rintf(k0n_s))));
-                    const int c1n = max(-7, min(7, static_cast<int>(rintf(k1n_s))));
+                    const int c0n = static_cast<int>(gqa_kv_quant_i4_code(k0n_nb, k_inv));
+                    const int c1n = static_cast<int>(gqa_kv_quant_i4_code(k1n_nb, k_inv));
                     const int vc0n = static_cast<int>(__shfl_xor_sync(FullMask, vc0, 1));
                     const int vc1n = static_cast<int>(__shfl_xor_sync(FullMask, vc1, 1));
                     const std::int64_t kb0 = gqa_kv_i4_code_index<Geometry>(
@@ -429,6 +466,60 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const std::uint8_t* v_slot =
                 cold_v_slots == nullptr ? nullptr
                                          : cold_v_slots + slot_flat * slot_bytes;
+            if constexpr (E8) {
+                // BF16-COLD-LAND E4. The e8 tier's record is the SAME raw record, but its
+                // code plane holds the tier's packed 4-bit codes VERBATIM (the requant's
+                // E8KvG64 arm) rather than a requantized E2M1 code, so this stages exactly
+                // what the hot path stages -- 8 bytes of codes per 16 dims into the packed
+                // smem position, four g64 scales per row -- and lets the existing E8
+                // unpack pass expand it. Nothing about the QK/PV math changes, so a cold
+                // key row is decoded by the same instructions as a hot one.
+                //
+                // The g64 scale is the E4M3 byte the requant replicated into its four g16
+                // slots, so g reads tail byte 4*g.
+                for (int key_l = tid; key_l < Bc; key_l += Threads) {
+                    const int key = tile_k0 + key_l;
+                    if (key >= split_start && key < split_end && v_slot != nullptr) {
+                        const int row = key & kPagedKVPageMask;
+                        const std::uint8_t* k_row_s =
+                            ninfer::ops::detail::cold_i8_slot_scales(k_slot) + row * 16;
+                        const std::uint8_t* v_row_s =
+                            ninfer::ops::detail::cold_i8_slot_scales(v_slot) + row * 16;
+#pragma unroll
+                        for (int g = 0; g < Groups; ++g) {
+                            k_scale_s[key_l * Groups + g] = __float2half_rn(
+                                gqa_kv_nvfp4_e4m3_to_f32(k_row_s[g * 4]));
+                            v_scale_s[key_l * Groups + g] = __float2half_rn(
+                                gqa_kv_nvfp4_e4m3_to_f32(v_row_s[g * 4]));
+                        }
+                    } else {
+                        gqa_i8_scale_row_clear<Groups>(&k_scale_s[key_l * Groups]);
+                        gqa_i8_scale_row_clear<Groups>(&v_scale_s[key_l * Groups]);
+                    }
+                }
+#pragma unroll 1
+                for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+                    const int key_l = chunk / (D / 16);
+                    const int dc    = chunk - key_l * (D / 16);
+                    const int key   = tile_k0 + key_l;
+                    std::int8_t* kdst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
+                    std::int8_t* vdst = &v_i8[key_l * D + dc * 16];
+                    if (key >= split_start && key < split_end && v_slot != nullptr) {
+                        const int row = key & kPagedKVPageMask;
+                        ninfer::ops::cp_async<8>(
+                            kdst,
+                            ninfer::ops::detail::cold_i8_slot_codes(k_slot) + row * 128 + dc * 8);
+                        ninfer::ops::cp_async<8>(
+                            vdst,
+                            ninfer::ops::detail::cold_i8_slot_codes(v_slot) + row * 128 + dc * 8);
+                    } else {
+                        store_vec(kdst, make_int4(0, 0, 0, 0));
+                        store_vec(vdst, make_int4(0, 0, 0, 0));
+                    }
+                }
+                ninfer::ops::cp_commit();
+                return;
+            }
             for (int key_l = tid; key_l < Bc; key_l += Threads) {
                 const int key = tile_k0 + key_l;
                 if (key >= split_start && key < split_end && v_slot != nullptr) {
@@ -534,36 +625,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 std::int8_t* vdst = &v_i8[key_l * D + d];
                 const int2 kpacked = load_vec<int2>(kdst);
                 const int2 vpacked = load_vec<int2>(vdst);
-                std::int8_t kout[16];
-                std::int8_t vout[16];
+                std::int8_t kout[kGqaKvUnpackWidth];
+                std::int8_t vout[kGqaKvUnpackWidth];
                 gqa_kv_unpack_i4x16(reinterpret_cast<const std::uint8_t*>(&kpacked), kout);
                 gqa_kv_unpack_i4x16(reinterpret_cast<const std::uint8_t*>(&vpacked), vout);
-                store_vec(kdst, make_int4(
-                                    static_cast<int>(kout[0]) | (static_cast<int>(kout[1]) << 8) |
-                                        (static_cast<int>(kout[2]) << 16) |
-                                        (static_cast<int>(kout[3]) << 24),
-                                    static_cast<int>(kout[4]) | (static_cast<int>(kout[5]) << 8) |
-                                        (static_cast<int>(kout[6]) << 16) |
-                                        (static_cast<int>(kout[7]) << 24),
-                                    static_cast<int>(kout[8]) | (static_cast<int>(kout[9]) << 8) |
-                                        (static_cast<int>(kout[10]) << 16) |
-                                        (static_cast<int>(kout[11]) << 24),
-                                    static_cast<int>(kout[12]) | (static_cast<int>(kout[13]) << 8) |
-                                        (static_cast<int>(kout[14]) << 16) |
-                                        (static_cast<int>(kout[15]) << 24)));
-                store_vec(vdst, make_int4(
-                                    static_cast<int>(vout[0]) | (static_cast<int>(vout[1]) << 8) |
-                                        (static_cast<int>(vout[2]) << 16) |
-                                        (static_cast<int>(vout[3]) << 24),
-                                    static_cast<int>(vout[4]) | (static_cast<int>(vout[5]) << 8) |
-                                        (static_cast<int>(vout[6]) << 16) |
-                                        (static_cast<int>(vout[7]) << 24),
-                                    static_cast<int>(vout[8]) | (static_cast<int>(vout[9]) << 8) |
-                                        (static_cast<int>(vout[10]) << 16) |
-                                        (static_cast<int>(vout[11]) << 24),
-                                    static_cast<int>(vout[12]) | (static_cast<int>(vout[13]) << 8) |
-                                        (static_cast<int>(vout[14]) << 16) |
-                                        (static_cast<int>(vout[15]) << 24)));
+                store_vec(kdst, gqa_kv_pack_i8x16_to_int4(kout));
+                store_vec(vdst, gqa_kv_pack_i8x16_to_int4(vout));
             }
         }
         __syncthreads();

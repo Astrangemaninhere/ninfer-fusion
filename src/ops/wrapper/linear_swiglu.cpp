@@ -1,5 +1,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 
+#include "ninfer/ops/linear.h"
+#include "ops/generic/rowsplit_generic.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
@@ -8,10 +10,26 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops {
 namespace {
+
+// The generic (unregistered-shape) route materializes the full [gate_up_rows, T] projection and
+// then splits it -- the same two steps the registered Materialized schedule uses.
+std::size_t materialized_swiglu_scratch_bytes(std::int32_t gate_up_rows, std::int32_t input_rows,
+                                              std::int32_t max_tokens) {
+    if (gate_up_rows <= 0 || (gate_up_rows % 2) != 0 || max_tokens <= 0 ||
+        !detail::generic_rowsplit_shape_capable(gate_up_rows, input_rows)) {
+        throw std::invalid_argument("linear_swiglu workspace: invalid generic profile");
+    }
+    if (gate_up_rows > std::numeric_limits<std::int32_t>::max() / 2 / max_tokens) {
+        throw std::overflow_error("linear_swiglu workspace: scratch size overflows int32");
+    }
+    return static_cast<std::size_t>(gate_up_rows) * static_cast<std::size_t>(max_tokens) *
+           sizeof(std::uint16_t);
+}
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -51,8 +69,20 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_swiglu workspace: Q4 admits only A16");
         }
-        return detail::q4_linear_swiglu_capacity_workspace_bytes(
-            gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
+        try {
+            return detail::q4_linear_swiglu_capacity_workspace_bytes(
+                gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
+        } catch (const std::invalid_argument&) {
+            return materialized_swiglu_scratch_bytes(gate_up_rows, input_rows, max_tokens);
+        }
+    }
+    if (qtype == QType::Q5G64_F16S || qtype == QType::Q6G64_F16S) {
+        // No registered linear_swiglu variant exists for Q5/Q6; both go through the generic
+        // materialized route, which needs the [gate_up_rows, T] projection scratch.
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("linear_swiglu workspace: Q5/Q6 admit only A16");
+        }
+        return materialized_swiglu_scratch_bytes(gate_up_rows, input_rows, max_tokens);
     }
     if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
@@ -85,6 +115,18 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                           gate_up_weight.padded_shape[1] == 2048;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
         out.ne[3] != 1 || (!large_shape && !w8_shape)) {
+        // Not a user error: the registered linear_swiglu shapes belong to other models. The
+        // generic route materializes [2I, T] with ops::linear and then applies the same split the
+        // registered Materialized schedule applies.
+        if (t > 0 && x.ne[2] == 1 && x.ne[3] == 1 && out.ne[1] == t && out.ne[2] == 1 &&
+            out.ne[3] == 1 && gate_up_weight.n == 2 * out.ne[0] &&
+            gate_up_weight.k == x.ne[0] && detail::generic_fallback_enabled() &&
+            detail::generic_rowsplit_weight_ok(gate_up_weight)) {
+            Tensor scratch = ws.alloc(DType::BF16, {gate_up_weight.n, t});
+            linear(x, gate_up_weight, scratch, stream);
+            detail::generic_swiglu_split_dispatch(scratch, out, stream);
+            return;
+        }
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {

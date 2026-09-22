@@ -58,7 +58,8 @@ __launch_bounds__(Block) __global__
 
     sum       = warp_reduce_sum(sum);
     float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(d) + eps) : 0.0f;
-    inv       = __shfl_sync(kFullWarpMask, inv, 0);
+    // Pin Width: unpinned, srcLane 0 is the hardware wave's absolute lane 0, not this row's.
+    inv       = __shfl_sync(kFullWarpMask, inv, 0, kWarpSize);
 
 #pragma unroll
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
@@ -103,7 +104,8 @@ __launch_bounds__(Block) __global__
     float sum                   = x0.x * x0.x + x0.y * x0.y + x1.x * x1.x + x1.y * x1.y;
     sum                         = warp_reduce_sum(sum);
     float inv                   = lane == 0 ? rsqrtf(sum * (1.0f / 128.0f) + eps) : 0.0f;
-    inv                         = __shfl_sync(kFullWarpMask, inv, 0);
+    // Pin Width: unpinned, srcLane 0 is the hardware wave's absolute lane 0, not this row's.
+    inv                         = __shfl_sync(kFullWarpMask, inv, 0, kWarpSize);
 
     const float2 w0 = __bfloat1622float2(weight[pair0]);
     const float2 w1 = __bfloat1622float2(weight[pair1]);

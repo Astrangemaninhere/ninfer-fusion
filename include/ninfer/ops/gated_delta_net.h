@@ -52,15 +52,27 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                      Tensor& ssm_state, Tensor& out, cudaStream_t stream);
 
+namespace detail::gated_delta_net::chunked {
+// Observation point for the three stages of the chunked recurrence.  The chunked launcher calls
+// `record_stage(user_data, stage_id, stream)` after prepare-wy-wu (0), state passing (1) and the
+// chunk output (2).  Added for the copied Flash-Next target's stage ledger; the donor carries the
+// same struct (igorls/ninfer @ 5e4a66d include/ninfer/ops/gated_delta_net.h:56).
+struct GdnChunkedStageHook {
+    void (*record_stage)(void* user_data, int stage_id, cudaStream_t stream) = nullptr;
+    void* user_data = nullptr;
+};
+} // namespace detail::gated_delta_net::chunked
+
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
  * `ssm_state_in` and `ssm_state_out` may be disjoint or exactly the same storage. No other
- * arguments may overlap either state.
+ * arguments may overlap either state. `hook` is optional and records the three chunked stages.
  */
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                     cudaStream_t stream);
+                     cudaStream_t stream,
+                     const detail::gated_delta_net::chunked::GdnChunkedStageHook* hook = nullptr);
 
 /**
  * One-token update for B independent state-pool slots. q/k are contiguous BF16 [128,Hqk,1,B],

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/memory.cuh"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 
 #include <cuda_bf16.h>
 
@@ -9,8 +10,9 @@
 namespace ninfer::ops::detail {
 
 struct Nvfp4GdnInputOutput {
-    static constexpr std::int32_t kQkvRows = 10240;
-    static constexpr std::int32_t kZRows   = 6144;
+    // Row split of the fused projection, declared once in nvfp4_config.h.
+    static constexpr std::int32_t kQkvRows = kNvfp4GdnQkvRows;
+    static constexpr std::int32_t kZRows   = kNvfp4GdnZRows;
 
     __nv_bfloat16* qkv;
     __nv_bfloat16* z;

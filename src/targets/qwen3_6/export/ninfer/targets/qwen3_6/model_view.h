@@ -13,6 +13,15 @@ namespace ninfer {
 
 class DeviceArena;
 
+namespace product {
+
+// W13: the weight-offload runtime is owned by the MaterializedArtifact, and this
+// view only ever borrows a pointer to it, so a forward declaration is enough here
+// and the view stays free of the artifact and CUDA headers.
+class WeightResidencyRuntime;
+
+} // namespace product
+
 namespace targets::qwen3_6 {
 
 template <class ProjectionPayload, class PostMixerPayload>
@@ -114,6 +123,25 @@ struct DFlash2Weights {
     Weight selector_successor_codebook;
 };
 
+// W13: the layer-boundary residency hook (TextContext::run_layers) runs inside the
+// shared runtime, which holds only this view -- never the artifact. The loader that
+// fills the view owns the MaterializedArtifact and publishes the runtime pointer
+// through bind(). A value member with a null-safe accessor rather than a raw
+// pointer member, because "nothing was offloaded" is a legitimate state and the
+// hook tests exactly that (`w13 != nullptr`). The reader of this member is
+// TextContext::run_layers; the writer is each target's impl/load/bindings.cpp.
+class WeightResidencyAttachment {
+public:
+    void bind(product::WeightResidencyRuntime* runtime) noexcept { runtime_ = runtime; }
+
+    [[nodiscard]] product::WeightResidencyRuntime* weight_residency() const noexcept {
+        return runtime_;
+    }
+
+private:
+    product::WeightResidencyRuntime* runtime_ = nullptr;
+};
+
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,
           class MtpAttentionPayload, class MtpPostMixerPayload, class DFlashPayload,
           class DFlash2Payload, std::size_t FullAttentionLayers, std::size_t GdnLayers>
@@ -125,6 +153,9 @@ struct ModelView {
     using DFlash2   = DFlash2Payload;
 
     DeviceArena* weights_arena = nullptr;
+    // W13: nullptr (the default, and what a loader that never binds it leaves)
+    // means every weight is device-resident -- the behaviour of every run today.
+    WeightResidencyAttachment backing;
     Weight token_embedding;
     std::array<FullLayer, FullAttentionLayers> full_layers;
     std::array<GdnLayer, GdnLayers> gdn_layers;

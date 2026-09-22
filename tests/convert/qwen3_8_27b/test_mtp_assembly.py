@@ -23,14 +23,19 @@ from tools.convert.common import quantize as repo_quantize
 from tools.convert.qwen3_8_27b import mtp
 
 
-MTP_SOURCE = Path(os.environ.get(
-    "NINFER_MTP_SOURCE",
-    "/home/user/models/q38_abl_huihui_nvfp4/model-mtp-bf16.safetensors",
-))
-REFERENCE = Path(os.environ.get(
-    "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS",
-    "/home/user/models/qwen3_8_27b_nvfp4.ninfer",
-))
+def _opt_in_path(variable: str) -> Path:
+    """Opt-in machine resource.
+
+    The tree bakes in no absolute path, so an unset variable yields a path that
+    cannot exist and the real-material test below skips instead of failing.
+    """
+
+    value = os.environ.get(variable, "")
+    return Path(value) if value else Path(variable + ".unset")
+
+
+MTP_SOURCE = _opt_in_path("NINFER_MTP_SOURCE")
+REFERENCE = _opt_in_path("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS")
 
 W8 = "W8G32_F16S"
 

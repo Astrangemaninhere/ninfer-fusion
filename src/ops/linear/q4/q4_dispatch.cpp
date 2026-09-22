@@ -45,6 +45,35 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             break;
         }
         break;
+    case 4096:
+        // The 4096-wide text stack's q4 geometries: (24576,4096) MLP gate/up, (4096,4096) the
+        // GDN q/k projection and the MTP q / output-gate row views, (10240,4096) the MTP packed
+        // attention input. The SIMT and MMA launches read k at runtime; the GEMV does not when its
+        // schedule carries a static group count, so these entries take the runtime-groups GEMV --
+        // k is 4096 here (64 groups per row), not 5120 (80).
+        switch (n) {
+        case 24576:
+        case 10240:
+        case 4096:
+            if (t == 1) { return launch_q4_gemv_r1_w8_runtime; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
+    case 8192:
+        // (4096, 8192) is the MTP FC input projection: the concatenated embedding+hidden state
+        // back down to the hidden width. 8192 wide is 128 groups per row, so as with case 4096 the
+        // decode GEMV must be the runtime-groups one.
+        if (n == 4096) {
+            if (t == 1) { return launch_q4_gemv_r1_w8_runtime; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
     case 2048:
         if (n == 131072) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
@@ -99,6 +128,18 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
         break;
     }
     throw std::invalid_argument("q4 linear: unsupported policy");
+}
+
+// Non-throwing spelling of the registry lookup. It is deliberately defined *in terms of*
+// select_q4_a16_launch rather than as a second copy of the switch: a duplicated admission list
+// would be free to drift away from the one the dispatcher actually uses.
+bool q4_a16_shape_registered(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
+    try {
+        (void)select_q4_a16_launch(n, k, t);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

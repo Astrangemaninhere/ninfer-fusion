@@ -20,7 +20,12 @@ void gelu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     const auto gate_addr   = reinterpret_cast<std::uintptr_t>(gate.data);
     const auto up_addr     = reinterpret_cast<std::uintptr_t>(up.data);
     const auto out_addr    = reinterpret_cast<std::uintptr_t>(out.data);
-    if (((gate_addr | up_addr | out_addr) & (alignof(Bf16x8Pack) - 1)) == 0 && (n % 8) == 0) {
+    // The bf16x8 route reads gate/up as contiguous packs and never consults ne/nb, so it is only
+    // valid for contiguous inputs. Slices of one packed gate/up matrix must fall through to the
+    // strided kernel below (the same ordering ops::silu_mul uses).
+    const bool contiguous = gate.is_contiguous() && up.is_contiguous();
+    if (contiguous && ((gate_addr | up_addr | out_addr) & (alignof(Bf16x8Pack) - 1)) == 0 &&
+        (n % 8) == 0) {
         const std::int64_t packs = n / 8;
         const int grid           = static_cast<int>(std::min<std::int64_t>(
             kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(kBlock)))));

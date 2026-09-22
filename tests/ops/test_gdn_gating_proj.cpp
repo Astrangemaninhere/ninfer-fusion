@@ -430,14 +430,30 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
 } // namespace
 
 int main() {
+    // masked1, 2026-09-22. This block is pure HOST-side capacity arithmetic:
+    // verify_workspace_capacity_contract() calls the two public capacity functions and compares
+    // route witnesses, and needs no device at all. It used to sit AFTER the cuda_unavailable()
+    // early return, so on any run without a visible device the whole contract read
+    // `***Skipped` and a route regression could hide behind the skip -- the same shape as
+    // #131/#132 (tests/ops/test_gdn_input_proj_conv_{record,snapshot}.cpp, fixed the same day).
+    // MEASURED with the device hidden, dl/masked1/logs/p01_arms.hidden.log:
+    //   pre-image  + a forced contract failure -> 77 (SKIP; the failure is invisible)
+    //   this patch + the same forced failure   -> 1  (reported)
+    // The device gate therefore sits after the contract, and the contract returns on its own
+    // so a broken witness is reported with or without a card. Verdicts with a device present
+    // are unchanged: a broken contract already reached the same `return 1` via the tail.
+    int failures = 0;
+    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
+    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
+    if (failures != 0) {
+        std::cout << "FAIL gdn_gating_proj workspace capacity contract\n";
+        return 1;
+    }
+
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-
-    int failures = 0;
-    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
-    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
 
     // Every registered 27B projection route, including predicated and full token tiles.
     for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {

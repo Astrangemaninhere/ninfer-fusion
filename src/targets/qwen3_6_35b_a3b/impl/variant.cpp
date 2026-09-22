@@ -99,7 +99,8 @@ std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_
 }
 
 std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
-                                                               std::uint32_t draft_window) {
+                                                               std::uint32_t draft_window,
+                                                               bool ladder_capture) {
     if (draft_window == 0 || capacity == 0) { return {}; }
     std::vector<std::uint32_t> ends;
     const auto add_shifted = [&](std::uint32_t visible_end, std::uint32_t offset) {
@@ -107,6 +108,18 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     };
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
         add_shifted(visible_end, 2 * draft_window);
+    }
+    // This target has never carried a measured small-T launch boundary, and a fixed-k run here
+    // is unchanged by this. A ladder capture applies the 27b-measured fork set
+    // (128/160/512/1029/2054/8198, see the 27b variant) as a conservative superset: an extra
+    // boundary only splits a range, while a missing one can leave two INT8 implementation
+    // families inside one topology class and the graph install fails. THE TRANSFER OF THOSE
+    // NUMBERS TO THIS TARGET IS UNVERIFIED -- the T=K+1 launch geometry is the same, so the forks
+    // are expected at the same visible ends, but that has not been measured here.
+    if (ladder_capture) {
+        for (const std::uint32_t visible_end : {128U, 160U, 512U, 1029U, 2054U, 8198U}) {
+            add_shifted(visible_end, draft_window + 1);
+        }
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());

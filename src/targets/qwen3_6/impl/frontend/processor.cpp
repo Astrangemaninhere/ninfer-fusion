@@ -640,10 +640,28 @@ void enforce_media_resource_limits(const PreprocessStats& stats, const Processor
 }
 
 void assign_positions(ProcessedInput& output,
-                      std::span<const EncodedChat::MediaTokenRun> media_runs) {
+                      std::span<const EncodedChat::MediaTokenRun> media_runs,
+                      std::span<const std::uint8_t> token_classes) {
     const std::size_t length = output.input_ids.size();
     output.positions.assign(length * 3, 0);
     output.token_types.assign(length, 0);
+    // NOTE ON LINE NUMBERS: the `file:line` references in this block and in `encode_rendered_chat`
+    // below are PRE-LANDING (HEAD 3944a53); each is also given by SYMBOL. Current values:
+    //   processor.cpp assign_positions:642  encode_rendered_chat:761  exact-frontier throw:814
+    //   tokenizer.cpp encode_with_boundaries:797  the conservative branch:697
+    //
+    // THE FRAME AXIS, IN ITS OWN COLUMN -- and this is where it used to die. The statement above is
+    // the ONLY per-token byte column this struct had, and it is the VISION MODALITY column, so the
+    // class column cannot ride in it (see the note on `ProcessedInput::token_classes`). An empty
+    // input means the caller did not classify, and then this column is all-Literal; a wrong-sized
+    // input is an error and never a silent truncation.
+    if (token_classes.empty()) {
+        output.token_classes.assign(length, static_cast<std::uint8_t>(0));
+    } else if (token_classes.size() == length) {
+        output.token_classes.assign(token_classes.begin(), token_classes.end());
+    } else {
+        throw std::logic_error("encoded token classes do not match the prompt's token count");
+    }
     auto set = [&](int axis, std::size_t index, std::int32_t value) {
         output.positions[static_cast<std::size_t>(axis) * length + index] = value;
     };
@@ -767,10 +785,21 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         byte_boundaries.push_back(run.bytes.end);
     }
 
-    BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
+    // THE FRAME AXIS IS TAKEN HERE, as an OPT-IN second pass. `encode_with_frame_classes` runs the
+    // SAME tokenization twice -- once for the caller's markers exactly as before, once to resolve the
+    // literal-span edges -- because asking for those edges in the same call would push the caller's
+    // markers onto `append_ordinary_text`'s conservative path (tokenizer.cpp:696-698) and could turn
+    // a rewrite checkpoint's `exact_frontier` into `nullopt`, which this function THROWS on
+    // (`:784-786` below). Cost: one extra BPE pass over the prompt, once per request, on the prefill
+    // path. The ids and the markers stay bit-for-bit what they were.
+    FrameClassifiedEncode classified = tokenizer.encode_with_frame_classes(
         rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
         rendered.literal_spans);
-    encoded.input_ids = std::move(tokenized.input_ids);
+    BoundaryEncodedText& tokenized  = classified.encoded;
+    encoded.input_ids               = std::move(tokenized.input_ids);
+    encoded.token_classes           = std::move(tokenized.token_classes);
+    encoded.literal_spans_resolved   = classified.literal_spans_resolved;
+    encoded.literal_spans_unresolved = classified.literal_spans_unresolved;
     if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
     std::size_t boundary_index = 0;
     const auto to_frontier     = [](std::size_t frontier, std::string_view kind) {
@@ -1086,7 +1115,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     stats.media_preprocess_seconds      = media_preprocess_seconds;
     stats.media_preprocess_work_seconds = cache_stats.build_seconds;
     output.vision_items                 = std::move(items);
-    assign_positions(output, encoded.media_token_runs);
+    assign_positions(output, encoded.media_token_runs, encoded.token_classes);
     check_preparation_control(control);
     output.stats = stats;
     return output;

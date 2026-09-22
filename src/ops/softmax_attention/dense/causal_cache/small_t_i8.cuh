@@ -81,7 +81,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
     // The 262144-key maximum envelope spans at most 49 pages in this split geometry.
-    constexpr int PageIds         = 64;
+    constexpr int PageIds         = paged_kv_page_ids(kCausalAttentionMaximumVisibleKeys);
     constexpr int ProducerThreads = RowTiles * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
     constexpr float Log2E         = 1.4426950408889634074f;
@@ -204,6 +204,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+    // Contract: page_count is bounded by PageIds =
+    // paged_kv_page_ids(envelope) for every split a launcher can dispatch.
+    // Without this check a larger envelope would run off the end of shared
+    // memory silently instead of declining the split.
+    if (page_count > PageIds) {
+        write_neutral();
+        return;
+    }
     for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }

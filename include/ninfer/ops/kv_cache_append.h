@@ -20,6 +20,35 @@ struct KVCacheAppendPrefixExecutionEnvelope {
 };
 
 /**
+ * The e8 lattice family's table handle, as the OP LAYER can see it: two DEVICE pointers,
+ * supplied by the caller.
+ *
+ * WHY THIS IS A HANDLE AND NOT AN OWNER
+ * -------------------------------------
+ * The 3-bit and 2-bit e8 K plate is written by an E8 lattice codec that needs 6 428 B of
+ * stage-1/stage-2 tables (4 368 + 2 060; `ops/kernel/e8_lattice_kv_plane.cuh:74-75`). The
+ * host-side contents have a codec-of-record accessor (`ops/kv/e8_lattice_plane_codec.cuh`'s
+ * `e8_lattice_stage1_table()` / `e8_lattice_stage2_table()`), but the DEVICE arm reads the
+ * tables from device memory, and `kv_cache_append` owns no allocation by contract ("The Op
+ * owns no persistent allocation" -- this header, above). So where the 6 428 B live is the
+ * caller's decision and this op only borrows them. A null pair is refused by name rather
+ * than launched, because a null handle would fault on device instead of refusing on host.
+ *
+ * WHY `const void*` AND NOT THE CODEC'S OWN TYPE
+ * ----------------------------------------------
+ * The codec's `E8KvLatticeTables` is declared in a CUDA-only header that carries
+ * `__device__` members, so it cannot appear in this header or in the host-compiled TU that
+ * implements the admission. These two members are typed as the raw device addresses and are
+ * cast to the codec's types exactly once, inside the CUDA TU that launches the arm.
+ *
+ * SWAPPING THE TWO IS A WRONG-PLANE READ, so they are named rather than positional.
+ */
+struct E8KvAppendTables {
+    const void* stage1 = nullptr;   // device E8LatticeStage1, 4 368 B
+    const void* stage2 = nullptr;   // device E8LatticeStage2, 2 060 B
+};
+
+/**
  * Append every K/V row to single-sequence paged growing-cache storage.
  *
  * k/v are contiguous BF16 [256,4|2,T] and positions is contiguous sequential device I32 [T].
@@ -52,9 +81,43 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * is overwritten, and no unrelated cache row is read or written. Inputs and every cache
  * plane/table are pairwise non-overlapping. The Op owns no persistent allocation, frontier,
  * request identity, or commit authority.
+ *
+ * THE e8 FAMILY IS REFUSED HERE BY NAME. This overload writes ONE code per element ({fp8, i8,
+ * bf16} arm, no e8 arm), so it cannot fill a packed K plate: over a 128/96/64-byte e8 row
+ * stride its BF16 fallback would write 256 bf16 elements per row. An e8 pool therefore
+ * appends through the tables-carrying overload below, or through the gqa e8 prefill launch.
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, cudaStream_t stream);
+
+/**
+ * Append every K/V row to a paged growing cache laid out at its OWN e8 tier extent.
+ *
+ * THIS IS THE ADMISSION FOR THE PACKED e8 FAMILY, AND IT IS A SEPARATE OVERLOAD ON PURPOSE.
+ * `cache.dtype` selects both the K row extent and the arm: E8K3Kv is a 96-byte K plate and
+ * E8K2Kv a 64-byte one, beside a V plate that this family does NOT narrow (128 B/row at every
+ * width -- product/kv_e8_width.h:131-137). The extents are not restated here; they are read
+ * from `d256_kv_cache_profile(cache.dtype)`, the same table the unpacked tiers are checked
+ * against, so this overload cannot admit a width the geometry of record does not publish.
+ *
+ * The K and V scales use the family's g64 profile: one FP16 per 64-channel group, 4 groups per
+ * row, on BOTH planes.
+ *
+ * What a caller must guarantee, in addition to the contract above:
+ *   * `tables.stage1` / `tables.stage2` are DEVICE addresses of the codec's stage-1 and
+ *     stage-2 tables (4 368 + 2 060 B), valid for the stream. A null pair is refused.
+ *   * the pool is laid out at `d256_kv_cache_profile(cache.dtype)`: k_pages at
+ *     `code_leading_extent`, v_pages at `v_code_leading_extent`, both scale planes at
+ *     `scale_leading_extent`. A pool at any other extent, including the unpacked 256 or the
+ *     4-bit tier's 128 K plate, is refused rather than written.
+ *
+ * E8Kv (the shipped 4-bit tier) is NOT served here: its K plate is the packed i4 codec at
+ * 128 B/row and writing a 96/64-byte lattice plate into it is the corruption the extent check
+ * refuses. E8Kv appends through the gqa e8 prefill launch. A non-e8 dtype keeps the exact
+ * behaviour of the overload above (it is forwarded to it).
+ */
+void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                     PagedKVLayerView cache, E8KvAppendTables tables, cudaStream_t stream);
 
 /**
  * Append device-selected exact BF16 prefixes to batched paged growing-cache storage.

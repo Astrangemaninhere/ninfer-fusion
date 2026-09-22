@@ -25,6 +25,15 @@ from tools.artifact.container import (ArtifactIdentity, ArtifactWriter, Resource
 from tools.artifact.container import RAW_BYTES_V1
 from tools.artifact.layouts import encode_direct, encode_nvfp4
 from tools.convert.qwen3_6.common.inventory import CONTIGUOUS_LAYOUT
+# The front door's contract for this target: ``validate_config`` (config pins),
+# ``SOURCE_QUANT_METHODS`` (which source flavours this converter consumes) and
+# ``SUPPLIES_FRONTEND_RESOURCES``.  Kept in its own module so the pins are
+# readable and testable without importing torch-heavy converter code first.
+from .config_pins import (  # noqa: F401  (re-exported: import_model.py looks them up here)
+    SOURCE_QUANT_METHODS,
+    SUPPLIES_FRONTEND_RESOURCES,
+    validate_config,
+)
 
 HIDDEN = 6656
 LAYERS = 52
@@ -71,6 +80,19 @@ class MuseReader:
     def contains(self, key: str) -> bool:
         return key in self._map
 
+    def meta(self, key: str) -> tuple[str, tuple]:
+        """(dtype, shape) from the shard header, WITHOUT reading the payload.
+
+        `get` is the right accessor whenever the values are needed and the wrong one
+        whenever only the declared dtype/shape are: it seeks to the tensor and reads
+        the whole thing.  A caller that only classifies a tensor must use this, or it
+        pays a full read per classification (see `mlp_layer_fmt`).
+        """
+        shard = self._map[key]
+        header, _base = self._header(shard)
+        entry = header[key]
+        return str(entry["dtype"]), tuple(entry["shape"])
+
     def get(self, key: str) -> torch.Tensor:
         shard = self._map[key]
         header, base = self._header(shard)
@@ -92,6 +114,18 @@ class MuseReader:
             return torch.frombuffer(raw, dtype=torch.uint8).reshape(shape).clone().to(_DEVICE)
         raise ValueError(f"{key}: unsupported dtype {dtype}")
 
+
+#: The torch dtype `MuseReader.get` yields per stored dtype.  `mlp_layer_fmt` classifies
+#: on `str(t.dtype) == 'torch.uint8'`, and `get` maps U8 *and* both FP8 spellings to
+#: torch.uint8, so the header-based classifier has to reproduce that mapping exactly or
+#: an fp8 tensor would stop counting as packed.
+_TORCH_DTYPE = {
+    "U8": torch.uint8,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F8_E4M3": torch.uint8,
+    "F8_E4M3FN": torch.uint8,
+}
 
 _DEVICE = torch.device('cpu')
 
@@ -128,9 +162,20 @@ def fp8_row_scaled_stream(reader: MuseReader, key: str, n_src: int, n_total: int
 
     geometry = row_scale_geometry(FP8, (n_total, k))
 
+    # The source tensor is read ONCE, not once per block.  This used to be
+    # `tb = reader.get(key)[b0:b1s]...` inside the closure, and MuseReader.get
+    # seeks to the tensor's byte range and reads the WHOLE tensor before the
+    # slice is applied -- so a 202,112-row embedding was read and cast once per
+    # 4096-row block, 50 times per pass and 100 times across both passes.
+    # Measured before the fix: 27.1 GB read to produce 219 MB of artifact
+    # (~123x amplification, ~2.3 MB/s of artifact).  Reading once and slicing
+    # the resident tensor is the same payload for 1/N the IO; the payload bytes
+    # are unchanged, so no number in the artifact moves.
+    src = reader.get(key)
+
     def row_block(b0, b1):
         b1s = min(b1, n_src)
-        tb = reader.get(key)[b0:b1s].to(torch.bfloat16).float()
+        tb = src[b0:b1s].to(torch.bfloat16).float()
         if b1s < b1:
             pad = torch.zeros(b1 - b1s, k, dtype=torch.float32, device=_DEVICE)
             tb = torch.cat([tb, pad], dim=0)
@@ -202,11 +247,16 @@ def obj(name: str, fmt: str, shape: tuple) -> TensorSpec:
 
 
 def mlp_layer_fmt(reader: MuseReader, layer: int, proj: str) -> str:
-    """源 dtype -> 对象格式: packed nvfp4 -> NVFP4; fp8 全宽/bf16 -> FP8."""
+    """源 dtype -> 对象格式: packed nvfp4 -> NVFP4; fp8 全宽/bf16 -> FP8.
+
+    Reads the shard HEADER, not the payload: the answer depends only on the declared
+    dtype and the second dimension, and this is called twice per layer, so using `get`
+    here meant ~6.9 GB of reads for 104 booleans (measured; see the patch note).
+    """
     key = f"{PREFIX}layers.{layer}.mlp.{proj}.weight"
-    t = reader.get(key)
-    if str(t.dtype) == 'torch.uint8':
-        k = tuple(t.shape)[1]
+    dtype_name, shape = reader.meta(key)
+    if _TORCH_DTYPE.get(dtype_name) == torch.uint8:
+        k = shape[1]
         full_k = HIDDEN if proj in ('gate_proj', 'up_proj') else INTERMEDIATE
         return NVFP4 if k == full_k // 2 else FP8
     return FP8  # bf16 直通也 fp8 编码

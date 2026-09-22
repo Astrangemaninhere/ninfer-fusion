@@ -1,5 +1,6 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 
+#include "ops/generic/rowsplit_generic.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include <cmath>
@@ -77,19 +78,38 @@ void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std:
 
 } // namespace
 
-std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::int32_t input_rows,
-                                                     std::int32_t min_tokens,
-                                                     std::int32_t max_tokens) {
-    return detail::bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
-                                                            max_tokens);
-}
-
 std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens) {
+    // The registered (heads, input_rows) pairs are two models' geometries. A different pair is
+    // served by the generic route, which is a plain block reduction and needs no transient
+    // storage; only a malformed request is refused.
+    const bool registered =
+        (heads == 48 && input_rows == 5120) || (heads == 32 && input_rows == 2048);
+    if (!registered) {
+        if (heads <= 0 || input_rows <= 0 || min_tokens <= 0 || max_tokens < min_tokens) {
+            throw std::invalid_argument("gdn_norm_gating_proj workspace: invalid profile");
+        }
+        return 0;
+    }
     return detail::bf16_gdn_norm_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
                                                                  max_tokens);
+}
+
+std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::int32_t input_rows,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    const bool registered =
+        (heads == 48 && input_rows == 5120) || (heads == 32 && input_rows == 2048);
+    if (!registered) {
+        if (heads <= 0 || input_rows <= 0 || min_tokens <= 0 || max_tokens < min_tokens) {
+            throw std::invalid_argument("gdn_gating_proj workspace: invalid profile");
+        }
+        return 0;
+    }
+    return detail::bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
+                                                            max_tokens);
 }
 
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
@@ -133,6 +153,19 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     const std::int32_t tokens = x.ne[1];
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
+    }
+    // The registered gating projections are two exact (heads, input_rows) pairs belonging to other
+    // models. A head count / width this engine has no registry entry for still has a well-defined
+    // result -- the same unit-offset rmsnorm, the same two projections, the same gating
+    // elementwise -- and the generic route evaluates exactly that arithmetic.
+    const bool registered =
+        (a_weight.n == 48 && a_weight.k == 5120) || (a_weight.n == 32 && a_weight.k == 2048);
+    if (!registered &&
+        detail::generic_norm_gating_problem_ok(x, norm_weight, a_weight, b_weight, A_log, dt_bias,
+                                               h, g, beta)) {
+        detail::generic_norm_gating_proj_dispatch(x, norm_weight, eps, a_weight, b_weight, A_log,
+                                                  dt_bias, h, g, beta, stream);
+        return;
     }
     require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
     require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");

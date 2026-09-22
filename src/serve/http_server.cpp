@@ -39,6 +39,13 @@ void ensure_openai_request_id(const httplib::Request& request, httplib::Response
     }
 }
 
+// mtplogx: make_throughput_report() runs once per interval in run_stats_reporter(), plus once for
+// the tail report, so this counter names the interval without changing the reporter loop or the
+// helper signature.
+std::uint64_t throughput_report_index() {
+    static std::uint64_t value = 0;
+    return ++value;
+}
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
                                         const ninfer::RuntimeStats& current,
                                         double interval_seconds) {
@@ -52,6 +59,9 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
         .decode_row_rounds = current.decode_row_rounds - previous.decode_row_rounds,
         .previous          = previous,
         .current           = current,
+        // mtplogx: the report counter is the interval number; interval 1 is the one where a
+        // request can be prefilling and decoding inside the same bucket.
+        .interval_index = throughput_report_index(),
     };
 }
 
@@ -122,6 +132,11 @@ bool report_has_activity(const ThroughputReport& report) {
                report.previous.host_work.engine_commit_output_ns ||
            report.current.host_work.engine_maintenance_ns !=
                report.previous.host_work.engine_maintenance_ns ||
+            // mtplogx: an interval whose only activity was an on-demand MTP rung capture still
+            // produces a report line, because that capture is one of the events being measured.
+            report.current.mtp_graph_extension_calls != report.previous.mtp_graph_extension_calls ||
+            report.current.mtp_graph_extension_nanoseconds !=
+                report.previous.mtp_graph_extension_nanoseconds ||
            report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
 }
 
@@ -302,6 +317,35 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_openai_request_id(req, res);
+        // def3 (04-healthguard): THE LOADING GUARD COMES FIRST, and the line below it is why.
+        // This exemption used to sit above the guard and RETURN from the pre-routing handler,
+        // so whenever no --api-key was configured (the default) the guard was skipped
+        // entirely. Measured on the A5 arm: in the same second /health read
+        // 503 {"status":"loading"} while /v1/chat/completions read 404 model_not_found from
+        // the route handler -- public_model_id_ is empty until attach(), so the model check
+        // rejected the request before anything touched the engine, and that is the only reason
+        // a null service_ was not dereferenced.
+        // NAMED TRADE-OFF: while the model loads, a request with a BAD api key reads 503
+        // engine_loading instead of 401. /health is already auth-exempt and already reveals
+        // this state, and there is no engine to protect yet.
+        // def3: the accept loop is ALREADY RUNNING while the engine loads, so a request that
+        // arrives in that window must be answered BY NAME instead of dereferencing a service
+        // that does not exist yet. /health has its own arm and is answered there.
+        if (!engine_ready_.load(std::memory_order_acquire) && req.path != "/health") {
+            ApiError loading;
+            loading.status  = 503;
+            loading.type    = "server_error";
+            loading.code    = "engine_loading";
+            loading.message = "the model is still loading: this server accepts connections but "
+                              "has no engine attached yet. Retry once /health reports "
+                              "{\"engine\":{\"state\":\"ready\"}}";
+            if (req.path.rfind("/v1/messages", 0) == 0) {
+                write_anthropic_error(res, loading, new_anthropic_request_id());
+            } else {
+                write_openai_error(res, loading);
+            }
+            return httplib::Server::HandlerResponse::Handled;
+        }
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -369,7 +413,21 @@ void HttpServer::register_routes() {
         // tensor names, or byte counts from exception text. The full reason goes
         // to the server log ("[engine] engine failure ..." line) and to
         // authenticated callers via EngineFailureState::reason.
-        if (service_ != nullptr) {
+        if (!engine_ready_.load(std::memory_order_acquire)) {
+            // def3: the NAMED loading state. Before this arm the listener was not accepting at
+            // all during the load (see http_server.h), so a probe read http=000 for the whole
+            // window and the fallback below answered {"status":"ok"} the instant it could answer
+            // at all -- one state, and it said ready. 503 + a named state is the distinction an
+            // orchestrator needs: 200+ready = serving, 503+loading = alive and not serving,
+            // connection refused = not started or gone.
+            res.status = 503;
+            res.set_content(nlohmann::json{{"status", "loading"},
+                                           {"engine", {{"state", "loading"}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        {
             const ninfer::EngineFailureState failure = service_->failure_state();
             nlohmann::json engine{{"state", failure.failed ? "failed" : "ready"}};
             if (failure.failed) {
@@ -394,7 +452,9 @@ void HttpServer::register_routes() {
                 "application/json");
             return;
         }
-        res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+        // def3: the bare {"status":"ok"} that used to stand here is GONE. It was the arm for
+        // "no engine attached yet" -- i.e. it reported a ready engine for the whole load -- and
+        // the guard above now answers every request that arrives before attach().
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
@@ -468,7 +528,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
                     "application/json");
 }
 
-// POST /reload_kv  body: {"kv_layer_storage": "0-11:e8,12-15:nvfp4"} (CLI-flag grammar).
+// POST /reload_kv  body: {"kv_layer_storage": "0-11:rk4v4,12-15:nvfp4"} (CLI-flag grammar).
 // Drain-based relayout: new requests are rejected with 503-style errors while in-flight
 // ones finish, then the KV pool is re-planned and swapped. Accepts the same api-key/auth
 // path as every other route (see register_routes middleware).
@@ -528,7 +588,7 @@ void HttpServer::handle_recover(const httplib::Request&, httplib::Response& res)
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
 
 void HttpServer::attach(GenerationService& service) {
-    if (service_ != nullptr) {
+    if (engine_ready_.load(std::memory_order_acquire)) {
         throw std::logic_error("HTTP generation service is already attached");
     }
     const ninfer::LoadSummary load = service.load_summary();
@@ -537,6 +597,43 @@ void HttpServer::attach(GenerationService& service) {
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());
+    // def3: PUBLISH LAST, with a release store. The accept thread has been running since
+    // main.cpp called listen_in_background(), so everything above must be visible before any
+    // handler may act on it (the guard reads this flag with an acquire load).
+    engine_ready_.store(true, std::memory_order_release);
+    // The reporter reads service_ on its own thread, so it starts here and not with the accept
+    // loop: before attach() it would have nothing to read.
+    if (options_.log_stats_interval_ms != 0) {
+        stats_stopping_ = false;
+        stats_thread_   = std::thread([this] { run_stats_reporter(); });
+    }
+}
+
+// def3: the accept loop, on its own thread, started BEFORE the model is loaded.
+void HttpServer::accept_loop() {
+    try {
+        accept_result_.store(server_.listen_after_bind(), std::memory_order_release);
+    } catch (const std::exception& error) {
+        write_console_log(ConsoleLogLevel::Error,
+                          std::string("HTTP accept loop failed: ") + error.what());
+        accept_result_.store(false, std::memory_order_release);
+    } catch (...) {
+        write_console_log(ConsoleLogLevel::Error, "HTTP accept loop failed");
+        accept_result_.store(false, std::memory_order_release);
+    }
+}
+
+void HttpServer::listen_in_background() {
+    if (accept_thread_.joinable()) {
+        throw std::logic_error("HTTP server is already accepting connections");
+    }
+    accept_thread_ = std::thread([this] { accept_loop(); });
+}
+
+bool HttpServer::wait_for_exit() {
+    if (accept_thread_.joinable()) { accept_thread_.join(); }
+    stop_stats_reporter();
+    return accept_result_.load(std::memory_order_acquire);
 }
 
 bool HttpServer::listen() {
@@ -544,18 +641,8 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.log_stats_interval_ms != 0) {
-        stats_stopping_ = false;
-        stats_thread_   = std::thread([this] { run_stats_reporter(); });
-    }
-    try {
-        const bool result = server_.listen_after_bind();
-        stop_stats_reporter();
-        return result;
-    } catch (...) {
-        stop_stats_reporter();
-        throw;
-    }
+    listen_in_background();
+    return wait_for_exit();
 }
 
 void HttpServer::stop() { server_.stop(); }

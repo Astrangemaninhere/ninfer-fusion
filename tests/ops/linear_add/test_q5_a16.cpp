@@ -24,6 +24,20 @@ int q5_a16_conformance() {
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 17408, 409U, kK17408RouteStarts, kK17408RouteInteriors});
+
+    // The 4096-wide GDN-hybrid text stack. BOTH are rows of 4096: k = 12288 is the MLP down
+    // projection (intermediate -> hidden) and k = 4096 is any hidden-width projection that writes
+    // the residual (attention output, GDN output, MTP output, MTP down). The route starts are this
+    // geometry's own table -- 1 column GEMV, 2..16 the split2 exact kernel, then the MMA set -- so
+    // the suite exercises every boundary of the geometry it just registered.
+    constexpr std::array<std::int32_t, 5> kK4096RouteStarts{2, 17, 33, 49, 129};
+    constexpr std::array<std::int32_t, 6> kK4096RouteInteriors{1, 8, 24, 40, 96, 256};
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+        ShapeCase{4096, 4096, 419U, kK4096RouteStarts, kK4096RouteInteriors});
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+        ShapeCase{4096, 12288, 421U, kK4096RouteStarts, kK4096RouteInteriors});
     return failures;
 }
 

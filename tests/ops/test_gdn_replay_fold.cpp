@@ -420,7 +420,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                           << " layer=" << layer << " row=" << row << "\n";
                 return failures + 1;
             }
-            if (layer == 0 && row == 0 && profile.layers == 30 && width == 2 && rows == 1 &&
+            // Independent float oracle on one (layer,row) of the single-token probes.  30x32 is the
+            // 35B-A3B geometry; 24x32 is qwen3_5_9b, which differs from it ONLY in the layer count.
+            const bool oracle_covers_profile = profile.layers == 30 || profile.layers == 24;
+            if (layer == 0 && row == 0 && oracle_covers_profile && width == 2 && rows == 1 &&
                 commits[0] == 2) {
                 failures += verify_fold_oracle(profile, width, commits[0], seed, key_records,
                                                value_records, gate_records, actual_recurrent);
@@ -792,6 +795,11 @@ int main() {
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
+    // qwen3_5_9b: 32 layers with full_attention_interval 4 -> 24 GDN layers, 35B-A3B planes.
+    // Same shapes as the 30x32 family, one fewer layer, so this exercises ONLY the layer extent.
+    failures += run_case({24, 32, 8192}, 2, 1, {2}, 1901U, true);
+    failures += run_case({24, 32, 8192}, 6, 2, {2, 5}, 1911U);
+    failures += run_case({24, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1921U);
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;

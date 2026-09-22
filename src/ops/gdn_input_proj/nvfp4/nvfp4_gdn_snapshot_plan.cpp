@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 
 #include <stdexcept>
 
@@ -16,7 +17,7 @@ struct Nvfp4GdnProjectedWorkspace {
 template <class Allocator>
 Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t tokens) {
     Nvfp4GdnProjectedWorkspace out;
-    out.projected = allocator.alloc(DType::BF16, {10240, tokens}, 256);
+    out.projected = allocator.alloc(DType::BF16, {kNvfp4GdnQkvRows, tokens}, 256);
     const std::size_t projection_bytes =
         nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, tokens, tokens);
     out.projection = allocator.alloc_bytes(projection_bytes, 256);
@@ -35,12 +36,17 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     }
     if (batch_size > 1) { return {Nvfp4GdnConvScheduleId::Materialized}; }
     if (policy == LinearPolicy::A16Only) {
-        if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
+        if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
+        if (tokens <= kNvfp4GdnConvA16Ceiling) {
+            return {Nvfp4GdnConvScheduleId::SmallTFusedA16};
+        }
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");
     }
-    // UNIFY-A: T=1 no longer takes the gemv decode route; it shares the small-T family
-    // with T in [2,16] (both the projection and the conv/store epilogue).
-    if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
+    // The A16 fallback ends exactly where the A4 route begins: T >= 4 takes the
+    // materialized W4A4 projection, so this boundary is what sizes the snapshot workspace
+    // from T = 4 up (see the record planner's std::max(min_width, 4)).
+    if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
+    if (tokens <= 3) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
     return {Nvfp4GdnConvScheduleId::Materialized};
 }
 

@@ -59,6 +59,41 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
                 throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
 
+    // ⚠ THE e8 FAMILY IS REFUSED BY NAME HERE, BEFORE THE SHAPE CHECKS BELOW (dl/e8decode).
+    // This family narrows K only: at W3/W2 the K plate is 96/64 B/row while the V plate stays
+    // the shipped W4 128 B/row (d256_profile.h:49-57 and :83-84 -- two extents, not one). The
+    // shape checks below pass BOTH planes through the K plane's `code_extent`, so a CORRECT
+    // narrow pool (V = 128) is rejected as "invalid shape for cache v pages" -- a refusal that
+    // blames geometry which is already right -- while a pool whose V plate were 96/64 would
+    // pass. Neither is the honest answer, and neither is the real defect: THIS FAMILY HAS NO
+    // e8 KERNEL. `small_t.cu` says exactly that ("there is no route in this family that can
+    // serve e8 ... a packed e8 plane would be read at the bf16 extent") and refuses the same
+    // family in `causal_attention_split_capacity` -- but that refusal is SHADOWED, because the
+    // shape check fires first. Worse, the prompt route has NO e8 refusal at all (prompt.cu:34
+    // is {I8 -> i8, else -> bf16}) and casts the packed plate to `const __nv_bfloat16*`, and it
+    // first calls `kv_cache_append_batch_launch`, whose BF16 arm (launch.cu:95-99) writes 256
+    // bf16 = 512 B per row over a 96/64/128-byte row stride. For a shipped E8Kv (128) pool the
+    // shape checks below PASS today, so that route is a silent mis-read plus an out-of-bounds
+    // write rather than a refusal.
+    //
+    // WHAT IS MISSING IS A CALL SITE, NOT A CODEC: the device reader for a 3-bit/2-bit plate
+    // exists and is compiled (ops/kernel/e8_lattice_kv_plane_inst.cu, src/CMakeLists.txt:173)
+    // but NOTHING on any runtime path calls `e8_kv_lattice_decode_group<3>` / `<2>`, and every
+    // attention arm in this engine reads the 4-bit nibble plane. Refusing the whole family here
+    // narrows nothing that works -- this family has no e8 kernel on any route.
+    if (d256_kv_cache_is_e8_family(cache.dtype)) {
+        throw std::invalid_argument(
+            std::string(op) +
+            ": the e8 family (E8Kv/E8K3Kv/E8K2Kv) is not served by this family -- it has no e8 "
+            "attention kernel on any route, and the reader that decodes a 3/2-bit K plate "
+            "(e8_lattice_kv_plane.cuh, e8_kv_lattice_decode_group<3>/<2>) is compiled but has "
+            "NO CALLER on any runtime path, so a narrow plate would be read at the 4-bit "
+            "extent. Refused here rather than by the shape check below, which passes both "
+            "planes through the K extent and so rejects the geometry of a CORRECT narrow pool "
+            "(K 96/64 B beside V 128 B). Serve the e8 tiers through the gqa family, which has "
+            "them for rk4v4.");
+    }
+
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_table.ne[0];
     const std::int64_t capacity       = static_cast<std::int64_t>(logical_pages) * kPagedKVPageSize;
@@ -70,9 +105,16 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    // Packed 4-bit tiers (E8Kv) store two codes per byte, halving the leading
-    // plane extent; everything else stores one code per element.
-    const std::int32_t code_extent = cache.dtype == DType::E8Kv ? kHeadDim / 2 : kHeadDim;
+    // THE CODE-PLANE EXTENT COMES FROM THE DTYPE TABLE, for every tier including the two
+    // narrow e8 widths. It used to be written here as an E8Kv-only ternary with the remark
+    // "everything else stores one code per element", which is false for a packed plate: a
+    // 3-bit e8 plate is 96 B/row and a 2-bit one is 64 B/row, and the ternary gave both of
+    // them 256. d256_kv_cache_profile derives 128 / 96 / 64 for W4 / W3 / W2 from
+    // product/kv_e8_width.h's e8_kv_row_code_bytes(), so a narrow plate is now checked at
+    // its OWN extent rather than the unpacked tiers'.
+    // The g64 FP16 scale block is a SEPARATE plane (profile.scale_leading_extent) and is
+    // deliberately not part of this extent.
+    const std::int32_t code_extent = profile.code_leading_extent;
     require_shape(cache.k_pages, code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
     require_shape(cache.v_pages, code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
@@ -117,6 +159,41 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
                 throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
 
+    // ⚠ THE e8 FAMILY IS REFUSED BY NAME HERE, BEFORE THE SHAPE CHECKS BELOW (dl/e8decode).
+    // This family narrows K only: at W3/W2 the K plate is 96/64 B/row while the V plate stays
+    // the shipped W4 128 B/row (d256_profile.h:49-57 and :83-84 -- two extents, not one). The
+    // shape checks below pass BOTH planes through the K plane's `code_extent`, so a CORRECT
+    // narrow pool (V = 128) is rejected as "invalid shape for cache v pages" -- a refusal that
+    // blames geometry which is already right -- while a pool whose V plate were 96/64 would
+    // pass. Neither is the honest answer, and neither is the real defect: THIS FAMILY HAS NO
+    // e8 KERNEL. `small_t.cu` says exactly that ("there is no route in this family that can
+    // serve e8 ... a packed e8 plane would be read at the bf16 extent") and refuses the same
+    // family in `causal_attention_split_capacity` -- but that refusal is SHADOWED, because the
+    // shape check fires first. Worse, the prompt route has NO e8 refusal at all (prompt.cu:34
+    // is {I8 -> i8, else -> bf16}) and casts the packed plate to `const __nv_bfloat16*`, and it
+    // first calls `kv_cache_append_batch_launch`, whose BF16 arm (launch.cu:95-99) writes 256
+    // bf16 = 512 B per row over a 96/64/128-byte row stride. For a shipped E8Kv (128) pool the
+    // shape checks below PASS today, so that route is a silent mis-read plus an out-of-bounds
+    // write rather than a refusal.
+    //
+    // WHAT IS MISSING IS A CALL SITE, NOT A CODEC: the device reader for a 3-bit/2-bit plate
+    // exists and is compiled (ops/kernel/e8_lattice_kv_plane_inst.cu, src/CMakeLists.txt:173)
+    // but NOTHING on any runtime path calls `e8_kv_lattice_decode_group<3>` / `<2>`, and every
+    // attention arm in this engine reads the 4-bit nibble plane. Refusing the whole family here
+    // narrows nothing that works -- this family has no e8 kernel on any route.
+    if (d256_kv_cache_is_e8_family(cache.dtype)) {
+        throw std::invalid_argument(
+            std::string(op) +
+            ": the e8 family (E8Kv/E8K3Kv/E8K2Kv) is not served by this family -- it has no e8 "
+            "attention kernel on any route, and the reader that decodes a 3/2-bit K plate "
+            "(e8_lattice_kv_plane.cuh, e8_kv_lattice_decode_group<3>/<2>) is compiled but has "
+            "NO CALLER on any runtime path, so a narrow plate would be read at the 4-bit "
+            "extent. Refused here rather than by the shape check below, which passes both "
+            "planes through the K extent and so rejects the geometry of a CORRECT narrow pool "
+            "(K 96/64 B beside V 128 B). Serve the e8 tiers through the gqa family, which has "
+            "them for rk4v4.");
+    }
+
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_tables.ne[0];
     const std::int32_t table_rows     = cache.block_tables.ne[1];
@@ -129,9 +206,16 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    // Packed 4-bit tiers (E8Kv) store two codes per byte, halving the leading
-    // plane extent; everything else stores one code per element.
-    const std::int32_t code_extent = cache.dtype == DType::E8Kv ? kHeadDim / 2 : kHeadDim;
+    // THE CODE-PLANE EXTENT COMES FROM THE DTYPE TABLE, for every tier including the two
+    // narrow e8 widths. It used to be written here as an E8Kv-only ternary with the remark
+    // "everything else stores one code per element", which is false for a packed plate: a
+    // 3-bit e8 plate is 96 B/row and a 2-bit one is 64 B/row, and the ternary gave both of
+    // them 256. d256_kv_cache_profile derives 128 / 96 / 64 for W4 / W3 / W2 from
+    // product/kv_e8_width.h's e8_kv_row_code_bytes(), so a narrow plate is now checked at
+    // its OWN extent rather than the unpacked tiers'.
+    // The g64 FP16 scale block is a SEPARATE plane (profile.scale_leading_extent) and is
+    // deliberately not part of this extent.
+    const std::int32_t code_extent = profile.code_leading_extent;
     require_shape(cache.k_pages, code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
     require_shape(cache.v_pages, code_extent, kPagedKVPageSize, kv_heads, physical_pages, op,
@@ -167,7 +251,7 @@ void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVL
                        std::int32_t tokens, const char* op) {
     const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeysYarn ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys > capacity) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope");
     }
@@ -248,7 +332,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeysYarn ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys > capacity ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(width)) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope or table");
@@ -367,7 +451,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     if (!supported_dtype || batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
         max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeysYarn ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(max_width)) {
         throw std::invalid_argument(
             "causal_softmax_attention workspace: invalid profile or interval");

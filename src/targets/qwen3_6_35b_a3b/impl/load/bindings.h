@@ -29,6 +29,13 @@ struct MoePlan {
     artifact::ObjectHandle routed_down;
     artifact::ObjectHandle shared_gate_up;
     artifact::ObjectHandle shared_down;
+    // The stored precision of `routed_down` is the artifact's own declaration:
+    // this source stores Q6G64_F16S on the layer numbers it names and
+    // Q5G64_F16S on the rest, and that split is a property of the checkpoint,
+    // not of the layer index.  Carrying the bound format in the plan is what
+    // keeps materialization from deriving the same fact a second time (and
+    // deriving it differently).
+    artifact::NumericFormat routed_down_format = artifact::NumericFormat::Q5G64_F16S;
 };
 
 struct FullAttentionPlan {

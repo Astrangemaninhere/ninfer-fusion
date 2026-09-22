@@ -74,7 +74,19 @@ public:
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
                      options.context_cache.max_long_anchors_per_continuation.value_or(0),
-                     std::move(context_cost)) {
+                     std::move(context_cost)),
+          // The prefill unit's mode, resolved once by normalize_engine_options() and turned into
+          // the governor's own switch by the one mapping in bandwidth_governor.h. Manual mode is
+          // therefore not "an off value somewhere else": it is a governor that never observes, so
+          // nothing in this loop can move the unit the Program was built with (adapts() == false
+          // leaves both the write and `installed` below false, and the trace still reports the
+          // value the Program holds -- which is what makes the two modes comparable in a log).
+          // value_or(Dynamic) only matters for a caller that skips normalize_engine_options; it
+          // matches resolve_mode()'s own default, so the two cannot disagree about "unset".
+          bandwidth_governor_(
+              BandwidthGovernor::from_env(),
+              BandwidthGovernor::adapts(
+                  options.prefill_chunk_mode.value_or(PrefillChunkMode::Dynamic))) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
@@ -147,6 +159,16 @@ public:
             }
             EngineCore* owner = std::exchange(owner_, nullptr);
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
+        }
+
+        // M21: append already-known tokens to this request and prefill them. Blocks until the
+        // worker has serviced the append or this request has failed. See
+        // EngineCore::append_context_tokens for the ordering guarantee and the accounting contract.
+        void append_context_tokens(std::span<const TokenId> tokens) {
+            if (owner_ == nullptr || request_ == nullptr) {
+                throw std::logic_error("concurrent submission is empty");
+            }
+            owner_->append_context_tokens(request_, tokens);
         }
 
     private:
@@ -230,6 +252,50 @@ public:
         request_admission_check();
         queue_cv_.notify_one();
         return Submission(*this, std::move(request));
+    }
+
+    // M21: append a run of already-known tokens to a live request and prefill them, with NO
+    // control-token accounting -- the tokens are INPUT (recall material), not sampled output, so they
+    // never enter Request::generated and never commit the generation budget.
+    //
+    // Handshake: arm under the record's mutex -> wake the worker -> wait for `context_append_done`.
+    // The worker services armed appends at the FIRST round boundary that observes one and BEFORE the
+    // decode membership for that boundary is built (worker_loop), which is what orders an append
+    // armed immediately after submit() ahead of the request's first sampled token.
+    void append_context_tokens(const std::shared_ptr<Request>& request,
+                               std::span<const TokenId> tokens) {
+        if (request == nullptr) { throw std::invalid_argument("context-append request is empty"); }
+        if (tokens.empty()) { throw std::invalid_argument("context-append token span is empty"); }
+        {
+            std::lock_guard lock(request->mutex);
+            if (request->context_append_pending) {
+                throw std::logic_error("a context append is already pending for this request");
+            }
+            if (request->response_done || request->error != nullptr ||
+                request->terminal_reason.has_value()) {
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "context append target has already finished");
+            }
+            request->context_append_tokens.assign(tokens.begin(), tokens.end());
+            request->context_append_pending = true;
+            request->context_append_done    = false;
+        }
+        queue_cv_.notify_one();
+        std::unique_lock lock(request->mutex);
+        const bool serviced = request->cv.wait_for(lock, std::chrono::seconds(600), [&] {
+            return request->context_append_done || request->error != nullptr ||
+                   request->response_done || request->terminal_reason.has_value();
+        });
+        if (request->context_append_error != nullptr) {
+            std::rethrow_exception(request->context_append_error);
+        }
+        // ONLY `context_append_done` means the append reached the Program. The wait above also
+        // returns on a terminal request, so a request that finished first has to be reported as a
+        // refusal instead of being read as success.
+        if (!serviced || !request->context_append_done) {
+            throw RequestError(RequestErrorKind::Unavailable,
+                               "context append was not serviced before the request finished");
+        }
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
@@ -1386,6 +1452,17 @@ private:
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
+        // The other half of the W6 service-work accounting (see
+        // Scheduling::recharge_service_work_for_unit_shrink and RequestRecord::prefill_tokens_done):
+        // how much of the prompt this request has already charged prefill units for. It is what
+        // says how much span is left when the governor shrinks the unit mid-prompt.
+        request->prefill_tokens_done += progress.processed_prompt_tokens;
+        // The per-unit readback (bandwidth_governor.h UnitTokens): this is the only place a
+        // prefill unit completes, and progress.processed_prompt_tokens is what that unit's
+        // Program::advance_prefill actually sliced -- paired with the chunk the same iteration
+        // installed, it settles 'manual slices 1024, dynamic slices less' from the ENGINE rather
+        // than from the option the caller passed.
+        bandwidth_governor_.note_prefill_unit(progress.processed_prompt_tokens);
         Scheduling::consume_service_work(*request, 1);
         if (progress.capture) {
             if (progress.complete || progress.pending) {
@@ -1562,6 +1639,17 @@ private:
                     request->budget.emplace(std::move(control.budget));
                     request->lane.emplace(control.destination);
                     request->remaining_service_work      = control.summary.service_work_quanta;
+                    // The reconciler in the worker loop is keyed on THESE numbers, not on
+                    // base_plan: this is the last moment the plan's summary is still
+                    // reachable, because release_planning_state() has already dropped
+                    // base_plan above and the request is about to start prefilling.
+                    request->planned_prefill_tokens =
+                        control.summary.prompt_tokens > control.summary.reusable_prompt_tokens
+                            ? control.summary.prompt_tokens -
+                                  control.summary.reusable_prompt_tokens
+                            : 0U;
+                    request->prefill_tokens_done = 0;
+                    request->service_work_unit   = 0;
                     request->backfill_epoch              = control.protection_epoch;
                     request->backfill_class              = control.backfill_class;
                     request->materialization_diagnostics = terminal.diagnostics;
@@ -1857,6 +1945,89 @@ private:
         publish_runtime_stats();
     }
 
+    // M21: the FIRST lane with an armed context append, or nothing. One lane per boundary,
+    // deliberately: the Program entry takes a single row stride, so two ragged appends cannot be
+    // co-scheduled and the second lane simply waits for the next boundary.
+    [[nodiscard]] std::optional<std::uint32_t> context_append_lane() const {
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request == nullptr) { continue; }
+            std::lock_guard lock(request->mutex);
+            if (!request->context_append_pending) { continue; }
+            // NOT YET ADMITTED / STILL PREFILLING is a NORMAL state for an append armed right after
+            // submit() -- the request is admitted asynchronously -- so it is skipped, not raised. The
+            // guarantee that matters still holds: the service point sits before the decode
+            // membership build at EVERY boundary, so whenever this lane does become decode-ready the
+            // append is serviced there, ahead of that request's first decode round.
+            // MEASURED (this line is a fix, not a guess): treating it as an invariant violation made
+            // an append armed after submit() stop the whole engine --
+            //   [engine] engine failure class=invariant phase=control
+            //   reason: context-append request is not decode-ready
+            // (LONGCTX-M21 cell T, 2026-09-15 19:28:08).
+            if (!request->is_decode_ready()) { continue; }
+            if (!request->sequence) {
+                throw std::logic_error("decode-ready context-append request has no sequence handle");
+            }
+            return lane;
+        }
+        return std::nullopt;
+    }
+
+    // M21: service one armed context append. Shares the host-phase / ProgramCallScope / lane-failure
+    // idioms of run_control_batch so the two host-work units are measurable the same way and a
+    // failing append fails the same lane the same way. It does NOT touch Request::generated,
+    // Request::budget or the output session: see the accounting contract on append_context_tokens.
+    void run_context_append(std::uint32_t lane) {
+        const std::shared_ptr<Request>& request = slots_[lane];
+        std::vector<TokenId> tokens;
+        std::uint64_t rounds_before = 0;
+        std::size_t generated_before = 0;
+        {
+            std::lock_guard lock(request->mutex);
+            tokens           = request->context_append_tokens;
+            rounds_before    = request->host_timing.decode_rounds;
+            generated_before = request->generated.size();
+        }
+        try {
+            nvtx::ScopedRange append_range(nvtx::Name::ControlBatch, nvtx::Category::Control, 1);
+            EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+            unit_phase_ = UnitPhase::Commit;
+            phase.pause_range();
+            ProgramCallScope program_call(*this);
+            const runtime::ExecutionTiming timing = instance_.program->append_context_prefill(
+                *request->sequence, std::span<const TokenId>(tokens), &program_call.failed_timing());
+            program_call.finish(timing);
+            phase.resume_range();
+            // The operator-visible record of a used feature (same shape as [unload]): it is emitted
+            // only when an append is actually serviced, so the default path cannot see it. The
+            // decode-round count is what makes "the append landed before the first decode round"
+            // checkable instead of assumed.
+            std::fprintf(stderr,
+                         "[context-append] lane=%u tokens=%zu decode_rounds_before=%llu "
+                         "generated_before=%zu\n",
+                         lane, tokens.size(), static_cast<unsigned long long>(rounds_before),
+                         generated_before);
+        } catch (...) {
+            std::lock_guard lock(request->mutex);
+            request->context_append_error   = std::current_exception();
+            request->context_append_pending = false;
+            request->context_append_done    = true;
+            request->context_append_tokens.clear();
+            request->cv.notify_all();
+            throw;
+        }
+        {
+            std::lock_guard lock(request->mutex);
+            request->context_append_pending = false;
+            request->context_append_done    = true;
+            request->context_append_rounds  = rounds_before;
+            request->context_append_tokens.clear();
+            request->cv.notify_all();
+        }
+        ++cumulative_stats_.host_work.control_units;
+        publish_runtime_stats();
+    }
+
     void run_control_batch(const ControlMembership& membership) {
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
@@ -2126,6 +2297,19 @@ private:
                 // not reinterpret an already-issued unit with a later atomic read.
                 const auto cancelled_at_unit_start = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_unit_start, boundary);
+                // M21: an armed context append is serviced at the FIRST boundary that observes it
+                // and before the decode membership below is built, so an append armed right after
+                // submit() is ordered ahead of this request's first sampled token. Both this and the
+                // control batch are host-work units; the append goes first because its caller is the
+                // one blocked on it.
+                if (const auto append_lane = context_append_lane(); append_lane.has_value()) {
+                    set_host_work_class(HostWorkClass::Control);
+                    finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    unit_owner_ = slots_[*append_lane];
+                    run_context_append(*append_lane);
+                    previous_unit_was_decode = true;
+                    continue;
+                }
                 const ControlMembership control_membership =
                     scheduler_.build_control_membership(slots_, max_concurrency_);
                 if (!control_membership.empty()) {
@@ -2148,13 +2332,97 @@ private:
                     prefill_runnable = !slots_[*lane]->capture_pending;
                 }
                 bandwidth_governor_.observe(steady_now_ns(), bandwidth_counters());
-                if (bandwidth_governor_.enabled()) {
-                    // W6: shrink the prefill unit with the admitted share so a decoding request
-                    // waits for one small unit instead of a full chunk.
-                    if constexpr (requires { instance_.program->set_prefill_chunk(0u); }) {
-                        instance_.program->set_prefill_chunk(bandwidth_governor_.prefill_chunk_for(
-                            instance_.program->prefill_chunk_capacity));
+                // W6: shrink the prefill unit with the admitted share so a decoding request waits
+                // for one small unit instead of a full chunk. prefill_chunk_capacity() is the
+                // startup-sized ceiling; prefill_chunk_for() returns a value inside
+                // [128, capacity], so what the Program runs is the *initial* value of a range and
+                // never a fixed constant.
+                //
+                // Which of the two modes this is (PrefillChunkMode, include/ninfer/types.h) was
+                // decided before the loop existed: the governor is constructed from the resolved
+                // mode, so `installed` below IS the mode -- dynamic writes the unit, manual writes
+                // nothing and leaves the Program at the value it was built with. That keeps the two
+                // modes on one code path (no second branch to drift) and makes the trace line, which
+                // names the mode and prints the value the Program holds, the readback for both.
+                //
+                // The guard is named in bandwidth_governor.h and not spelled out here so that the
+                // else branch below tests the same predicate, and the trace stays outside the
+                // installed test on purpose: it then reports the unit in BOTH modes, which is what
+                // makes a dynamic/manual comparison meaningful rather than an assertion about a
+                // code path.
+                if constexpr (bandwidth_detail::exposes_prefill_chunk_wire<Program>) {
+                    const std::uint32_t prefill_capacity =
+                        instance_.program->prefill_chunk_capacity();
+                    const std::uint32_t prefill_unit =
+                        bandwidth_governor_.prefill_chunk_for(prefill_capacity);
+                    const bool installed = bandwidth_governor_.enabled();
+                    if (installed) {
+                        instance_.program->set_prefill_chunk(prefill_unit);
                     }
+                    // The plan's service-work projection was made at the PLAN's prefill unit, and
+                    // prefill_chunk_for() may have just installed a smaller one. A prefill unit is
+                    // charged one quantum no matter how many tokens it slices, so a shrink makes
+                    // the requesting prompt need MORE quanta than it reserved, and the pair of
+                    // invariants in scheduler.h would turn that legal event into a whole-engine
+                    // stop (`consumed 1 quanta with 0 remaining`, then fail_all_locked). Re-charge
+                    // the span the request has NOT charged yet at the unit that is actually in
+                    // force; the rationale, the rebuild_work.h:18-33 precedent and the exactness
+                    // boundary are on Scheduling::recharge_service_work_for_unit_shrink.
+                    //
+                    // Keyed on the REQUEST, not on the governor: a request whose prefill starts
+                    // after a shrink must be reconciled too (there is no "previous governor unit"
+                    // to compare against in that case), and a request that is reconciled once
+                    // must not be charged twice for the same shrink.
+                    //
+                    // MEASURED, not assumed: keying it on the REQUEST is necessary but not
+                    // sufficient -- the numbers have to be request-owned too. The first version
+                    // of this block read them back from prefill_request->base_plan, which is
+                    // EMPTY here: release_planning_state() (engine_core.h:1694) resets it at
+                    // the admission transition and ensure_base_plan() only runs for pending
+                    // requests, so the guard was false for every prefill and the recharge was
+                    // dead code (proved by disassembly: worker_loop() carried the new divisions
+                    // while the reservation still stayed at exactly the plan's value). The plan's
+                    // numbers are seeded into planned_prefill_tokens at the same place the
+                    // reservation is written.
+                    if (const auto prefill_owner = scheduler_.prefill_lane(); prefill_owner) {
+                        const auto& prefill_request = slots_[*prefill_owner];
+                        if (prefill_request != nullptr && prefill_request->is_prefilling()) {
+                            const std::uint64_t remaining_tokens =
+                                prefill_request->planned_prefill_tokens >
+                                        prefill_request->prefill_tokens_done
+                                    ? prefill_request->planned_prefill_tokens -
+                                          prefill_request->prefill_tokens_done
+                                    : 0ULL;
+                            const std::uint32_t previous_unit =
+                                prefill_request->service_work_unit == 0
+                                    ? prefill_capacity
+                                    : prefill_request->service_work_unit;
+                            if (prefill_unit < previous_unit) {
+                                Scheduling::recharge_service_work_for_unit_shrink(
+                                    *prefill_request, remaining_tokens, previous_unit, prefill_unit);
+                            }
+                            prefill_request->service_work_unit = prefill_unit;
+                        }
+                    }
+                    // Recorded before the trace and before the write, and in both modes: the
+                    // pairing has to hold for manual too, where nothing is written and
+                    // `prefill_unit == prefill_capacity` is still what the Program holds while
+                    // the unit runs.
+                    bandwidth_governor_.note_installed_unit(prefill_unit, prefill_capacity,
+                                                            installed);
+                    bandwidth_governor_.trace_prefill_chunk(prefill_unit, prefill_capacity,
+                                                            installed, bandwidth_counters());
+                } else {
+                    // This branch used to be silent: a target whose Program wrapper has no
+                    // forwarders made the block above compile to nothing, and the engine still
+                    // built, linked and passed every test -- which is exactly how the shrink was
+                    // dead code for every target before runtime.h/api_impl.h grew the two
+                    // forwarders. A target may not drop the wire without saying so here.
+                    static_assert(bandwidth_detail::exposes_prefill_chunk_wire<Program>,
+                                  "Program exposes no set_prefill_chunk()/prefill_chunk_capacity(): "
+                                  "the bandwidth governor's prefill-unit shrink would compile to "
+                                  "nothing (see the W6 note in "
+                                  "ninfer/targets/qwen3_6/runtime.h)");
                 }
                 const bool prefill_admitted =
                     !prefill_runnable || bandwidth_governor_.prefill_allowed();
