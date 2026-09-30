@@ -1,10 +1,18 @@
 #include "ops/linear/q5/q5_dispatch.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 
 Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    // mtpopt r2 (landq 02-verify-mma).  Default OFF -> every return below is the pre-image
+    // launch, so an unset/0 run is byte-identical by construction.  =1 routes the four text-model
+    // decode geometries to the MMA schedule this same table already uses above t=24.
+    static const bool mtpopt_verify_mma = [] {
+        const char* value = std::getenv("NINFER_MTPOPT_VERIFY_MMA");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
     if (t <= 0) { throw std::invalid_argument("q5 linear: unsupported shape or T"); }
 
     switch (k) {
@@ -17,13 +25,17 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         case 6144:
             if (t == 1) { return launch_q5_gemv_r16_s2_x; }
             if (t <= 6) { return launch_q5_simt_split4_exact; }
-            if (t <= 24) { return launch_q5_simt_r8_c8; }
+            if (t <= 24) {
+                return mtpopt_verify_mma ? launch_q5_mma_r64_c64 : launch_q5_simt_r8_c8;
+            }
             if (t <= 64) { return launch_q5_mma_r64_c64; }
             return launch_q5_mma_r64_c128;
         case 7168:
             if (t == 1) { return launch_q5_gemv_r16_s2_x; }
             if (t <= 6) { return launch_q5_simt_split4_exact; }
-            if (t <= 16) { return launch_q5_simt_r8_c4; }
+            if (t <= 16) {
+                return mtpopt_verify_mma ? launch_q5_mma_r64_c64 : launch_q5_simt_r8_c4;
+            }
             return launch_q5_mma_r64_c128;
         default:
             break;
@@ -33,7 +45,9 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         if (n == 5120) {
             if (t == 1) { return launch_q5_simt_r8_c4; }
             if (t <= 6) { return launch_q5_simt_split2_exact; }
-            if (t <= 24) { return launch_q5_simt_r8_c8; }
+            if (t <= 24) {
+                return mtpopt_verify_mma ? launch_q5_mma_r64_c64 : launch_q5_simt_r8_c8;
+            }
             return launch_q5_mma_r64_c128;
         }
         break;
@@ -41,7 +55,9 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         if (n == 5120) {
             if (t == 1) { return launch_q5_simt_r8_c4; }
             if (t <= 6) { return launch_q5_simt_split2_exact; }
-            if (t <= 24) { return launch_q5_simt_r8_c8; }
+            if (t <= 24) {
+                return mtpopt_verify_mma ? launch_q5_mma_r64_c64 : launch_q5_simt_r8_c8;
+            }
             return launch_q5_mma_r64_c128;
         }
         break;

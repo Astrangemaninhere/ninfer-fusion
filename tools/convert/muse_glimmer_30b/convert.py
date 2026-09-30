@@ -16,6 +16,7 @@ import io
 import json
 import os
 import struct
+import sys
 import time
 from pathlib import Path
 
@@ -43,6 +44,12 @@ VOCAB = 202048      # token domain (真 vocab)
 ENGINE_VOCAB = 202112  # artifact 行 (N%128==0)
 MODEL_ID = "muse-glimmer-30b"
 WEIGHTS_ID = "nvfp4"
+#: The recipe's identity.  source_registry.py's muse row declares this same string as
+#: its ``recipe_id``, and ``validate_registry()`` compares the two -- the only consumer
+#: this constant has, and the same contract every other converter here already carries
+#: (qwen3_5_9b/inventory.py:41, qwen3_8_27b/convert_modelopt.py:163,
+#: gemma4_31b/convert.py:117).  The row cannot be verified without it.
+RECIPE_ID = "muse_glimmer_30b-modelopt-v1"
 Q = QHEADS * HD          # 4096
 KV = KVHEADS * HD        # 256
 FUSED = 2 * Q + 2 * KV   # 8704  (q | k | gate | v)
@@ -277,7 +284,23 @@ def resource_specs(model_dir: str):
                         encoding="utf-8"))
     tc["add_bos_token"] = False
     tc["add_prefix_space"] = False
-    tc["pad_token"] = "<|endoftext|>"
+    # CARRY the checkpoint's own pad token; do not OVERWRITE it.  The old line wrote
+    # "<|endoftext|>", which is not a token this model has at all (measured: absent from
+    # added_tokens, extra_special_tokens and model.vocab -- the model's own are
+    # <|end_of_text|> id 200001 on the NVFP4 revision and <|finetune_right_pad|> id 200018
+    # on the BF16 revision, both measured on the real checkpoints).  Overwriting turned a
+    # per-REVISION fact into a per-CONVERTER constant, and the engine then compared its
+    # own single-valued declaration against the corpse of that rewrite.  The artifact is
+    # the carrier of this fact; the policy declares the SET that is admissible.
+    source_pad = tc.get("pad_token")
+    if source_pad is None:
+        raise SystemExit(
+            "REFUSED BY NAME: the checkpoint's tokenizer_config.json declares no "
+            "pad_token, so the artifact would carry no pad-token fact and the engine's "
+            "loaded policy cannot be checked against anything.  What is missing: the "
+            "source's own pad_token.  Where to look: tokenizer_config.json of the "
+            "revision you passed.  How to retry: pass a revision that declares one, or "
+            "supply --pad-token <token> explicitly.")
     # chat_template 字段必须存在 (前端校验): 兜底拼接模板 (官方未发布).
     tmpl = tc.get("chat_template")
     if isinstance(tmpl, dict):
@@ -543,6 +566,28 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
+    # THE SOURCE IS CHECKED BY NAME BEFORE THE READER OPENS IT.
+    #
+    # ``MuseReader.__init__`` (line 66) opens ``<model>/model.safetensors.index.json``
+    # unconditionally and walks its ``weight_map``; that file IS this converter's
+    # contract with the source, because the three shards are addressed only through it.
+    # MEASURED 2026-09-23 (dl/writersweep, judgment-3 probe): without this guard a
+    # source that is merely missing that one file arrived as an UNCAUGHT
+    # ``FileNotFoundError`` traceback out of ``MuseReader.__init__``.  The traceback
+    # named the syscall and the absolute path and named neither the contract nor the
+    # fact that the source is the wrong shape, so the operator read a stack to learn
+    # that one file was absent.
+    #
+    # rc=2 is this tree's own spelling for "the source is not what this converter
+    # reads": ``tools/convert/gemma4_31b/convert.py:397-399`` returns 2 for the same
+    # class of condition.  Nothing about a source that HAS the index changes.
+    model_dir = Path(args.model)
+    index_path = model_dir / "model.safetensors.index.json"
+    if not index_path.is_file():
+        print(f"  no model.safetensors.index.json under {model_dir}: this converter is "
+              f"index-driven and addresses every shard through that file, so a source without "
+              f"it cannot be converted at all (not a crash: a refusal)", file=sys.stderr)
+        return 2
     global _DEVICE, _E2M1_TABLE
     if getattr(args, 'device', 'cpu') == 'cuda' and torch.cuda.is_available():
         _DEVICE = torch.device('cuda')

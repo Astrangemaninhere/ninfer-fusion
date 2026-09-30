@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 
 #include "product/kv_options.h"
+#include "product/ple_sidecar_carrier.h"
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
 #include "serve/translate.h"
@@ -304,6 +305,12 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.cold_host_bytes          = options_.cold_host_bytes;
     engine_options.cold_disk_path           = options_.cold_disk_path;
     engine_options.cold_disk_bytes          = options_.cold_disk_bytes;
+    // FlashNext PLE sidecar root. Refused at startup when it names a directory
+    // with no ple-manifest.json, for the same reason as the CLI front end: an
+    // absent PLE residual is additive silence, and a server that answers anyway
+    // is a server whose numbers cannot be trusted.
+    engine_options.ple_sidecar_root         = options_.ple_sidecar_root;
+    ninfer::product::validate_ple_sidecar_root(engine_options.ple_sidecar_root);
     engine_options.weight_host_offload_bytes = options_.weight_host_offload_bytes;
     engine_options.weight_device_arena_bytes = options_.weight_device_arena_bytes;
     engine_options.weight_prefetch_layers    = options_.weight_prefetch_layers;

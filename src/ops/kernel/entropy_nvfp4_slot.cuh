@@ -137,8 +137,8 @@ entropy_nvfp4_slot_rans_encode_to(std::uint8_t* dst, int capacity,
 // by attention producers that want to dequantize on the fly into BF16 smem.
 template <typename Fn>
 __device__ __forceinline__ bool entropy_nvfp4_slot_decode_stream_apply(const std::uint8_t* slot,
-                                                                       int half, int stream,
-                                                                       Fn&& fn) {
+                                                                       int slot_bytes, int half,
+                                                                       int stream, Fn&& fn) {
     const EntropyNvfp4SlotHeader* header =
         reinterpret_cast<const EntropyNvfp4SlotHeader*>(slot);
     if (header->magic != kEntropyNvfp4SlotMagic ||
@@ -149,6 +149,17 @@ __device__ __forceinline__ bool entropy_nvfp4_slot_decode_stream_apply(const std
     const EntropyNvfp4SlotHalf& half_header = header->halves[half];
     const std::uint32_t begin               = half_header.offsets[stream];
     const std::uint32_t end                 = half_header.offsets[stream + 1];
+    // The offsets are the SLOT'S OWN claim about where its streams live, so they are only usable
+    // as IN-SLOT offsets once they have been bounded by the slot the caller actually handed us.
+    // Without this bound a header whose magic/version/flags still check out -- a slot recycled
+    // under a stale reader, or one written under a different record width -- turns `slot + begin`
+    // into an arbitrary pointer, and every read below follows it. The bound is deliberately the
+    // WHOLE slot and not `slot_bytes - kEntropyNvfp4SlotScaleBytes`: what this check exists to
+    // establish is that `slot + begin .. slot + end` is inside the BUFFER, and tightening it to
+    // the data region would refuse slots this codec's own writers still produce. The MAXIMUM is
+    // tested FIRST, because `begin + 4` on the next line is computed in 32 bits and a begin of
+    // 0xFFFFFFFF would wrap it.
+    if (slot_bytes < 0 || end > static_cast<std::uint32_t>(slot_bytes)) { return false; }
     if (end < begin + 4) { return false; }
     const int size = static_cast<int>(end - begin);
 
@@ -185,10 +196,10 @@ __device__ __forceinline__ bool entropy_nvfp4_slot_decode_stream_apply(const std
 // Decode stream `stream` of `half` from a valid slot into 256 contiguous
 // packed code bytes. Returns false when the header/stream is malformed.
 __device__ __forceinline__ bool entropy_nvfp4_slot_decode_stream(
-    const std::uint8_t* slot, int half, int stream, std::uint8_t* dst) {
+    const std::uint8_t* slot, int slot_bytes, int half, int stream, std::uint8_t* dst) {
     std::uint8_t packed = 0;
     return entropy_nvfp4_slot_decode_stream_apply(
-        slot, half, stream, [&](int i, int symbol) {
+        slot, slot_bytes, half, stream, [&](int i, int symbol) {
             const int byte_index = i >> 1;
             if ((i & 1) == 0) {
                 packed         = static_cast<std::uint8_t>(symbol);
@@ -208,10 +219,11 @@ __device__ __forceinline__ const std::uint8_t* entropy_nvfp4_slot_scales(const s
 // Cooperative half-page decode: threads 0..15 each decode one 256-byte stream
 // into the contiguous 4096-byte half buffer. Other threads do nothing.
 __device__ __forceinline__ void entropy_nvfp4_slot_decode_half_parallel(const std::uint8_t* slot,
-                                                                        int half, int lane,
+                                                                        int slot_bytes, int half,
+                                                                        int lane,
                                                                         std::uint8_t* half_dst) {
     if (lane >= kEntropyNvfp4SlotStreamsPerHalf) { return; }
-    entropy_nvfp4_slot_decode_stream(slot, half, lane,
+    entropy_nvfp4_slot_decode_stream(slot, slot_bytes, half, lane,
                                      half_dst + lane * kEntropyNvfp4SlotStreamBytes);
 }
 

@@ -203,13 +203,37 @@ load_attention_projection(const FullAttentionPlan& plan,
 void bind_text_layers(artifact::Binder& binder, BindingPlan& out) {
     // All 52 Muse layers are softmax attention; the 39 sliding layers run as
     // full for the acceptance phase (short contexts: window is not clipped).
+    //
+    // F1227 -- THE TWO AXES, NAMED, BECAUSE THE FLAG BELOW IS ONLY ONE OF THEM.
+    // `is_full_attention` is the runtime's full-vs-GDN axis
+    // (config.h:65-70, `layer_kind[layer] != 2`): it selects WHICH LEAF carries the layer.
+    // Muse has no GDN at all (`kGdnScale == 0.0F`, config.h:140), so on this target the
+    // axis is degenerate -- TRUE for all 52 -- and `is_full_attention(layer)` is the
+    // honest spelling of that fact, not a per-layer decision.
+    //
+    // The WINDOW is the OTHER axis: `is_swa_attention` (config.h:71-73, 39 of 52) is what
+    // the KV plan keys on (the `is_swa_attention` loop in
+    // targets/qwen3_6/impl/runtime/layouts_impl.h), and it is where the declared 2048
+    // lives. The two axes coinciding at or below 2048 TOKENS -- the acceptance-phase
+    // regime -- is exactly what makes the all-full mapping exact, and it is now REPORTED
+    // with its number by the plan (`[kv-regime]`, same file) instead of only asserted
+    // here in prose. Above that number this file's mapping is a topology the model does
+    // not have; see the guard below, which checks the axis it can see and names the layer.
+    static_assert(TextConfig::swa_attention_layers() == 39,
+                  "F1227: the acceptance-phase mapping is 'all 52 full + 39 declared "
+                  "sliding'; if the sliding count moves, the regime number and this "
+                  "file's comment moved with it");
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
         target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
                                                                 NumericFormat::BF16,
                                                                 {TextConfig::hidden});
-        target.is_full_attention = true;
+        // F1227: read the target's own accessor instead of restating its answer. Today
+        // this is TRUE on all 52 (the axis is degenerate, see above); reading it keeps
+        // the binding and the declaration ONE fact, so a future kind-2 layer cannot be
+        // bound full by a hardcode that nothing re-reads.
+        target.is_full_attention = TextConfig::is_full_attention(static_cast<int>(layer));
         target.attention.projection = MuseAttentionProjectionPlan{
             .query = bind_weight(binder, prefix + "attention/query", kWeightFormat,
                                  {TextConfig::query_size, TextConfig::hidden}),
@@ -299,7 +323,22 @@ LoadedModelData::LoadedModelData(WeightsProfile weights_profile, BindingPlan pla
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         const TextLayerPlan& source = plan.text_layers[layer];
         if (!source.is_full_attention) {
-            throw std::logic_error("muse text topology must be all-full in the acceptance phase");
+            // F1227: THIS GUARD CHECKS THE FULL-vs-GDN AXIS AND ONLY IT. It used to say
+            // "must be all-full in the acceptance phase", which read as if the WINDOW were
+            // being enforced here; it is not and cannot be -- the window is the other axis
+            // (`TextConfig::is_swa_attention`, 39 layers) and it is carried by the KV plan,
+            // whose `[kv-window]` / `[kv-regime]` lines report what is actually in force.
+            // What this refuses is a layer routed to some leaf this runtime has no slot
+            // for: `full_layers` is the ONLY binding table muse has (there is no swa leaf,
+            // and `kGdnScale == 0.0F` means no GDN leaf either), so a non-full layer would
+            // be silently DROPPED rather than bound. Named per layer instead of per file:
+            throw std::logic_error(
+                "muse text layer " + std::to_string(layer) +
+                " is not on the full-attention axis, and this runtime binds only that leaf "
+                "(no swa and no gdn binding table exists for this target). The acceptance-phase "
+                "mapping is all 52 layers on the full leaf, with the declared 2048-token "
+                "window carried by the KV plan; see the [kv-regime] report for the regime "
+                "this mapping is exact in (F1227)");
         }
         FullAttentionWeights& target = full_layers.at(full_index++);
         target.input_norm            = artifact::materialized_tensor(

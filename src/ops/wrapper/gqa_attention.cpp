@@ -19,7 +19,7 @@ constexpr std::int32_t kQuantGroup                   = 64;
 constexpr std::int32_t kNvfp4QuantGroup              = 16;
 constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
-constexpr std::int32_t kMaximumBatchSize             = 8;
+constexpr std::int32_t kMaximumBatchSize             = 16;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 
@@ -356,6 +356,80 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     }
 }
 
+// M1 (per-column ancestor masks): WHO READS THE MASK, AS A BUILD FACT.
+//
+// The mask is one I64 word per column, bit i = "column j may attend column i". Until this
+// patch its support was asserted only in prose, in five places, and ONE OF THE FIVE WAS FALSE
+// (include/ninfer/ops/gqa_attention.h said "Only the BF16 partial kernel reads it").  A claim
+// about which kernel reads a pointer is exactly the class of claim this tree turns into a
+// table with a witness (src/ops/kernel/gqa_attention_simt_ffma.cuh:1011-1030 is the pattern,
+// for the sliding window), because the instrument and the fact cannot then drift apart.
+//
+// THE MENTION COUNTS ARE THE TREE'S OWN, RE-MEASURED BY THIS LINE with
+//   grep -c column_masks <header>
+// over the six partial kernels.  Re-run it before changing any row: a row that became nonzero
+// is a tier that can now carry a mask, and the refusal below would then be refused too much.
+struct GqaMaskReader {
+    const char* kernel;                   // the kernel header, by file name
+    std::int32_t mask_mentions;           // grep -c column_masks over that header
+    const char* kv_tier;                  // the KV tier(s) it serves, for a human reader
+    // A PROPERTY, NOT A SUBSTRING TEST.  This started out as `kv_tier[0] != 'b'`, which read
+    // the SIMT-FFMA row ("bf16 + nvfp4 codec") as bf16-only and dropped out of the count
+    // below -- and the static_assert turned that into a build error before it could become a
+    // shipped number.  A claim keyed on a free-text label is the drift this table exists to
+    // stop, so the property is a field.
+    bool serves_quantized_tier;           // part of this arm belongs to a non-bf16 KV tier
+    bool takes_append;                    // can it serve an append+attend launch?
+};
+inline constexpr GqaMaskReader kGqaMaskReaders[] = {
+    {"gqa_attention_decode_bf16.cuh", 5, "bf16", false, true},
+    {"gqa_attention_simt_ffma.cuh", 8, "bf16, and nvfp4 via its packed codec arm", true, false},
+    {"gqa_attention_decode_nvfp4.cuh", 0, "nvfp4", true, true},
+    {"gqa_attention_decode_i8.cuh", 0, "i8", true, true},
+    {"gqa_attention_decode_fp8.cuh", 0, "fp8", true, true},
+    {"gqa_attention_decode_iso3.cuh", 0, "iso3", true, true},
+};
+inline constexpr std::int32_t kGqaMaskReaderCount =
+    static_cast<std::int32_t>(sizeof(kGqaMaskReaders) / sizeof(kGqaMaskReaders[0]));
+
+// The facts the refusal below leans on, each asserted so that an edit which breaks one fails
+// the BUILD instead of silently changing which tiers are admissible.
+static_assert(kGqaMaskReaderCount == 6,
+              "six partial kernels: bf16, simt_ffma, nvfp4, i8, fp8, iso3");
+static_assert(kGqaMaskReaders[0].mask_mentions > 0, "the bf16 partial must read the mask");
+static_assert(kGqaMaskReaders[1].mask_mentions > 0, "the SIMT-FFMA family must read the mask");
+static_assert(kGqaMaskReaders[1].serves_quantized_tier,
+              "the SIMT-FFMA codec arm is a QUANTISED tier's arm; that is the whole finding");
+static_assert(!kGqaMaskReaders[1].takes_append,
+              "if the SIMT-FFMA codec arm ever takes an append source, the append+attend "
+              "refusal in gqa_attention() is refusing a launch that would be honoured");
+// THE LOAD-BEARING ONE.  Exactly one entry in the table both reads the mask AND belongs to a
+// quantised tier, and it is the one that cannot take this entry's shape.  A tier whose own
+// partial starts reading the mask makes this count 2 and the compile stops here.
+[[nodiscard]] constexpr std::int32_t gqa_quantized_tiers_reading_the_mask() {
+    std::int32_t n = 0;
+    for (std::int32_t i = 0; i < kGqaMaskReaderCount; ++i) {
+        if (kGqaMaskReaders[i].mask_mentions > 0 && kGqaMaskReaders[i].serves_quantized_tier) {
+            ++n;
+        }
+    }
+    return n;
+}
+// And the complement, which is the other half of the claim: FIVE of the six read it zero times.
+[[nodiscard]] constexpr std::int32_t gqa_kernels_ignoring_the_mask() {
+    std::int32_t n = 0;
+    for (std::int32_t i = 0; i < kGqaMaskReaderCount; ++i) {
+        if (kGqaMaskReaders[i].mask_mentions == 0) { ++n; }
+    }
+    return n;
+}
+static_assert(gqa_quantized_tiers_reading_the_mask() == 1,
+              "the mask's quantised-tier support is 1 of 6 kernels, and that one refuses an "
+              "append; changing this number changes which (route, KV tier) pairs are servable");
+static_assert(gqa_kernels_ignoring_the_mask() == 4,
+              "four kernels ignore the mask entirely; e8 has no partial at all, so the "
+              "quantised-family total is FIVE -- the count the refusal quotes");
+
 // M1 (per-column ancestor masks): shape/domain validation only. The VALUE contract -- bit i of
 // column j means "column j may attend column i", bit 0 always set -- is the caller's; a caller
 // that passes a mask the kernel cannot honor is refused below rather than silently exempted.
@@ -561,15 +635,40 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         route = detail::GqaAttentionRoute::Prompt;
     }
     // M1: a per-column ancestor mask makes each query's visible set a BIT SET instead of the
-    // causal prefix. The BF16 small-T kernels and the BF16 prompt body implement that; every other
-    // (route, KV tier) pair is refused by name here or in the launcher -- silently ignoring the
-    // mask would verify a chain and call it a tree.
+    // causal prefix. The BF16 small-T kernels and the BF16 prompt body implement that.
+    //
+    // WHAT IS REFUSED, AND THE REASON NAMED CORRECTLY. The sentence here used to read "implemented
+    // for the BF16 KV tier only", and that is FALSE: the SIMT-FFMA family reads the mask
+    // (kGqaMaskReaders above) and its NVFP4 codec arm belongs to a QUANTISED tier. The true
+    // blocker is the SHAPE, and it is a compile-time fact, not a policy:
+    //   * this entry is an append+attend launch -- k and v are non-null, so its CacheInput is
+    //     GqaAppendInput and CacheInput::writes_cache is TRUE;
+    //   * ops/kernel/gqa_attention_simt_ffma.cuh:1786 is
+    //     `static_assert(!CacheInput::writes_cache, ...)`, so that arm cannot take this shape
+    //     at all; and
+    //   * the shape it CAN take carries no mask: gqa_attention_cached() takes no column_masks
+    //     (ops/launcher/gqa_attention_decode_smallt.cu:367-374 leaves the field absent), so no
+    //     call site can hand it one.
+    // ⇒ Removing this refusal would NOT make the mechanism compose. On the five quantised
+    // tiers' tensor-core partials the mask would be DROPPED -- and a dropped mask verifies the
+    // chain and calls it a tree, which is the silent wrong this whole block exists to not
+    // commit (the same asymmetry is stated, and NOT refused, one level down at
+    // ops/launcher/gqa_attention_decode_partial.cuh:581-588). The refusal is the GUARD here.
     if (column_masks.data != nullptr) {
         if (cache.dtype != DType::BF16) {
             throw std::invalid_argument(
                 std::string(op) +
-                ": per-column masks (MTP tree verify) are implemented for the BF16 KV tier "
-                "only; this call has a quantized KV tier");
+                ": per-column masks (MTP tree verify) are not honoured on this (route, KV tier) "
+                "pair. The mask is read by the bf16 tier's partials and by the SIMT-FFMA family "
+                "(kGqaMaskReaders: 5 and 8 mention sites), but the SIMT-FFMA arm that serves a "
+                "quantised tier is compile-time refused for this shape -- gqa_attention() appends "
+                "and attends in one launch, and simt_ffma refuses an append source "
+                "(`static_assert(!CacheInput::writes_cache)`) -- while the five quantised tiers' "
+                "own tensor-core partials read the mask 0 times each (nvfp4 0, i8 0, fp8 0, "
+                "iso3 0; e8 has no partial at all). On this tier the mask would be DROPPED and "
+                "the chain would be verified as a tree. The tier this layer carries is not bf16; "
+                "pin it with --kv-layer-storage (or --kv-dtype bf16) if the round must verify a "
+                "tree.");
         }
         // The prompt route carries the masks now (gqa_attention_prompt_launch applies them in the
         // BF16 prompt body), so the blanket route refusal is gone. What stays refused here is the

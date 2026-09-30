@@ -1235,6 +1235,61 @@ private:
 struct RecallRequest {
     std::uint32_t token_begin = 0; // absolute, in the sequence's own token space
     std::uint32_t token_end = 0;   // exclusive
+
+    // =======================================================================================
+    // [F-1019] THE NOMINATION CHANNEL -- HOW N CONCURRENT AGENTS SHARE ONE LOOKUP.
+    // =======================================================================================
+    // WHAT WAS WRONG WITH THIS TYPE, IN THE RECORD'S OWN WORDS. `spec/semchan_stage2.h:25-31`
+    // states the structural fact and the whole shape of the second stage follows from it:
+    // "`RecallRequest` IS NOT A SET ... Two integers. ONE CONTIGUOUS SPAN. No container, no page
+    // list, no cap -- so there is no field a nominated page could enter and no place a union
+    // could be written." The consequence is at `:46-51`: "a nominated page OUTSIDE the arbiter's
+    // run cannot be added to the recall. It can only be ENCLOSED -- by growing the run upward
+    // until it contains the nomination, which drags in EVERY page in between. **The union route
+    // through `RecallRequest` is a route that COSTS KV, not one that saves it.**"
+    //
+    // WHY A PAGE LIST, AND NOT A SPAN LIST AND NOT A PER-AGENT BINDING. Three candidates were
+    // on the table; this field pair is two of them fused, and the reason is the granularity this
+    // file already fixes at `:1246`: "one logical page = kRecallPageTokens (64) tokens ACROSS ALL
+    // TEXT LAYERS ... the block table's addressing unit is the page, and a cold-slot sentinel
+    // encodes ONE slot base that the attention kernels index in every layer's cold_slots at once,
+    // so a page can only be moved whole".
+    //   * A SPAN LIST cannot be expressed in the delivery unit. A union of N agents' spans is a
+    //     set of spans whose members are PAGES; re-deriving pages from spans re-introduces the
+    //     rounding at `program_impl.h:14321-14325` (which rounds the end OUTWARD to a whole page)
+    //     and therefore re-introduces enclosure for every span whose end is mid-page.
+    //   * A PER-AGENT BINDING ALONE DOES NOT SHARE ANYTHING. It changes who owns a page, not
+    //     which pages are looked up: N agents' spans still become N contiguous runs and N calls
+    //     into `plan_recall_pages`, i.e. N lookups. The owner's order is 「lookup共用」 -- the
+    //     LOOKUP must be shared -- and bookkeeping is not what is shared.
+    //   * A PAGE LIST is the minimal shape that can carry the union WITHOUT enclosure, and N
+    //     agents' nominations CONCATENATE into ONE list, so ONE `RecallRequest` reaches ONE
+    //     `plan_recall_pages` call and ONE pass over the journal index. That is the sharing.
+    //
+    // AND THE PARALLEL OWNER VECTOR IS THE OTHER HALF, NOT A CONVENIENCE. One shared lookup must
+    // still answer N agents SEPARATELY, and after the plan is built the only surviving fact about
+    // a nominated page is its POSITION in this list -- a page number is not an agent. So
+    // `nominated_owner` is positionally parallel to `nominated_pages` and each entry is the
+    // caller's own agent index for the page at the same position. Without it the sharing is
+    // lossy: N agents would receive the union and each would have to re-derive its own share from
+    // page geometry, which is the enclosure problem again in the consumer.
+    //
+    // THE INVARIANTS, ALL CHECKED BY THE PLANNER, NONE OF THEM ASSUMED HERE:
+    //   * `nominated_pages` is ASCENDING and DUPLICATE-FREE, in PAGE units, exactly as
+    //     `RecallPagePlan::pages` is (`:1297`). `nominated_owner.size() == nominated_pages.size()`.
+    //   * EMPTY IS THE DEFAULT AND THE PRE-IMAGE BEHAVIOUR. With both vectors empty this struct
+    //     is byte-for-byte the two-integer struct above and every consumer takes the same path it
+    //     took before this field existed. That is what makes this change revertible and testable.
+    //   * A NOMINATION NEVER MOVES `token_begin` OR `token_end`. The arbiter's run is the run;
+    //     nominations are an ADDITION to it, which is the property `semchan_stage2.h:160-163`
+    //     states for its own extension ("`token_begin` NEVER MOVES UP") and the reason a refusal
+    //     here cannot corrupt the anchor at the low end of the run.
+    std::vector<std::uint32_t> nominated_pages; // ascending, page units, dedup'd; empty = none
+    std::vector<std::uint32_t> nominated_owner; // PARALLEL: the agent index for each page above
+
+    // True iff this request carries nominations. A named predicate so no caller writes
+    // `!nominated_pages.empty()` in its own spelling and drifts from the invariant.
+    [[nodiscard]] bool has_nominations() const noexcept { return !nominated_pages.empty(); }
 };
 
 // `frontier` is the sequence's committed-token count, so a provider can bound its
@@ -1291,6 +1346,13 @@ struct RecallPagePlanRequest {
     // 0 == UNBOUNDED == the flag and the environment variable were both absent. That is the
     // default, and it makes every existing run bit-identical: a zero here cannot refuse anything.
     std::uint64_t token_budget = 0;      // 0 => unbounded (neither the flag nor the env said so)
+
+    // ---- [F-1019] THE NOMINATION CHANNEL, CARRIED INTO THE DECISION --------------------------
+    // Plumbed straight through from `RecallRequest` by the ONE consumer (`program_impl.h`, the
+    // `plan_request` builder) -- the planner is handed the union and never re-derives it. Both
+    // vectors default empty, and the empty case is the pre-image plan byte-for-byte.
+    std::vector<std::uint32_t> nominated_pages; // ascending, page units; empty = the pre-image
+    std::vector<std::uint32_t> nominated_owner; // PARALLEL to the above
 };
 
 struct RecallPagePlan {
@@ -1323,6 +1385,24 @@ struct RecallPagePlan {
     // thing dropped" (`lo += drop`, :1263) is visible on the line without the caller's anchor.
     std::uint32_t dropped_budget_begin_page = 0;
     std::uint32_t dropped_budget_end_page   = 0;
+
+    // ---- [F-1019] THE NOMINATIONS, AND EVERY WAY ONE OF THEM CAN FAIL TO ARRIVE -------------
+    // Same discipline as the drop counters above: RECORDED, never inferred, and a total that
+    // names which of two different losses it totals. `nominated_kept` is the pages actually
+    // appended to `pages`; `nominated_missing` is the ones the journal could not serve (the ONLY
+    // reason a nomination is refused, because the criterion is `has_live_page` and nothing else);
+    // `nominated_gap` is a nomination the CALLER mis-built -- below the byte-budget edge, out of
+    // ascending order, or with no owner entry -- which is a programming error and is reported as
+    // such rather than silently repaired.
+    std::uint32_t nominated_kept    = 0;
+    std::uint32_t nominated_missing = 0;
+    std::uint32_t nominated_gap     = 0;
+    // The per-agent view of the SHARED lookup: for every agent index that nominated at least one
+    // page, the OWNER label and the pages of its nomination the plan actually holds, ascending.
+    // This is the whole delivery of "N agents, one lookup": the lookup was done once, and this is
+    // how the ONE result is handed back per agent without a second pass over the index.
+    std::vector<std::uint32_t> nominated_page_agents;      // distinct agent indices, ascending
+    std::vector<std::uint32_t> nominated_pages_kept;       // PARALLEL to nominated_pages above
 
     // ---- [PREFILLBUDGET] THE TOKEN BUDGET'S OWN REFUSAL, RECORDED, NEVER INFERRED ------------
     // dl/vectorkey/REPORT.md:284-288 states the hazard in its own words: "a plan may legitimately
@@ -1400,12 +1480,21 @@ struct RecallPagePlan {
         BudgetTruncated,
         HoleCut,
         FrontierClamped,
+        // [F-1019] A NOMINATION THE JOURNAL COULD NOT SERVE. Its own member, and NOT folded into
+        // HoleCut: a hole is a fact about the ARBITER'S RUN (its bytes are not this prefix's bytes
+        // any more, so the run must end there), while a missing nomination is a fact about a page
+        // the CALLER named out of a DIFFERENT lookup -- a shared one. Folding them would put two
+        // dimensions in one member, which is the defect class the [INEXACTGATE] block above exists
+        // to stop. It is checked LAST: the run's own defects are about the run, and the run is what
+        // the anchor and the selector's `covered_*` claim depend on.
+        NominationMissing,
     };
     [[nodiscard]] Defect defect() const noexcept {
         if (refused_prefill_budget) { return Defect::PrefillBudget; }
         if (dropped_budget != 0) { return Defect::BudgetTruncated; }
         if (dropped_hole != 0) { return Defect::HoleCut; }
         if (dropped_clamped != 0) { return Defect::FrontierClamped; }
+        if (nominated_missing != 0 || nominated_gap != 0) { return Defect::NominationMissing; }
         return Defect::None;
     }
     [[nodiscard]] bool inexact() const noexcept { return !exact(); }
@@ -1437,6 +1526,7 @@ struct RecallPagePlan {
         case RecallPagePlan::Defect::BudgetTruncated: return "budget-truncated";
         case RecallPagePlan::Defect::HoleCut: return "hole-cut";
         case RecallPagePlan::Defect::FrontierClamped: return "frontier-clamped";
+        case RecallPagePlan::Defect::NominationMissing: return "nomination-missing";
     }
     return "unknown";
 }
@@ -1460,6 +1550,7 @@ struct RecallPagePlan {
         case RecallPagePlan::Defect::BudgetTruncated: return "refused-byte-budget";
         case RecallPagePlan::Defect::HoleCut: return "refused-hole-cut";
         case RecallPagePlan::Defect::FrontierClamped: return "refused-frontier-clamp";
+        case RecallPagePlan::Defect::NominationMissing: return "refused-nomination";
     }
     return "unknown";
 }
@@ -1608,7 +1699,17 @@ plan_recall_pages_with_policy(const RecallPagePlanRequest& request,
         // The run is MEASURED in tokens whether or not a budget exists: a reader can then always
         // see how big the round it is reading actually was, and `prefill_tokens_wanted` is a
         // function of the plan rather than of the knob, so it cannot drift from `count()`.
-        const std::uint64_t want_pages_now = static_cast<std::uint64_t>(hi - lo);
+        // [F-1019] THE DENOMINATOR IS THE WHOLE PLAN, NOT ONLY THE RUN. This figure is the token
+        // budget's own measure of what the round would re-prefill, and a nomination OUTSIDE the run
+        // is restored by the very same executor (`recall_cold_pages_for_round` walks `plan.pages`
+        // page by page), so leaving it out would under-count the round and pass a budget the round
+        // exceeds -- the exact inversion [PREFILLBUDGET] above exists to remove. Nominations INSIDE
+        // the run are already in `hi - lo` and are not counted twice.
+        const std::uint64_t run_pages_now = static_cast<std::uint64_t>(hi - lo);
+        std::uint64_t       want_pages_now = run_pages_now;
+        for (const std::uint32_t page : request.nominated_pages) {
+            if (page < lo || page >= hi) { ++want_pages_now; }
+        }
         plan.prefill_tokens_wanted = want_pages_now * static_cast<std::uint64_t>(page_tokens);
         plan.prefill_token_budget  = request.token_budget;
         if (request.token_budget != 0 && plan.prefill_tokens_wanted > request.token_budget) {
@@ -1668,6 +1769,70 @@ plan_recall_pages_with_policy(const RecallPagePlanRequest& request,
 
     plan.pages.reserve(hi - lo);
     for (std::uint32_t page = lo; page < hi; ++page) { plan.pages.push_back(page); }
+
+    // =======================================================================================
+    // [F-1019] THE NOMINATIONS -- ADDITIVE, AND EACH ONE ACCOUNTED FOR.
+    // =======================================================================================
+    // WHERE THIS SITS, AND WHY IT IS THE LAST THING THAT TOUCHES `pages`. Everything above it is
+    // the ARBITER'S RUN and is left byte-identical: the frontier clamp, the hole cut, the token
+    // budget's refusal and the byte budget's edge all still see exactly the run they saw before,
+    // so the anchor-preservation the edge policy exists for is untouched. A nomination is an
+    // ADDITION to a decided run, never an input to deciding it -- which is what stops a shared
+    // lookup from moving the anchor (`semchan_stage2.h:160-163`).
+    //
+    // THE CRITERION IS THE SAME ONE CRITERION. A nominated page is kept iff `has_live_page(page)`
+    // says so -- literally the predicate the hole cut at `:1573` calls -- so a shared lookup cannot
+    // hold a page the standalone lookup would refuse. There is no second admissibility rule here,
+    // deliberately: two predicates on one page is what let the hot path and the replay disagree.
+    if (!request.nominated_pages.empty()) {
+        const std::size_t n_nom = request.nominated_pages.size();
+        if (request.nominated_owner.size() != n_nom) {
+            // A CALLER DEFECT, NAMED. The owner vector is how the ONE shared result is handed back
+            // per agent; without a length match there is no agent to attribute a page to, and
+            // guessing one would be the silent substitution this project refuses. The plan is
+            // returned with the run intact and the defect recorded -- NOT thrown, because a plan
+            // is a DECISION (this function does no I/O) and the caller owns the repair.
+            plan.nominated_gap = static_cast<std::uint32_t>(n_nom);
+        } else {
+            for (std::size_t i = 0; i < n_nom; ++i) {
+                const std::uint32_t page  = request.nominated_pages[i];
+                const std::uint32_t agent = request.nominated_owner[i];
+                if (i != 0 && page <= request.nominated_pages[i - 1]) {
+                    // NOT ASCENDING or duplicated: the invariant the struct documents. Counted,
+                    // not repaired -- a sort here would hide the caller's bug behind an order the
+                    // caller did not ask for.
+                    ++plan.nominated_gap;
+                    continue;
+                }
+                if (page < lo || page >= hi) {
+                    // OUTSIDE THE DECIDED RUN, i.e. the case the whole field exists for. It is
+                    // still bounded by the committed frontier (the run's own `hi` already was) and
+                    // it still has to be live.
+                    if (!has_live_page(page)) {
+                        ++plan.nominated_missing;
+                        continue;
+                    }
+                    plan.pages.push_back(page);
+                    ++plan.nominated_kept;
+                    plan.nominated_page_agents.push_back(agent);
+                    plan.nominated_pages_kept.push_back(page);
+                } else {
+                    // ALREADY IN THE RUN: cost 0, gain 0. Recorded as KEPT (it IS in the plan) and
+                    // attributed to the agent that named it, so the per-agent view is complete.
+                    ++plan.nominated_kept;
+                    plan.nominated_page_agents.push_back(agent);
+                    plan.nominated_pages_kept.push_back(page);
+                }
+            }
+        }
+        // `pages` stays ASCENDING, the order `:1254-1258` makes load-bearing ("ascending order is
+        // the order that lets consecutive pages merge into one batched read per layer file").
+        // `std::sort` is used rather than an insertion pass because the two sources (run, then
+        // nominations) interleave arbitrarily and a sort states the invariant outright.
+        std::sort(plan.pages.begin(), plan.pages.end());
+        plan.pages.erase(std::unique(plan.pages.begin(), plan.pages.end()), plan.pages.end());
+    }
+
     plan.bytes = static_cast<std::uint64_t>(plan.pages.size()) * request.page_bytes;
     return plan;
 }
@@ -1792,7 +1957,7 @@ struct RecallCost {
 // ALL-OR-NOTHING, PER PLAN, deliberately: a plan that injected half its pages as restored bytes
 // and half as re-prefilled text would put two different POSITION semantics into one round's
 // attention set (the byte leg restores rows IN PLACE, the append arm puts them AFTER the
-// frontier). That is the "two mechanisms inside one decision" shape `sum_dir_reach.h:102-108`
+// frontier). That is the "two mechanisms inside one decision" shape `sum_dir_reach.h [text: substitute the positional first-fit silently; = :110 on 2026-09-25]`
 // already refuses for the selector. One plan, one mechanism, and the line says which.
 //
 // HOST-ONLY, PURE, std-only: no CUDA, no engine header, no I/O -- the same shape as

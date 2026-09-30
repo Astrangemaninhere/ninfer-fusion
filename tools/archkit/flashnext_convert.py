@@ -19,7 +19,7 @@
   - depthwise conv artifact = (kernel, channels), channels = 2*key_dim + value_dim
     (同 target impl/config.h:37 convolution_dim = 2*key_dim + value_dim 实证)。
   - 1-D 范数直通; token_embd = (vocab, hidden); output_head = (vocab, hidden)。
-  - PLE 表 (20019200x160 BF16) 永不进 artifact: SSD sidecar
+  - PLE 表 (320001536x160 BF16) 永不进 artifact: SSD sidecar
     (tools/convert/ple_sidecar_build.py, 引擎 PleTable 分页 fault 消费)。
 
 已知契约缺口 (真 checkpoint 到位后按实际键表回填, 本文件用 status 标注):
@@ -120,6 +120,9 @@ _rule(r"^layer\.\d+\.gdn\.conv_bias$", "norm", PENDING_SEMANTICS,
 _rule(r"^layer\.\d+\.gdn\.beta$", "norm")
 _rule(r"^layer\.\d+\.gdn\.dt_bias$", "norm", PENDING_SEMANTICS,
       "alias 合并 dt_bias/A_log 两个语义不同张量; 引擎两槽都要 → 契约拆项后按实际键变换")
+_rule(r"^layer\.\d+\.gdn\.a_log$", "norm")
+_rule(r"^layer\.\d+\.gdn\.in_proj_a$", "linear")
+_rule(r"^layer\.\d+\.gdn\.in_proj_b$", "linear")
 _rule(r"^layer\.\d+\.gdn\.norm$", "norm")
 _rule(r"^layer\.\d+\.gdn\.gate$", "linear")
 _rule(r"^layer\.\d+\.gdn\.out$", "linear")
@@ -189,6 +192,12 @@ def artifact_shape(engine: str, geo: Geometry) -> tuple[int, ...]:
         return (geo.gdn_conv_channels,)
     if engine.endswith(".gdn.beta") or engine.endswith(".gdn.dt_bias"):
         return (geo.gdn_v_heads,)
+    if engine.endswith(".gdn.a_log"):
+        return (geo.gdn_v_heads,)
+    if engine.endswith(".gdn.in_proj_a"):
+        return (geo.gdn_v_heads, geo.hidden)
+    if engine.endswith(".gdn.in_proj_b"):
+        return (geo.gdn_v_heads, geo.hidden)
     if engine.endswith(".gdn.norm"):
         return (geo.gdn_v_head_dim,)
     if engine.endswith(".gdn.gate"):
@@ -545,7 +554,7 @@ def self_test(with_safetensors: bool = False) -> int:
     print(f"[self-test] plan: {summary['entries']} entries "
           f"({summary['artifact_tensors']} tensors + {summary['sidecars']} sidecar), "
           f"pending={summary['pending']}")
-    assert summary["entries"] == 74520, summary
+    assert summary["entries"] == 74628, summary
     assert summary["sidecars"] == 1
     assert all(p.status != PENDING_SHAPE for p in plan), "shape rules incomplete"
 
@@ -584,11 +593,33 @@ def self_test(with_safetensors: bool = False) -> int:
         checked += 1
     print(f"[self-test] transforms: {checked} sampled entries OK (shape + numeric identity)")
 
-    # 3) PLE 表: sidecar 声明, 永不进 artifact
+    # 3) PLE 表: sidecar 声明, 永不进 artifact.
+    #    出处/身份判据, NOT a literal. MEASURED 2026-09-22 (FN-NUM): the check here used to be
+    #    `assert rows == 20019200 and width == 160`. Because _PLE_TABLE is itself read out of the
+    #    contract's shape string (see _ple_table_shape above), that assertion was satisfied BY the
+    #    contract's own wrong number: it could not see the very defect it looked like it guarded.
+    #    This compares the contract against the provenance module that validates the shipped
+    #    checkpoint instead -- tools/convert/qwen3_8_flash_next/source.py, whose constants come
+    #    from the 128 FP8 shards and the BF16 sidecar, and which imports nothing from this package
+    #    -- and additionally requires the shard decomposition to line up, so a self-consistent
+    #    wrong number can no longer satisfy it.
     ple = by_engine["ple.table"]
     rows, width = ple.artifact_shape
     assert ple.status == SIDECAR and ple.transform == "sidecar"
-    assert rows == 20019200 and width == 160, ple.artifact_shape
+    root = HERE.parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from tools.convert.qwen3_8_flash_next import source as ple_provenance
+    assert (rows, width) == (ple_provenance.PLE_ROWS, ple_provenance.PLE_WIDTH), (
+        f"contract ple.table is {rows}x{width}, but the source provenance says "
+        f"{ple_provenance.PLE_ROWS}x{ple_provenance.PLE_WIDTH} "
+        "(tools/convert/qwen3_8_flash_next/source.py:29-30)"
+    )
+    assert rows == ple_provenance.PLE_SHARDS * ple_provenance.PLE_ROWS_PER_SHARD, (
+        f"ple.table rows {rows} != {ple_provenance.PLE_SHARDS} shards x "
+        f"{ple_provenance.PLE_ROWS_PER_SHARD} rows per shard "
+        "(tools/convert/qwen3_8_flash_next/source.py:27-28)"
+    )
     print(f"[self-test] ple.table sidecar: {rows}x{width} BF16 "
           f"({rows * width * 2 / 2**30:.1f} GiB, SSD only)")
 

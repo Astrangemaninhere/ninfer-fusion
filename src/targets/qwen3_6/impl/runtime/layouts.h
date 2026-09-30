@@ -114,6 +114,17 @@ struct SequencePlanningInputs {
     // SEPARATION: row-scale three-state spec (auto|off|<path>). Empty leaves
     // the decision to NINFER_KV_ROWSCALE, i.e. the pre-separation behaviour.
     std::string kv_row_scale_spec;
+    // --stage-layers SPEC, verbatim: the pipeline stage partition this run walks. Carried as
+    // the RAW spec so the ONE parser (core/stage_plan.h) is the only reader of the grammar,
+    // and so the runtime can refuse against the artifact's own layer count. Empty == absent.
+    // Declared here, immediately after kv_row_scale_spec, because the designator lists in
+    // layouts_impl.h must follow declaration order and this is where its designator sits.
+    std::string stage_layers_spec;
+    // --stage-handoff DIR / --stage-handoff-cut: the boundary payload's directory and the
+    // negative control. Carried beside the spec they belong to, for the same reason the
+    // layer_kv_dtypes_set mask travels with the table it belongs to.
+    std::string stage_handoff_dir;
+    bool stage_handoff_cut = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -176,6 +187,17 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     // SEPARATION: row-scale three-state spec (auto|off|<path>). Empty leaves
     // the decision to NINFER_KV_ROWSCALE, i.e. the pre-separation behaviour.
     std::string kv_row_scale_spec;
+    // --stage-layers SPEC, verbatim: the pipeline stage partition this run walks. Carried as
+    // the RAW spec so the ONE parser (core/stage_plan.h) is the only reader of the grammar,
+    // and so the runtime can refuse against the artifact's own layer count. Empty == absent.
+    // Declared here, immediately after kv_row_scale_spec, because the designator lists in
+    // layouts_impl.h must follow declaration order and this is where its designator sits.
+    std::string stage_layers_spec;
+    // --stage-handoff DIR / --stage-handoff-cut: the boundary payload's directory and the
+    // negative control. Carried beside the spec they belong to, for the same reason the
+    // layer_kv_dtypes_set mask travels with the table it belongs to.
+    std::string stage_handoff_dir;
+    bool stage_handoff_cut = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

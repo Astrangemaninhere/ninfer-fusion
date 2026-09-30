@@ -133,6 +133,18 @@ struct PagedKVCacheLayout {
     // Carried on the layout so PagedKVCache can publish it as v_dtype without
     // re-deriving it from a global option.
     KvVCodec kv_v_codec = KvVCodec::Iso3;
+    // [F1255 kvaxisA] ⭐⭐ THE THIRD AXIS, AS THE LAYOUT STATES IT.
+    // A layer that carries a SECOND plane set carries the pages of its narrow class there; the
+    // first set is then sized for the REST of the pool's pages. `layer_narrow_base[L]` is the plane
+    // index the narrow set starts at (0 = this layer has no narrow class, the pre-image shape) and
+    // `layer_narrow_pages[L]` is how many pages it holds. The class of a given (block, layer) CELL
+    // is carried by that layer's own block-table row, so the unit of the decision is the cell.
+    // APPENDED, so no existing field's offset moves.
+    std::array<std::uint32_t, 64> layer_narrow_base{};
+    std::array<std::uint32_t, 64> layer_narrow_pages{};
+    // Pool-wide resolved narrow capacity (0 = the knob is unset = the pre-image pool). One number
+    // rather than a table because `plan_cache` resolves ONE knob for every layer it applies to.
+    std::uint32_t narrow_pages_per_layer = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -181,6 +193,22 @@ public:
     [[nodiscard]] std::uint32_t max_cold_pages() const noexcept { return max_cold_pages_; }
     std::int32_t allocate_cold_slot() noexcept;
     void release_cold_slot(std::int32_t slot) noexcept;
+
+    // [F1255 kvaxisA] THE THIRD AXIS, READABLE. The narrow plane set of one layer, and the pool-wide
+    // resolved capacity. Both are the LAYOUT's own numbers; a reader must not re-derive them from
+    // the knob, or the reading and the storage could drift.
+    [[nodiscard]] std::uint32_t layer_narrow_base(std::uint32_t layer) const noexcept {
+        return layer < layers_ ? layer_narrow_base_[layer] : 0U;
+    }
+    [[nodiscard]] std::uint32_t layer_narrow_pages(std::uint32_t layer) const noexcept {
+        return layer < layers_ ? layer_narrow_pages_[layer] : 0U;
+    }
+    [[nodiscard]] std::uint32_t narrow_pages_per_layer() const noexcept {
+        return narrow_pages_per_layer_;
+    }
+    [[nodiscard]] std::uint32_t resident_page_capacity() const noexcept {
+        return pages_.capacity_pages();
+    }
 
     // Per-layer sliding windows (0 = full attention, i.e. the layer reads every
     // committed token), sized to the layer count. The Cold Host tier's read-free
@@ -244,6 +272,10 @@ private:
     std::array<bool, 64> layer_residual_{};
     std::array<std::uint32_t, 64> layer_sliding_windows_{};
     std::array<std::uint32_t, 64> layer_plane_base_{};
+    // [F1255 kvaxisA] the third axis, carried on the OBJECT as well as the layout.
+    std::array<std::uint32_t, 64> layer_narrow_base_{};
+    std::array<std::uint32_t, 64> layer_narrow_pages_{};
+    std::uint32_t narrow_pages_per_layer_ = 0;
     // L26 instrument: PagedKVCacheLayout::layer_dropped, plus its popcount.
     std::array<bool, 64> layer_dropped_{};
     std::uint32_t dropped_layers_ = 0;

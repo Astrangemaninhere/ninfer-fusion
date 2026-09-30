@@ -326,8 +326,15 @@ def build_scores_table(arms, note=None):
         if quality is None or speed is None:
             out.append(f"# {tier}: UNMEASURED (no usable uniform arm in this run) -- "
                        f"supply it or leave the header's prior in place")
-            out.append(f"{tier} {0 if quality is None else quality} "
-                       f"{0 if speed is None else speed}   # placeholder, NOT a measurement")
+            # [dl/backlog item6-producer] THE SENTINEL IS -1, WHICH IS WHAT THE DOCSTRING ABOVE
+            # ALREADY PROMISES. It wrote 0 until now, and the consumer STRIPS this comment
+            # (kv_bit_budget.h's parse_scores does line.find('#') then resize), so a REFUSAL
+            # arrived at the DP as a MEASURED ZERO -- "nobody looked" and "the error is zero"
+            # were the same value, which is the one thing this branch exists to prevent.
+            # -1 is refused by the consumer's own range check, so the refusal now arrives as a
+            # refusal. Measured population: 2 of 6 emitted rows in --quick on pin 8c566fba.
+            out.append(f"{tier} {-1 if quality is None else quality} "
+                       f"{-1 if speed is None else speed}   # UNMEASURED sentinel -1, NOT a measurement")
         else:
             out.append(f"{tier} {quality} {speed}")
     return "\n".join(out) + "\n"

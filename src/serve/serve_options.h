@@ -74,7 +74,7 @@ struct ServeOptions {
     // --kv-score-table show|emit=<path>: the penalty table's own entry point.
     std::string kv_score_table_spec;
     bool kv_score_table_explicit          = false;
-    // Separable per-range ceilings ("0-7:8,8-63:4.5"); empty means the scalar form above.
+    // Separable per-range ceilings ("0-7:8,8-15:4.5", tiling every FULL-ATTENTION layer); empty means the scalar form above.
     std::string kv_bit_budget_ranges;
     // --kv-tier-formats SPEC + --nvfp4-mode (kvcfg/kv_formats.h vocabulary). Raw text:
     // the per-layer landing needs the model's layer count, so it happens in the planner
@@ -123,6 +123,11 @@ struct ServeOptions {
     std::uint64_t cold_host_bytes  = 7ULL << 30;
     std::string cold_disk_path;
     std::uint64_t cold_disk_bytes = 32ULL << 30;
+    // --ple-sidecar: the qwen4_exp (FlashNext) PLE n-gram sidecar root. Empty =
+    // PLE off. Refused at startup when it names a directory with no
+    // ple-manifest.json (product/ple_sidecar_carrier.h), the same split the CLI
+    // front end makes, so one typo cannot mean two different things.
+    std::string ple_sidecar_root;
     std::uint64_t weight_host_offload_bytes = 0; // --weight-host-bytes: 0 = off
     std::uint64_t weight_device_arena_bytes = 0; // --weight-device-arena-bytes: 0 = derive
     std::uint32_t weight_prefetch_layers    = 2; // --weight-prefetch-layers

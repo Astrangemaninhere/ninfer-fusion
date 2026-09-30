@@ -3,6 +3,7 @@
 
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ops/stream_capture.h"   // F881: the one capture-predicate reader
 
 #include <cstdio>
 #include <cstdlib>
@@ -76,13 +77,12 @@ bool acceptlog_order_dump() {
     return !(env != nullptr && env[0] == '0' && env[1] == '\0');
 }
 
-// Is a capture running on `stream` RIGHT NOW? cudaStreamIsCapturing is legal during capture -- it
-// is the query CUDA provides for exactly this branch -- and answers for that stream.
-bool acceptlog_capturing(cudaStream_t stream) {
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    const cudaError_t err          = cudaStreamIsCapturing(stream, &status);
-    return err == cudaSuccess && status != cudaStreamCaptureStatusNone;
-}
+// Is a capture running on `stream` RIGHT NOW?
+// F881 -- the predicate is NOT owned here. It is owned by ONE reader, `ops/stream_capture.h`,
+// which the `[accmask]` and FreeToken repairs also call; this function is kept as the name the
+// rest of this header already calls (`:161`, `:216`) so those call sites did not have to move.
+// REPAIRING here and not there, or the other way round, is how one rule becomes two spellings.
+bool acceptlog_capturing(cudaStream_t stream) { return ninfer::ops::stream_is_capturing(stream); }
 
 void acceptlog_record(const Tensor& current_extents, const Tensor& accepted_drafts,
                       const Tensor& licensed_counts, const Tensor& anchors, const Tensor& drafts,

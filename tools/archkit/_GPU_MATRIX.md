@@ -170,10 +170,10 @@ sm_52 的三个档位相关失败 (各带出处):
 | `mma.sync.m8n8k4.f16` (QPN 的 tensor 通道) | 拒 (`Feature 'mma' requires .target sm_70 or higher`) | 拒 | 收 | ops/common/mma.cuh:191 |
 | `mma.sync.m16n8k16.f16` | 拒 | 拒 | 拒 (要 sm_80) | ops/common/mma.cuh:128 |
 | `ldmatrix` | 拒 (要 sm_75) | 拒 | 拒 | ops/common/mma.cuh:100 |
-| `cp.async` | 拒 (要 sm_80) | 拒 | 拒 | ops/common/memory.cuh:65 |
+| `cp.async` | 拒 (要 sm_80) | 拒 | 拒 | ops/common/memory.cuh:126 |
 | `__dp4a` | **未定义** | 收 | 收 | ops/linear/qpn/qpn_kernels.cuh:581 |
 | `${__half}` 算术 (`__hmul2`) | 收 | 收 | 收 | — (sm_50 也编得过) |
-| `nvcuda::wmma` 16x16x16 | 命名空间不存在 | 命名空间不存在 | 收 | qpn_kernels.cuh:404 |
+| `nvcuda::wmma` 16x16x16 | 命名空间不存在 | 命名空间不存在 | 收 | qpn_kernels.cuh:430 |
 | `__grid_constant__` | 拒 ("only allowed for compute_70 or later") | 拒 | 收 | ops/kvarn/attention.cu:292,341 |
 
 由此得到的内核结论:

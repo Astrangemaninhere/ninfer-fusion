@@ -49,6 +49,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+#: The converter ROUTING facts are declared in ONE place now --
+#: ``tools/convert/source_registry.py``.  Its ``ADAPTATIONS`` table is what
+#: ``ARCH_OWN_CONVERTER`` below and the auto-conversion chain's ``plan_conversion`` both
+#: read, so the arch->converter fact and the geometry that guards it cannot be stated twice
+#: with the guard dropped from one copy (which is F1065's defect).
+from tools.convert import source_registry as _registry  # noqa: E402
+
 #: Targets whose contract this module can evaluate.  Listed explicitly rather
 #: than discovered, so a stray directory under tools/convert never becomes
 #: routable by accident.
@@ -100,17 +107,19 @@ NON_DECODER_MARKERS: tuple[str, ...] = (
 )
 
 #: Architectures that carry their own converter, keyed by the GGUF's declared
-#: ``general.architecture`` -- the same key ``tools/convert/convert_runner.py`` uses, so
-#: the front door and the auto-conversion chain cannot disagree about who converts what.
+#: ``general.architecture`` -- the same key the auto-conversion chain now reads from the
+#: SAME table, so the front door and the auto-conversion chain cannot disagree about who
+#: converts what.  That was the defect: this dict and convert_runner.py's
+#: ``QWEN3_5_GGUF_ARCH`` were the same fact stated twice, and only THIS one was guarded by
+#: the file's own geometry.  Derived from ``tools/convert/source_registry.py`` (the
+#: ``arch_owned_converters()`` view) rather than restated.
 #:
 #: Why the generic chain is wrong advice for these: ``gguf_extract.py`` materialises a
 #: bf16 safetensors intermediate, and for the 5.78 GB ornith file that intermediate is
 #: ~18 GB with a 12-14 GB peak on a 22 GB box, which is why the conversion never finished
 #: (``tools/convert/qwen3_5_9b/convert.py`` docstring; n7land REPORT.md section 5.3,
 #: measured).  The family converter reads the GGUF directly and streams row blocks.
-ARCH_OWN_CONVERTER: dict[str, str] = {
-    "qwen35": "tools/convert/qwen3_5_9b/convert.py",
-}
+ARCH_OWN_CONVERTER: dict[str, str] = _registry.arch_owned_converters()
 
 
 def load_json(path: Path) -> Any:
@@ -348,6 +357,95 @@ def _group_summary(quant: Mapping[str, Any]) -> str:
     return "; ".join(parts)
 
 
+#: The engine's own KV-storage vocabulary, and where it is OWNED.  This tuple is a READING of
+#: ``src/product/kv_storage_dtype.h::kKvStorageNames`` (15 tokens) filtered to the six the engine's
+#: per-layer slot resolver accepts; the aliases are the ones ``apps/cli/options.cpp::parse_kv_cache``
+#: accepts.  It is stated HERE rather than imported because that vocabulary is C++: the honest
+#: statement of the risk is that a tier added in the header will be refused here as "unknown" until
+#: this tuple is extended -- a NAMED refusal, which is the safe direction, and the opposite of the
+#: silent drop this section replaces (``kv_cache_scheme`` had exactly ONE reader in the whole tree:
+#: the print in :func:`classify_quant`, which put it in a detail string and dropped it).
+KV_ENGINE_TOKENS: tuple[str, ...] = (
+    "bf16",        # KvCacheStorage::BFloat16      -- the engine's default
+    "int8",        # KvCacheStorage::Int8Group64
+    "fp8",         # Fp8E4M3Row256 / Fp8Group16    -- both spellings are one tier
+    "nvfp4",       # KvCacheStorage::Nvfp4Group16
+    "iso4e",       # KvCacheStorage::Iso3Group16   (deprecated spelling: iso3)
+    "rk4v4",       # KvCacheStorage::E8Group64     (deprecated spelling: e8)
+)
+#: Spellings that name a REAL engine enumerator the engine REFUSES BY NAME, with the engine's own
+#: reason.  Kept apart from "unknown" because the fix is different: these do not need a mapping,
+#: they need a kernel (``product/kv_e8_width.h``: the K code plate has no reader), or a storage the
+#: engine deliberately discards (``KvCacheStorage::Dropped``, ``NINFER_KV_DROP_LAYERS``).
+KV_ENGINE_REFUSED: dict[str, str] = {
+    "rk3v4": "no decode or append kernel in this tree reads a 3-bit K code plate (src/product/kv_e8_width.h)",
+    "rk3v4-g64": "no decode or append kernel in this tree reads a 3-bit K code plate (src/product/kv_e8_width.h)",
+    "rk2v4": "no decode or append kernel in this tree reads a 2-bit K code plate (src/product/kv_e8_width.h)",
+    "rk2v4-g64": "no decode or append kernel in this tree reads a 2-bit K code plate (src/product/kv_e8_width.h)",
+    "dropped": "this layer's KV storage was DISCARDED (NINFER_KV_DROP_LAYERS), so it owns no KV "
+               "planes and has no codec to resolve (src/product/kv_storage_dtype.h)",
+}
+KV_ALIASES: dict[str, str] = {"bfloat16": "bf16", "iso3": "iso4e", "iso3-g16": "iso4e",
+                              "iso4e-g16": "iso4e", "e8": "rk4v4", "rk4v4-g64": "rk4v4",
+                              "fp8-e4m3-r256": "fp8", "fp8-g16": "fp8", "int8-g64": "int8",
+                              "nvfp4-g16": "nvfp4"}
+
+
+@dataclass(slots=True)
+class KvScheme:
+    """What the SOURCE declares about KV-cache quantisation, and whether the engine can serve it.
+
+    ``token`` is "" when the source declares nothing (a measurement: "the source did not say"),
+    which is NOT the same as "bf16" -- the engine's default is applied at serve time and must not be
+    attributed to a checkpoint that never stated it.
+    """
+
+    declared: str          # the source's own spelling, verbatim
+    token: str             # the engine token, or "" when nothing was declared
+    where: str             # the file the declaration was read from
+    refusal: str = ""      # non-empty => NAMED REFUSAL (quantisation class), never a drop
+
+
+def classify_kv_scheme(source: Path, config: Mapping[str, Any]) -> KvScheme:
+    """Read the source's KV-cache quantisation declaration; refuse by name what the engine cannot serve.
+
+    The measurement this replaces: ``kv_cache_scheme`` appears exactly ONCE in the engine and tools
+    trees (``grep -rn kv_cache_scheme src tools apps``) and that one site put it in a printed detail
+    string, so a checkpoint declaring an unserveable KV tier was imported with the declaration
+    silently dropped -- the same shape as ``--kv-dtype`` accepted-and-ignored on the serve side.
+    """
+
+    quant = config.get("quantization_config")
+    declared, where = "", ""
+    if isinstance(quant, Mapping) and quant.get("kv_cache_scheme") is not None:
+        declared = str(quant.get("kv_cache_scheme"))
+        where = "config.json:quantization_config.kv_cache_scheme"
+    if not declared:
+        sidecar = source / "hf_quant_config.json"
+        if sidecar.is_file():
+            body = load_json(sidecar)
+            inner = body.get("quantization") if isinstance(body, Mapping) else None
+            for holder, label in ((inner, "hf_quant_config.json:quantization"),
+                                  (body, "hf_quant_config.json")):
+                if isinstance(holder, Mapping) and holder.get("kv_cache_scheme") is not None:
+                    declared = str(holder.get("kv_cache_scheme"))
+                    where = label + ".kv_cache_scheme"
+                    break
+    if not declared:
+        return KvScheme("", "", "", "")
+
+    key = declared.strip().lower()
+    if key in KV_ENGINE_REFUSED:
+        return KvScheme(declared, "", where, KV_ENGINE_REFUSED[key])
+    token = KV_ALIASES.get(key, key)
+    if token not in KV_ENGINE_TOKENS:
+        return KvScheme(declared, "", where,
+                        "the engine has no KV tier named %r; it serves %s (src/product/"
+                        "kv_storage_dtype.h::kKvStorageNames, six of the accepted slot spellings)"
+                        % (declared, ", ".join(KV_ENGINE_TOKENS)))
+    return KvScheme(declared, token, where, "")
+
+
 def classify_quant(source: Path, config: Mapping[str, Any]) -> QuantFlavour:
     """Name the quantisation scheme; acceptance is decided by the converters."""
 
@@ -451,30 +549,46 @@ def target_source_contract(target: str) -> tuple[frozenset, bool]:
     return frozenset(methods), bool(getattr(module, "SUPPLIES_FRONTEND_RESOURCES", False))
 
 
-def _arch_owner_geometry(own: str) -> tuple[int, int] | None:
-    """The `(block_count, nextn)` the inventory behind an arch-owned converter implements.
+def _arch_owner_geometry(own: str) -> tuple[tuple[int, int], ...]:
+    """The `(main_layers, nextn_layers)` pairs the converter behind an arch-owned route accepts.
 
     An arch-owned converter is named for the ARCHITECTURE, and one architecture can be
     published at more than one geometry in the same family -- `qwen35` is.  So the
     architecture alone does not decide whether that converter's inventory describes this
-    file; the file's own declared `(block_count, nextn)` does (the same pair the target's
-    weight-carrying gate opens with).  These numbers are read out of that target's own
-    ``inventory`` module rather than restated here -- the rule
-    ``_weight_carrying_gate_note`` follows -- so the two statements cannot drift.
-    ``None`` leaves today's advice unchanged: it is returned when the inventory cannot be
-    imported or does not declare both numbers, because failing to *report* an unknown is
-    worse than the unknown.
+    file; the file's own declared `(main_layers, nextn_layers)` does -- the SAME pair
+    `coverage` carries (``tools/convert/gguf_names.py:154``, and the 主栈/草稿块 wording at
+    ``:765`` above), so the comparison is in one unit.
+
+    THAT IS A REPAIR, NOT A REFACTOR.  This function used to return a single
+    `(layers + draft, draft)` -- `(33, 1)` for the 9B package -- while its only caller built
+    the other side as `(main_layers, nextn_layers)` = `(32, 1)`
+    (``tools/convert/test_convert_runner.py:480`` pins exactly that pair for Ornith).  The
+    two sides were in different units, so the comparison was ALWAYS false and the front
+    door printed "this file is not the geometry that converter implements" for every
+    `qwen35` GGUF it could describe -- declining the arch-owned route it had just declared
+    correct.  Returning the whole accepted SET in the caller's unit fixes that, and keeps
+    the intended behaviour: a file at a geometry the gate refuses is still declined.
+
+    THE TABLE ANSWERS FIRST.  ``tools/convert/source_registry.py`` declares those pairs on
+    the row naming this converter, so asking it is asking the one statement the
+    auto-conversion chain also reads.  The inventory read remains as the fallback for a
+    converter the table does not carry a row for -- note the fallback is `(layers, draft)`,
+    the same unit as the table, because a fallback in the wrong unit is how this broke.
+    ``()`` when neither source can answer, which leaves the caller's message as it was.
     """
 
+    declared = _registry.geometry_for_converter(own)
+    if declared:
+        return declared
     try:
         target = (REPO_ROOT / own).parent.name
         module = importlib.import_module(f"tools.convert.{target}.inventory")
     except Exception:                                 # noqa: BLE001
-        return None
+        return ()
     layers, draft = getattr(module, "LAYERS", None), getattr(module, "MTP_LAYERS", None)
     if not isinstance(layers, int) or not isinstance(draft, int):
-        return None
-    return (layers + draft, draft)
+        return ()
+    return ((layers, 0), (layers, draft))
 
 
 def _weight_carrying_gate_note(target: str, config: Mapping[str, Any]) -> str:
@@ -794,11 +908,11 @@ def report_gguf(source: Path) -> int:
                 if coverage is not None else None
             )
             owner_geometry = _arch_owner_geometry(own)
-            if (declared_geometry is not None and owner_geometry is not None
-                    and declared_geometry != owner_geometry):
+            if (declared_geometry is not None and owner_geometry
+                    and declared_geometry not in owner_geometry):
                 print("  ** this file is not the geometry that converter implements **")
-                print(f"     {own} implements (block_count, nextn) == {owner_geometry}")
-                print(f"     this file declares (block_count, nextn) == {declared_geometry}"
+                print(f"     {own} accepts (main_layers, nextn_layers) in {owner_geometry}")
+                print(f"     this file declares (main_layers, nextn_layers) == {declared_geometry}"
                       "（源自述，见上面第 3 节）")
                 print("     -> 该入口的几何门会按名拒绝本文件（rc=3），上面的命令跑不通。")
                 own = None
@@ -902,8 +1016,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     _rule("③ 量化形态")
     flavour = classify_quant(source, config)
-    print(f"  flavour : {flavour.method}")
     print(f"  detail  : {flavour.detail}")
+
+    # ③b: the SOURCE's KV-cache declaration, and whether this engine can serve it.  Three states,
+    # none of them a silence: not declared / declared+servable / DECLARED+REFUSED-BY-NAME.
+    kv = classify_kv_scheme(source, config)
+    if not kv.declared:
+        print("  KV 声明  : 源未声明 KV 量化（本引擎的默认 tier 是服务期的事，不是本检查点的属性）")
+    elif kv.refusal:
+        print(f"  KV 声明  : **具名拒绝（量化不支持）** —— {kv.declared}（来自 {kv.where}）：{kv.refusal}")
+    else:
+        print(f"  KV 声明  : {kv.declared}（来自 {kv.where}）-> 引擎词汇表里的 {kv.token}；"
+              f"artifact 侧承载字段：**无（具名缺口）** —— 见 ⑧")
 
     _rule("④ 权重清点（只读 index）")
     census = census_weights(source)
@@ -1027,6 +1151,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "frontend": profile.report()["resources"] if profile else None,
                 "frontend_counts": dict(counts),
                 "frontend_verdict": frontend_reject or None,
+                "kv_scheme": {"declared": kv.declared, "token": kv.token,
+                              "where": kv.where, "refusal": kv.refusal or None,
+                              "artifact_carrier": None},
                 "targets": [{"target": v.target, "entry": v.entry, "status": v.status,
                              "message": v.message, "command": v.command}
                             for v in list(verdicts) + list(quant_verdicts)],
@@ -1076,7 +1203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # artifact, so it is decided by loading it.  The gate is imported from
             # convert_runner rather than re-implemented here, so the CLI chain and
             # the GUI chain cannot reach different verdicts about the same file.
-            from tools.convert.convert_runner import ArtifactUnverified, verify_artifact
+            from tools.convert.artifact_verify import ArtifactUnverified, verify_artifact
             print(f"  加载验证 {out_path} ……")
             try:
                 artifact_report = verify_artifact(str(out_path))
@@ -1093,6 +1220,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     print("  work-item（已理解，但缺件/形态不同，需先落地对应实现）：")
+    if kv.refusal:
+        print("    1b) KV 声明（量化不支持，**按名拒绝**）：源声明 %s（%s）—— %s"
+              % (kv.declared, kv.where, kv.refusal))
+    elif kv.token:
+        print("    1c) KV 声明（已读，未丢弃）：%s（%s）-> 引擎 tier %s；"
+              "artifact 目前没有承载该声明的字段，这是本行按名记下的缺口。" % (kv.declared, kv.where, kv.token))
     if frontend_error:
         print(f"    0) 前端资源根未配置（硬阻断，本源的 tokenizer 侧车未测量）："
               f"{frontend_error}")
@@ -1177,6 +1310,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "frontend": profile.report()["resources"] if profile else None,
             "frontend_counts": dict(counts),
             "frontend_verdict": frontend_error or frontend_reject or None,
+            "kv_scheme": {"declared": kv.declared, "token": kv.token,
+                          "where": kv.where, "refusal": kv.refusal or None,
+                          "artifact_carrier": None},
             "targets": [{"target": v.target, "entry": v.entry, "status": v.status,
                          "message": v.message, "command": v.command}
                         for v in list(verdicts) + list(quant_verdicts)],

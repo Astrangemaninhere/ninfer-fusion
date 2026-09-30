@@ -430,7 +430,8 @@ void launch_tc_partial_nvfp4(const Tensor& q, const __nv_bfloat16* input_k,
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                 logical_capacity, cache.layer_index, scale, static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-                invocation.batch_size, masked, writes_cache);
+                invocation.batch_size, masked, writes_cache,
+                nvfp4_frag_ld_launch_flag());
     };
     // Minimal production schedule set for the first NVFP4 revision.
     if constexpr (Geometry::GroupSize == 16) {

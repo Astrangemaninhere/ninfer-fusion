@@ -35,7 +35,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 sys.path.insert(0, REPO)
-import convert_runner as cr                      # noqa: E402
+#: P1-b: the load gate moved to tools/convert/artifact_verify.py, and this self-test IS the
+#: gate's own test -- so it binds the MOVED module.  That is also what makes ``cr.ENGINE = ...``
+#: below redirect the engine: verify_artifact reads ITS OWN module globals, so setting the
+#: attribute on a re-exporter would silently do nothing.  The routing half (plan_conversion)
+#: still lives in the GUI front door and is bound separately.
+from tools.convert import artifact_verify as cr  # noqa: E402
+from tools.gui import convert_runner as _front   # noqa: E402
+
+#: The artifact basename the qwen3.5-family row declares.  It was ``cr.QWEN3_5_OUT_NAME`` in
+#: the module P1-b retired; kept as a LITERAL on purpose, so this test still PINS the published
+#: name -- a change to it must be a deliberate edit on both sides, not a silent re-derivation
+#: from the same table the door reads.
+QWEN3_5_OUT_NAME = 'qwen3_5_9b_auto.ninfer'
 
 #: Bounded re-attempts around the ONE step that touches a 5.78 GB file which lives on
 #: /mnt/c (a Windows drive over this machine's relay).  Two real runs (15:39, 15:43)
@@ -215,7 +227,7 @@ def main():
             os.environ["NINFER_RESOURCE_ROOTS"] = res
             if res_names:
                 try:
-                    steps, out_name = cr.plan_conversion(ornith_scan)
+                    steps, out_name = _front.plan_conversion(ornith_scan)
                     argv = steps[0][1] if steps else []
                     joined = " ".join(str(a) for a in argv)
                     check("ornith: the recipe is one streaming step",
@@ -229,7 +241,7 @@ def main():
                     check("ornith: --gguf and --resources are both passed",
                           "--gguf" in argv and "--resources" in argv, " | %s" % joined)
                     check("ornith: the artifact is named for the family",
-                          out_name == cr.QWEN3_5_OUT_NAME, " | %r" % out_name)
+                          out_name == QWEN3_5_OUT_NAME, " | %r" % out_name)
                 except ValueError as exc:
                     check("ornith: plan_conversion routes the real qwen35 scan", False,
                           " | it raised: %s" % exc)
@@ -237,7 +249,7 @@ def main():
             # NEGATIVE CONTROL: a GGUF of another family must still be refused.
             other = dict(ornith_scan, arch_names=["gemma4", "gemma-4-31b"])
             try:
-                cr.plan_conversion(other)
+                _front.plan_conversion(other)
                 red = "it was ROUTED -- the door was opened for everything"
             except ValueError as exc:
                 red = str(exc)
@@ -248,7 +260,7 @@ def main():
             # rather than emitting a command the converter cannot run.
             os.environ["NINFER_RESOURCE_ROOTS"] = os.path.join(d, "nowhere")
             try:
-                cr.plan_conversion(ornith_scan)
+                _front.plan_conversion(ornith_scan)
                 red2 = "it planned anyway -- a silent bad recipe"
             except ValueError as exc:
                 red2 = str(exc)

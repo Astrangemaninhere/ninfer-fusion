@@ -5,6 +5,10 @@
 #include "product/kv_tier_formats.h"
 #include "product/kv_kv_bits.h"
 #include "runtime/engine/bandwidth_governor.h"
+// --stage-layers' grammar, cover and run-shape refusals. Linked in by the front door so a
+// mis-shaped SPEC is refused before any artifact is opened -- and so the ONE parser in
+// core/stage_plan.h is called here and, with the artifact's own layer count, in the runtime.
+#include "core/stage_plan.h"
 
 #include <cerrno>
 #include <cmath>
@@ -13,6 +17,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+
+#include "spec/inject_channel.h"
 
 namespace ninfer::cli {
 namespace {
@@ -90,6 +96,93 @@ float parse_float(const char* text, std::string_view label, float minimum, float
     return static_cast<float>(value);
 }
 
+// ---------------------------------------------------------------------------
+// SET-BUT-EMPTY-VALUE, for the KV slider family (every `--kv-*` flag here that
+// takes a value).  An empty value is not a spelling of anything in any of these
+// grammars, and the reason that is not harmless is that the consumers which do
+// meet one meet it by IMPUTING a state:
+//
+//   parse_kv_layer_storage_spec("")   -> a table whose mask is all-false, i.e. "no
+//                                        layer was named" -- so the flag parsed,
+//                                        was marked explicit, and was read by
+//                                        nothing (its own parser documents the
+//                                        mask as the thing that decides).
+//   kv_rowscale_mode_from_spec("")    -> Auto, i.e. exactly what
+//                                        `--kv-row-scale auto` asks for.
+//   --kv-tier-scores ""               -> the built-in table, i.e. as if unset.
+//   parse_kv_residual_layers_spec("") -> an all-false table under
+//                                        kv_residual_explicit = true, which is the
+//                                        very "explicitly no residuals" state
+//                                        apps/cli/main.cpp warns an all-false table
+//                                        must not be handed over unconditionally.
+//
+// The sites that did refuse printed `invalid <flag>: ` with NOTHING after the
+// colon, so an empty value and a missing one read the same to an operator and only
+// one of them is a typo.  This is the same class the sibling front end caught on
+// `--kv-score-table` (src/core/vendor_sim.h, the `set-but-empty-value` outcome).
+//
+// The refusal prints what the other refusals in this file print -- the TERM that
+// failed, the VALUE it carried (as '' when there is nothing to print) and the set
+// it was compared against -- plus, by name, the state the empty spelling imputed,
+// because that half cannot be recovered from the accepted-set list.
+std::string kv_value_not_empty(std::string_view flag, const char* text,
+                               std::string_view accepted, std::string_view consequence) {
+    if (text != nullptr && *text != '\0') { return std::string(text); }
+    throw std::invalid_argument(
+        "set-but-empty-value: " + std::string(flag) + " '' -- the value is EMPTY, and an "
+        "empty value is not a spelling of anything: " + std::string(flag) + " accepts " +
+        std::string(accepted) + ". Read as empty, " + std::string(consequence) +
+        ". Drop the flag, or give one of the accepted spellings.");
+}
+
+// How many layers a `--kv-bit-budget` RANGE spec claims for itself: 1 + the largest
+// `last` a readable entry names.  This is a TOKENIZER, not a second grammar -- it
+// decides nothing about tiling, ceilings or ordering, it never refuses, and an entry
+// it cannot read is left to product::kv_bit_budget_parse_ranges
+// (product/kv_bit_budget.h), which is the ONE definition of that grammar and whose
+// message is what the operator gets.  All this answers is "which layer count would
+// make this spec's own last range land inside the table", so the front door can ask
+// the real parser the real question at parse time instead of after the artifact is
+// already open.
+//
+// SOUNDNESS (why this cannot refuse anything the planner accepts): the planner
+// accepts a spec only when its ranges tile [0, full_layers), which means the last
+// range ends at full_layers - 1, so the claim derived here IS full_layers and
+// kv_bit_budget_parse_ranges receives exactly the number the planner would have
+// given it.  A spec the planner would refuse may now be refused EARLIER, which is
+// the point of the change; a spec the planner accepts cannot be refused here.
+std::int32_t kv_budget_ranges_claimed_layers(std::string_view spec) {
+    std::int32_t claimed = 0;
+    std::size_t cursor = 0;
+    while (cursor <= spec.size()) {
+        const std::size_t comma = spec.find(',', cursor);
+        const std::string_view item =
+            comma == std::string_view::npos ? spec.substr(cursor)
+                                            : spec.substr(cursor, comma - cursor);
+        const std::size_t colon = item.find(':');
+        if (colon != std::string_view::npos) {
+            const std::string_view layers = item.substr(0, colon);
+            const std::size_t dash = layers.find('-');
+            const std::string_view last_text =
+                dash == std::string_view::npos ? layers : layers.substr(dash + 1);
+            const std::string text(last_text);
+            if (!text.empty()) {
+                errno             = 0;
+                char* end         = nullptr;
+                const long parsed = std::strtol(text.c_str(), &end, 10);
+                if (errno == 0 && end == text.c_str() + text.size() && parsed >= 0 &&
+                    parsed < std::numeric_limits<std::int32_t>::max()) {
+                    const std::int32_t candidate = static_cast<std::int32_t>(parsed) + 1;
+                    if (candidate > claimed) { claimed = candidate; }
+                }
+            }
+        }
+        if (comma == std::string_view::npos) { break; }
+        cursor = comma + 1;
+    }
+    return claimed;
+}
+
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
@@ -146,7 +239,7 @@ int set_process_env(const char* name, const char* value) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] [--prefill-chunk N] [--max-new N]\n"
            "       [--prefill-chunk-mode dynamic|manual]\n"
            "           (who owns the prefill unit. dynamic (default) lets the bandwidth governor\n"
            "            install a unit inside [128, --prefill-chunk] and shrink it while decode\n"
@@ -156,7 +249,45 @@ std::string usage_text(const char* argv0) {
            "            --prefill-chunk is the ceiling, and NINFER_FT_BW_TRACE=1 prints the mode\n"
            "            and the unit the engine installed.)\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|iso4e|iso3|rk4v4|e8] [--kv-layer-storage SPEC] [--kv-bit-budget SPEC] [--spec auto|off|mtp|dflash|dflash2|dspark|none --draft-tokens N]\n           (dspark is a spelling of dflash, not a fourth backend: the DSpark drafter IS\n            the DFlash (v1) runtime, and the artifact's own weights identity\n            (weights_id=nvfp4-dspark) is what decides whether its Markov head runs --\n            dflash/markov_w1+w2 are bound only for that identity, and without them the\n            same --spec dflash drafts by plain argmax.)\n           (--kv-dtype names ONE global KV tier: bf16, int8, fp8 (row-scaled E4M3 D256),\n            nvfp4, and the pair this engine prints as iso4e-g16 / rk4v4-g64 -- iso3 and e8\n            are their deprecated aliases, accepted for one release. nvfp4 is the WEIGHT tier\n            the shipped qwen3_8_27b_nvfp4_modelopt artifact records for itself (weights_id:\n            nvfp4-modelopt), i.e. the tier this project ships. It cannot be combined\n            with --kv-bit-budget/--kv-bits, whose ceiling would replace the table it fills.\n           (--kv-bit-budget takes a ceiling per KV element, or per layer range:\n            \"0-7:8,8-63:4.5\"; it never exceeds the declared ceilings)\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|iso4e|iso3|rk4v4|e8] [--kv-layer-storage SPEC] [--kv-bit-budget SPEC] [--spec auto|off|mtp|dflash|dflash2|dspark|none --draft-tokens N]\n           (dspark is a spelling of dflash, not a fourth backend: the DSpark drafter IS\n            the DFlash (v1) runtime, and the artifact's own weights identity\n            (weights_id=nvfp4-dspark) is what decides whether its Markov head runs --\n            dflash/markov_w1+w2 are bound only for that identity, and without them the\n            same --spec dflash drafts by plain argmax.)\n           (--kv-dtype names ONE global KV tier: bf16, int8, fp8 (row-scaled E4M3 D256),\n            nvfp4, and the pair this engine prints as iso4e-g16 / rk4v4-g64 -- iso3 and e8\n            are their deprecated aliases, accepted for one release. nvfp4 is the WEIGHT tier\n            the shipped qwen3_8_27b_nvfp4_modelopt artifact records for itself (weights_id:\n            nvfp4-modelopt), i.e. the tier this project ships. It cannot be combined\n            with --kv-bit-budget/--kv-bits, whose ceiling would replace the table it fills.\n           (--kv-bit-budget takes a ceiling per KV element, or per layer range:\n            \"0-7:8,8-15:4.5\" -- the ranges must TILE every\n            FULL-ATTENTION layer (16 here, NOT the 64 the old example assumed: this\n            variant has 48 GDN layers, and they carry no paged KV); it never exceeds the\n            declared ceilings)\n"
+           "       [--stage-layers SPEC] [--stage-handoff DIR] [--stage-handoff-cut]\n"
+           "           (THE PIPELINE STAGE PARTITION of the text-layer axis, and the one\n"
+           "            surface that makes a pp world askable from a command line instead of\n"
+           "            only from a farm probe. SPEC is lo-hi layer ranges, one per STAGE:\n"
+           "            0-17,18-35 is a pp world of 2 over 36 layers, and 0-35 is the\n"
+           "            IDENTITY -- one stage, i.e. axis none, byte-for-byte a run with no\n"
+           "            flag at all. lo-hi is inclusive hi, the same spelling --kv-layer-storage\n"
+           "            documents as 0-7:bf16. The grammar, the cover and the axis check live\n"
+           "            in ONE place, core/stage_plan.h, called by this front door AND by the\n"
+           "            runtime -- a second spelling of the grammar is what this project keeps\n"
+           "            paying for.)\n"
+           "           (REFUSED BY NAME, never accepted and ignored: refused-stage-layers for a\n"
+           "            mis-shaped SPEC; refused-stage-layers-partition for a spec that is not a\n"
+           "            cover of [0, layers); refused-stage-layers-axis for a spec the rank axis\n"
+           "            does not derive -- plan_shards() itself decides, so a layer range that\n"
+           "            is not a shard of the world core/shard_plan.h hands out is refused\n"
+           "            rather than run and reported as something it is not. NOTE what is NOT\n"
+           "            touched: --stage-layers makes pp REACHABLE, it does not make\n"
+           "            validate_virtual_request(pp).active read anything but 0. The virtual\n"
+           "            -device guard still refuses pp, with its own reason, unchanged.)\n"
+           "           (A PARTIAL range is additionally refused by name where the range cannot\n"
+           "            be honoured: refused-stage-layers-spec with speculation on (the drafters\n"
+           "            walk the layer axis themselves -- dflash_impl.h:143/:236,\n"
+           "            dflash2_impl.h:190/:248, mtp_impl.h:264 -- and this range does not bound\n"
+           "            them); refused-stage-layers-w13 with the W13 weight host-offload budget\n"
+           "            set (product/weight_residency.h:374-383 asserts that every pass enters\n"
+           "            every offloaded layer through note_layer(), and a partial pass does not);\n"
+           "            refused-stage-layers-graph with CUDA-graph capture on (the seam is a\n"
+           "            HOST-side write/read, which a captured graph would replay stale -- the\n"
+           "            same reason W13's H2D is prefill-only).)\n"
+           "           (--stage-handoff DIR names the directory the boundary hidden state\n"
+           "            crosses through: stage k writes stage_k.bin, reads stage_{k-1}.bin, as\n"
+           "            raw bytes plus a header carrying a magic, the producing layer, the\n"
+           "            element count and an FNV-1a, so a payload left over from another prompt\n"
+           "            is DETECTABLE rather than silently consumed. --stage-handoff-cut is a\n"
+           "            NEGATIVE CONTROL, not a feature: it silences the producer so the ids\n"
+           "            MOVE, which is how \"the handoff is load-bearing\" is falsified on the\n"
+           "            shipped binary instead of asserted.)\n"
            "       [--kv-residual-layers SPEC]\n"
            "           (the per-layer NVFP4 SECOND-STAGE RESIDUAL planes, SPEC = a bare layer\n"
            "            list over the family-wide 64 slots, \"2-5\" or \"0,3,7\". This is the\n"
@@ -263,7 +394,7 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
+           "       [--print-prompt-ids] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
            "       [--cold-policy none|off|window|host|disk|host-then-disk|host+disk] "
            "(host+disk is an accepted equivalent spelling of host-then-disk; "
@@ -274,10 +405,11 @@ std::string usage_text(const char* argv0) {
            "       [--append-context-text <text>]\n"
            "       [--cold-host-bytes N[g|m|k]]\n"
            "       [--cold-disk-path DIR] [--cold-disk-bytes N]\n"
+           "       [--ple-sidecar DIR]\n"
            "       [--weight-host-bytes N] [--weight-device-arena-bytes N]\n"
            "       [--weight-prefetch-layers N] [--weight-span-floor-bytes N]\n"
            "       [--no-cuda-graph] [--graph-capture-ceiling N]\n"
-           "       [--ft-stats on|off]\n"
+           "       [--ft-stats on|off] [--inject-spec PATH]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -288,6 +420,24 @@ std::string usage_text(const char* argv0) {
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
+           "--inject-spec PATH declares a CHOSEN TENSOR and the position range it will "
+           "occupy (src/spec/inject_channel.h): direction=ingest|egress, dtype=bf16|f16|f32, "
+           "layout=token-major, rows, cols, position0, scale, path, digest. The tensor's "
+           "alphabet is the input-embedding space, so it enters the model where a gathered "
+           "token's embedding enters, and an ingress of the engine's own bytes is a no-op "
+           "to the model (the etiquette requirement of src/spec/sum_dir.h:98, made into a "
+           "measurement). The declaration is validated here, with the header's own parser, "
+           "so a wrong field or a wrong dtype refuses by name before the artifact is loaded; "
+           "the checks that need the model (rows, position range) are made at bind time. "
+           "Every admitted ingest is reported on stderr with its shape, dtype, position "
+           "range and ingested digest, and every mismatch with its refusal name. "
+           "NINFER_INJECT_SPEC is the env spelling and the flag beats it.\n"
+           "--print-prompt-ids prints, on stderr, the ids the PROMPT was tokenized to, in order. "
+           "It is the input side of --print-token-ids, and it exists because a `sum_dir` row's "
+           "identity is a digest over its block's token ids (src/spec/sum_dir.h:210-224), so a row "
+           "cannot be NAMED -- and therefore cannot be bound to the inject channel "
+           "(src/spec/sum_dir_inject.h) -- without them. Read-only: the engine already holds the "
+           "sequence (include/ninfer/engine.h:30) and this flag is the surface it never had. "
            "--ft-stats on enables the FreeToken per-layer attention-energy observation "
            "(NINFER_FT_STATS=1 is the env spelling); it is off by default and the flag "
            "beats the env. Its consumer -- the periodic KV relayout -- is a serve-side "
@@ -356,6 +506,11 @@ Options parse_options(int argc, char** argv) {
     // src/serve/serve_options.cpp:198/523/836 uses, so the two front ends cannot
     // disagree about whether a flag beats NINFER_KV_UNLOAD_WATERMARK_PAGES.
     bool unload_watermark_explicit = false;
+    // The same "the operator named it" gate for --weight-prefetch-layers, and the ONLY one of the
+    // four W13 knobs that needs a gate rather than a value test: its default is 2 -- a legal depth
+    // -- so `weight_prefetch_layers != 2` would let `--weight-prefetch-layers 2` alone through and
+    // would hard-code the default here. src/serve/serve_options.cpp carries the same variable.
+    bool weight_prefetch_layers_explicit = false;
 
     // first_arg_is_flag subsumes score_table_standalone: "--kv-score-table" itself
     // begins with "--", so both cases read every flag from index 1.
@@ -377,6 +532,14 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--max-concurrency") {
+            // allow_zero on purpose: the bound in the validation block below is what refuses
+            // 0, so the refusal names the BOUND ("--max-concurrency must be in [1,16]") exactly
+            // as ninfer-serve's does. A plain parse_u32 would refuse 0 first with a message
+            // that names the parse instead, and the two front ends would then answer the same
+            // argv differently. Precedent for the spelling: --draft-tokens.
+            options.max_concurrency =
+                parse_u32(value(arg), "max-concurrency", /*allow_zero=*/true);
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--prefill-chunk-mode") {
@@ -387,18 +550,62 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
         } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_cache(value(arg));
+            options.kv_cache = parse_kv_cache(kv_value_not_empty(
+                arg, value(arg), "bf16|int8|fp8|nvfp4|iso4e|iso3|rk4v4|e8",
+                "the refusal printed the flag and then nothing where the value belongs, "
+                "so an empty value and a missing one read the same"));
             options.kv_cache_explicit = true;
         } else if (arg == "--kv-bit-budget") {
             // "N" (one ceiling for every full-attention layer) or "lo-hi:bits,..."
             // (separable per-range ceilings; the DP minimises each range independently).
-            const std::string budget_spec = value(arg);
+            const std::string budget_spec = kv_value_not_empty(
+                arg, value(arg), "one ceiling like 4.5, or ranges like 0-7:8,8-15:4.5 (ranges tile every full-attention layer)",
+                "the refusal printed the flag and then nothing where the value belongs, "
+                "so an empty value was indistinguishable from a missing one");
             if (budget_spec.find(':') != std::string::npos ||
                 budget_spec.find(',') != std::string::npos) {
+                // RANGES: the tiling is now checked HERE, by the allocator's own parser,
+                // with the layer count the spec claims for itself
+                // (kv_budget_ranges_claimed_layers above). It used to be checked only in
+                // the planner (targets/qwen3_6/impl/runtime/layouts_impl.h), i.e. after
+                // the artifact was already open, so every malformed range spec reached
+                // the engine first: `0-7:` (ceiling missing), `99:4` (layer out of
+                // range), `8,4` (no lo-hi:bits), `0-7:0` and `0-7:-1` (non-positive
+                // ceiling), `4.5,` (empty entry), `0-7:8,4-5:4.5` (out of order) all
+                // parsed clean at this front door.
+                //
+                // Nothing is duplicated: this call IS product::kv_bit_budget_parse_ranges,
+                // and the planner's own call with the MODEL's layer count is unchanged --
+                // so a spec that tiles [0,N) for a claim N that is not this model's
+                // full-attention count is still refused there, where the count lives.
+                try {
+                    (void)product::kv_bit_budget_parse_ranges(
+                        budget_spec, kv_budget_ranges_claimed_layers(budget_spec));
+                } catch (const std::invalid_argument& error) {
+                    // The parser's verdict is kept VERBATIM (it is the one definition of
+                    // this grammar); only the context it cannot know is added. Several of
+                    // its refusals name the FIELD and not the text that landed in it
+                    // ("invalid budget: " with the piece elided), so the value the
+                    // operator typed is printed in full here.
+                    throw std::invalid_argument(std::string(error.what()) +
+                                                " [--kv-bit-budget '" + budget_spec + "']");
+                }
                 options.kv_bit_budget_ranges   = budget_spec;
                 options.kv_bit_budget_bits     = 0.0;
                 options.kv_bit_budget_explicit = true;
             } else {
+                if (budget_spec.find('-') != std::string::npos) {
+                    // A RANGE WITHOUT ITS CEILING. `0-7` is not a ceiling and is not a
+                    // range either, and the generic number refusal ("invalid
+                    // --kv-bit-budget: 0-7", because strtod stops at the '-') leaves the
+                    // operator to guess which of the two grammars was expected.
+                    throw std::invalid_argument(
+                        "invalid --kv-bit-budget: " + budget_spec +
+                        " -- this names a LAYER RANGE, and a range needs its ceiling: the "
+                        "grammar is lo-hi:bits, comma separated for several ranges (e.g. "
+                        "0-7:8,8-15:4.5). A ceiling for every layer at once is a plain "
+                        "number (e.g. 4.5).");
+                }
                 options.kv_bit_budget_bits =
                     parse_float(budget_spec.c_str(), "--kv-bit-budget", 0.01F, 16.0F);
                 options.kv_bit_budget_ranges.clear();
@@ -408,25 +615,49 @@ Options parse_options(int argc, char** argv) {
             // 0 = fastest KV path, 1 = most accurate; the DP minimises
             // w*quality + (1-w)*speed per tier inside the bit ceiling.
             options.kv_quality_weight =
-                parse_float(value(arg), "--kv-quality-weight", 0.0F, 1.0F);
+                parse_float(kv_value_not_empty(
+                                arg, value(arg), "a weight in [0,1] (0 = fastest)",
+                                "the refusal printed the flag and then nothing where the "
+                                "value belongs")
+                                .c_str(),
+                            "--kv-quality-weight", 0.0F, 1.0F);
         } else if (arg == "--kv-tier-scores") {
-            options.kv_tier_scores = value(arg);
+            options.kv_tier_scores = kv_value_not_empty(
+                arg, value(arg), "a file path, or the table's own text",
+                "the empty spec selects the BUILT-IN table (kv_bit_budget_default_scores), "
+                "so the flag would be accepted and change nothing");
         } else if (arg == "--kv-bits") {
             // JOINT form: ONE overall ceiling for the whole KV stack ("合起来整体定").
-            options.kv_joint_bits =
-                parse_float(value(arg), "--kv-bits", 0.01F, 16.0F);
+            options.kv_joint_bits = parse_float(
+                kv_value_not_empty(arg, value(arg), "a bits-per-element ceiling like 4.5",
+                                   "the refusal printed the flag and then nothing where the "
+                                   "value belongs")
+                    .c_str(),
+                "--kv-bits", 0.01F, 16.0F);
             options.kv_kv_bits_explicit = true;
         } else if (arg == "--kv-k-bits") {
             // SPLIT form: K gets its own ceiling, and its own per-layer layering.
-            options.kv_k_bits = parse_float(value(arg), "--kv-k-bits", 0.01F, 16.0F);
+            options.kv_k_bits = parse_float(
+                kv_value_not_empty(arg, value(arg), "a bits-per-element ceiling like 4.5",
+                                   "the refusal printed the flag and then nothing where the "
+                                   "value belongs")
+                    .c_str(),
+                "--kv-k-bits", 0.01F, 16.0F);
             options.kv_kv_bits_explicit = true;
         } else if (arg == "--kv-v-bits") {
             // SPLIT form: V gets its own ceiling, and its own per-layer layering.
-            options.kv_v_bits = parse_float(value(arg), "--kv-v-bits", 0.01F, 16.0F);
+            options.kv_v_bits = parse_float(
+                kv_value_not_empty(arg, value(arg), "a bits-per-element ceiling like 4.5",
+                                   "the refusal printed the flag and then nothing where the "
+                                   "value belongs")
+                    .c_str(),
+                "--kv-v-bits", 0.01F, 16.0F);
             options.kv_kv_bits_explicit = true;
         } else if (arg == "--kv-bits-mode") {
             // Which reading of a per-plane request runs: joint | split | ceiling.
-            options.kv_bits_mode = product::kv_bits_mode_from_name(value(arg));
+            options.kv_bits_mode = product::kv_bits_mode_from_name(kv_value_not_empty(
+                arg, value(arg), "joint|split|ceiling",
+                "the refusal printed the flag and then nothing where the value belongs"));
             options.kv_bits_mode_explicit = true;
         } else if (arg == "--kv-codec-preference") {
             // SLIDERWIRE: WHICH codec the fit picks among candidates that cost the SAME bits.
@@ -483,10 +714,16 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-k-tier-scores") {
             // The K plane's own score columns (quality/speed) for the split entry.
-            options.kv_k_tier_scores = value(arg);
+            options.kv_k_tier_scores = kv_value_not_empty(
+                arg, value(arg), "a file path, or the table's own text",
+                "the empty spec selects the BUILT-IN table (kv_bit_budget_default_scores), "
+                "so the flag would be accepted and change nothing");
         } else if (arg == "--kv-v-tier-scores") {
             // The V plane's own score columns for the split entry.
-            options.kv_v_tier_scores = value(arg);
+            options.kv_v_tier_scores = kv_value_not_empty(
+                arg, value(arg), "a file path, or the table's own text",
+                "the empty spec selects the BUILT-IN table (kv_bit_budget_default_scores), "
+                "so the flag would be accepted and change nothing");
         } else if (arg == "--capability-report") {
             // The BUILD capability surface's OWN entry point. No value: it takes no argument,
             // because everything it prints comes from this build's own tables. Handled in
@@ -499,8 +736,56 @@ Options parse_options(int argc, char** argv) {
             // entry runs with no model at all (see apps/cli/main.cpp).
             options.kv_score_table_spec     = value(arg);
             options.kv_score_table_explicit = true;
+        } else if (arg == "--stage-layers") {
+            // THE FLAG THIS LINE ADDS. The value is kept RAW here and parsed by
+            // core/stage_plan.h -- the same parser the runtime calls -- so the grammar has one
+            // implementation. The grammar IS this front door's promise, so it is checked HERE,
+            // before any artifact is opened, exactly as --kv-layer-storage's entries are
+            // (options.cpp:686-693).
+            const std::string spec = kv_value_not_empty(
+                arg, value(arg), "lo-hi layer ranges, one per stage, like 0-17,18-35",
+                "an empty SPEC is refused rather than read as \"no stages\", because a run that "
+                "quietly became single-device is indistinguishable from a successful world at "
+                "the point where the numbers are read");
+            ninfer::multi::StagePlan parsed;
+            const std::string refusal = ninfer::multi::parse_stage_layers(spec, parsed);
+            if (!refusal.empty()) { throw std::invalid_argument(refusal); }
+            options.stage_layers_spec     = spec;
+            options.stage_layers_explicit = true;
+        } else if (arg == "--stage-handoff") {
+            const std::string dir = kv_value_not_empty(
+                arg, value(arg), "a directory the stage boundary payload crosses through",
+                "an empty directory would put stage_k.bin in the process's cwd, where a "
+                "leftover file from an unrelated run is consumed as this run's boundary");
+            options.stage_handoff_dir     = dir;
+            options.stage_handoff_explicit = true;
+        } else if (arg == "--stage-handoff-cut") {
+            options.stage_handoff_cut      = true;
+            options.stage_handoff_explicit = true;
         } else if (arg == "--kv-layer-storage") {
-            options.kv_layer_storage_spec = value(arg);
+            // The table AND its mask are parsed in main() (the mask is what makes
+            // `0-11:bf16` a real per-layer baseline rather than "inherit --kv-dtype"),
+            // but the grammar is this front door's promise, so an empty value and an
+            // empty entry are refused here instead of being handed over.
+            const std::string storage_spec = kv_value_not_empty(
+                arg, value(arg), "lo-hi:dtype entries like 0-7:bf16, or all:dtype",
+                "product::parse_kv_layer_storage_spec(\"\") returns a table whose mask is "
+                "all-false, so the flag would be marked explicit and read by nothing");
+            if (storage_spec.back() == ',') {
+                // A TRAILING COMMA. parse_kv_layer_storage_spec's loop runs
+                // `while (begin < spec.size())`, so a spec that ends on a comma never
+                // reaches the `if (item.empty()) throw` inside it: `0-7:bf16,` was
+                // accepted, and the empty entry it names was dropped without a word.
+                // Refused here, by name, with the entry printed; the parser's own loop
+                // bound is the thing that would make this check unnecessary.
+                throw std::invalid_argument(
+                    "kv-layer-storage: '" + storage_spec +
+                    "' ends on a comma, so its last entry is EMPTY. The grammar is a "
+                    "comma-separated list with no empty element (e.g. 0-7:bf16,8-15:int8 "
+                    "or all:bf16), and an empty final entry is not a spelling of "
+                    "anything -- it was dropped in silence before this check.");
+            }
+            options.kv_layer_storage_spec     = storage_spec;
             options.kv_layer_storage_explicit = true;
         } else if (arg == "--kv-residual-layers") {
             // Stored raw and parsed in main() next to the EngineOptions it produces,
@@ -508,14 +793,22 @@ Options parse_options(int argc, char** argv) {
             // still precedes Engine construction, so a typo is refused before any device
             // work (rule: behavioural differences that happen at parse time are settled
             // on the host, never with the GPU in the loop).
-            options.kv_residual_layers_spec     = value(arg);
+            options.kv_residual_layers_spec = kv_value_not_empty(
+                arg, value(arg), "a layer list like 2-5 or 0,3,7",
+                "product::parse_kv_residual_layers_spec(\"\") returns an all-false table "
+                "while kv_residual_explicit is set to true, i.e. exactly the \"explicitly "
+                "no residuals\" state apps/cli/main.cpp warns an all-false table must not "
+                "be handed over unconditionally");
             options.kv_residual_layers_explicit = true;
         } else if (arg == "--kv-tier-formats") {
             // KV tier vocabulary ("hot=bf16,tail=fp16,cold=iso3"; kvcfg/kv_formats.h).
             // Parsed raw: the vocabulary's own rules are checked after the loop (the
             // nvfp4 mode may come later in argv) and the per-layer landing needs the
             // model's layer count, so it happens in the planner.
-            options.kv_tier_formats_spec     = value(arg);
+            options.kv_tier_formats_spec = kv_value_not_empty(
+                arg, value(arg), "tier=format pairs like hot=bf16,cold=int8",
+                "the vocabulary's own parser accepts the empty text and lands nothing, so "
+                "the flag would be marked explicit and read by nothing");
             options.kv_tier_formats_explicit = true;
         } else if (arg == "--nvfp4-mode") {
             const std::string_view mode = value(arg);
@@ -530,7 +823,10 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-rotation") {
             // SEPARATION: SO(4) rotation of K on cache write and Q before
             // quantization; off takes the identity map on BOTH sides.
-            const std::string_view mode = value(arg);
+            const std::string_view mode = kv_value_not_empty(
+                arg, value(arg), "on|off",
+                "the refusal printed the flag, then nothing where the value belongs, then "
+                "the accepted set");
             if (mode == "off") {
                 options.kv_rotation_off = true;
             } else if (mode == "on" || mode == "auto" || mode == "default") {
@@ -543,7 +839,11 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-row-scale") {
             // SEPARATION: three-state row scale (auto|off|<path>); validated at
             // plan time by the same parser NINFER_KV_ROWSCALE uses.
-            options.kv_row_scale_spec     = std::string(value(arg));
+            options.kv_row_scale_spec = kv_value_not_empty(
+                arg, value(arg), "auto|off|FILE",
+                "kv_rowscale_mode_from_spec(\"\") returns Auto, so the flag would be "
+                "accepted and behave exactly as --kv-row-scale auto, with no line saying "
+                "the value never arrived");
             options.kv_row_scale_explicit = true;
         } else if (arg == "--recalibrate") {
             // N3 runtime loop: re-run the calibration capture and overwrite the
@@ -556,7 +856,10 @@ Options parse_options(int argc, char** argv) {
             // printer emits (:1497). `iso3` is the DEPRECATED spelling of the SAME
             // state and is accepted for one release with a warning, exactly as
             // --kv-dtype treats its aliases (options.cpp:98-104, usage_text :159).
-            const std::string_view mode = value(arg);
+            const std::string_view mode = kv_value_not_empty(
+                arg, value(arg), "iso4e|e2m1",
+                "the refusal printed the flag, then nothing where the value belongs, then "
+                "the accepted set");
             if (mode == "iso4e") {
                 options.kv_v_codec = KvVCodec::Iso3;
             } else if (mode == "iso3") {
@@ -610,6 +913,8 @@ Options parse_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {
             options.raw_output = true;
+        } else if (arg == "--print-prompt-ids") {
+            options.print_prompt_ids = true;
         } else if (arg == "--print-token-ids") {
             options.print_token_ids = true;
         } else if (arg == "--no-thinking") {
@@ -666,6 +971,15 @@ Options parse_options(int argc, char** argv) {
             unload_watermark_explicit      = true;
         } else if (arg == "--cold-disk-path") {
             options.cold_disk_path = value(arg);
+        } else if (arg == "--ple-sidecar") {
+            // The FlashNext PLE n-gram sidecar root. Parsed exactly as
+            // src/serve/serve_options.cpp parses it, and for the same reason
+            // --kv-unload-watermark-pages gives above: both front ends must name
+            // the same failures the same way instead of drifting into two
+            // vocabularies for one knob. The value is NOT stat'd here; it is
+            // checked at startup by product::validate_ple_sidecar_root(), which is
+            // where a refusal can still stop the run before the engine is built.
+            options.ple_sidecar_root = value(arg);
         } else if (arg == "--cold-disk-bytes") {
             options.cold_disk_bytes = parse_u64(value(arg), "cold-disk-bytes");
             if (options.cold_disk_bytes == 0) {
@@ -677,6 +991,7 @@ Options parse_options(int argc, char** argv) {
             options.weight_device_arena_bytes = parse_u64(value(arg), "weight-device-arena-bytes");
         } else if (arg == "--weight-prefetch-layers") {
             options.weight_prefetch_layers = parse_u32(value(arg), "weight-prefetch-layers");
+            weight_prefetch_layers_explicit = true;
             if (options.weight_prefetch_layers < 2) {
                 throw std::invalid_argument(
                     "--weight-prefetch-layers below 2 would let the arena slot of the layer "
@@ -686,6 +1001,8 @@ Options parse_options(int argc, char** argv) {
             options.weight_span_floor_bytes = parse_u64(value(arg), "weight-span-floor-bytes");
         } else if (arg == "--graph-capture-ceiling") {
             options.graph_capture_ceiling = parse_u32(value(arg), "graph-capture-ceiling");
+        } else if (arg == "--inject-spec") {
+            options.inject_spec = value(arg);
         } else if (arg == "--ft-stats") {
             // FreeToken step 1 observation (src/ops/common/ft_stats.h). Off by
             // default; `on` is what makes the per-layer energy lines (and the
@@ -743,6 +1060,25 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--greedy") {
             options.greedy = true;
         } else {
+            // `<flag>=<value>` is not a spelling this front end accepts ANYWHERE: every
+            // flag here takes its value as the NEXT argv entry, so the whole token is an
+            // unknown argument. The generic refusal printed the token and stopped there,
+            // which for the empty-value spelling (`--kv-bit-budget=`) printed the flag
+            // and left the VALUE -- the part that is empty, and the whole reason the
+            // operator needs to be told -- invisible ("invalid X: " with nothing after
+            // the colon, the same half-answer this change removes elsewhere). Both halves
+            // are named, and the two-argument spelling is named as the way out.
+            const std::size_t equals = arg.find('=');
+            if (equals != std::string_view::npos) {
+                throw std::invalid_argument(
+                    "unknown argument: " + std::string(arg) +
+                    " -- this front end takes a flag and its value as TWO arguments, so '" +
+                    std::string(arg.substr(0, equals)) + "' carrying the value '" +
+                    std::string(arg.substr(equals + 1)) +
+                    "' is not a spelling of anything here. An empty value after the '=' is "
+                    "not one either: an empty value names no state, and the parse sites "
+                    "that do meet one impute a state instead of reporting it.");
+            }
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
     }
@@ -750,6 +1086,103 @@ Options parse_options(int argc, char** argv) {
     // ...and a run that consumed flags without ever naming a model says so by name.
     // --kv-score-table is its own entry point and needs no artifact, which is why it
     // is the one exception.
+    // ---------------------------------------------------------------------------------
+    // --stage-layers: the cross-flag checks this front door owes, refused BY NAME.
+    // ---------------------------------------------------------------------------------
+    // The SHAPE checks (grammar, cover) are done where the spec is read, above. What is left
+    // is what only a whole command line can decide. The AXIS check -- is this a world the rank
+    // axis derives -- cannot be done here at all: it needs the artifact's own layer count, so
+    // it runs in the runtime, where plan_shards() has a geometry to be asked about. That split
+    // is stated in the help text so a reader is not left thinking the front door validated
+    // more than it did.
+    if (options.stage_handoff_explicit && !options.stage_layers_explicit) {
+        throw std::invalid_argument(
+            std::string(ninfer::multi::kStageLayersHandoffRefusal) + ": " +
+            std::string(ninfer::multi::kStageHandoffFlag) + " was given with no " +
+            std::string(ninfer::multi::kStageLayersFlag) +
+            ", so there is no stage boundary for it to carry. A directory written and never "
+            "read is a flag accepted and ignored.");
+    }
+    if (options.stage_layers_explicit) {
+        ninfer::multi::StagePlan staged;
+        const std::string parse_refusal =
+            ninfer::multi::parse_stage_layers(options.stage_layers_spec, staged);
+        if (!parse_refusal.empty()) { throw std::invalid_argument(parse_refusal); }
+        // The cover, with text_layers == 0: this front door has no artifact and must not guess
+        // one, so only the shape rules that need no layer count are applied here. The cover
+        // against the real layer count is the runtime's.
+        if (const std::string refusal =
+                ninfer::multi::stage_layers_partition_refusal(staged, 0U);
+            !refusal.empty()) {
+            throw std::invalid_argument(refusal);
+        }
+        // The three run shapes a PARTIAL range cannot carry. Each names its own file:line.
+        if (const std::string refusal = ninfer::multi::stage_layers_run_shape_refusal(
+                staged,
+                options.speculative.backend != SpeculativeBackend::None,
+                options.weight_host_offload_bytes != 0 || options.weight_device_arena_bytes != 0,
+                options.use_cuda_graph);
+            !refusal.empty()) {
+            throw std::invalid_argument(refusal);
+        }
+        // And the boundary: a partial range needs one (stated), and the identity must not be
+        // given one (a directory written and never read).
+        if (const std::string refusal =
+                ninfer::multi::stage_handoff_refusal(staged, options.stage_handoff_dir);
+            !refusal.empty()) {
+            throw std::invalid_argument(refusal);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // W13 weight offload: the cross-flag contradictions this front door owes.
+    // ---------------------------------------------------------------------------------
+    // COPIED FROM src/serve/serve_options.cpp:971-981 -- the ONE statement of this rule -- because
+    // THIS front door stored both numbers, printed both in its own usage text, passed both into
+    // EngineOptions, and read NEITHER. The plan builder's FIRST statement returns an empty plan
+    // when the pinned host mirror is zero
+    //     if (limits.host_pinned_bytes == 0) { return plan; }
+    // (src/product/weight_residency.h:447, twin src/artifact/binder.cpp:188), and the reader of
+    // --weight-device-arena-bytes sits BELOW that return (weight_residency.h:554). So the flag was
+    // ACCEPTED AND IGNORED, which is this project's own worst outcome, and it was measurable from
+    // the outside: passing it alone changed nothing but the usage dump of a 16,936 B stderr.
+    // The repair is therefore not a new rule but the rule the sibling front door already makes, in
+    // its own words, so the two front ends cannot drift into two vocabularies for one knob.
+    // THE RESIDUAL THIS COMMENT USED TO NAME IS CLOSED IN THE SAME BLOCK, and the reasoning that
+    // made it hard is KEPT because it is exactly why the instrument is a BIT and not a value test:
+    // --weight-prefetch-layers is dropped by the SAME return, its default is 2 -- a legal value --
+    // so `prefetch_layers != 2` could not tell "unset" from "explicitly 2" and would hard-code the
+    // default in three front ends. Each front end now sets an explicit bit in that flag's OWN parse
+    // branch, and the third refusal below covers it in ONE set of words in all three front doors,
+    // so the vocabularies cannot diverge.
+    if (options.weight_host_offload_bytes == 0 &&
+        (options.weight_device_arena_bytes != 0 || options.weight_span_floor_bytes != 0)) {
+        throw std::invalid_argument("--weight-device-arena-bytes / --weight-span-floor-bytes "
+                                    "need a positive --weight-host-bytes");
+    }
+
+    // THE THIRD KNOB OF THE SAME FAMILY, and the reason it is not covered by the check above: the
+    // pair's two knobs signal by a NON-ZERO value, but this one's DEFAULT IS A LEGAL VALUE (2), so
+    // no value test can tell "unset" from "explicitly 2" and the gate has to be a BIT that flag's
+    // own parse branch sets. The plan builder returns an empty plan at its FIRST statement when the
+    // pinned host mirror is zero
+    //     if (limits.host_pinned_bytes == 0) { return plan; }
+    // (src/product/weight_residency.h:447, twin src/artifact/binder.cpp:188), and BOTH readers of
+    // the depth sit BELOW that return: the domain check at :448 and the only derive at :563, inside
+    // the `else` of :554. So without the partner the flag is ACCEPTED AND IGNORED -- and a flag that
+    // is accepted and ignored is this project's own worst outcome, so it is refused here with the
+    // reason named rather than left to be discovered.
+    if (options.weight_host_offload_bytes == 0 && weight_prefetch_layers_explicit) {
+        throw std::invalid_argument("--weight-prefetch-layers needs a positive --weight-host-bytes: "
+                                    "without the host mirror the offload plan returns before the "
+                                    "depth is read, so the flag would be accepted and ignored");
+    }
+    if (options.weight_host_offload_bytes != 0 &&
+        options.weight_device_arena_bytes >= options.weight_host_offload_bytes) {
+        throw std::invalid_argument(
+            "--weight-device-arena-bytes is not smaller than --weight-host-bytes, so the "
+            "offload would free no device memory");
+    }
     if (options.artifact_path.empty() && !options.kv_score_table_explicit &&
         !options.capability_report_requested) {
         throw std::invalid_argument(".ninfer model path is required");
@@ -867,17 +1300,22 @@ Options parse_options(int argc, char** argv) {
             "same ceiling set: --kv-bit-budget is the plane-agnostic form, --kv-bits (or "
             "--kv-k-bits + --kv-v-bits) the K/V form. Give one of them.");
     }
-    // kv4 P3 REFUSE: the same rule for the OLD spelling of the ceiling. ninfer-serve
-    // has refused this pair all along (src/serve/serve_options.cpp:703); the CLI did
-    // not, and the planner then skipped the whole --kv-bit-budget resolution because
-    // --kv-layer-storage had already filled the table (layouts_impl.h:
-    // "if (options.kv_bit_budget_explicit && !storage_explicit)"), so the ceiling was
-    // accepted and read by nothing -- this project's worst outcome.
-    if (options.kv_bit_budget_explicit && options.kv_layer_storage_explicit) {
-        throw std::invalid_argument(
-            "--kv-bit-budget and --kv-layer-storage are mutually exclusive: the budget "
-            "is resolved into exactly the table --kv-layer-storage provides");
-    }
+    // kv4 P3 REFUSE -- REMOVED BY F903, because the thing it refused now COMPOSES.
+    // WHAT CHANGED IS THE CONSTRUCTION AND NOT THE SPELLING. The old rule was right about
+    // the old engine: `--kv-layer-storage` filled the per-layer table and layouts_impl.h
+    // then skipped the whole ceiling ("if (options.kv_bit_budget_explicit && !storage_explicit)"),
+    // so the ceiling was accepted and read by nothing -- this project's worst outcome, and
+    // refusing was the correct thing to do about it. The engine now has a PIN SET: the mask
+    // of slots the operator actually WROTE is frozen before any resolution, the ceiling runs
+    // over the WHOLE stack, and the pins are applied OVER its plan. Two providers of one
+    // table became two ROLES on one table -- a CONSTRAINT and an OBJECTIVE -- which is why
+    // the pair no longer needs a door. The one case that still cannot compose (a table naming
+    // EVERY layer, where the ceiling really would be read by nothing) is refused BY NAME in
+    // layouts_impl.h, where the layer count exists, rather than here, where it does not.
+    //
+    // A NOTE ON THE TWIN, so it is not mistaken for fixed: src/serve/serve_options.cpp:870
+    // still carries this refusal verbatim. The engine side under it composes in this build;
+    // the serve front door does not yet say so. Named, not silent.
     // res-kv5 FIX: --kv-dtype x a ceiling is the SAME contradiction as the two rules
     // above -- --kv-dtype is a table provider (it fills every slot with one global
     // tier) and a ceiling is resolved into exactly the per-layer table that replaces
@@ -894,11 +1332,10 @@ Options parse_options(int argc, char** argv) {
             "table that would replace it -- so one of the two would be accepted and read "
             "by nothing. Give one of them.");
     }
-    if (options.kv_kv_bits_explicit && options.kv_layer_storage_explicit) {
-        throw std::invalid_argument(
-            "--kv-bits/--kv-k-bits/--kv-v-bits and --kv-layer-storage are mutually exclusive: "
-            "the budget is resolved into exactly the table --kv-layer-storage provides.");
-    }
+    // F903: the same pair, the other ceiling spelling, removed for the same reason and with
+    // the same residual (a table naming EVERY layer is refused by name in layouts_impl.h).
+    // The K/V entry composes through the SAME pin application, so the two ceiling spellings
+    // cannot disagree about what a pin means.
     if (options.kv_bits_mode_explicit && !options.kv_kv_bits_explicit) {
         throw std::invalid_argument(
             "--kv-bits-mode needs a K/V bit request to act on: it names which reading of "
@@ -934,27 +1371,31 @@ Options parse_options(int argc, char** argv) {
             "--kv-bits is the ONE overall ceiling, the two per-plane ceilings cover it. Give "
             "one or the other; --kv-bits-mode picks the reading of the per-plane form.");
     }
-    // SLIDERWIRE: --kv-codec-preference. Same two-sided rule as --kv-quality-weight below:
-    // the preference is read ONLY inside a bit-budget fit, so naming it without one used to
-    // be a silent no-op. Refused here with the flag that makes it act, AND refused against
-    // the pre-existing --kv-bit-budget / --kv-layer-storage spellings, whose resolution path
-    // (src/targets/.../layouts_impl.h, options.kv_bit_budget_explicit) does not carry a
-    // candidate order at all: on those the preference would be accepted and read by nothing.
-    // --kv-bits (the joint K/V form) is the one entry that carries it.
-    if (options.kv_codec_preference_explicit && !options.kv_kv_bits_explicit) {
+    // SLIDERWIRE: --kv-codec-preference. What SURVIVES here is the side that is still true:
+    // the preference is read ONLY inside a bit-budget fit, so naming it with NO ceiling at all
+    // is still a silent no-op and is still refused, with the flags that make it act named.
+    // WHAT F903 REMOVED IS THE OTHER TWO SIDES, because both had gone STALE against the tree:
+    //   * "only the --kv-bits resolution carries a candidate order" -- FALSE. The
+    //     --kv-bit-budget entry resolves through product::kv_bit_budget_solve_scored, whose
+    //     LAST PARAMETER is `const std::vector<std::int32_t>& candidate_order = {}`
+    //     (product/kv_bit_budget.h:1263-1270). layouts_impl.h simply never passed it. It does
+    //     now, so the preference acts on the --kv-bit-budget spelling too.
+    //   * "and --kv-layer-storage IS the per-layer table" -- FALSE since the pin set. The
+    //     table names a SUBSET; the preference acts on the layers the table does NOT name,
+    //     and the pinned slots keep the codec the operator wrote. Both are read.
+    // TWO RESIDUALS, NAMED RATHER THAN HIDDEN: the RANGE spelling of --kv-bit-budget
+    // (kv_bit_budget_scored_ranges takes no candidate_order) and src/serve/serve_options.cpp
+    // both still refuse; the first is refused by name in layouts_impl.h, the second is named
+    // there in the twin note. A refusal that names the missing plumbing is not a composition,
+    // and this comment is the reading, not the verdict.
+    if (options.kv_codec_preference_explicit && !options.kv_kv_bits_explicit &&
+        !options.kv_bit_budget_explicit) {
         throw std::invalid_argument(
-            "--kv-codec-preference needs --kv-bits to act on: it names which codec the solver "
-            "picks among candidates that cost the SAME bits, and only the --kv-bits (ONE "
-            "overall ceiling) resolution carries a candidate order. --kv-bit-budget and "
-            "--kv-layer-storage fix the per-layer table directly and would leave the "
-            "preference accepted and read by nothing. Add --kv-bits (e.g. --kv-bits 4.5 "
-            "--kv-quality-weight 0 --kv-codec-preference iso4e), or drop the flag.");
-    }
-    if (options.kv_codec_preference_explicit && options.kv_layer_storage_explicit) {
-        throw std::invalid_argument(
-            "--kv-codec-preference and --kv-layer-storage are mutually exclusive: "
-            "--kv-layer-storage IS the per-layer table, so the codec of every layer is already "
-            "named there and the preference would be accepted and read by nothing.");
+            "--kv-codec-preference needs a ceiling to act on: it names which codec the solver "
+            "picks among candidates that cost the SAME bits, and that choice is made inside a "
+            "bit-budget fit. Without a ceiling nothing reads it and it would be accepted and "
+            "read by nothing. Add --kv-bits (e.g. --kv-bits 4.5 --kv-quality-weight 0 "
+            "--kv-codec-preference iso4e) or --kv-bit-budget, or drop the flag.");
     }
     if (options.kv_bits_mode_explicit && options.kv_joint_bits > 0.0 &&
         options.kv_bits_mode != KvBitsMode::Joint) {
@@ -975,6 +1416,43 @@ Options parse_options(int argc, char** argv) {
             "the JOINT reading (one ceiling, one ladder), where a per-plane table has nothing "
             "to fit and would be read by nothing. Give --kv-k-bits/--kv-v-bits so each plane "
             "is solved in its own budget, or drop the per-plane tables.");
+    }
+
+    // F738 injectchan: the ingress declaration. Validated HERE with the header's own
+    // parser, so a mis-shaped or mis-dtyped declaration refuses by name before a
+    // multi-gigabyte artifact is loaded; the model-dependent half of the admission (rows
+    // against the model's hidden, the position range against the context capacity) is
+    // made at bind(), where those numbers first exist. Committed to the variable the
+    // engine reads at parse time, which is the --ft-stats precedent and the reason the
+    // flag beats the environment.
+    if (!options.inject_spec.empty()) {
+        const spec::inject::ParseResult declaration =
+            spec::inject::parse_spec_file(options.inject_spec);
+        if (!declaration.ok()) {
+            throw std::invalid_argument(
+                std::string("--inject-spec: ") +
+                spec::inject::refusal_name(declaration.settlement.refusal) +
+                (declaration.settlement.field.empty()
+                     ? std::string{}
+                     : " (field " + declaration.settlement.field + ")") +
+                " in " + options.inject_spec + " : " + declaration.settlement.detail);
+        }
+        // The PAYLOAD's own checks, at the same parse time and for the same reason: the file, its
+        // declared size, the caller's pinned digest and the finiteness of every element all need
+        // no model. bake() is the header's own function -- the engine calls it again at bind()
+        // where the model-dependent half of the admission is the only thing left to decide, so
+        // this is a second call and not a second rule.
+        const spec::inject::PayloadSettlement payload = spec::inject::bake(declaration.declaration);
+        if (!payload.settled()) {
+            throw std::invalid_argument(
+                std::string("--inject-spec: ") + spec::inject::refusal_name(payload.refusal) +
+                (payload.field.empty() ? std::string{}
+                                       : " (field " + payload.field + ")") +
+                " in " + options.inject_spec + " : " + payload.detail);
+        }
+        if (set_process_env("NINFER_INJECT_SPEC", options.inject_spec.c_str()) != 0) {
+            throw std::invalid_argument("cannot set NINFER_INJECT_SPEC for --inject-spec");
+        }
     }
 
     // FreeToken: commit an explicit --ft-stats to the variable the observation
@@ -1009,13 +1487,41 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
+    // The engine's own bound, spelled as ninfer-serve spells it (serve_options.cpp:831-832),
+    // so the same argv is refused the same way by both front ends. Checked HERE rather than
+    // left to engine.cpp normalize_engine_options, because that function clamps
+    // max_concurrency to 1 inside its CausalScoring branch (engine.cpp:52) BEFORE testing the
+    // bound -- so an out-of-range request on --score would be silently accepted as 1 there.
+    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
+        throw std::invalid_argument("--max-concurrency must be in [1,16]");
+    }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens == 0) {
         throw std::invalid_argument("--kv-capacity must be positive");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
-        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
+        // landq/unlock -- THE REASON CATEGORY, NAMED RATHER THAN IMPLIED.
+        //
+        // The sentence below used to read "cannot be combined with --vision", which is a claim
+        // of impossibility. The reading does not support one, and it does not support the
+        // opposite either -- it supports a THIRD answer, "not validated":
+        //   * NOT an artifact fact (byte caliber, the containers' own objects[]): 9 of the 91
+        //     readable .ninfer artifacts on this box declare the four dflash2/* entry objects
+        //     AND all five vision/* entry objects, so one artifact carries the draft head and
+        //     the vision tower at once. Three more carry vision + the DFlash (v1) head.
+        //   * NOT a designed pairing: the upstream family ships its Vision companion as a
+        //     separate `vision-mtp-bf16` head, and its acceptance-rate plan spells the backend
+        //     as `--spec dflash2 --draft-tokens K` with no --vision.
+        //   * MISSING: a validated pair. No run of the two together is on record in this tree,
+        //     and the Program refuses the two view sets at program_impl.h:1024 for that same
+        //     reason.
+        // The refusal STAYS. Only its reason category changes: history, not physics.
+        throw std::invalid_argument(
+            "--spec dflash with --vision is not co-validated: this front end refuses an "
+            "unvalidated pair rather than running it. This is a policy refusal, not an "
+            "artifact limit -- one artifact does carry the draft head and the vision tower at "
+            "once, and what does not exist is a validation of the two together. Drop one.");
     }
     if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");

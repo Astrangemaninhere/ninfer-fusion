@@ -114,7 +114,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--draft-tokens must be in [1,15]");
     }
     if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
-        throw std::invalid_argument("--batch must be in [1,8]");
+        throw std::invalid_argument("--batch must be in [1,16]");
     }
     return options;
 }

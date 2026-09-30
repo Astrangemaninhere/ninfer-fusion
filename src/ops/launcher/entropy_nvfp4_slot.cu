@@ -4,6 +4,8 @@
 #include "ops/kernel/entropy_nvfp4_slot_kernels.cuh"
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 
@@ -30,12 +32,24 @@ void entropy_nvfp4_slot_decode_grid_launch(const std::uint8_t* slots, int slot_b
 
 void entropy_nvfp4_slot_scales_scatter_launch(const std::uint8_t* slots, int slot_bytes,
                                               int slot_page_stride, int kv_heads,
-                                              int page_count, const std::int32_t* page_ids,
+                                              int page_count, std::int32_t physical_page,
                                               int scale_page_stride, std::uint8_t* scales,
                                               cudaStream_t stream) {
+    // ONE physical page per launch, because one scalar is one page. A page map of more than one
+    // entry no longer has anywhere to go in this signature, and silently reinterpreting it is
+    // exactly the defect this change removes -- so it is refused BY NAME, the same rule the
+    // environment readers in runtime/engine/bandwidth_governor.h now follow. The refusal is
+    // strictly NARROWER than the old contract, never wider: the only call site in the tree passes
+    // page_count == 1 (program_impl.h, the K and V scatters of restore_cold_page).
+    if (page_count != 1) {
+        throw std::invalid_argument(
+            "entropy_nvfp4_slot_scales_scatter requires page_count == 1 (the physical page is a "
+            "scalar, not a per-page map), got " +
+            std::to_string(page_count));
+    }
     const dim3 grid(kv_heads, page_count);
     entropy_nvfp4_slot_scales_scatter_kernel<<<grid, 64, 0, stream>>>(
-        slots, slot_bytes, slot_page_stride, page_ids, scale_page_stride, scales);
+        slots, slot_bytes, slot_page_stride, physical_page, scale_page_stride, scales);
     CUDA_CHECK(cudaGetLastError());
 }
 

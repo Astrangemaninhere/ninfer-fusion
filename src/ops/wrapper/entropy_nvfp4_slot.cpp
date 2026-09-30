@@ -25,11 +25,11 @@ void entropy_nvfp4_slot_decode_grid_raw(const std::uint8_t* slots, int slot_byte
 
 void entropy_nvfp4_slot_scales_scatter_raw(const std::uint8_t* slots, int slot_bytes,
                                            int slot_page_stride, int kv_heads,
-                                           int page_count, const std::int32_t* page_ids,
+                                           int page_count, std::int32_t physical_page,
                                            int scale_page_stride, std::uint8_t* scales,
                                            cudaStream_t stream) {
     detail::entropy_nvfp4_slot_scales_scatter_launch(slots, slot_bytes, slot_page_stride,
-                                                     kv_heads, page_count, page_ids,
+                                                     kv_heads, page_count, physical_page,
                                                      scale_page_stride, scales, stream);
 }
 

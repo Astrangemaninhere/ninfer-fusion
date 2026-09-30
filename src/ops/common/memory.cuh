@@ -1,6 +1,18 @@
 #pragma once
 
+#if defined(__AMDGCN__) || defined(__HIP_PLATFORM_AMD__)
+// NINFER_GFX906_COMPAT -- the AMD arm of this include, and why it is here at all.
+// MEASURED: ROCm 7.2.4 ships NO cuda_pipeline.h (0 occurrences anywhere in its include tree), so
+// the include cannot be spelled on this target.  The pipeline primitives below carry their own AMD
+// arm instead, which is what this file's own sibling,
+// src/compat/gfx906/include/cuda_pipeline.h, already states verbatim:
+//   "ops/common/memory.cuh replaces every pipeline primitive with synchronous loads under
+//    NINFER_GFX906_COMPAT; nothing is provided here."
+// (That comment described a contract this file did not discharge: NINFER_GFX906_COMPAT occurred 0
+// times in it.  This arm is that contract, in this file, where the port layer said it would be.)
+#else
 #include <cuda_pipeline.h>
+#endif
 #include <cuda_runtime.h>
 
 
@@ -189,15 +201,45 @@ __device__ __forceinline__ void cp_wait() {
 template <int Bytes>
 __device__ __forceinline__ void pipe_copy(void* smem_dst, const void* gmem_src) {
     static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "pipe_copy supports 4, 8, or 16 bytes");
+#if defined(__AMDGCN__) || defined(__HIP_PLATFORM_AMD__)
+    // NINFER_GFX906_COMPAT -- the AMD arm.  ROCm declares NONE of __pipeline_* (MEASURED: 0
+    // occurrences in the whole ROCm 7.2.4 include tree), so the honest behaviour is the trap this
+    // file already defines at the top, for exactly this situation:
+    //   "A trap is the honest behaviour for an instruction family this target cannot assemble: the
+    //    alternative (leaving the destination untouched) would report success while copying
+    //    nothing."
+    // NOT a silent substitute: a caller that reaches this arm stops here rather than computing a
+    // wrong number.
+    (void)smem_dst; (void)gmem_src;
+    unsupported_instruction_trap();
+#else
     __pipeline_memcpy_async(smem_dst, gmem_src, Bytes);
+#endif
 }
 
-__device__ __forceinline__ void pipe_commit() { __pipeline_commit(); }
+__device__ __forceinline__ void pipe_commit() {
+#if defined(__AMDGCN__) || defined(__HIP_PLATFORM_AMD__)
+    // NINFER_GFX906_COMPAT -- see pipe_copy: trapping, not empty.  An empty body would SILENTLY DROP
+    // the group boundary, so a downstream pipe_wait would look satisfied while nothing was ever in
+    // flight -- the same asymmetry the cp_async family in this file already closed by name.
+    unsupported_instruction_trap();
+#else
+    __pipeline_commit();
+#endif
+}
 
 template <int Groups>
 __device__ __forceinline__ void pipe_wait() {
     static_assert(Groups >= 0 && Groups <= 7, "pipe_wait group count must fit the PTX immediate");
+#if defined(__AMDGCN__) || defined(__HIP_PLATFORM_AMD__)
+    // NINFER_GFX906_COMPAT -- the AMD arm.  A static_assert here would only MOVE the failure (the
+    // same reasoning the cp_wait arm above records); trapping lets the TU BUILD and keeps the
+    // channel from being reached silently.
+    (void)0;
+    unsupported_instruction_trap();
+#else
     __pipeline_wait_prior(Groups);
+#endif
 }
 
 } // namespace ninfer::ops

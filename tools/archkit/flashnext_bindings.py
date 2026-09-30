@@ -88,9 +88,52 @@ for i in GDN_LAYERS:
     e(f"layer.{i}.gdn.beta", "[48]",
       [f"{p}.beta.weight", f"{p}.b_proj.weight", f"{g}.gdn_beta.weight"],
       "delta gate beta (per v-head)", layer_scope=str(i))
+    e(f"layer.{i}.gdn.in_proj_a", "[2560,48]",
+      [f"{p}.in_proj_a.weight", f"{g}.gdn_in_proj_a.weight"],
+      "delta-gate alpha input proj (per v-head)", layer_scope=str(i))
+    # in_proj_b is the SECOND HALF of one engine tensor, not a second `beta` and not a
+    # separate operator.  The geometry, measured on both sides:
+    #   src/targets/qwen3_8_flash_next/impl/model_view.h:64   Weight a_b_projection;
+    #   src/targets/qwen3_8_flash_next/impl/gdn.cpp:105,171   exact_bf16_weight(..., 96, 2'560)
+    #   .../impl/load/materialized.cpp:149                    bf16_weight(..., 96, 2'560)
+    #   .../impl/gdn_kernels.cu:143                           reads a_b_projection.qdata as ONE buffer
+    #   tools/convert/qwen3_8_flash_next/inventory.py:85      a_b_projection (96, 2_560) BF16
+    #   tools/convert/qwen3_8_flash_next/recipe.py:114-122    concat-rows(in_proj_a (48,2560), in_proj_b (48,2560))
+    # The engine wants the FUSED parent: A occupies rows [0,48) and B rows [48,96) of a
+    # BF16 [96,2560] tensor, exactly as include/ninfer/ops/gdn_gating_proj.h:51-52 splits
+    # its registered parents (`[96,5120]` for the 27B geometry, `[64,2048]` for 35B-A3B;
+    # Flash-Next's hidden is 2560, which is why its parent is [96,2560] and not [96,5120]).
+    # The checkpoint carries both halves per GDN layer -- `...linear_attn.in_proj_a.weight`
+    # and `...linear_attn.in_proj_b.weight`, BF16 [48,2560], 36 each.
+    # They stay TWO contract entries because `audit()` admits exactly one source key per
+    # entry: `flashnext_bindings.py:162-163` records `len(hits) > 1` as an ambiguous alias
+    # and binds only hits[0], so a single entry carrying both keys would be ambiguous AND
+    # would still leave one key unconsumed.  The fusion lives where it already lives, in
+    # the recipe's `concat-rows` transform.
+    e(f"layer.{i}.gdn.in_proj_b", "[2560,48]",
+      [f"{p}.in_proj_b.weight", f"{g}.gdn_in_proj_b.weight"],
+      "delta-gate beta input proj, second half of the fused a_b_projection",
+      layer_scope=str(i))
     e(f"layer.{i}.gdn.dt_bias", "[48]",
-      [f"{p}.dt_bias", f"{p}.A_log", f"{g}.gdn_dt_bias"],
-      "decay bias/log-A per v-head", layer_scope=str(i))
+      [f"{p}.dt_bias", f"{g}.gdn_dt_bias"],
+      "decay bias per v-head (softplus pre-activation)", layer_scope=str(i))
+    # A_log is a DISTINCT operator, not a second alias of dt_bias. The engine declares
+    # them as two tensors and feeds them as two independent arguments:
+    #   src/targets/qwen3_5_9b/impl/load/bindings.h:230-231  Tensor a_log; Tensor dt_bias;
+    #   include/ninfer/ops/gdn_gating_proj.h:44-46           gdn_gating_proj(x, a_weight,
+    #                                                        b_weight, A_log, dt_bias, ...)
+    #   include/ninfer/ops/gdn_gating_proj.h:32              g[h,t] = -exp(A_log[h]) *
+    #                                                        softplus(a[h,t] + dt_bias[h])
+    # With A_log in dt_bias's alias list the fold bound whichever name resolved first and
+    # left the other one unconsumed, so the engine's a_log had no source at all: 36 real
+    # checkpoint keys (`...linear_attn.A_log`) fell into the unexpected residue and
+    # `audit()` reported 36 ambiguous aliases. Two operators, two entries.
+    # `-exp` deliberately stays on the ENGINE side: measured on this checkpoint A_log is
+    # signed and O(1) (36/36 layers MIXED, min=-2.445 max=+2.316, 409/1728 negative), i.e.
+    # the raw log form the engine expects. See dl/flashnextaudit/REPORT.md section 3.
+    e(f"layer.{i}.gdn.a_log", "[48]",
+      [f"{p}.A_log", f"{g}.gdn_a_log"],
+      "log-A decay scale per v-head (engine applies -exp to it)", layer_scope=str(i))
     e(f"layer.{i}.gdn.norm", "[128]",
       [f"{p}.norm.weight", f"{g}.gdn_norm.weight"],
       "group RMSNorm over v heads (sigmoid output gate type)", layer_scope=str(i))
@@ -124,8 +167,29 @@ for i in QSA_LAYERS:
     e(f"layer.{i}.qsa.idx_wk", "[2560,128]",
       [f"{p}.indexer.wk.weight", f"{g}.idx_wk.weight"],
       "indexer key proj (1x128)", layer_scope=str(i))
+    # MEASURED 2026-09-22 (FN-SRC): the third alias is the name THIS checkpoint ships.
+    # `{p}.indexer.k_norm.weight` exists nowhere -- 0 of 296,475 keys, and 0 at the
+    # safetensors-header level -- while
+    #   model.language_model.layers.<L>.self_attn.indexer.k_layernorm.weight  BF16 [128]
+    # exists for all 12 QSA layers and was falling into the audit's unexpected residue
+    # while this engine entry was counted missing.  Two independent readings already
+    # bind the operator under that name:
+    #   recipe.py:224  ap + "indexer.k_layernorm.weight"  -> object
+    #     `attention/indexer/key_norm`, which is this entry's role (and :343 for MTP);
+    #   load/bindings.cpp:172  .indexer_key_norm = bind("indexer/key_norm",
+    #     NumericFormat::BF16, kBf16Layout, {128}), with materialized.cpp:160
+    #     bf16_tensor(backing, plan.indexer_key_norm, {128}).
+    # Appended THIRD, so alias[0] -- which flashnext_convert's synthetic-name
+    # self-tests read -- is unchanged.
+    # NOT folded in: the engine also declares `indexer_query_norm`
+    # (load/bindings.cpp:173) and the disk ships `{p}.indexer.q_layernorm.weight`
+    # BF16 [128] as well.  That second operator has no contract entry, and the two
+    # names have IDENTICAL shapes, so a set-based audit cannot distinguish a correct
+    # binding from a swapped one.  Adding it is a modelling addition (it needs a
+    # `_rule` and an `artifact_shape` branch), not an alias edit.
     e(f"layer.{i}.qsa.idx_norm", "[128]",
-      [f"{p}.indexer.k_norm.weight", f"{g}.idx_norm.weight"],
+      [f"{p}.indexer.k_norm.weight", f"{g}.idx_norm.weight",
+       f"{p}.indexer.k_layernorm.weight"],
       "indexer key norm", layer_scope=str(i))
     # hc (hierarchical compression): 4 groups, lowrank 320
     for hc in range(4):
@@ -165,9 +229,9 @@ for i in range(N_LAYERS):
           layer_scope=str(i))
 
 # ---- PLE n-gram residual stack (sits at layer id 2 per spec; 1-based docs -> 2) ----
-e("ple.table", "[20019200,160]",
+e("ple.table", "[320001536,160]",
   ["ple.ngram_embed.weight", "ngram_emb.weight"],
-  "20M-row x160 BF16 lookup; NEVER GPU-resident (SSD runtime contract)")
+  "320001536-row x160 BF16 lookup; NEVER GPU-resident (SSD runtime contract)")
 e("ple.key", "[2560,2560]",
   ["ple.key_proj.weight", "ple_key.weight"], "PLE key linear (residual stack)")
 e("ple.value", "[2560,2560]",

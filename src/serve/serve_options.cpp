@@ -123,6 +123,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--cold-policy none|window|host|disk|host-then-disk] [--cold-keep-tokens N] "
            "[--max-cold-pages N] [--cold-host-bytes N] [--cold-disk-path FILE] "
            "[--cold-disk-bytes N] [--kv-unload-watermark-pages N] "
+           "[--ple-sidecar DIR] "
            "[--weight-host-bytes N] [--weight-device-arena-bytes N] "
            "[--weight-prefetch-layers N] [--weight-span-floor-bytes N] [--yarn] "
            "[--spec mtp|dflash|dflash2|dspark|auto --draft-tokens N] "
@@ -185,7 +186,7 @@ std::string serve_usage_text(const char* argv0) {
            "reader. --kv-dtype cannot be combined with --kv-bit-budget/--kv-bits, whose "
            "ceiling would replace the table it fills (refused by name, before any load).\n"
            "       --kv-bit-budget takes a scalar bits-per-element ceiling in [0.01,16] or per "
-           "layer ranges (\"0-7:8,8-63:4.5\"): the plane-agnostic spelling of the same ceiling "
+           "layer ranges (\"0-7:8,8-15:4.5\", tiling every FULL-ATTENTION layer): the plane-agnostic spelling of the same ceiling "
            "set as --kv-bits/--kv-k-bits/--kv-v-bits, and mutually exclusive with it and with "
            "--kv-layer-storage. --kv-layer-storage SPEC pins a per-layer table; "
            "--kv-residual-layers SPEC names the layers kept at full precision.\n"
@@ -241,6 +242,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     // The same gate as apps/cli/options.cpp: the MTP adaptive escape hatch must not
     // overwrite a width the flag pinned (that file's `draft_tokens_explicit`).
     bool draft_tokens_explicit       = false;
+    // The "the operator named it" gate for --weight-prefetch-layers, and the ONLY one of the four
+    // W13 knobs that needs a gate rather than a value test: its default is 2 -- a legal depth -- so
+    // `prefetch_layers != 2` would let `--weight-prefetch-layers 2` alone through and would
+    // hard-code the default in this file. The sibling front doors carry the same variable.
+    bool weight_prefetch_layers_explicit   = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -393,7 +399,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kv_layer_storage_set = parsed.set;
             options.kv_layer_storage_explicit = true;
         } else if (arg == "--kv-tier-formats") {
-            // KV tier vocabulary ("hot=bf16,tail=fp16,cold=iso4e"; kvcfg/kv_formats.h).
+            // KV tier vocabulary ("hot=bf16,cold=iso4e"; kvcfg/kv_formats.h; tail= is refused by name).
             // Raw text: vocabulary rules are checked after the loop (the mode may come
             // later in argv) and the per-layer landing needs the model's layer count.
             options.kv_tier_formats_spec     = require_value("--kv-tier-formats");
@@ -453,7 +459,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kv_v_codec_explicit = true;
         } else if (arg == "--kv-bit-budget") {
             // Same two forms as the CLI: a scalar ceiling, or separable per-range ceilings
-            // ("0-7:8,8-63:4.5") parsed by the allocator itself.
+            // ("0-7:8,8-15:4.5", tiling every FULL-ATTENTION layer) parsed by the allocator itself.
             const std::string budget_spec = require_value("--kv-bit-budget");
             if (budget_spec.find(':') != std::string::npos ||
                 budget_spec.find(',') != std::string::npos) {
@@ -530,6 +536,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             else { throw std::invalid_argument("invalid cold-policy: " + std::string(v)); }
         } else if (arg == "--cold-disk-path") {
             options.cold_disk_path = require_value("--cold-disk-path");
+        } else if (arg == "--ple-sidecar") {
+            // The FlashNext PLE n-gram sidecar root, the serve-side twin of the CLI
+            // flag of the same name. Empty is the off switch and is accepted; the
+            // root is stat'd at startup by product::validate_ple_sidecar_root().
+            options.ple_sidecar_root = require_value("--ple-sidecar");
         } else if (arg == "--cold-disk-bytes") {
             options.cold_disk_bytes =
                 parse_u64(require_value("--cold-disk-bytes"), "cold-disk-bytes");
@@ -608,6 +619,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     "being computed be overwritten by its own prefetch");
             }
             options.weight_prefetch_layers = static_cast<std::uint32_t>(layers);
+            weight_prefetch_layers_explicit = true;
         } else if (arg == "--weight-span-floor-bytes") {
             options.weight_span_floor_bytes =
                 parse_u64(require_value("--weight-span-floor-bytes"), "weight-span-floor-bytes");
@@ -823,7 +835,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+        throw std::invalid_argument("--max-concurrency must be in [1,16]");
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");
@@ -839,13 +851,38 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
-        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
-    }
-    if (options.kv_bit_budget_explicit && options.kv_layer_storage_explicit) {
+        // landq/unlock -- THE REASON CATEGORY, NAMED RATHER THAN IMPLIED.
+        //
+        // The sentence below used to read "cannot be combined with --vision", which is a claim
+        // of impossibility. The reading does not support one, and it does not support the
+        // opposite either -- it supports a THIRD answer, "not validated":
+        //   * NOT an artifact fact (byte caliber, the containers' own objects[]): 9 of the 91
+        //     readable .ninfer artifacts on this box declare the four dflash2/* entry objects
+        //     AND all five vision/* entry objects, so one artifact carries the draft head and
+        //     the vision tower at once. Three more carry vision + the DFlash (v1) head.
+        //   * NOT a designed pairing: the upstream family ships its Vision companion as a
+        //     separate `vision-mtp-bf16` head, and its acceptance-rate plan spells the backend
+        //     as `--spec dflash2 --draft-tokens K` with no --vision.
+        //   * MISSING: a validated pair. No run of the two together is on record in this tree,
+        //     and the Program refuses the two view sets at program_impl.h:1024 for that same
+        //     reason.
+        // The refusal STAYS. Only its reason category changes: history, not physics.
         throw std::invalid_argument(
-            "--kv-bit-budget and --kv-layer-storage are mutually exclusive: the budget "
-            "is resolved into exactly the table --kv-layer-storage provides");
+            "--spec dflash with --vision is not co-validated: this front end refuses an "
+            "unvalidated pair rather than running it. This is a policy refusal, not an "
+            "artifact limit -- one artifact does carry the draft head and the vision tower at "
+            "once, and what does not exist is a validation of the two together. Drop one.");
     }
+    // F911 -- THE TWIN, CLOSED. This is the SAME rule the CLI's F903 patch removed, verbatim,
+    // and it was left behind with a note calling itself "the same class as the head item, one
+    // door over". It is not the same class any more: the engine beneath BOTH front doors now
+    // composes the pair (a PIN SET is frozen before resolution, the ceiling runs over the whole
+    // stack, and the pins are applied OVER its plan), so this door was refusing a construction
+    // that exists. The one case that still cannot compose -- a table that names EVERY
+    // full-attention layer, where the ceiling really would be read by nothing -- is refused BY
+    // NAME in src/targets/qwen3_6/impl/runtime/layouts_impl.h, where the layer count exists,
+    // rather than here, where it does not. Second spelling of one rule, second spelling of its
+    // repair, same layer count gate.
     // The K/V bit-width entries (product/kv_kv_bits.h). Same contradiction rule as the
     // CLI: they are a second spelling of the same ceiling, not an addition to it.
     if (options.kv_kv_bits_explicit && options.kv_bit_budget_explicit) {
@@ -864,11 +901,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             "pins the global KV tier, and a ceiling is resolved into exactly the "
             "per-layer table that would replace it. Give one of them.");
     }
-    if (options.kv_kv_bits_explicit && options.kv_layer_storage_explicit) {
-        throw std::invalid_argument(
-            "--kv-bits/--kv-k-bits/--kv-v-bits and --kv-layer-storage are mutually exclusive: "
-            "the budget is resolved into exactly the table --kv-layer-storage provides");
-    }
+    // F911: the same pair under the OTHER ceiling spelling, removed for the same reason. The
+    // K/V entry composes through the SAME pin application, so the two ceiling spellings cannot
+    // disagree about what a pin means (see the note above).
     if (options.kv_bits_mode_explicit && !options.kv_kv_bits_explicit) {
         throw std::invalid_argument(
             "--kv-bits-mode needs a K/V bit request to act on (--kv-bits / --kv-k-bits / "
@@ -943,6 +978,23 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         (options.weight_device_arena_bytes != 0 || options.weight_span_floor_bytes != 0)) {
         throw std::invalid_argument("--weight-device-arena-bytes / --weight-span-floor-bytes "
                                     "need a positive --weight-host-bytes");
+    }
+
+    // THE THIRD KNOB OF THE SAME FAMILY, and the reason it is not covered by the check above: the
+    // pair's two knobs signal by a NON-ZERO value, but this one's DEFAULT IS A LEGAL VALUE (2), so
+    // no value test can tell "unset" from "explicitly 2" and the gate has to be a BIT that flag's
+    // own parse branch sets. The plan builder returns an empty plan at its FIRST statement when the
+    // pinned host mirror is zero
+    //     if (limits.host_pinned_bytes == 0) { return plan; }
+    // (src/product/weight_residency.h:447, twin src/artifact/binder.cpp:188), and BOTH readers of
+    // the depth sit BELOW that return: the domain check at :448 and the only derive at :563, inside
+    // the `else` of :554. So without the partner the flag is ACCEPTED AND IGNORED -- and a flag that
+    // is accepted and ignored is this project's own worst outcome, so it is refused here with the
+    // reason named rather than left to be discovered.
+    if (options.weight_host_offload_bytes == 0 && weight_prefetch_layers_explicit) {
+        throw std::invalid_argument("--weight-prefetch-layers needs a positive --weight-host-bytes: "
+                                    "without the host mirror the offload plan returns before the "
+                                    "depth is read, so the flag would be accepted and ignored");
     }
     if (options.weight_host_offload_bytes != 0 &&
         options.weight_device_arena_bytes >= options.weight_host_offload_bytes) {

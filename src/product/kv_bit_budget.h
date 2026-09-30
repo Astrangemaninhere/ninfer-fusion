@@ -82,11 +82,24 @@
 // see both an ops header and this one.
 
 #include "ninfer/types.h"
+#include "product/kv_options.h"        // parse_kv_storage / parse_kv_layer_storage_spec
+#include "product/kv_storage_dtype.h"  // kv_dtype_for_storage: the ONE deploy decision point
 #include "product/kv_tier_formats.h"   // kKvColdPoolStrideBytes: the cold record, once
+// [F1231 items 1+6] THE TWO HEADERS THAT OWN THE GEOMETRY THIS FILE'S `bits_x100` COLUMN IS
+// PRICED FROM, included so the column can be CHECKED against them at compile time rather than
+// asserted in prose: `cell_rung(CellMode).plane_bytes` is the descent's own plane price and
+// `e8_kv_pair_bits_x100(K, V)` is the CLI storage grammar's pair price. The edge is a DAG --
+// neither header includes this one (checked by content, not by assumption), and both are
+// header-only product headers with no engine dependency.
+#include "product/kv_cell_modes.h"     // cell_rung / CellMode / CellRung::plane_bytes
+#include "product/kv_e8_width.h"       // e8_kv_pair_bits_x100 / E8KvPlaneFormat
+// kvreach-k1-includes
 
 #include <array>
 #include <cmath>
+#include <optional>
 #include <sstream>
+// kvreach-k2-optional
 #include <cstdint>
 #include <map>
 #include <stdexcept>
@@ -137,7 +150,33 @@ namespace ninfer::product {
 // KV-fidelity failure, NOT a speculative-decoding artifact.
 //
 // Raise this only with a measurement that covers the layer range being raised over.
-inline constexpr std::int32_t kKvBitBudgetE8LayerLimit = 8;
+//
+// =====================================================================================
+// RAISED 8 -> 16 ON 2026-09-29 BY OWNER INSTRUCTION. THIS IS A POLICY CHANGE, NOT A
+// MEASUREMENT, AND THE MEASUREMENT ABOVE IS THE ONE IT KNOWINGLY ACCEPTS.
+// =====================================================================================
+// The owner's sentence, verbatim: 「我允许你在**任何层用e8 2bit** 这个没有办法，**我可以放宽限制**
+// …总之 e8 2bit 因为预算不得不开那就开吧。」 -- i.e. e8-2bit may be opened on ANY layer, because
+// the budget has to open it. What that unblocks, in the comparison's own numbers: with the cap at 8
+// the layer-KV floor is (8 x 4.25 + 8 x 4.50) / 16 = 4.375 b/el on a 16-layer stack, which is why
+// 2.8 and 3.5 measured UNREACHABLE on the engine side while the instrument side could express them.
+// At 16 every budget point is expressible on both sides.
+//
+// WHAT IS ACCEPTED, ON THE RECORD: the paragraph above measures all-16-rk4v4 at 0/27 retrieval,
+// twice, identically, with the tier proven to have run. That reading is not withdrawn and this
+// relaxation does not claim it wrong; it says the budget requirement outranks it for the comparison.
+// Any accuracy reading taken at a budget that only the raised cap can express is therefore taken on
+// a configuration this file's own evidence rates as degraded, and must be reported as such.
+//
+// THE MEASUREMENT THE SENTENCE ABOVE STILL ASKS FOR IS OWED, BY NAME: a retrieval/acceptance arm
+// over the 8..15 band at the deep budgets. Nothing in this tree has taken it (dl/musesparkfix F1227
+// did not; dl/kvcompare's arms could not express the budgets).
+//
+// SCOPE, SO THE NUMBER IS NOT MISREAD: 16 is this comparison stack's full-attention layer count, so
+// on qwen3_6_27b it means "no cap". On a stack with MORE paged layers (muse_glimmer_30b 52,
+// spark_x2_5_4b 36) this constant is still a cap, deliberately: the owner's relaxation was given for
+// the 16-layer comparison, and extending it to another target needs that target's own reading.
+inline constexpr std::int32_t kKvBitBudgetE8LayerLimit = 16;
 
 // ---------------------------------------------------------------------------
 // D4/B5: the rk4v4 constraint is a SET, not a COUNT.
@@ -246,6 +285,60 @@ struct KvBitBudgetTier {
 };
 
 // Cost ladder (cheapest first is not needed; the DP explores all of them).
+//
+// =============================================================================================
+// [F1231 2026-09-29] ITEM 1 -- THE UNIT OF `bits_x100`, DECLARED PER ROW, BECAUSE THE COLUMN WAS
+// IN TWO OF THEM AND THE MIXING WAS INVISIBLE.
+// =============================================================================================
+//
+// THE UNIT IS: **bits per KV value, averaged over K and V, of THE ROW'S OWN GEOMETRY.** That
+// sentence was already here ("per KV element, K+V averaged") and it was already TRUE for every
+// row -- what it did not say is **WHICH V EACH ROW AVERAGES WITH**, and that is where the mixing
+// lived. MEASURED (dl/rework/arms/tier_column_probe.cpp, PRE-EDIT, so this is a reading and not a
+// re-derivation):
+//
+//   * FIVE ROWS ARE TWO-PLANE-SYMMETRIC CELLS: `bf16 1600, int8 825, nvfp4 450, rk4v4 425,
+//     iso4e 450`. For these the declared bits EQUAL `cell_rung(mode).plane_bytes * 100 / 2048`
+//     exactly -- i.e. K and V are the same tier, which is what a `CellMode` cell IS
+//     (`cell_vector_charge` sums one `plane_bytes` per plane). **This is the descent's own
+//     currency**, and it is the currency a solve must use.
+//   * TWO ROWS ARE K-NARROWED PAIRS: `rk3v4 375` and `rk2v4 325`, whose V STAYS i4 (the row
+//     comments said so; the audit now proves it: `375 == e8_kv_pair_bits_x100(B3, B4)` and
+//     `325 == e8_kv_pair_bits_x100(B2, B4)`, both asserted below). **This is the CLI storage
+//     grammar's currency** -- `--kv-layer-storage`'s `rk3v4`/`rk2v4` ARE "K narrowed, V still
+//     i4" -- and it is NOT the geometry the descent's `CellMode` can express.
+//   * ONE ROW HAS NO GEOMETRY AT ALL: `fp8`. There is no `CellMode::Fp8`, so the descent can
+//     neither price nor choose it; its 850 is the symmetric fp8 plane (17,408 B) by derivation.
+//   ⚠⚠ AND THE ROW WHERE THE TWO CURRENCIES MEET IS `rk3v4`: the ladder declares **375**
+//   ((K 6,656 + V i4 8,704)/2) while the descent's own `CellMode::Rk3v4` is a SYMMETRIC cell
+//   priced **325** (6,656/2,048 x 100). **One name, two objects, 50 units apart.** The audit says
+//   this is the mixing's ENTIRE extent: of the eight rows, seven are priced by exactly one
+//   geometry and only `rk3v4` is priced by one geometry while a DIFFERENT object of the same name
+//   exists in the engine. Both numbers are pinned below so neither can drift, and the choice of
+//   which one a solve should charge is NOT taken here (see the OWED note).
+//
+// ⚠ AND NOTHING NUMERIC CHANGES IN THIS EDIT, on purpose. The numbers are the shipped answers'
+// basis: the probe's own sweep shows SHIPPED SOLVES ALREADY CHOOSING THESE ROWS
+// (`ladder_coldcap[lim8]` at 4.00 bits -> `0:rk4v4,1-2:rk3v4,3-7:rk2v4,8-15:nvfp4`;
+// `gear_default[lim8]` -> `0-2:rk2v4,3-4:rk4v4,5-7:rk2v4,8-15:nvfp4`). A "correction" of 375 -> 325
+// would move those plans, and the rework's rule is that the change in the shipped answers must be
+// NAMED before it is made -- so it is named here and NOT made. The diff of the pre/post sweeps is
+// the proof that nothing moved.
+//
+// THE OWED DECISION, NAMED RATHER THAN TAKEN: whether the ladder should price `rk3v4` as the
+// storage pair (375, today) or as the symmetric cell the engine would build for it (325). It is a
+// question about which OBJECT a solve is choosing -- a storage spelling or a `CellMode` -- and it
+// belongs to the solve's design, not to a comment. Until it is answered, a solve that compares
+// `rk3v4` against any symmetric row is comparing two geometries, and the conversion it must use is
+// written down below.
+//
+// THE CONVERSION, SO THE NEXT LINE DOES NOT RE-DERIVE IT:
+//     symmetric cell  : bits_x100 = cell_rung(mode).plane_bytes * 100 / 2048
+//     K-narrowed pair : bits_x100 = (K_plane_bytes + V_i4_plane_bytes) / 2 * 100 / 2048
+//                                      = e8_kv_pair_bits_x100(K, E8KvPlaneFormat::B4)
+// A solve must convert BOTH sides into the symmetric-cell currency before comparing them, because
+// that is the currency the engine's charge (`cell_vector_charge`) and the descent's budget are in.
+//
 // Bit costs are the ENGINE's plane geometry (per KV element, K+V averaged), not nominal
 // format widths - see src/targets/qwen3_6/impl/state/decoder_state.cpp: every tier is a
 // nibble or byte code plane plus a scale plane, so int8 pays 16 bits per 64 elements of
@@ -279,7 +372,7 @@ inline constexpr std::array<KvBitBudgetTier, 8> kKvBitBudgetTiers{{
     {"fp8", 850, 3},     // E4M3 scales at group 16 (8.50 bits); still dominated by int8
     {"nvfp4", 450, 30},
     {"rk4v4", 425, 8},      // nibble + FP16/g64
-    {"iso4e", 450, 200},  // == nvfp4 planes; pinned out of the candidate set
+    {"iso4e", 450, 30},   // == nvfp4 planes; THE 200 PIN IS RETIRED -- F1229, see the note below
     // The rk4v4 family's narrower K planes. bits_x100 is DERIVED (product/kv_e8_width.h:
     // layer bytes 15360 / 13312 * 8 * 100 / 32768 -> 375 / 325), not written down, and
     // the w=4 row above is the derivation's check against the shipped plane.
@@ -292,10 +385,154 @@ inline constexpr std::array<KvBitBudgetTier, 8> kKvBitBudgetTiers{{
     // prohibition, and leaving it would make the two rows unusable for a second reason while
     // claiming they are available. NOTE what this pair still does NOT buy -- see the precondition
     // notice at the top of patch_flip_batch.py: no caller and no append arm exist yet.
-    {"rk3v4", 375, 12, true},   // K at 3 bits (96 B/row); V still i4
-    {"rk2v4", 325, 16, true},   // K at 2 bits (64 B/row); V still i4
+    // [F1231 item 1] THESE TWO ROWS ARE IN THE OTHER CURRENCY, AND THE COMMENTS NOW SAY SO.
+    // `375 = (K 6,656 + V i4 8,704)/2 x 100/2,048` and `325 = (K 4,608 + V i4 8,704)/2 x 100/2,048`
+    // -- i.e. V is NOT the row's own tier, which is what makes them different objects from every
+    // row above. `rk3v4` additionally disagrees with the engine's own `CellMode::Rk3v4` (a
+    // SYMMETRIC cell at 325); `rk2v4` has no `CellMode` at all. Both facts are pinned below.
+    {"rk3v4", 375, 12, true},   // K at 3 bits (96 B/row); V still i4  [pair ruler: see the banner]
+    {"rk2v4", 325, 16, true},   // K at 2 bits (64 B/row); V still i4  [pair ruler: see the banner]
 }};
 
+// =============================================================================================
+// [F1231 2026-09-29] ITEM 6 -- `fp8` IS DOMINATED AND IS NAMED AS DOMINATED HERE. And a second,
+// LIVE defect rides on the same row, which is why this is two statements and not one.
+// =============================================================================================
+//
+// (1) DOMINATION, ON EVERY AXIS THE ENGINE HAS, MEASURED (`tier_column_probe.cpp`, three tables):
+//       * COST     : fp8 850 > int8 825 -- fp8 costs MORE bits;
+//       * QUALITY  : default (int8 2, fp8 3); measured_short (int8 49, fp8 49); measured_long
+//                    (int8 2, fp8 3) -- fp8 is never BETTER, and on two of three tables it is worse;
+//       * SPEED    : int8 0, fp8 0 on all three tables -- a tie, and int8 is the measured fastest.
+//     ⇒ **NO WEIGHT OF `--kv-quality-weight` CAN CHOOSE fp8 WHILE int8 IS ADMISSIBLE**: the blend is
+//     a convex combination, so int8's blended penalty is <= fp8's at every weight, and where they
+//     tie the BITS axis decides -- against fp8. The `static_assert` below pins the default table's
+//     half of that; the probe proves it for both measured tables.
+//     ⚠ WHAT IS *NOT* DONE HERE, AND WHY: `selectable` is left `true`. Flipping it would (a) retire
+//     the deliberate decision that made this row "a runnable reference point rather than a refusing
+//     one", and (b) OVERRIDE AN OPERATOR-SUPPLIED `--kv-tier-scores` TABLE, which is an INPUT in
+//     this tree's own terms. The exclusion is therefore stated and pinned rather than enforced,
+//     because enforcement would take a decision that is not this line's to take. Named, not hidden.
+//
+// (2) AND THE LIVE DEFECT: `--kv-dtype fp8` BUILDS THE DOCUMENTED-DEFECTIVE ROTATION-ON STATE BY
+//     DEFAULT, AND NOTHING REFUSES IT. The site is `gqa_attention_decode_fp8.cuh:268-271`, whose
+//     own comment reads as if the gate protects the call -- *"the gate lives inside
+//     `gqa_isoquant_rot_block4()`, so 'rotation off' stays identity on both sides"* -- while the
+//     call `gqa_prefill_nvfp4_rotate_8(x, d)` is made unconditionally. MEASURED BY A SIBLING LINE
+//     2026-09-29 (`ninfer-perplexity`, same instrument family as the nats column above): the cost
+//     of rotation ON at fp8 is **+0.31550 nats worse**. So the tier is not merely dominated: its
+//     DEFAULT SPELLING is defective, and no refusal names it.
+//     ⚠ SCOPE: the DESCENT cannot reach fp8 at all (no `CellMode`), so this binds (a) the ladder/DP
+//     above, which may choose fp8 when nothing cheaper is admissible, and (b) every front end that
+//     accepts `--kv-dtype fp8`. The descent's own `kv_bit_budget_solve` calls are unaffected.
+//     ⚠ THIS LINE DID NOT MEASURE IT AND DOES NOT RE-MEASURE IT; the reading is the sibling's, it is
+//     dated, and the reproducible spelling is `--kv-dtype fp8` against the fp8 rotation-off control.
+static_assert(kKvBitBudgetTiers[2].bits_x100 > kKvBitBudgetTiers[1].bits_x100,
+              "F1231 item 6: fp8 must cost MORE bits than int8 (850 > 825), or its domination "
+              "argument above is no longer the argument that holds");
+// (The DEFAULT-table half of the fp8 domination pin lives at the FOOT of
+// `kv_bit_budget_default_scores()` below, where the table it asserts about exists -- it was first
+// written here and could not compile, because this point in the file is ~1,080 lines earlier.)
+
+// =============================================================================================
+// [F1231] THE QUARANTINE, IN THE FILE'S OWN WORDS, RE-STATED WHERE THE GATE FLIP IS RECORDED.
+// =============================================================================================
+// `rk3v4`/`rk2v4` are, by this file's own note on their score rows, *"PRIORS, NOT MEASUREMENTS --
+// the only invented numbers in this batch"*. `selectable = true` (the gate flip) means the DP MAY
+// CHOOSE THEM, and the probe shows shipped solves DO (`ladder_coldcap[lim8]` and
+// `gear_default[lim8]` above). **THE FLIP CHANGED REACHABILITY, NOT EVIDENCE**: a row whose cost
+// column is derived but whose QUALITY and SPEED columns are invented cannot be the basis of a
+// solve, and it must stay out of any allocation whose objective or constraint is a measured
+// quantity until a measurement exists. Keep this block beside the gate-flip note it qualifies.
+
+// =============================================================================================
+// THE PINS. THE COLUMN IS NOW SELF-CHECKING: any future edit that moves a row's bits, or its
+// geometry, fails to compile HERE with the geometry's owner quoted.
+// =============================================================================================
+// (1) THE FIVE TWO-PLANE-SYMMETRIC ROWS ARE THE DESCENT'S OWN PRICE. `iso4e` is pinned against
+// `CellMode::Nvfp4` because it shares that plane geometry (`decoder_state.cpp` gives it the same
+// quant_group and nothing more) -- and there is no `CellMode::Iso4e`, which is why that is the pin.
+static_assert(kKvBitBudgetTiers[0].bits_x100 ==
+                      cell_rung(CellMode::Bf16).plane_bytes * 100 / 2048 &&
+                  kKvBitBudgetTiers[1].bits_x100 ==
+                      cell_rung(CellMode::Int8).plane_bytes * 100 / 2048 &&
+                  kKvBitBudgetTiers[3].bits_x100 ==
+                      cell_rung(CellMode::Nvfp4).plane_bytes * 100 / 2048 &&
+                  kKvBitBudgetTiers[4].bits_x100 ==
+                      cell_rung(CellMode::Rk4v4).plane_bytes * 100 / 2048 &&
+                  kKvBitBudgetTiers[5].bits_x100 ==
+                      cell_rung(CellMode::Nvfp4).plane_bytes * 100 / 2048,
+              "F1231 item 1: bf16/int8/nvfp4/rk4v4/iso4e are TWO-PLANE-SYMMETRIC cells and their "
+              "bits_x100 IS the descent's own price (cell_rung(mode).plane_bytes*100/2048). If "
+              "this fires, either a plane price moved in kv_cell_modes.h or a row changed ruler "
+              "-- and the second case is the mixing this block exists to make impossible in "
+              "silence");
+// (2) `fp8` HAS NO `CellMode`: its 850 is the symmetric fp8 plane (8 code bits + 8 per 16 of
+// E4M3FN scale over 64 tokens = 8.50 b/el = 17,408 B), so it is pinned against that literal and
+// the provenance is named. A `CellMode::Fp8` would make this pin redundant, not wrong.
+static_assert(kKvBitBudgetTiers[2].bits_x100 == 17408 * 100 / 2048,
+              "F1231 item 1: fp8's 850 is the symmetric fp8 plane (17,408 B = 8.50 b/el)");
+// (3) THE TWO K-NARROWED ROWS ARE THE CLI STORAGE GRAMMAR'S PAIR, AND THEY ARE PINNED AGAINST THE
+// HEADER THAT OWNS THAT GEOMETRY (`kv_e8_width.h`), not against a typed number.
+static_assert(kKvBitBudgetTiers[6].bits_x100 ==
+                  e8_kv_pair_bits_x100(E8KvPlaneFormat::B3, E8KvPlaneFormat::B4),
+              "F1231 item 1: rk3v4's 375 is the (K at 3 bits, V still i4) PAIR -- the CLI's "
+              "storage geometry, not the CellMode cell");
+static_assert(kKvBitBudgetTiers[7].bits_x100 ==
+                  e8_kv_pair_bits_x100(E8KvPlaneFormat::B2, E8KvPlaneFormat::B4),
+              "F1231 item 1: rk2v4's 325 is the (K at 2 bits, V still i4) PAIR -- and note it "
+              "equals e8_kv_pair_bits_x100(B3,B3), which is why the two rows can be confused");
+// (4) THE DISAGREEMENT ITSELF, PINNED ON BOTH SIDES: the ladder's rk3v4 (375, pair) versus the
+// engine's `CellMode::Rk3v4` (325, symmetric cell). If a later round converts one of them, it must
+// delete this assertion deliberately rather than discover the mixing again.
+static_assert(cell_rung(CellMode::Rk3v4).plane_bytes * 100 / 2048 == 325 &&
+                  kKvBitBudgetTiers[6].bits_x100 == 375 &&
+                  cell_rung(CellMode::Rk3v4).plane_bytes * 100 / 2048 !=
+                      kKvBitBudgetTiers[6].bits_x100,
+              "F1231 item 1: `rk3v4` is THE ONE ROW where the ladder's pair ruler and the "
+              "descent's symmetric-cell ruler disagree (375 vs 325). This assertion is the "
+              "mixing's extent, as a fact: seven rows are priced by one geometry, this one by two");
+// (5) THE DESCENT'S REACHABLE PRICE SET, SO THE CENSUS CANNOT DRIFT SILENTLY: six `CellMode`s, and
+// the ladder's bits column intersects them at exactly five rows (bf16/int8/nvfp4/rk4v4 and rk3v4
+// only through its SYMMETRIC price, which the ladder does not use). `fp8`, `iso4e` and `rk2v4` have
+// no `CellMode` at all -- two of them are ladder rows, which is why the ladder and the descent have
+// different admissible sets and a solve must not read one as the other.
+static_assert(cell_all_modes().count() == 6,
+              "F1231: the descent's admissible set is exactly its six CellModes; the ladder has "
+              "eight rows, so three of them (fp8, iso4e, rk2v4) are outside the descent's space");
+
+// [F1229, line `landing`, 2026-09-29] THE iso4e PENALTY IS 30, NOT 200. The 200 was pinned as
+// "a naming/policy choice, not a measured quality claim" -- the ladder's own sentence, and it was
+// true: its only work was to make the bit-equal partner of nvfp4 unreachable through
+// kv_gear_solve_preferring ("prefer iso4e at 4.50 returns nvfp4: THE PIN IS A PENALTY"). 30 is
+// also what BOTH measured columns in this file already carry (kv_bit_budget_measured_scores:
+// iso4e == nvfp4 == (30,114)), so this edit makes the default column agree with the measured ones
+// instead of disagreeing with them by a policy margin.
+//
+// MEASURED TWO-SIDED BEFORE LANDING, because the tree held two contradictory claims about it.
+//   * NO SHIPPED PLAN MOVES. dl/landing/probe/iso_pin_probe.cpp solves 61 ceilings (3.75..18.75
+//     in 0.25 steps) x 2 rk4v4 windows (8, the pinned test's argument, and 16, this file's own
+//     kKvBitBudgetE8LayerLimit) x 7 entries: kv_bit_budget_solve, kv_bit_budget_solve_audited
+//     (cold pool on), kv_bit_budget_solve_scored at w=1 over the default table and over BOTH
+//     measured tables, kv_gear_solve_default, and kv_gear_solve_preferring("iso4e"). 854 solves
+//     per side; the diff of before-vs-after is 18 lines, ALL of them gear_prefer_iso4e solves,
+//     and every one of the six shipped entries is byte-identical at every ceiling and both
+//     windows. In particular kv_bit_budget_solve(16, 4.50, 8, 0) still returns `0-15:nvfp4` at
+//     penalty 4.80 -- the contract tests/test_kv_budget_saturation.cpp:382 pins -- and
+//     kv_gear_solve_default's own answers are unmoved too.
+//   * SO THIS IS A STRICT WIDENING: it unblocks the preference axis and moves nothing else.
+//
+// WARNING: iso4e AND nvfp4 ARE NOT QUALITY-EQUAL, and this number should not be read as claiming
+// they are. Measured on ninfer-perplexity (binary 54588b93..., 13,318-token zh corpus, ctx 4096 /
+// stride 2048, resolution 0.00000): all-nvfp4 mean_nll 0.39090, all-iso4e 0.41330, so iso4e costs
+// +0.02240 nats. In this ladder's own unit that is not zero: the ladder prices 0 -> 30 as the
+// measured bf16-vs-nvfp4 step (0.12962 nats, same instrument), so the measured price of iso4e is
+// ~30 + 30*(0.02240/0.12962) ~ 35, and 30 is its floor. 30 was landed because this is the DEFAULT
+// PRIOR column, both measured columns already carry 30, and 35 would leave the preference
+// unreachable (a gear scored STRICTLY worse is never chosen). The delta is dated and reproducible
+// with `--kv-layer-storage all:iso4e` vs `all:nvfp4`; moving the two integers 30 -> 35 is the
+// honest-price variant and is the OWNER'S call, not a comment repair.
+//
 // RENAME-INVARIANCE PIN (dl/isoname, iso3 -> iso4e). The rename is a NAME change: it may
 // touch a spec_name and nothing else. The bit column is what the slider's whole axis
 // rests on -- nvfp4 and iso4e are the ONLY two rows that cost the same bits, and that
@@ -665,7 +902,145 @@ struct KvBitBudgetSolution {
     return total;
 }
 
+// ===========================================================================
+// THE DEPLOYABILITY CENSUS -- DERIVED FROM THE DEPLOY LAYER'S OWN DECISION POINT
+// ===========================================================================
+// `KvBitBudgetTier::selectable` answers "may the DP CHOOSE this row". It does not answer
+// "can the engine RUN the row it chose", and on this tree the two answers differ for
+// exactly two rows:
+//
+//   product/kv_storage_dtype.h:107-123 REFUSES KvCacheStorage::E8K3Group64 / E8K2Group64
+//   BY NAME -- "'rk3v4' is a DEFINED rk4v4 tier whose codec, K plate layout and WRITER all
+//   exist but which NO RUNTIME PATH CAN READ" -- and
+//   src/targets/qwen3_6/impl/runtime/layouts_impl.h:681-684 refuses the same two rows one
+//   step later. So a plan the SOLVER calls `deployed` can be a plan the BUILD layer throws
+//   on.
+//
+// MEASURED on this tree (dl/kdslider/logs/21_probe_v2_baseline.txt, section D): every
+// `--kv-bits` landing at 4.25 / 4.80 / 5.00 / 6.00 -- and the 4.50 default -- carried
+// `rk2v4` or `rk3v4` and was refused by the build, while the solver answered
+// `deployed=1 refused=0`. The 4.50 default was
+// `0-2:rk2v4,3-4:rk4v4,5:rk3v4,6-7:rk2v4,8-9:int8,10-15:nvfp4`.
+//
+// WHY THIS IS A CALL AND NOT A LIST: a hand-written set of "rows the engine can read" is a
+// SECOND spelling of a question product/kv_storage_dtype.h already answers, and this
+// project's worst outcome is a knob (or a gate) accepted and read by nothing.
+// `parse_kv_storage` (product/kv_options.h:46-61) is the ladder's own name->storage
+// spelling -- the same vocabulary the --kv-layer-storage parser uses -- and
+// `kv_dtype_for_storage` (product/kv_storage_dtype.h:45) is the deploy layer's ONE decision
+// point. So this census cannot drift from the set of rows an operator can actually run: the
+// batch that wires a 3-bit/2-bit K-plate reader deletes the throw THERE, and these two rows
+// become admissible here with no edit to this file.
+[[nodiscard]] inline const std::array<bool, 8>& kv_bit_budget_deployable_rows() {
+    static const std::array<bool, 8> rows = [] {
+        std::array<bool, 8> out{};
+        for (std::size_t i = 0; i < kKvBitBudgetTiers.size() && i < out.size(); ++i) {
+            const std::optional<KvCacheStorage> storage =
+                parse_kv_storage(kKvBitBudgetTiers[i].spec_name);
+            if (!storage) { continue; }   // no storage for this row: not deployable
+            try {
+                (void)kv_dtype_for_storage(*storage, "kv-bit-budget");
+                out[i] = true;
+            } catch (const std::invalid_argument&) {
+                out[i] = false;
+            }
+        }
+        return out;
+    }();
+    return rows;
+}
+
+// The deployable rows by name, in ladder order.
+[[nodiscard]] inline std::string kv_bit_budget_deployable_list() {
+    const std::array<bool, 8>& ok = kv_bit_budget_deployable_rows();
+    std::string out;
+    for (std::size_t i = 0; i < kKvBitBudgetTiers.size() && i < ok.size(); ++i) {
+        if (!ok[i]) { continue; }
+        if (!out.empty()) { out += ", "; }
+        out += kKvBitBudgetTiers[i].spec_name;
+    }
+    return out;
+}
+
+// The rows the census withholds, in the ladder's own spelling.
+[[nodiscard]] inline std::string kv_bit_budget_withheld_rows() {
+    const std::array<bool, 8>& ok = kv_bit_budget_deployable_rows();
+    std::string out;
+    for (std::size_t i = 0; i < kKvBitBudgetTiers.size() && i < ok.size(); ++i) {
+        if (ok[i]) { continue; }
+        if (!out.empty()) { out += ", "; }
+        out += kKvBitBudgetTiers[i].spec_name;
+    }
+    return out;
+}
+
+// `cold` -> `nvfp4`: THE ROW A COLD-PLANNED LAYER'S HOT WINDOW ACTUALLY RESOLVES TO.
+// A cold layer is planned as the NVFP4 hot window and never reaches the deploy layer under
+// the `cold` token -- product::parse_kv_storage has no `cold` row, and the target plan
+// resolves the cold ranges separately (layouts_impl.h: "cold-planned layers keep a HOT
+// window at NVFP4"; product/kv_kv_bits.h detail::kv_bits_hot_window_tier is that same fact
+// as one function). Walking the RAW spec therefore declared a deployable cold plan NOT
+// deployable -- MEASURED on the first version of this line
+// (dl/kvreach/logs/50_after_test_kv_budget_saturation.txt: "entry spellings agree on the
+// spec at ...: (empty) vs 0-5:cold,6-15:fp8"). The rewrite is what makes the walk see the
+// plan the POOL will have rather than the plan's shorthand.
+[[nodiscard]] inline std::string kv_bit_budget_hot_window_spec(std::string_view spec) {
+    std::string out;
+    std::size_t begin = 0;
+    while (begin <= spec.size()) {
+        const std::size_t comma = spec.find(',', begin);
+        const std::string_view item =
+            spec.substr(begin, comma == std::string_view::npos ? spec.size() - begin
+                                                               : comma - begin);
+        const std::size_t colon = item.rfind(':');
+        const std::string_view type =
+            colon == std::string_view::npos ? item : item.substr(colon + 1);
+        if (!out.empty()) { out += ','; }
+        if (type == "cold") {
+            out += std::string(colon == std::string_view::npos ? std::string_view{}
+                                                               : item.substr(0, colon + 1));
+            out += "nvfp4";
+        } else {
+            out += std::string(item);
+        }
+        if (comma == std::string_view::npos) { break; }
+        begin = comma + 1;
+    }
+    return out;
+}
+
+// WHY THIS WALK EXISTS SEPARATELY FROM THE CENSUS. The census answers about a CLASS of
+// rows; this answers about a PLAN -- the one the solver is about to hand over -- using the
+// same two deploy-layer calls the target plan uses on the same grammar
+// (product/kv_options.h:72). So the counter in product/kv_kv_bits.h cannot disagree with
+// what the build does, and it names the FIRST refused layer rather than a row set.
+[[nodiscard]] inline bool kv_bit_budget_spec_is_deployable(std::string_view spec,
+                                                           std::string* why = nullptr,
+                                                           std::int32_t* bad_layer = nullptr) {
+    if (spec.empty()) { return false; }
+    const std::string hot = kv_bit_budget_hot_window_spec(spec);
+    KvLayerStorageSpec parsed;
+    try {
+        parsed = parse_kv_layer_storage_spec(hot);
+    } catch (const std::exception& e) {
+        if (why != nullptr) { *why = e.what(); }
+        return false;
+    }
+    for (std::size_t i = 0; i < parsed.set.size(); ++i) {
+        if (!parsed.set[i]) { continue; }
+        try {
+            (void)kv_dtype_for_storage(parsed.table[i], "--kv-bits[" + std::to_string(i) + "]");
+        } catch (const std::exception& e) {
+            if (why != nullptr) { *why = e.what(); }
+            if (bad_layer != nullptr) { *bad_layer = static_cast<std::int32_t>(i); }
+            return false;
+        }
+    }
+    return true;
+}
+
 // Full solution. Structurally IDENTICAL to the Python DP (tools/archkit/kv_bit_budget.py)
+// kvreach-k3-census
 // so the two agree byte-for-byte, including tie-breaks:
 //   * state key = (bits, cold_used); the rk4v4 count is carried in the surviving path's
 //     value (NOT an extra dimension), exactly like the Python counts dict;
@@ -1017,7 +1392,7 @@ struct KvBitBudgetSolution {
 
 // ---------------------------------------------------------------------------
 // Separable per-range bit ceilings ("分开约束"): the user may cap different layer
-// ranges independently, e.g. "0-7:8,8-63:4.5" (leading layers 8 bits, the rest 4.5).
+// ranges independently, e.g. "0-7:8,8-15:4.5" (leading layers 8 bits, the rest 4.5): the ranges must tile every FULL-ATTENTION layer, so the example follows the variant (16 here), NOT a total layer count.
 //
 // Optimality: the objective is the sum of per-layer penalties and the constraints are
 // per-range capacities, so the feasible set is the Cartesian product of the ranges'
@@ -1059,11 +1434,18 @@ using KvTierScoreTable = std::array<KvTierScoreRow, 8>;   // same order as the d
 // reading past the end.
 namespace detail {
 
+// [dl/backlog item8-guard] THIS LOOP CANNOT RUN, AND THAT IS THE DEFECT.
+// State the population: KvTierScoreTable is std::array<KvTierScoreRow, 8> (:1184) and
+// kKvBitBudgetTiers is std::array<KvBitBudgetTier, 8> (:281), so the loop below was
+// `for (i = 8; i < 8; ++i)` -- ZERO iterations, and the function returned `true` without
+// evaluating a single row. It was NOT vacuous when it was written: the table was six rows
+// and the ladder eight, and the two appended rows were the unselectable pair. The gate
+// flip made the table eight rows and the predicate became unconditional.
+// The honest replacement is the PRECONDITION the loop relied on -- table and ladder are
+// the same set -- so that a future edit which makes the ladder grow past the table fails
+// TO COMPILE here instead of silently restoring the vacuous pass.
 [[nodiscard]] constexpr bool scores_cover_every_selectable_gear() noexcept {
-    for (std::size_t i = KvTierScoreTable{}.size(); i < kKvBitBudgetTiers.size(); ++i) {
-        if (kKvBitBudgetTiers[i].selectable) { return false; }
-    }
-    return true;
+    return KvTierScoreTable{}.size() == kKvBitBudgetTiers.size();
 }
 
 }  // namespace detail
@@ -1095,10 +1477,15 @@ kv_bit_budget_scored_ladder(const KvTierScoreTable& scores, double quality_weigh
         ladder[i].penalty_x100 = static_cast<std::int32_t>(std::nearbyint(combined));
         if (ladder[i].penalty_x100 < 0) { ladder[i].penalty_x100 = 0; }
     }
+    // [dl/backlog item8b-loop] ZERO ITERATIONS TODAY (scores.size() == ladder.size() == 8),
+    // so this body never runs. Kept because it is correct the moment a score table is
+    // SHORTER than the ladder again -- but its old comment claimed the two appended rows
+    // were unselectable and that that was what kept the DP off them. Both halves are false
+    // now (kKvBitBudgetTiers[6].selectable and [7].selectable are `true`), and the thing
+    // that actually keeps the DP off them is their being DOMINATED in the score numbers --
+    // which is a property of the table's CONTENTS and not of this guard. See the withheld
+    // rows' notes in kv_bit_budget_measured_scores() (dl/backlog item7).
     for (std::size_t i = scores.size(); i < ladder.size(); ++i) {
-        // NOT a no-op: it states, where a reader will look, that these rows are outside the
-        // score grammar and therefore carry no score. They are unselectable, so the DP
-        // cannot reach them.
         ladder[i].penalty_x100 = kKvBitBudgetTiers[i].penalty_x100;
     }
     return ladder;
@@ -1117,30 +1504,126 @@ kv_bit_budget_scored_ladder(const KvTierScoreTable& scores, double quality_weigh
 // the speed column starts from the measured uniform-tier decode rates once they exist
 // (fastest path = 0, others scaled by their relative per-token time cost). Both columns are
 // x100 and normalised onto one scale by whoever builds the table.
-[[nodiscard]] inline KvTierScoreTable kv_bit_budget_default_scores() {
+// constexpr so detail::default_quality_column_is_the_shipped_penalty_column() can pin it at
+// COMPILE time; its body is a single return of a constexpr aggregate, so this is a strict widening.
+[[nodiscard]] constexpr KvTierScoreTable kv_bit_budget_default_scores() {
     // speed_x100 is (fastest/v - 1)*100 from the measured uniform-tier rates below, so the
     // fastest path is 0 and slower tiers scale up. quality_x100 still carries the shipped
     // priors until the offline replay (tools/calib) supplies measured per-layer errors.
     return KvTierScoreTable{{
         {/*bf16 */ 0, 7},    // 80.7 tok/s
         {/*int8 */ 2, 0},    // 86.2 tok/s - the measured fastest
-        {/*fp8  */ 3, 0},    // speed UNMEASURED, not "does not run": [RK4V4-CONTROL 2026-09-18 vs PATCHSET/RK4V4-CONTROL/REPORT.md] fp8 runs today
-                            // (`--kv-layer-storage 0-15:fp8` -> `kv cache dtype fp8-e4m3-row256`,
-                            // 4.75 GiB, 27/27). The 0 is the field default, not a measurement; it
-                            // is still correctly excluded by cost (8.50 > int8's 8.25).
+        {/*fp8  */ 3, 0},    // speed UNMEASURED, not "does not run". [dl/backlog item1-R1] The 0 is the
+                             // field default, not a measurement; the tier is still correctly excluded
+                             // by cost (8.50 > int8's 8.25).
+                             // (dl/tierclose R1, applied verbatim) The RK4V4-CONTROL 2026-09-18
+                             // citation this used to carry (`--kv-layer-storage 0-15:fp8` ->
+                             // fp8-e4m3-row256, 4.75 GiB, 27/27) does NOT reproduce on pin
+                             // 8c566fba8843b15b3a4632e009d5cd936a6981d8db93f64a498639c3d0bd15 under
+                             // examples/cli/messages/long_niah_64k.json: that exact spelling is
+                             // refused by the engine's cold-host window guard (layer 0 declares
+                             // sliding_window_tokens = 646720 and fp8's decode path does not read the
+                             // field), and idem-perplexity refuses --kv-dtype fp8 the same way. The
+                             // measurement above stands for the configuration it was taken on; cite
+                             // THAT configuration, or cite nothing.
         {/*nvfp4*/ 30, 114}, // 40.3 tok/s: QK runs twice + software V decode
         {/*rk4v4   */ 8, 218},  // 27.1 tok/s: lattice projection + nibble unpack
-        {/*iso4e */ 200, 114},// == nvfp4
+        {/*iso4e */ 30, 114}, // == nvfp4, and == the ladder row row-for-row (F1229 retired the pin)
         // ⚠ PRIORS, NOT MEASUREMENTS -- the only invented numbers in this batch. Derived from
         // rk4v4's {8, 218} in this table's own idiom: a narrower K plane costs a little
         // precision (quality_x100 up) and a little speed (speed_x100 up), so the two rows are
         // DOMINATED by rk4v4 and can only be CHOSEN when the ceiling leaves no other feasible
         // allocation -- which is exactly the case the gate exists for. Replace these two rows
         // with measured columns before quoting any slider result that depends on the tie-break.
-        {/*rk3v4 */ 10, 225},// PRIOR (narrower K than rk4v4)
-        {/*rk2v4 */ 13, 232},// PRIOR (narrowest K)
+        // ⚠ ALIGNED TO THE LADDER ROW'S OWN DECLARED COLUMN (slider line `kdslider`).
+        // These two rows are still PRIORS, not measurements -- but they now carry the SAME number
+        // the ladder row declares (12 / 16, this file's kKvBitBudgetTiers above), and that is
+        // load bearing rather than cosmetic: the quality column of THIS table then IS the shipped
+        // penalty column row for row, which is what product/kv_perlayer_policy.h:52 has asserted
+        // since before the e8 gate flip ("BYTE-IDENTICAL ... and --kv-quality-weight 1 is a
+        // provable no-op"). The flip appended these two rows with the PRE-flip prior (10 / 13) and
+        // broke that identity in silence. detail::default_quality_column_is_the_shipped_penalty_
+        // column() below now fails to COMPILE if it breaks again. With the identity restored,
+        // w = 1.0 reproduces kKvBitBudgetTiers exactly, so resolving an ABSENT --kv-quality-weight
+        // to the quality end changes no plan (measured: 104/104 budgets,
+        // dl/kdslider/probe/w_sweep.cpp).
+        {/*rk3v4 */ 12, 225},// the ladder row's own declared penalty; PRIOR (narrower K than rk4v4)
+        {/*rk2v4 */ 16, 232},// the ladder row's own declared penalty; PRIOR (narrowest K)
     }};
 }
+
+// [F1231 item 6] THE DEFAULT TABLE'S HALF OF THE `fp8` DOMINATION PIN, at the one place in this
+// file where the table it asserts about exists. `fp8` costs more bits than int8 (850 > 825, pinned
+// at the ladder) and is never better on either score column here; the blend is convex, so at every
+// `--kv-quality-weight` int8's combined penalty is <= fp8's and the bits axis decides the ties --
+// against fp8. The two MEASURED tables carry `int8 (49,0) / fp8 (49,0)` and `(2,0) / (3,0)`, both
+// verified by dl/rework/arms/tier_column_probe.cpp rather than by this comment, because a runtime
+// table cannot be asserted at compile time.
+static_assert(kv_bit_budget_default_scores()[1].quality_x100 <=
+                      kv_bit_budget_default_scores()[2].quality_x100 &&
+                  kv_bit_budget_default_scores()[1].speed_x100 <=
+                      kv_bit_budget_default_scores()[2].speed_x100,
+              "F1231 item 6: on the DEFAULT score table int8 must not be worse than fp8 on either "
+              "axis, or some weight could choose fp8 -- re-read the domination block at the "
+              "ladder's definition, and re-run dl/rework/arms/tier_column_probe.cpp");
+
+// ===========================================================================
+// THE SLIDER'S DEFAULT: AN ABSENT --kv-quality-weight IS THE QUALITY END
+// ===========================================================================
+// The owner's rule, verbatim: the slider exists so that at the SAME bit count one allocates
+// different KINDS of quantisation, not fewer bits -- THE BIT COUNT IS AN INPUT. The knob that
+// acts on it is --kv-quality-weight, whose two ends are the two readings of the columns:
+//
+//   w = 1.0  -- the QUALITY end: penalty = the quality column. THE SHIPPED ANSWER.
+//   w = 0.0  -- the SPEED   end: penalty = the speed  column. The fastest answer.
+//
+// ABSENCE USED TO MEAN "do not run the table at all", i.e. the shipped single-penalty ladder.
+// That made the scored table a trick the operator had to know, and it is why every refusal in
+// this tree has to say "add --kv-quality-weight 0". It now means THE QUALITY END, and that is NOT
+// a behaviour change -- a reason this header can state and then CHECK, rather than assert:
+//
+//   * both engine entries funnel into the SAME kv_gear_solve(request) and differ ONLY in
+//     request.ladder: kv_bit_budget_solve passes kKvBitBudgetTiers, kv_bit_budget_solve_scored
+//     passes kv_bit_budget_scored_ladder(scores, w) (this file's two entries, at the bottom);
+//   * at w = 1.0 the combined penalty is round(1*quality + 0*speed), i.e. the quality column;
+//   * so the two entries agree at w = 1.0 IFF this table's quality column IS kKvBitBudgetTiers'
+//     penalty column -- asserted at COMPILE time just below.
+//
+// Measured, not argued: dl/kdslider/probe/w_sweep.cpp section A compares the two entries over 104
+// budgets (3.05 .. 9.05 step 0.05) on BOTH columns, and reports 88 of them differing BEFORE the
+// alignment and 0 AFTER. Those 88 are the RED CONTROL: a comparison that cannot fail proves
+// nothing.
+inline constexpr double kKvQualityWeightQualityEnd = 1.0;
+// The sentinel stays -1.0, so "was the flag NAMED?" -- the ceiling requirement in
+// apps/cli/options.cpp, src/serve/serve_options.cpp and layouts_impl.h -- keeps meaning what it
+// means: an ABSENT flag does not demand a ceiling, an EXPLICIT one does.
+inline constexpr double kKvQualityWeightAbsent = -1.0;
+
+// The one place the sentinel is given a meaning. Every entry that chooses between the shipped
+// ladder and the scored table calls this instead of comparing to 0.0 itself.
+[[nodiscard]] inline double kv_quality_weight_resolved(double weight) noexcept {
+    return weight < 0.0 ? kKvQualityWeightQualityEnd : weight;
+}
+
+namespace detail {
+
+// THE PIN. `false` means an absent weight and w = 1.0 would resolve DIFFERENT plans, i.e. that
+// making the scored table the default WOULD move every existing --kv-bits run. That is the one
+// thing this change was required not to do, so it is a compile error rather than a note.
+[[nodiscard]] constexpr bool default_quality_column_is_the_shipped_penalty_column() noexcept {
+    const KvTierScoreTable scores = kv_bit_budget_default_scores();
+    for (std::size_t i = 0; i < scores.size(); ++i) {
+        if (scores[i].quality_x100 != kKvBitBudgetTiers[i].penalty_x100) { return false; }
+    }
+    return true;
+}
+
+}  // namespace detail
+static_assert(detail::default_quality_column_is_the_shipped_penalty_column(),
+              "the DEFAULT score table's quality column must equal kKvBitBudgetTiers' penalty "
+              "column row for row: --kv-quality-weight's ABSENCE resolves to the quality end "
+              "(kKvQualityWeightQualityEnd), so any other pair of columns would silently change "
+              "the default plan of every --kv-bits / --kv-bit-budget run");
 
 // "tier quality_x100 speed_x100" per line, '#' comments; must name all EIGHT tiers.
 [[nodiscard]] inline KvTierScoreTable kv_bit_budget_parse_scores(std::string_view text) {
@@ -1163,7 +1646,22 @@ kv_bit_budget_scored_ladder(const KvTierScoreTable& scores, double quality_weigh
         if (index < 0) {
             throw std::invalid_argument("kv-tier-scores: unknown tier '" + name + "'");
         }
-        if (quality < 0.0 || speed < 0.0 || quality > 10000.0 || speed > 10000.0) {
+        // [dl/backlog item6-consumer] A REFUSAL MUST NOT ARRIVE AS A MEASURED ZERO. The
+        // producer (tools/archkit/kv_tier_matrix.py) writes `# UNMEASURED ... -1` for a
+        // column it has no arm for, and this parser STRIPS the comment (line.find('#') then
+        // resize, above), so the sentinel is the only channel left -- and the range check
+        // below used to report it as a generic range error. Name it instead, and refuse the
+        // row rather than accepting it: a tier the producer could not classify has no score,
+        // and the caller's alternative is to omit the tier, which the missing-tier loop at
+        // the end of this function also refuses. Measured population of the old shape: 2 of
+        // 6 emitted rows in --quick on pin 8c566fba (fp8, rk4v4), each emitted as `0 0`.
+        if (quality < 0.0 || speed < 0.0) {
+            throw std::invalid_argument(
+                "kv-tier-scores: tier '" + name + "' is UNMEASURED (sentinel -1), not a "
+                "score of -1: 'nobody looked' and 'the error is zero' are different values, "
+                "and this loader refuses the first rather than loading it as a zero");
+        }
+        if (quality > 10000.0 || speed > 10000.0) {
             throw std::invalid_argument("kv-tier-scores: scores must be in [0,10000] x100");
         }
         table[static_cast<std::size_t>(index)] = KvTierScoreRow{
@@ -1359,16 +1857,25 @@ kv_bit_budget_spec_ranges(std::int32_t layers, const std::vector<KvBitBudgetRang
 // The scored ladder under per-range ceilings. Without this, a caller that passes both knobs
 // silently loses the ceilings: the range form leaves the scalar budget at 0, so a scored run
 // would resolve every layer against a zero-bit ceiling instead of the range's own.
+// F911 -- THE MISSING PARAMETER, ADDED. This function's scored sibling
+// (kv_bit_budget_solve_scored) has ALWAYS taken a `candidate_order` as its last parameter; the
+// range form simply had none to hand it and hard-called the scalar solver with the shipped
+// order, which is why --kv-codec-preference was refused by name under the RANGE spelling of
+// --kv-bit-budget. The parameter is DEFAULTED and empty means the shipped order, so every
+// existing call site is byte-identical; the operator's preference now reaches the same fit that
+// the scalar spelling already reached.
 [[nodiscard]] inline std::string kv_bit_budget_scored_ranges(
     std::int32_t layers, const std::vector<KvBitBudgetRange>& ranges,
     const KvTierScoreTable& scores, double quality_weight,
-    std::int32_t rk4v4_limit = kKvBitBudgetE8LayerLimit, std::int32_t cold_cap = 0) {
+    std::int32_t rk4v4_limit = kKvBitBudgetE8LayerLimit, std::int32_t cold_cap = 0,
+    const std::vector<std::int32_t>& candidate_order = {}) {
     return kv_bit_budget_ranges_driver(
         layers, ranges, rk4v4_limit, cold_cap,
-        [&scores, quality_weight](std::int32_t count, double bits, std::int32_t local_rk4v4,
-                                 std::int32_t cold_left) {
+        [&scores, quality_weight, &candidate_order](std::int32_t count, double bits,
+                                                    std::int32_t local_rk4v4,
+                                                    std::int32_t cold_left) {
             return kv_bit_budget_solve_scored(count, bits, scores, quality_weight, local_rk4v4,
-                                              cold_left);
+                                              cold_left, candidate_order);
         });
 }
 
@@ -1446,6 +1953,22 @@ kv_bit_budget_spec_ranges(std::int32_t layers, const std::vector<KvBitBudgetRang
 //     so it may break a tie and must never outrank a tier difference; (b) it is
 //     BIT-IDENTICAL on rk4v4 (the negative control), so it must not be applied to
 //     the rk4v4 gear at all.
+//     WARNING [F1229, line `landing`, 2026-09-29] THE COLUMN ABOVE DOES NOT REPRODUCE AND ITS
+//     CONCLUSION IS INVERTED. Re-measured by line `kvarnk` (dl/kvarnk/blob_F1222.md, binary
+//     24ef9e0e..., SAME harness, SAME 13,318-token zh corpus, ctx 4096 / stride 2048): base
+//     (baked row scale, rotation ON) mean_nll 0.39090 and base_repeat 0.39090, i.e. the
+//     instrument's resolution is exactly 0.00000; against that floor the identity table costs
+//     +0.34966 nats, the INVERTED table (rs_wrong_rec) +0.44654, rotation OFF +0.23439, and a
+//     WHOLE TIER CHANGE IN THE SAME BATTERY (bf16) +0.12962. So the row scale's error is about
+//     170x the 0.00207 recorded here, and LARGER than the tier change it is compared against:
+//     the sentence "the row-scale/rotation effect is SECOND ORDER -- 180-490x smaller than a
+//     tier choice (0.775 nats)" is FALSE on the current binary. The recorded runs are from
+//     2026-09-12; the mechanism gained its decode Q-read site (gqa_attention_decode_nvfp4.cuh:647)
+//     and its prefill sites since, which is a CANDIDATE explanation and is NOT established.
+//     THE CREDIT BELOW IS STILL APPLIED AT 5. It is now known to be a POLICY value resting on a
+//     measurement that did not survive re-measurement -- NOT the "Derived, not chosen" value its
+//     own comment claims (see kKvRowScaleCreditX100). Re-deriving it is OWED and is NOT done by
+//     F1229, because it moves the scored default path and that is the owner's call.
 //   * fp8 rotation defect (research/notes/TODO.md section 4): the fp8 decode
 //     kernel applies R to K but not to Q, so with rotation ON the fp8 tier
 //     computes q^T R k instead of (Rq)^T(Rk) -- measured O(1) wrong (mean 1.97 vs
@@ -1549,7 +2072,14 @@ struct KvGearComponentMode {
 };
 
 // The row-scale/rotation quality credit, in the ladder's own x100 penalty units.
-// z100 == 0.01 loss. Derived, not chosen: the measured deltas above are
+// z100 == 0.01 loss. WARNING [F1229]: THIS IS NO LONGER "DERIVED". The deltas it was derived
+// from are refuted by re-measurement (see the row-scale block above: the identity table costs
+// +0.34966 nats against a 0.00000 floor, not +0.00012..0.00207), so the 5 below is a POLICY
+// value standing on a stale measurement. Re-deriving it -- which under the same 0->30 ==
+// 0.12962-nats mapping would be ~35, i.e. a credit ~7x larger than the tier step the comment
+// below says it must never outrank -- MOVES the scored default path and is OWED, not done.
+// PRE-F1229 TEXT (kept so the change is auditable): "Derived, not chosen: the measured deltas
+// above are
 // |-0.00159|, |-0.00207| and |+0.00012| nats on the mean NLL, i.e. at most 0.00207
 // nats. The ladder's own reference loss is nvfp4's 0.30 for the whole 4-bit step,
 // and the largest measured tier-choice gap is 0.775 nats, so expressing the row
@@ -1602,6 +2132,22 @@ enum class KvScoreContext : std::uint8_t { Long = 0, Short = 1 };
             {/*nvfp4*/ 67, 114},
             {/*rk4v4   */ 9, 218},
             {/*iso4e */ 67, 114},   // shares nvfp4's planes and speed; unpinned
+            // [dl/backlog item7 + item10] THE TWO ROWS THE DEPLOY LAYER REFUSES, CARRIED AT THE
+            // LADDER'S OWN DECLARED PENALTY. This initialiser had SIX entries for a
+            // std::array<KvTierScoreRow, 8>, so rows 6/7 (rk3v4, rk2v4) were value-initialised
+            // to (0, 0) -- the global MINIMUM on both slider ends. A PASSING shipped test then
+            // emitted `0-4:rk3v4,5-7:rk2v4,...` and the deploy layer REFUSED it at layer 0
+            // (product/kv_storage_dtype.h:117-119: 'rk3v4 is a DEFINED rk4v4 tier ... which NO
+            // RUNTIME PATH CAN READ'). That is a correctness defect, not a doc defect.
+            // NO VALUE IS INVENTED HERE. These are the SAME two numbers kKvBitBudgetTiers
+            // declares for these two rows and kv_bit_budget_default_scores() already carries
+            // (12/225 and 16/232). They are PRIORS, and they are load-bearing for exactly one
+            // reason: rk4v4 is (9, 218), so 12 > 9 AND 225 > 218 means rk3v4 is DOMINATED on
+            // BOTH columns for every w in [0,1] -- and likewise 16 > 9 and 232 > 218 for
+            // rk2v4. A dominated row can never be CHOSEN, so the DP can no longer emit a plan
+            // the deploy layer refuses, at any --kv-quality-weight.
+            {/*rk3v4 */ 12, 225},  // the ladder's declared penalty; PRIOR, dominated by rk4v4
+            {/*rk2v4 */ 16, 232},  // the ladder's declared penalty; PRIOR, dominated by rk4v4
         }};
     }
     // Long context. The 64k sweep carries the SPEED column and the retrieval
@@ -1615,6 +2161,13 @@ enum class KvScoreContext : std::uint8_t { Long = 0, Short = 1 };
         {/*nvfp4*/ 30, 114},
         {/*rk4v4   */ 9, 218},
         {/*iso4e */ 30, 114},
+        // [dl/backlog item7 + item10] same reason as the Short arm above: six
+        // initialisers for a std::array<KvTierScoreRow, 8> left rows 6/7 at (0, 0),
+        // the global minimum on both ends. Carried at the ladder's declared penalty
+        // (12/225, 16/232) they are dominated by rk4v4's (9, 218) on BOTH columns and
+        // can never be chosen. No value is invented: both are already in this file.
+        {/*rk3v4   */ 12, 225},
+        {/*rk2v4   */ 16, 232},
     }};
 }
 
@@ -2312,10 +2865,19 @@ static_assert(!kv_gear_slot_in_grammar(99),
 // THE SLIDER'S OWN ENTRY. The same solve, with `tier` tried FIRST among candidates that
 // score equally. This is the opt-in shape, chosen over the two alternatives for reasons
 // that are measured, not stylistic:
-//   * NOT "unpin iso4e in the auto set": that would move the DEFAULT answer at 4.50 from
-//     `0-15:nvfp4` to `0-15:iso4e`, i.e. change the arithmetic of every existing
-//     `--kv-bits 4.5` run without anyone asking, and it would contradict the pinned
-//     test_reported_defect_is_gone() (`--kv-bits 4.50` -> `0-15:nvfp4`).
+//   * NOT "unpin iso4e in the auto set" -- AND THE REASON THIS BULLET USED TO GIVE WAS WRONG.
+//     [F1229, line `landing`, 2026-09-29, measured, not argued] It said unpinning "would move
+//     the DEFAULT answer at 4.50 from `0-15:nvfp4` to `0-15:iso4e`". It does not. With the pin
+//     retired, kv_bit_budget_solve(16, 4.50, 8, 0) still returns `0-15:nvfp4` at penalty 4.80,
+//     and across 61 ceilings x 2 rk4v4 windows the six SHIPPED entries (ladder cold-off,
+//     ladder cold-audited, default-table scored at w=1, both measured columns,
+//     kv_gear_solve_default) are byte-identical before and after the edit
+//     (dl/landing/probe/iso_pin_probe.cpp, 854 solves per side, 18 lines of diff and all 18
+//     are gear_prefer_iso4e). The reason is the one this file already documents two hundred
+//     lines up: nvfp4 is inserted BEFORE iso4e in detail::gear_candidates, so an equal-penalty
+//     tie is kept by nvfp4 whatever the penalty column says. What the pin actually blocked was
+//     THIS function's own axis -- see the bullet below, whose text is now measured-true where
+//     it was previously only argued: `prefer iso4e` returned nvfp4 BECAUSE of the pin.
 //   * NOT "drive it from --kv-quality-weight": measured incapable. At 4.50 the solver
 //     returns `0-15:nvfp4` for every w in {0,0.25,0.5,0.75,1} under BOTH measured score
 //     tables and under the default table -- 15/15 knob combinations, one spec -- because
@@ -2397,7 +2959,67 @@ static_assert(!kv_gear_slot_in_grammar(99),
 // counts is derived from the per-layer plan, so it can no longer disagree with the
 // spec the way a separately-accumulated count can.
 // ---------------------------------------------------------------------------
+namespace detail {
+
+// ===========================================================================
+// THE GATED FALLBACK -- TWO PASSES, AND THE FIRST PASS IS THE SHIPPED ONE
+// ===========================================================================
+// WHY NOT NARROW THE CANDIDATE SET UP FRONT. Measured on a shadow tree
+// (dl/kvreach/logs/44_zero_move.txt): ANDing the deployability census into the candidate
+// set BEFORE solving moved 47 landings that were ALREADY DEPLOYABLE -- same achieved_bits,
+// different codec mix, different penalty -- because shrinking the candidate set
+// re-optimises the ladder's own objective EVERYWHERE, not only on the ceilings where the
+// withheld row was chosen. A landing that works must not move, so the shipped candidate set
+// gets the first word and the census only breaks a tie the engine cannot build.
+//
+// THE RULE, IN FOUR LINES: solve as shipped; if the answer is a plan the deploy layer
+// accepts, return it UNTOUCHED; otherwise solve again with the withheld rows made
+// unselectable and return that. The second pass can never be reached on a ceiling whose
+// shipped answer was already runnable, which is what makes the zero-move property
+// STRUCTURAL rather than measured.
+//
+// WHAT IT DOES NOT DO: it lowers no penalty, moves no bit count, and does NOT touch
+// `selectable` -- a withheld row is still a ladder row, still priced, still spellable by
+// --kv-layer-storage (where the deploy layer refuses it by name), and still inside the
+// candidate GRAMMAR, so --kv-codec-preference rk3v4 is still rejected for the reason it
+// always was (the row loses the fit) rather than newly accepted-and-ignored.
+[[nodiscard]] inline KvBitBudgetSolution kv_bit_budget_solve_impl_gated(
+    std::int32_t layers, double budget_bits, const std::array<KvBitBudgetTier, 8>& ladder,
+    std::int32_t rk4v4_limit, std::int32_t cold_cap,
+    std::int32_t cold_bits_x100 = kKvBitBudgetColdBitsX100) {
+    KvBitBudgetSolution first =
+        kv_bit_budget_solve_impl(layers, budget_bits, ladder, rk4v4_limit, cold_cap,
+                                 cold_bits_x100);
+    if (kv_bit_budget_spec_is_deployable(first.spec)) { return first; }
+    std::array<KvBitBudgetTier, 8> masked = ladder;
+    const std::array<bool, 8>& ok = kv_bit_budget_deployable_rows();
+    for (std::size_t i = 0; i < masked.size() && i < ok.size(); ++i) {
+        if (!ok[i]) { masked[i].selectable = false; }
+    }
+    return kv_bit_budget_solve_impl(layers, budget_bits, masked, rk4v4_limit, cold_cap,
+                                    cold_bits_x100);
+}
+
+[[nodiscard]] inline KvGearSolution kv_gear_solve_gated(const KvGearSolveRequest& request) {
+    KvGearSolution first = kv_gear_solve(request);
+    if (kv_bit_budget_spec_is_deployable(first.spec)) { return first; }
+    KvGearSolveRequest masked = request;
+    if (masked.per_layer.empty()) {
+        masked.per_layer.assign(static_cast<std::size_t>(request.layers), KvGearSet::all());
+    }
+    const std::array<bool, 8>& ok = kv_bit_budget_deployable_rows();
+    for (KvGearSet& set : masked.per_layer) {
+        for (std::size_t i = 0; i < set.allowed.size() && i < ok.size(); ++i) {
+            if (!ok[i]) { set.allowed[i] = false; }
+        }
+    }
+    return kv_gear_solve(masked);
+}
+
+}  // namespace detail
+
 [[nodiscard]] inline KvBitBudgetSolution kv_gear_to_budget_solution(
+// kvreach-k4-funnel
     const KvGearSolution& solved, const std::array<KvBitBudgetTier, 8>& ladder,
     std::int32_t layers, std::int32_t cold_bits_x100) {
     KvBitBudgetSolution out;
@@ -2453,9 +3075,13 @@ static_assert(!kv_gear_slot_in_grammar(99),
     // what this header produced before rather than silently re-laid-out. The gearbox is
     // reached whenever cold is off, which is the default (`--max-cold-pages 0`).
     if (cold_cap > 0) {
-        return kv_bit_budget_solve_impl(layers, budget_bits, kKvBitBudgetTiers, rk4v4_limit,
-                                        cold_cap, cold_bits_x100);
+        // THE GATED FUNNEL, not kv_bit_budget_solve_impl: the cold plan is built by the
+        // legacy multiset DP and must reach the same deployability rule as the gear path,
+        // or the two entry SPELLINGS would disagree about the ceilings that need it.
+        return detail::kv_bit_budget_solve_impl_gated(layers, budget_bits, kKvBitBudgetTiers,
+                                                      rk4v4_limit, cold_cap, cold_bits_x100);
     }
+// kvreach-k5-cold-legacy
     KvGearSolveRequest request;
     request.layers = layers;
     request.budget_bits = budget_bits;
@@ -2465,8 +3091,12 @@ static_assert(!kv_gear_slot_in_grammar(99),
     request.cold_bits_x100 = cold_bits_x100;
     // SLIDERWIRE: the caller's preference, verbatim. Empty keeps the shipped order.
     request.candidate_order = candidate_order;
-    const KvGearSolution solved = kv_gear_solve(request);
+    // THE GATED FUNNEL: the shipped candidate set gets the first word (so no already-runnable
+    // landing moves), and the deployability census breaks a tie only when the first answer is
+    // a plan the build layer refuses.
+    const KvGearSolution solved = detail::kv_gear_solve_gated(request);
     return kv_gear_to_budget_solution(solved, kKvBitBudgetTiers, layers, cold_bits_x100);
+// kvreach-k7-gear-legacy
 }
 
 [[nodiscard]] inline KvBitBudgetSolution kv_bit_budget_solve_scored(
@@ -2484,10 +3114,12 @@ static_assert(!kv_gear_slot_in_grammar(99),
     }
     // Same cold-path note as kv_bit_budget_solve above.
     if (cold_cap > 0) {
-        return kv_bit_budget_solve_impl(layers, budget_bits,
-                                        kv_bit_budget_scored_ladder(scores, quality_weight),
-                                        rk4v4_limit, cold_cap);
+        // Same gated funnel as kv_bit_budget_solve's cold arm, one rule both entries.
+        return detail::kv_bit_budget_solve_impl_gated(
+            layers, budget_bits, kv_bit_budget_scored_ladder(scores, quality_weight), rk4v4_limit,
+            cold_cap);
     }
+// kvreach-k6-cold-scored
     KvGearSolveRequest request;
     request.layers = layers;
     request.budget_bits = budget_bits;
@@ -2499,8 +3131,10 @@ static_assert(!kv_gear_slot_in_grammar(99),
     request.cold_cap = cold_cap;
     // SLIDERWIRE: the caller's preference, verbatim. Empty keeps the shipped order.
     request.candidate_order = candidate_order;
-    const KvGearSolution solved = kv_gear_solve(request);
+    // Same gated funnel as kv_bit_budget_solve's gear arm: one rule, both spellings.
+    const KvGearSolution solved = detail::kv_gear_solve_gated(request);
     return kv_gear_to_budget_solution(solved, request.ladder, layers, kKvBitBudgetColdBitsX100);
+// kvreach-k8-gear-scored
 }
 
 } // namespace ninfer::product

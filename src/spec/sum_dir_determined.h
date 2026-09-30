@@ -15,13 +15,13 @@
 //   (D1) `SumDir::find`'s duplicate run (sum_dir.h:1747-1761) plus `spec/sum_dir_query_key.h`;
 //   (D2) the cargo record's ABSENT length field, so the length can only come from the ROW
 //        (`sum_dir_row_tokens`, sum_dir.h:515-517); (D3) `sum_dir_block_digest` recomputed on read;
-//   (D4) `sum_dir_reach.h:104-108` + `program_impl.h:14502-14507`, which forbid choosing a page by
+//   (D4) `sum_dir_reach.h [text: substitute the positional first-fit silently; = :110 on 2026-09-25]` + `program_impl.h [text: chooses a page by POSITION; = :16212 on 2026-09-25]`, which forbid choosing a page by
 //   POSITION. What did not exist is ONE function that runs all four and can FAIL. This is that
 //   function.
 //
 // THE REFUSAL SIDE IS HALF OF IT, AND IT IS THE HALF THAT MAKES IT SAFE
 //   A similarity score, a distance, a cosine, a top-k rank or any threshold may NOT produce
-//   `DETERMINED`. It may only contribute to the candidate-set UNION -- program_impl.h:14418-14422,
+//   `DETERMINED`. It may only contribute to the candidate-set UNION -- program_impl.h [text: exact-or-silent, never approximately right; = :15948 on 2026-09-25],
 //   verbatim: "It is exact-or-silent, never approximately right, and that is the property that makes
 //   it admissible under this project's refusal discipline. A semantic channel ... belongs in the
 //   candidate-set UNION, never in place of this arbiter." This header therefore takes a KEY and an
@@ -93,7 +93,7 @@ struct SumDirDeterminedClauses {
     // not an optional extra.
     bool model_binding        = true;
     // ⛔ THE MUTANT CARRIER. Setting this true makes the check resolve a |candidates| != 1 BY
-    // POSITION -- i.e. the forbidden fallback of sum_dir_reach.h:104-108 -- instead of refusing.
+    // POSITION -- i.e. the forbidden fallback of sum_dir_reach.h [text: substitute the positional first-fit silently; = :110 on 2026-09-25] -- instead of refusing.
     // It exists so the executed check can be RUN against the forbidden shape and be watched
     // admitting it, which is what makes (D1) load-bearing. It must never be true in a production
     // call, and `sum_dir_determined_clauses_with_dropped("POSITIONAL")` is the only producer of it.
@@ -226,7 +226,7 @@ struct SumDirDeterminedReport {
         (lookup.verdict == SumDirQueryKeyVerdict::RefusedAmbiguous ||
          lookup.verdict == SumDirQueryKeyVerdict::RefusedNoCandidate)) {
         // ⛔ THE MUTANT'S ONLY INPUT, and it is the exact shape the tree forbids:
-        // sum_dir_reach.h:104-108 -- "that fallback chooses a page by POSITION, which is precisely
+        // sum_dir_reach.h [text: substitute the positional first-fit silently; = :110 on 2026-09-25] -- "that fallback chooses a page by POSITION, which is precisely
         // the 'plausible-looking wrong anchor' the requirement forbids". A |candidates| != 1 is
         // resolved by taking the row the PLAN named instead of refusing. With this input the
         // conjunction ADMITS an ambiguous key, which is what makes (D1) load-bearing rather than

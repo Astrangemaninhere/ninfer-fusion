@@ -147,6 +147,9 @@ private:
     std::atomic<bool> running_{false};
     std::thread thread_;
     std::string pending_spec_;  // candidate seen in the previous cycle
+    // kvfix (F893): the last withheld-reason REPORTED, so a refusal is printed once per
+    // distinct reason instead of once per 250 ms cycle.
+    std::string withheld_reported_;
     std::string applied_spec_;  // spec handed to apply_ successfully
     std::array<KvCacheStorage, kKvLayerStorageSlots> applied_table_{};
     double vram_ewma_ = 0.0;              // damped free-VRAM reading (bytes)
@@ -187,6 +190,38 @@ int ft_vram_shift_for(std::int64_t free_minus_reference_bytes, std::uint64_t lay
 std::string build_ft_spec(const std::vector<std::pair<int, double>>& energy,
                           int full_attn_layers, double deep_frac = 0.2,
                           int rk4v4_shift = 0);
+
+// kvfix (F893) -- THE REFUSAL THIS FUNCTION NOW CARRIES.
+//
+// `build_ft_spec` chose between `iso4e` and `nvfp4` from the energy tap, and that pair is the
+// one pair in the ladder the choice costs NOTHING to change -- which is exactly why the choice
+// was never a cost choice:
+//   * BYTE-NEUTRAL: this header's own note above (:179-181) says "iso4e costs the same bytes as
+//     nvfp4, so the iso4e/nvfp4 boundary is byte-neutral".
+//   * PRIOR-NEUTRAL: the shipped table scores both rows quality_x100 = 114
+//     (product/kv_bit_budget.h:1297-1299, `{/*iso4e */ 200, 114},// == nvfp4`), and that column
+//     is a PRIOR, not a measurement.
+// So the tap was separating two tiers on no evidence of any difference, while
+// product/kv_perlayer_policy.h:37 says of it, verbatim: "WARNING: it is a COST / compressibility
+// proxy, NOT a quantization-error signal."  :253-259 already answers the same case for the
+// sibling DROP axis -- "Without a per-plane error measurement the answer is NO, and it stays NO
+// however small the energy is" -- and no per-plane quantisation-error provider exists in this
+// tree (:45-47 names the absence rather than defaulting it).
+//
+// ⇒ the byte-neutral boundary is REFUSED BY NAME rather than approximated. A caller MUST report
+// this string; a caller that swallows it turns a refusal into a silent no-op, which is this
+// project's worst outcome.
+inline constexpr const char* kFtByteNeutralBoundaryWithheld =
+    "the per-layer tier table is WITHHELD: this request would decide the iso4e/nvfp4 boundary "
+    "from the energy tap, and that boundary is BYTE-NEUTRAL (serve/kv_auto_relayout.h:179-181) "
+    "and PRIOR-NEUTRAL (product/kv_bit_budget.h:1297-1299 scores iso4e and nvfp4 the same "
+    "quality_x100 = 114), while the tap is, in product/kv_perlayer_policy.h:37's own words, "
+    "\"a COST / compressibility proxy, NOT a quantization-error signal\". "
+    "product/kv_perlayer_policy.h:253-259 already answers this case for the sibling drop axis "
+    "('a cost signal cannot justify' a quality placement) and no per-plane quantisation-error "
+    "provider exists in this tree (kv_perlayer_policy.h:45-47). Give --kv-layer-storage "
+    "explicitly; the proxy keeps only the boundary it can pay for (rk4v4's, which moves bytes).";
+
 
 // "0-11:rk4v4,12-15:nvfp4" formatting for a per-layer table (first `layers` slots).
 std::string format_kv_table(const std::array<KvCacheStorage, kKvLayerStorageSlots>& table,

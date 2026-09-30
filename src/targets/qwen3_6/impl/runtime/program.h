@@ -23,6 +23,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 #include "targets/qwen3_6/impl/runtime/mtp_window_cut.h"
+#include "product/cold_spill_writeback.h"
 #include "spec/turn_recall_journal.h"
 #include "spec/sum_dir.h"
 
@@ -752,6 +753,13 @@ public:
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
+    // --stage-layers SPEC and its boundary, copied once from the plan so that every
+    // schedule::ExecutionCore build site in program_impl.h reads it from this one copy and
+    // no two readers can see different values. Empty spec == the flag was
+    // absent == one stage == axis `none`; every reader below is a no-op in that state.
+    const std::string stage_layers_spec;
+    const std::string stage_handoff_dir;
+    const bool stage_handoff_cut;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
@@ -848,6 +856,34 @@ public:
     // set, so returning one can never move a page's bytes on disk.
     std::uint64_t cold_disk_file_slots = 0;
     std::vector<std::uint8_t> cold_disk_file_used;
+    // [COLD-SPILL] THE DISK TIER'S WRITE-BACK ENGINE, AND ITS SLAB POOL.
+    // WHAT STOOD HERE: the mirror wrote each layer with fseek+fwrite on the caller's
+    // own thread and then called `std::fflush(nullptr)`, after paying one
+    // `cudaStreamSynchronize` PER LAYER. The reference material names that shape
+    // twice, and both times as a defect:
+    //   * `kvmem_known_issues.md:331`, verbatim 「NVMe stage-in reads 已重做，但
+    //     stage-out writes 仍同步。」 -- the reference implementation fixed the READ
+    //     half and left the WRITE half synchronous, which is the limitation this line
+    //     was ordered to get past;
+    //   * `kvmem_nvme_ssd_architecture.md:184-190` ("Why the current tier cannot use
+    //     SSD performance") lists, verbatim: "owns one `FILE *`; performs one `fseek`
+    //     plus `fread`/`fwrite` per block; calls `fflush` after every block write".
+    // product/cold_spill_writeback.h owns the engine and states the completion
+    // contract; these four members are its inputs and its counters.
+    //
+    // `cold_disk_slabs` is one pinned slab PER TEXT LAYER -- which is what lets a whole
+    // page's D2H be enqueued before ONE stream sync instead of one per layer.
+    // `cold_disk_staging[0]` and `[1]` remain the first two entries of it, so every
+    // read path and the teardown keep working unchanged.
+    std::vector<void*> cold_disk_slabs;
+    std::unique_ptr<product::ColdSpillWriteback> cold_spill_wb;
+    // Pages whose write was REFUSED by the engine's bound and therefore went down the
+    // synchronous path for that layer. A refusal is not a drop, so this counter is the
+    // evidence that the fallback covered it.
+    std::uint64_t cold_spill_fallbacks = 0;
+    // Pages the mirror could not place at all (write failed, or the synchronous
+    // fallback failed). Those pages keep their device replica -- the pre-existing arm.
+    std::uint64_t cold_spill_unplaced = 0;
     // [TEXT-CARGO] THE COLD PAYLOAD, AS TEXT. The user's order of 2026-09-15 is that the
     // retired block's DURABLE payload is its 64 token ids and a recall re-prefills them
     // instead of loading KV back ("召回 = 把这段文字重新 prefill"), so this is the cargo the

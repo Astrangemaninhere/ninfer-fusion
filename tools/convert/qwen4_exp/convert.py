@@ -178,14 +178,23 @@ def preflight(mixed_dir: str | Path, ple_dir: str | Path) -> int:
               % (ple_int4, source.PLE_REVISION, variant or "unknown", ple_dir))
         failures += 1
 
-    for label, fn, args in (
-        ("validate_bundle", source.validate_bundle, (mixed_dir, ple_dir)),
-        ("validate_mixed_source",
-         importlib.import_module(f"tools.convert.{FAMILY}.recipe").validate_mixed_source,
-         (mixed_dir,)),
+    # The two validators are RESOLVED INSIDE the guard, not while the tuple is built.
+    # Building it eagerly called `importlib.import_module(recipe)` before the `try`, and
+    # `tools/convert/qwen3_8_flash_next/recipe.py:559` runs `validate_recipe()` at module
+    # scope, which calls `inventory.validate_inventory()` at `:539` -- an unconditional
+    # call that the documented escape at `inventory.py:332-333` does NOT cover.  So a
+    # REPORTABLE divergence arrived as a bare ImportError traceback, which is the one thing
+    # this function promises never to do: "with each divergence named, never a bare
+    # failure" (`preflight`'s own docstring).  Resolving them here does not weaken any
+    # check: the identical exceptions still raise, are still printed with their full
+    # message, and are still counted in `failures`, so the exit code cannot change.
+    for label, run in (
+        ("validate_bundle", lambda: source.validate_bundle(mixed_dir, ple_dir)),
+        ("validate_mixed_source", lambda: importlib.import_module(
+            f"tools.convert.{FAMILY}.recipe").validate_mixed_source(mixed_dir)),
     ):
         try:
-            fn(*args)
+            run()
             print("ok       %s" % label)
         except Exception as exc:                      # noqa: BLE001 -- report, never crash
             print("FAILED   %s: %s" % (label, exc))

@@ -521,11 +521,85 @@ inline bool e8_kv_decode_plane_lattice(E8KvWidth w, const std::uint8_t* code_in,
 enum class E8KvPlaneCodec : std::uint8_t {
     Scalar = 0,   // the one-integer-per-coordinate codec; the shipped W4 row and the control
     Lattice,      // the reconstructing E8 lattice point codec; W3 and W2 only
+    // [dl/e8vaxis F1166] THE PACKED i4 CODEC, named HERE because the plane axis must be a TOTAL
+    // function and a V plane at B4 is a real, shipped choice. It is NOT this family's lattice and
+    // it is NOT defined in this file: its ONE spelling lives in
+    // ops/kernel/gqa_attention_kv_quant.cuh (gqa_kv_quant_i4_code / gqa_kv_pack_i4 /
+    // kv_scale_half), which a host compiler cannot include. This enumerator therefore NAMES the
+    // codec without redefining it, so the dispatch can answer for a V plane instead of falling
+    // back in silence -- which, before this enumerator, was the ONLY answer available for V.
+    I4 = 2,
 };
 
+// THE PRE-IMAGE DISPATCH, UNCHANGED. It answers for the **K** plane, which is what every one of
+// its callers means: the family's widths ARE K widths, and W4 -> Scalar is the shipped row.
 [[nodiscard]] constexpr E8KvPlaneCodec e8_kv_plane_codec_of_record(E8KvWidth w) noexcept {
     return e8_kv_lattice_supports(w) ? E8KvPlaneCodec::Lattice : E8KvPlaneCodec::Scalar;
 }
+
+// ===========================================================================
+// [dl/e8vaxis F1166] THE PLANE AXIS AT THE DISPATCH
+// ===========================================================================
+// The pre-image above takes a WIDTH and no PLANE, and that is the whole of the KV-bound design
+// at this layer: one answer per width, and V could not be asked about at all. It is joined by
+// the pair below for any caller that has a plane to name, and the geometry it reads is
+// product/kv_e8_width.h's plane axis.
+//
+// THE REUSE IS THE POINT, AND IT IS WHY THIS COSTS NO MATHEMATICS. E8 quantises eight
+// coordinates along the CHANNEL axis and the codec never learns which plane it is filling, so
+// `Lattice` is returned for a B2 or B3 plane WHICHEVER IT IS, and `e8_kv_lattice_width_of()`
+// then hands the caller the ONE E8KvWidth that plane uses -- meaning a B2 V plane is encoded by
+// the SAME e8_kv_encode_plane_lattice(W2, ...) instantiation as a B2 K plane, with the same
+// stage-1 and stage-2 tables and the same e8_lattice_hadamard64().
+[[nodiscard]] constexpr E8KvPlaneCodec e8_kv_plane_codec_of_record(E8KvPlane plane,
+                                                                   E8KvPlaneFormat f) noexcept {
+    switch (f) {
+    case E8KvPlaneFormat::B3:
+    case E8KvPlaneFormat::B2:
+        // BOTH PLANES. The lattice does not know which one it is on, and it must not be told.
+        return E8KvPlaneCodec::Lattice;
+    case E8KvPlaneFormat::B4:
+        // ONE byte geometry, TWO codecs -- the tree's own "SAME SIZE, different MEANING". On K
+        // the 4-bit record is the SCALAR codec (the shipped W4 row); on V it is the shipped
+        // packed i4. NEITHER is the lattice: the codeword has a 16-bit form and a 24-bit form
+        // and NO 32-bit form, so a 4-bit lattice plane does not exist to be chosen.
+        return plane == E8KvPlane::K ? E8KvPlaneCodec::Scalar : E8KvPlaneCodec::I4;
+    }
+    return E8KvPlaneCodec::Scalar;
+}
+
+// THE WIDTH A LATTICE PLANE USES. This is the bridge that makes "V reuses K's codec" a
+// DERIVATION rather than a promise: the format's bits ARE the width.
+[[nodiscard]] constexpr E8KvWidth e8_kv_lattice_width_of(E8KvPlaneFormat f) noexcept {
+    return f == E8KvPlaneFormat::B3 ? E8KvWidth::W3 : E8KvWidth::W2;
+}
+
+// THE PINS. The K plane's answers must be the PRE-IMAGE DISPATCH's, format for width, or the
+// shipped row has moved; and the V plane's answers are the new fact this line lands.
+static_assert(e8_kv_plane_codec_of_record(E8KvPlane::K, E8KvPlaneFormat::B4) ==
+                  e8_kv_plane_codec_of_record(E8KvWidth::W4),
+              "the K plane at B4 must still be the SCALAR codec: W4 is the shipped row");
+static_assert(e8_kv_plane_codec_of_record(E8KvPlane::K, E8KvPlaneFormat::B3) ==
+                  e8_kv_plane_codec_of_record(E8KvWidth::W3) &&
+                  e8_kv_plane_codec_of_record(E8KvPlane::K, E8KvPlaneFormat::B2) ==
+                  e8_kv_plane_codec_of_record(E8KvWidth::W2),
+              "the K plane's answer must be the pre-image dispatch's, format for width");
+static_assert(e8_kv_plane_codec_of_record(E8KvPlane::V, E8KvPlaneFormat::B3) ==
+                      E8KvPlaneCodec::Lattice &&
+                  e8_kv_plane_codec_of_record(E8KvPlane::V, E8KvPlaneFormat::B2) ==
+                      E8KvPlaneCodec::Lattice,
+              "THE PLANE AXIS: V at B3/B2 is the SAME lattice codec K uses (marker F1166)");
+static_assert(e8_kv_plane_codec_of_record(E8KvPlane::V, E8KvPlaneFormat::B4) == E8KvPlaneCodec::I4,
+              "V at B4 is the shipped i4 V -- NAMED, not silently defaulted to a lattice");
+static_assert(e8_kv_plane_codec_of_record(E8KvPlane::K, E8KvPlaneFormat::B4) !=
+                      E8KvPlaneCodec::Lattice &&
+                  e8_kv_plane_codec_of_record(E8KvPlane::V, E8KvPlaneFormat::B4) !=
+                      E8KvPlaneCodec::Lattice,
+              "there is no 4-bit lattice plane on EITHER plane: the codeword has no 32-bit "
+              "form, which is the same fact that makes e8_kv_lattice_supports(W4) false");
+static_assert(e8_kv_lattice_width_of(E8KvPlaneFormat::B2) == E8KvWidth::W2 &&
+                  e8_kv_lattice_width_of(E8KvPlaneFormat::B3) == E8KvWidth::W3,
+              "a V plane at B2 IS the W2 lattice instantiation, verbatim -- not a lookalike");
 
 // The seam. `codec` selects explicitly; there is no silent fallback in either direction:
 // asking for Lattice at a width that cannot carry it returns false and writes nothing.
@@ -551,6 +625,60 @@ enum class E8KvPlaneCodec : std::uint8_t {
     }
     e8_kv_decode_plane(w, code_in, scale_in, rows, x);
     return true;
+}
+
+// ===========================================================================
+// [dl/e8vaxis F1166] THE PLANE-AWARE SEAM
+// ===========================================================================
+// `plane` decides the CODEC and `format` decides the BYTES -- and since the two planes of one
+// format are the same geometry, "the floor is B2 on both" is a statement about two planes and
+// not about two different things. Named `..._format_as` rather than overloaded onto the seam
+// above for one reason: two overloads that differ only in the two leading enum types are legal
+// but hard to read at a call site, and this file's whole subject is that a reader must be able
+// to tell WHICH THING it is looking at.
+[[nodiscard]] inline bool e8_kv_encode_plane_format_as(E8KvPlane plane, E8KvPlaneFormat f,
+                                                       const float* x, std::int32_t rows,
+                                                       std::uint8_t* code_out,
+                                                       std::uint16_t* scale_out,
+                                                       E8LatticeEncoder enc =
+                                                           E8LatticeEncoder::Exact) {
+    switch (e8_kv_plane_codec_of_record(plane, f)) {
+    case E8KvPlaneCodec::Lattice:
+        return e8_kv_encode_plane_lattice(e8_kv_lattice_width_of(f), x, rows, code_out,
+                                          scale_out, enc);
+    case E8KvPlaneCodec::Scalar:
+        // Reachable ONLY for (K, B4), because the dispatch never returns Scalar for a lattice
+        // format. It calls e8_kv_encode_plane() rather than re-deriving the layout, which is
+        // what keeps this arm bit-identical to the shipped row -- section 8.3 of
+        // e8_width_codec_test.cpp pins that identity, and 10.1 pins that this arm did not move.
+        e8_kv_encode_plane(E8KvWidth::W4, x, rows, code_out, scale_out);
+        return true;
+    case E8KvPlaneCodec::I4:
+        break;
+    }
+    // A V plane at B4 is a REAL, shipped choice whose codec lives in
+    // ops/kernel/gqa_attention_kv_quant.cuh, a CUDA header this one cannot include. It is
+    // REFUSED here rather than approximated: filling a plane of the SAME byte count with the
+    // lattice plate would be the "right name, wrong codec" this tree has already paid for
+    // (product/kv_storage_dtype.h on RK4V4E8/RK2V4E8). The writer that DOES fill it is
+    // ops/kv_cache/append/e8_lattice_narrow_kernel.cuh, whose V arm links the i4 codec directly.
+    return false;
+}
+
+[[nodiscard]] inline bool e8_kv_decode_plane_format_as(E8KvPlane plane, E8KvPlaneFormat f,
+                                                       const std::uint8_t* code_in,
+                                                       const std::uint16_t* scale_in,
+                                                       std::int32_t rows, float* x) {
+    switch (e8_kv_plane_codec_of_record(plane, f)) {
+    case E8KvPlaneCodec::Lattice:
+        return e8_kv_decode_plane_lattice(e8_kv_lattice_width_of(f), code_in, scale_in, rows, x);
+    case E8KvPlaneCodec::Scalar:
+        e8_kv_decode_plane(E8KvWidth::W4, code_in, scale_in, rows, x);
+        return true;
+    case E8KvPlaneCodec::I4:
+        break;
+    }
+    return false;
 }
 
 }   // namespace ninfer::product

@@ -418,10 +418,79 @@ void test_disabled_governor_ignores_a_hostile_feed() {
            control + "the unit did not move, so the second guard is untested by this feed");
 }
 
+
+// ---- an UNREADABLE value is REFUSED BY NAME, never promoted to a meaning --------------------
+// The switch below has two front ends and, until this test existed, only one of them checked its
+// input. The CLI front end spells the choice through `parse_mode` and throws on a bad spelling
+// ("prefill chunk mode must be dynamic|manual, got '...'", rc=1 -- measured in
+// dl/recallnext/logs/r5_analyze.txt under RC2). The ENVIRONMENT front end had no check at all:
+// `env_tristate` returned `true` for every byte string that was not one of seven off spellings, so
+// `NINFER_FT_BW_GOV=2` ran 3/3 legs on the default and printed the default's own trace line
+// (`[ft] bw mode=dynamic chunk=3072 capacity=3072 installed=1`, same file, RC1) -- an operator
+// typo and a deliberate default were indistinguishable from outside the process.
+//
+// Every case below is TWO-SIDED, which is the only shape that can fail: the unreadable value must
+// be refused AND the refusal must NAME the variable and QUOTE the offending value, and then the
+// eight documented spellings must still resolve quietly in both directions. A reader that refused
+// everything would satisfy the first half and fail the second; one that accepted everything fails
+// the first. On the pre-image header this function reports 6 failures and the file exits 1.
+void test_out_of_contract_refused_by_name() {
+    const char* unreadable[] = {"2", "maybe", "enabled", "-1", "0 ", "true1"};
+    for (const char* value : unreadable) {
+        set_env("NINFER_FT_BW_GOV", value);
+        bool threw = false;
+        std::string what;
+        try {
+            (void)BandwidthGovernor::resolve_enabled();
+        } catch (const std::exception& error) {
+            threw = true;
+            what  = error.what();
+        }
+        expect(threw, std::string("NINFER_FT_BW_GOV=") + value +
+                          " was accepted instead of refused; a value that cannot be read must not "
+                          "be promoted to a meaning");
+        expect(what.find("NINFER_FT_BW_GOV") != std::string::npos,
+               std::string("the refusal for NINFER_FT_BW_GOV=") + value +
+                   " does not name the variable it came from: " + what);
+        expect(what.find(value) != std::string::npos,
+               std::string("the refusal for NINFER_FT_BW_GOV=") + value +
+                   " does not quote the offending value: " + what);
+    }
+
+    const struct {
+        const char* env;
+        bool on;
+    } quiet[] = {
+        {"0", false},     {"false", false}, {"off", false}, {"no", false},
+        {"FALSE", false}, {"Off", false},   {"nO", false},  {"1", true},
+        {"true", true},   {"on", true},     {"yes", true},  {"TRUE", true},
+        {"On", true},     {"Yes", true},
+    };
+    for (const auto& one : quiet) {
+        set_env("NINFER_FT_BW_GOV", one.env);
+        bool threw = false;
+        bool got   = false;
+        try {
+            got = BandwidthGovernor::resolve_enabled();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        expect(!threw, std::string("the documented spelling NINFER_FT_BW_GOV=") + one.env +
+                           " was refused; only an UNREADABLE value may be refused");
+        expect(got == one.on, std::string("NINFER_FT_BW_GOV=") + one.env +
+                                  " resolved to the wrong side of the switch");
+    }
+
+    // The refusal must not have changed what ABSENT means: unset is still the default, still ON.
+    unset_env("NINFER_FT_BW_GOV");
+    expect(BandwidthGovernor::resolve_enabled(),
+           "unset NINFER_FT_BW_GOV is no longer ON, so the refusal changed the default");
+}
 } // namespace
 
 int main() {
     test_spellings();
+    test_out_of_contract_refused_by_name();
     test_adapts_mapping();
     test_resolution_precedence();
     test_two_modes_differ();

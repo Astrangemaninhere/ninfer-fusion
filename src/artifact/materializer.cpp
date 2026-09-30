@@ -1,5 +1,9 @@
 #include "artifact/materializer.h"
 
+// F1059: `ops/stream_capture.h` is deliberately NOT included any more. The fetch no longer needs
+// to ASK whether a capture is running -- the fork in fetch_enroll() is issued unconditionally, so
+// it is correct in both regimes and the branch that its predicate would have driven is gone.
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -72,7 +76,43 @@ struct ReadSpan {
 // (program_impl.h:920), so the two host tiers behave identically under WSL.
 class CudaWeightResidencyDevice final : public product::WeightResidencyDevice {
 public:
-    explicit CudaWeightResidencyDevice(cudaStream_t stream) : stream_(stream) {}
+    // THREE streams now, and the third one is the fix (F1059/streamfix).
+    //
+    // notehook split `stream_` into `consumer_` + `transfer_` and made the H2D ride
+    // `transfer_` = `device.transfer_stream`. That is the ENGINE'S OWN stream: it carries the
+    // context/state pipeline (`context_completion_.record(device.transfer_stream)` at
+    // program_impl.h:6237/6294/6417/7278/9195/9632, `context_source_ready_.wait(
+    // device.transfer_stream)` at :9151/:9561, `state_store->begin_host_to_device(...)` at
+    // :6105/:6759), and the engine reads that timeline back through its own transfer timers
+    // (:1006-1008). Injecting 8.56 GB per pass into it is what turned the offloaded run into the
+    // engine's degenerate-head token 0 -- measured, not inferred: F1057's `CUDA_LAUNCH_BLOCKING=1`
+    // and `NINFER_HEADDBG=1` arms are byte-identical to the resident arm.
+    //
+    // So the fetch gets a stream of its OWN, `fetch_`. Nothing is added to the engine's stream and
+    // nothing on it is synchronised: the ordering the layer walk needs is one event per layer,
+    // recorded on `fetch_` and waited on by `consumer_` (fetch_event_record / consumer_wait), and
+    // a copy that has already landed makes that wait free.
+    CudaWeightResidencyDevice(cudaStream_t consumer, cudaStream_t transfer)
+        : consumer_(consumer), transfer_(transfer) {
+        if (cudaStreamCreateWithFlags(&fetch_, cudaStreamNonBlocking) != cudaSuccess) {
+            (void)cudaGetLastError();
+            throw std::runtime_error("weight offload fetch stream creation failed");
+        }
+        // The fork event: published on the CONSUMER while the consumer is being captured, which is
+        // what enrols `fetch_` in that capture (cudaStreamWaitEvent PROPAGATES the capture to the
+        // stream it waits from -- src/core/decode_graph_peer.h:296-300). DisableTiming because it
+        // is an edge, never a measurement.
+        if (cudaEventCreateWithFlags(&fork_, cudaEventDisableTiming) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaStreamDestroy(fetch_);
+            fetch_ = nullptr;
+            throw std::runtime_error("weight offload capture fork event creation failed");
+        }
+    }
+    ~CudaWeightResidencyDevice() override {
+        if (fork_ != nullptr) { (void)cudaEventDestroy(fork_); }
+        if (fetch_ != nullptr) { (void)cudaStreamDestroy(fetch_); }
+    }
 
     void* device_alloc(std::uint64_t bytes) override {
         void* slot = nullptr;
@@ -94,19 +134,88 @@ public:
     }
     void pinned_free(void* pinned) noexcept override { (void)cudaFreeHost(pinned); }
     void enqueue_h2d(void* device_slot, const void* pinned, std::uint64_t bytes) override {
+        // F1059: rides `fetch_`, NOT the engine's `transfer_`. A HOST->DEVICE cudaMemcpyAsync
+        // from pinned memory is CAPTURABLE (it becomes a memcpy node); it is the HOST-destination
+        // form that is illegal under capture, which is why `transfer_` cannot be used here and
+        // why the old code had to skip the whole hook while capturing.
         CUDA_CHECK(cudaMemcpyAsync(device_slot, pinned, static_cast<std::size_t>(bytes),
-                                   cudaMemcpyHostToDevice, stream_));
+                                   cudaMemcpyHostToDevice, fetch_));
     }
-    void synchronize() override { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
+    // F1059: PUBLISH THE CONSUMER'S POSITION AND MAKE THE FETCH STREAM WAIT ON IT, before this
+    // layer's copies are enqueued. TWO jobs, one pair of calls, and the first one is the fix.
+    //
+    //  1. THE ORDERING -- and this is NOT about graphs, which is why it is UNCONDITIONAL.
+    //     slot(i) = i % arena_layers, and fetch_layer(index) prefetches layer
+    //     `index + arena_layers - 1`, whose slot is
+    //         (index + arena_layers - 1) % arena_layers = (index - 1) % arena_layers.
+    //     That is EXACTLY slot(index - 1): the strip belonging to the layer the consumer enqueued
+    //     ONE STEP EARLIER. At this host call that layer has only been ENQUEUED -- its GEMMs are
+    //     queued or executing, and the CPU runs layers ahead -- so without this wait the copy lands
+    //     in a strip that is still being read, and `fetch_layer`'s own eviction loop clears
+    //     `resident_[index - 1]` while nothing joins the write to the read. It is a SYSTEMATIC
+    //     ordering defect rather than a rare race (with k strips the overwritten strip is ALWAYS
+    //     the previous layer's), which is why F1057's 1-strip and 6-strip runs and its 11-token and
+    //     3,400-token runs all produced the same wrong bytes. Waiting on an event recorded on the
+    //     CONSUMER here makes the copy's first byte land after everything the consumer has enqueued
+    //     so far, the previous layer's GEMMs included.
+    //  2. THE CAPTURE. The same pair is what enrols `fetch_` in a capture: cudaStreamWaitEvent
+    //     PROPAGATES the capture to the stream it waits from (src/core/decode_graph_peer.h:296-300),
+    //     so issued while the consumer is capturing, the copies become graph NODES and each layer's
+    //     record/wait pair becomes a graph EDGE. One mechanism, both defects.
+    //
+    // Per LAYER rather than per capture on purpose: this tree has more than one capture site
+    // (decode_impl.h:85, graph_impl.h:26, mtp_impl.h:420, dflash_impl.h:615), so a flag that
+    // latched "already enrolled" would enrol the first capture and silently miss the second. A
+    // per-layer fork carries no state across calls, and the matching rejoin is the per-layer
+    // consumer_wait() that already exists.
+    //
+    // The cost is two stream ops per fetch (116 per 8-token round in the measured arm) and the
+    // prefetch overlap the arena exists for is PRESERVED: `arena_layers - 1` layers of compute
+    // still separate a copy from its consumer.
+    void fetch_enroll() override {
+        CUDA_CHECK(cudaEventRecord(fork_, consumer_));
+        CUDA_CHECK(cudaStreamWaitEvent(fetch_, fork_, 0));
+    }
+    // NOTHING in this backend calls this any more, and that is the point: `synchronize()` used to
+    // drain the stream the fetch ran on, and F1057 measured that the fetch path never called it
+    // (it has no caller in weight_residency.h). It is kept as a HOST wait on `fetch_` so that a
+    // future caller that wants a barrier gets one on the offload's OWN stream, not the engine's.
+    void synchronize() override { CUDA_CHECK(cudaStreamSynchronize(fetch_)); }
     std::uint64_t now_ns() const noexcept override {
         return static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count());
     }
+    // THE JOIN. `cudaEventDisableTiming` because nothing reads this event's duration: it is an
+    // edge, not a measurement. The destroy tolerates nullptr so a partially constructed runtime
+    // can still be torn down.
+    void* fetch_event_create() override {
+        cudaEvent_t event = nullptr;
+        if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return nullptr;
+        }
+        return static_cast<void*>(event);
+    }
+    void fetch_event_record(void* event) override {
+        CUDA_CHECK(cudaEventRecord(static_cast<cudaEvent_t>(event), fetch_));
+    }
+    void consumer_wait(void* event) override {
+        CUDA_CHECK(cudaStreamWaitEvent(consumer_, static_cast<cudaEvent_t>(event), 0));
+    }
+    void fetch_event_destroy(void* event) noexcept override {
+        if (event != nullptr) {
+            (void)cudaEventDestroy(static_cast<cudaEvent_t>(event));
+        }
+    }
 
 private:
-    cudaStream_t stream_ = nullptr;
+    cudaStream_t consumer_ = nullptr;
+    cudaStream_t transfer_ = nullptr;
+    // F1059: the offload's OWN stream for the H2D, and the event that enrols it in a capture.
+    cudaStream_t fetch_ = nullptr;
+    cudaEvent_t fork_   = nullptr;
 };
 
 } // namespace
@@ -201,7 +310,12 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         if (declared != offload.offloaded_bytes) {
             throw ArtifactError("weight offload byte accounting does not match the plan");
         }
-        out.weight_backend_ = std::make_shared<CudaWeightResidencyDevice>(device.transfer_stream);
+        // notehook: the CONSUMING stream is passed as well, so the runtime can make it wait on
+        // each layer's fetch event. `device.stream` is the stream the layer walk computes on
+        // (TextContext holds this same DeviceContext and uses ctx_.stream throughout).
+        out.weight_backend_ =
+            std::make_shared<CudaWeightResidencyDevice>(device.stream, device.transfer_stream);
+
         out.weight_residency_ =
             std::make_unique<product::WeightResidencyRuntime>(offload, out.weight_backend_.get());
         out.stats_.weight_host_bytes         = offload.offloaded_bytes;

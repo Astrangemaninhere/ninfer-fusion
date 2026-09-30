@@ -31,8 +31,16 @@ enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 
 struct GqaSmallTInvocation {
     const Tensor* valid_columns = nullptr;
-    // M1: per-column ancestor bit masks (I64 [W,B]), or null for a chain round. Only the BF16
-    // partial kernel reads it; the other tiers never receive one (the wrapper refuses them).
+    // M1: per-column ancestor bit masks (I64 [W,B]), or null for a chain round. TWO arms read
+    // it: the BF16 tier's tensor-core partials (5 mention sites) and the SIMT-FFMA family
+    // (8 sites), whose NVFP4 codec arm belongs to a QUANTISED tier. What stays true is that
+    // only the BF16 TIER is one gqa_attention() will admit a mask for -- and for a structural
+    // reason, not a tier rule: the SIMT-FFMA codec arm is compile-time refused for an append
+    // source (`static_assert(!CacheInput::writes_cache)`,
+    // ops/kernel/gqa_attention_simt_ffma.cuh:1786), and gqa_attention() appends and attends in
+    // one launch. The witness table and the named refusal are in
+    // src/ops/wrapper/gqa_attention.cpp (kGqaMaskReaders). (This comment used to claim "only
+    // the BF16 partial kernel reads it", which the counts above contradict.)
     const Tensor* column_masks  = nullptr;
     const Tensor* table_rows    = nullptr;
     std::int32_t full_width     = 0;

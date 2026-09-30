@@ -27,6 +27,13 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_graph_segment(segment, segments);
+          // --stage-layers: the layer range this stage walks, resolved and refused BY NAME
+          // against plan_shards() here, where the loaded model's layer count is known. Called
+          // on every TextContext the ordinary batch builds, so a pp world needs no separate
+          // code path -- the same card runs one stage or all of them.
+          card.set_stage_layers_spec(state.execution.stage_layers_spec,
+                                     state.execution.stage_handoff_dir,
+                                     state.execution.stage_handoff_cut);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
                 Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);

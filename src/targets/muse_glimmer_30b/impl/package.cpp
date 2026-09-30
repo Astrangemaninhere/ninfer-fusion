@@ -8,6 +8,7 @@
 
 #include "artifact/reader.h"
 #include "targets/muse_glimmer_30b/impl/load/bindings.h"
+#include "targets/muse_glimmer_30b/impl/tokenizer_policy.h"
 #include "targets/muse_glimmer_30b/impl/variant.h"
 
 #include <array>
@@ -123,6 +124,10 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
                                       .token_domain =
                                           static_cast<std::size_t>(detail::Variant::TextConfig::token_domain),
                                       .validate_official_special_ids = false,
+                                      // Muse's OWN tokenizer policy, declared in
+                                      // impl/tokenizer_policy.h -- the fact this model
+                                      // could not state before the F879 seam.
+                                      .tokenizer_policy = detail::kTokenizerPolicy,
                                       .max_context    = options.max_context,
                                       .media_cache_bytes        = options.media_cache_bytes,
                                       .media_live_bytes         = options.media_live_bytes,

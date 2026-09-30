@@ -28,8 +28,8 @@ Qwen3.8 NVFP4 checkpoint, under different key names::
     this source                        modelopt reader
     <base>.weight_packed          <->  <base>.weight
     <base>.weight_scale           <->  <base>.weight_scale
-    <base>.weight_global_scale    <->  <base>.weight_scale_2
-    <base>.input_global_scale     <->  <base>.input_scale
+    <base>.weight_global_scale    <->  <base>.weight_scale_2 (ROLE match; RECIPROCAL as stored)
+    <base>.input_global_scale     <->  <base>.input_scale    (ROLE match; RECIPROCAL as stored)
 
 so ``tools/artifact/layouts.py``'s ``encode_nvfp4`` (which the Qwen3.8 NVFP4
 converter already uses, and which its own docstring describes as "Encode exact

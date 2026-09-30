@@ -124,7 +124,12 @@ void test_table_integrity() {
         check(!rung.label.empty() && !rung.cards.empty(),
               "every rung names a microarchitecture and representative cards");
     }
-    check(ninfer::caps::arch_rung(60) == nullptr, "sm_60 is not in the ladder");
+    // F702 (2026-09-24): this used to read `arch_rung(60) == nullptr` with the message "sm_60 is
+    // not in the ladder". sm_50/52/53/60/61/62 ARE rows now -- added WITH measured evidence (the
+    // pre-75 block; see the comment block above kArchLadder in src/core/arch_caps.h) -- so the
+    // "unlisted" example moved to a number that is still unrouted. sm_35 (K40) is the honest
+    // one: no toolkit on this box can codegen for it, which is why it has no row.
+    check(ninfer::caps::arch_rung(35) == nullptr, "sm_35 is not in the ladder");
     check(ninfer::caps::arch_rung(999) == nullptr, "an absurd sm is not in the ladder");
     // Group 1d: EVERY NumericFormat enumerator is accounted for exactly once -- by a floor row or
     // by a deliberate named refusal -- and the totals are checked against the ENUM rather than
@@ -254,13 +259,34 @@ void test_verdicts() {
         check(ninfer::caps::evaluate_artifact_formats(sm, one(NumericFormat::I32)).ok(),
               "i32 control payloads are supported at sm_" + std::to_string(sm));
     }
-    // bf16 weights need sm_80 and above only.
-    check(!ninfer::caps::evaluate_artifact_formats(70, one(NumericFormat::BF16)).ok(),
-          "bf16 weights are refused on sm_70");
-    check(!ninfer::caps::evaluate_artifact_formats(75, one(NumericFormat::BF16)).ok(),
-          "bf16 weights are refused on sm_75");
+    // bf16 weights need sm_80 and above for their DECLARED floor -- and on sm_70/sm_75, which
+    // have fp16 tensor cores and no bf16 mma, they are now served by the fp16-plane arm rather
+    // than refused. BOTH PINS HERE READ `!...ok()` UNTIL 2026-09-25 AND WERE ALREADY STALE when
+    // dl/fp16route (F-736) read them: F-720 gave those two rungs the tensor-core-free rescue, so
+    // the verdict has been Supported-with-a-fallback since then and this pin was not updated
+    // with it. Measured rather than argued -- dl/fp16route/out/grid_PRE_qpn.tsv reads
+    // `sm=70 format=BF16 -> Supported, 1 fallback` BEFORE this line's change.
+    check(ninfer::caps::evaluate_artifact_formats(70, one(NumericFormat::BF16)).ok(),
+          "bf16 weights are ACCEPTED on sm_70 (fp16 tensor cores + the fp16-plane arm)");
+    check(ninfer::caps::evaluate_artifact_formats(75, one(NumericFormat::BF16)).ok(),
+          "bf16 weights are ACCEPTED on sm_75 (fp16 tensor cores + the fp16-plane arm)");
     check(ninfer::caps::evaluate_artifact_formats(80, one(NumericFormat::BF16)).ok(),
           "bf16 weights are accepted on sm_80");
+    // ... and the KIND of the rescue on those two rungs is the fp16 TENSOR-CORE one, not the
+    // FMA pipe. This is the assertion that makes the wall's removal visible at the gate.
+    for (const int sm : {70, 75}) {
+        const ninfer::caps::CapabilityReport r =
+            ninfer::caps::evaluate_artifact_formats(sm, one(NumericFormat::BF16));
+        check(r.fallbacks.size() == 1 && r.fallbacks[0].format == NumericFormat::BF16 &&
+                  !r.fallbacks[0].tensor_core_free &&
+                  r.fallbacks[0].fallback_used == Cap::Fp16Mma,
+              "sm_" + std::to_string(sm) +
+                  " serves bf16 from its fp16 TENSOR CORE, not from the FMA pipe");
+        check(std::string(r.fallbacks[0].fallback_kernel).find("bf16_mma_fp16.cuh") !=
+                  std::string::npos,
+              "sm_" + std::to_string(sm) +
+                  " must cite the fp16-plane kernel file, not merely a capability bit");
+    }
     // groupwise-int (W8G32_F16S) is the format the community sm_86 fork ships. It is refused
     // on sm_75, which is a correction of the "groupwise-int targets Turing+" claim in
     // CMakeLists.txt:6-8 and layouts_impl.h:931.
@@ -301,34 +327,127 @@ void test_verdicts() {
                                                   NumericFormat::FP8_E4M3FN_ROW_BF16S, true),
           "the predicate must be false for fp8 even with the build fact true");
     // Unknown compute capability is a refusal, not an optimistic pass.
+    // F702 (2026-09-24): this probed sm_60, which is now a ladder ROW (the pre-75 block), so it
+    // would have returned Unsupported-with-a-named-gap -- a DIFFERENT and better answer, not the
+    // UnknownArch warning this check is about. The example moved to sm_35 (K40), which no toolkit
+    // on this box can codegen for and which therefore has no row.
     const ninfer::caps::CapabilityReport unknown =
-        ninfer::caps::evaluate_artifact_formats(60, one(NumericFormat::BF16));
-    check(unknown.verdict == Verdict::UnknownArch, "sm_60 yields UnknownArch");
+        ninfer::caps::evaluate_artifact_formats(35, one(NumericFormat::BF16));
+    check(unknown.verdict == Verdict::UnknownArch, "sm_35 yields UnknownArch");
     check(!unknown.ok(), "an unlisted compute capability is not ok()");
+    // ... and the OTHER half of the same question, which the pre-75 rows turned into a live
+    // distinction: a pre-Volta rung now has a ROW, so the gate must NAME the floor it misses
+    // instead of reporting that no floor can be checked. Same rung, same call, and the format is
+    // one whose refusal SURVIVES dl/floorfix (F-720)'s change -- FP8_E4M3FN_ROW_F32S is a note
+    // row because no kernel in this tree can execute it, and no capability can change that.
+    const ninfer::caps::CapabilityReport pre_volta =
+        ninfer::caps::evaluate_artifact_formats(61, one(NumericFormat::FP8_E4M3FN_ROW_F32S));
+    check(pre_volta.verdict == Verdict::Unsupported && pre_volta.gaps.size() == 1 &&
+              pre_volta.gaps[0].required == Cap::Bf16Mma,
+          "sm_61 is a row now: the gate must refuse a format with no kernel by naming the floor "
+          "it would need, not take the UnknownArch warning path");
+    // AND THE PIN THAT HAD TO MOVE. This assertion used to read
+    //   evaluate_artifact_formats(61, {BF16}) -> Unsupported, one gap (Cap::Bf16Mma)
+    // and it moved for a MEASURED reason, not to make a change fit: dl/floorfix widened
+    // caps::simt_floor_executable()'s second clause from `caps == Cap::None` to "this rung cannot
+    // serve this format's declared floor", and BF16's row now names a TENSOR-CORE-FREE kernel
+    // (ops/linear/bf16/bf16_gemv.cuh; census dl/floorfix/out/tc_free_census/census.txt). sm_61,
+    // sm_70 and sm_75 are the SAME case for this format -- all three fail Cap::Bf16Mma -- so the
+    // assertion stays at sm_61 where it was and is strengthened: the rescue must be reported as
+    // TENSOR-CORE-FREE, with Cap::None as its floor (Cap's six bits are all tensor-core
+    // families), rather than as a capability the card has.
+    const ninfer::caps::CapabilityReport pre_volta_bf16 =
+        ninfer::caps::evaluate_artifact_formats(61, one(NumericFormat::BF16));
+    check(pre_volta_bf16.verdict == Verdict::Supported && pre_volta_bf16.gaps.empty() &&
+              pre_volta_bf16.fallbacks.size() == 1 &&
+              pre_volta_bf16.fallbacks[0].tensor_core_free &&
+              pre_volta_bf16.fallbacks[0].fallback_used == Cap::None,
+          "sm_61 x BF16: the floor is unmet, and the gate must admit through the named "
+          "tensor-core-free arm -- dl/floorfix F-720");
     // Mixed artifacts report every gap, not just the first.
     const std::array<NumericFormat, 2> mixed = {NumericFormat::BF16, NumericFormat::NVFP4};
+    // sm_80 MEETS THE BF16 FLOOR, so BF16 is not a fallback there at all: the branch above
+    // returns before either lower floor is consulted, and that is the property that keeps this
+    // change from ever trading a tensor-core route for a narrower one. NVFP4 ALONE IS STILL A GAP
+    // at 80, and deliberately so -- see the NVFP4 row's own note in arch_caps.h: giving it a
+    // simt_kernel_evidence column would admit it on 86/89/90/100/103 as well, where the RUNTIME
+    // does not consult that answer and would fall through to a kind::mxf4nvf4 kernel those ISAs
+    // do not have. Asserted here so the hole cannot be closed by accident.
     const ninfer::caps::CapabilityReport both =
         ninfer::caps::evaluate_artifact_formats(80, mixed);
-    check(both.verdict == Verdict::Unsupported, "a mixed artifact on sm_80 is unsupported");
-    check(both.gaps.size() == 1, "sm_80 meets the bf16 floor, so only nvfp4 is a gap");
-    check(both.gaps[0].format == NumericFormat::NVFP4, "the reported gap is nvfp4");
-    // sm_70 on a MIXED artifact: bf16 is still a GAP (it has no fp16 fallback kernel at
-    // all), while nvfp4 is now served by the QPN fallback, so it is reported as a FALLBACK
-    // and not as a gap. The two lists are what keep "the artifact loads" from being confused
-    // with "the card meets every floor", and the counts are asserted on both.
+    check(both.verdict == Verdict::Unsupported, "a mixed artifact on sm_80 is still unsupported");
+    check(both.gaps.size() == 1 && both.gaps[0].format == NumericFormat::NVFP4,
+          "sm_80 meets the bf16 floor, so only nvfp4 is a gap -- and it must STAY one until the "
+          "op's W4A4-vs-A16 decision is rung-aware");
+    // sm_70 ON THE MIXED ARTIFACT: bf16's floor is unmet and it is now a FALLBACK (the
+    // tensor-core-free arm -- the 122 refusing cells of the census), while nvfp4 is a FALLBACK
+    // for the reason it always was (the fp16 QPN channel). "The artifact loads" and "the card
+    // meets every floor" must not be confused: the counts are asserted on both lists, and the
+    // KIND of each fallback is asserted rather than its existence.
     const ninfer::caps::CapabilityReport v100 =
         ninfer::caps::evaluate_artifact_formats(70, mixed);
-    check(v100.gaps.size() == 1, "sm_70 reports exactly one GAP on the mixed artifact (bf16)");
-    check(v100.gaps[0].format == NumericFormat::BF16,
-          "the remaining gap on sm_70 is bf16, which has no fp16 fallback kernel");
-    check(v100.fallbacks.size() == 1 && v100.fallbacks[0].format == NumericFormat::NVFP4,
-          "nvfp4 on sm_70 is reported as a FALLBACK, not as a gap");
-    check(v100.verdict == Verdict::Unsupported,
-          "the mixed artifact is still Unsupported on sm_70: one gap is enough");
+    check(v100.gaps.empty(), "sm_70 reports no gap on the mixed artifact after F-720");
+    check(v100.verdict == Verdict::Supported,
+          "the mixed artifact is Supported on sm_70: the bf16 half of the v100 hole is closed");
+    check(v100.fallbacks.size() == 2 && v100.fallbacks[0].format == NumericFormat::BF16 &&
+              v100.fallbacks[1].format == NumericFormat::NVFP4,
+          "sm_70 reports BOTH formats as fallbacks, in the artifact's own first-seen order");
+    check(!v100.fallbacks[0].tensor_core_free &&
+              v100.fallbacks[0].fallback_used == Cap::Fp16Mma,
+          "bf16 is now the fp16 TENSOR-CORE kind: sm_70 has fp16 mma, the fp16-plane arm reads "
+          "this artifact's own bf16 bytes, and the FMA-pipe rescue is no longer the answer. "
+          "(This assertion read the opposite until dl/fp16route, F-736 -- and the change is the "
+          "point, not an adjustment: an ffma kernel was being named on a rung with tensor cores.)");
+    check(std::string(v100.fallbacks[0].fallback_kernel).find("bf16_mma_fp16.cuh") !=
+              std::string::npos,
+          "the bf16 fallback's kernel citation must name the fp16-plane file");
+    check(!v100.fallbacks[1].tensor_core_free &&
+              v100.fallbacks[1].fallback_used == Cap::Fp16Mma,
+          "nvfp4 is still the fp16 kind (the QPN channel), unchanged by this change");
+    // THE TWO BUILD FACTS ARE SEPARATE AND BOTH DECIDE -- which is why the three worlds below
+    // are asserted separately instead of as one count. This is the control that shows the new
+    // arm is a BUILD fact and not a mood: with NINFER_HAVE_BF16_FP16_MMA absent, bf16 must fall
+    // back to the FMA-pipe rescue it had before, byte for byte.
     const ninfer::caps::CapabilityReport v100_closed =
         ninfer::caps::evaluate_artifact_formats(70, mixed, /*qpn_in_build=*/false);
-    check(v100_closed.gaps.size() == 2 && v100_closed.fallbacks.empty(),
-          "without the QPN sources both formats are gaps again, as before this change");
+    check(v100_closed.gaps.size() == 1 && v100_closed.gaps[0].format == NumericFormat::NVFP4,
+          "without the QPN sources NVFP4 is a gap again, as before this change");
+    check(v100_closed.fallbacks.size() == 1 &&
+              v100_closed.fallbacks[0].format == NumericFormat::BF16 &&
+              !v100_closed.fallbacks[0].tensor_core_free &&
+              v100_closed.fallbacks[0].fallback_used == Cap::Fp16Mma,
+          "BF16 stays served without the QPN sources: its kernel is not a QPN kernel");
+    // ... and here is the NEW fact on its own. There is no parameter for it (it is a compile-time
+    // constant in THIS binary), so the world without it is asserted through the predicate and the
+    // predicate's own first clause, which is exactly what a build without the source line gets.
+    check(ninfer::caps::fp16_plane_executable(70, NumericFormat::BF16, /*in_build=*/false) == false,
+          "with the fp16-plane kernel out of the build the arm is not executable on sm_70");
+    check(ninfer::caps::fp16_plane_executable(70, NumericFormat::BF16, true) == true,
+          "with the fp16-plane kernel in the build the arm IS executable on sm_70");
+    check(ninfer::caps::fp16_plane_executable(75, NumericFormat::BF16, true) == true,
+          "and on sm_75");
+    // NEGATIVE CONTROLS: a rung with no tensor core, and a format with no fp16-plane arm.
+    for (const int sub : {50, 52, 53, 60, 61, 62}) {
+        check(ninfer::caps::fp16_plane_executable(sub, NumericFormat::BF16, true) == false,
+              "sm_" + std::to_string(sub) +
+                  " has NO tensor core, so the fp16-plane arm must be unreachable there -- "
+                  "FFMA IS its native route and that is not a defect");
+        check(ninfer::caps::simt_floor_executable(sub, NumericFormat::BF16) == true,
+              "sm_" + std::to_string(sub) +
+                  " must keep the FFMA route for bf16: the new clause must not have taken it");
+    }
+    check(ninfer::caps::fp16_plane_executable(70, NumericFormat::NVFP4, true) == false,
+          "NVFP4 must be untouched: its fallback is the QPN family, not this arm, and its 18 "
+          "sim cells must stay byte-identical to their PRE state (F-722)");
+    for (const NumericFormat g : {NumericFormat::Q4G64_F16S, NumericFormat::Q5G64_F16S,
+                                  NumericFormat::Q6G64_F16S, NumericFormat::W8G32_F16S}) {
+        check(ninfer::caps::fp16_plane_executable(70, g, true) == false,
+              std::string(format_name(g)) +
+                  " has no fp16-plane arm in this tree: its bytes must be DECODED to fp16 first, "
+                  "which is a per-format kernel and not a flag");
+        check(ninfer::caps::simt_floor_executable(70, g) == true,
+              std::string(format_name(g)) + " must keep the FFMA rescue on sm_70");
+    }
 }
 
 void test_message_is_actionable() {
@@ -434,8 +553,12 @@ void test_message_is_actionable() {
           "is right, only that the fact arrived.");
 
     // An unknown compute capability gets its own text and does not borrow a neighbour's row.
+    // F702 (2026-09-24): this probed sm_60, which is a RUNG now (the pre-75 block), so the report
+    // it renders names the FLOOR sm_60 misses instead of saying the number is not in the ladder
+    // -- a better answer, and a different check. sm_35 (K40) is the example that is still
+    // unrouted, for the same reason it carries no row: no toolkit on this box can codegen it.
     const std::string unknown = ninfer::caps::render_capability_report(
-        ninfer::caps::evaluate_artifact_formats(60, one(NumericFormat::BF16)), "x/y");
+        ninfer::caps::evaluate_artifact_formats(35, one(NumericFormat::BF16)), "x/y");
     check(mentions(unknown, "not in the capability ladder"),
           "an unknown sm says so instead of quoting a route");
 

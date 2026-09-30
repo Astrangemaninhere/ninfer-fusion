@@ -170,7 +170,7 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
 // native faster channel and this file had no way to name it; it is NOT yet consumed by
 // any kernel in this tree, and the report says so rather than implying a route.
 //
-// The m8n8k4 form is written exactly as src/ops/linear/qpn/qpn_kernels.cuh:695 and :895
+// The m8n8k4 form is written exactly as src/ops/linear/qpn/qpn_kernels.cuh:729 and :929
 // emit it (the eight-register vector is the form ptxas accepts; the four-register form
 // that the PTX manual's signature suggests is REJECTED with "Argument vector size
 // mismatch", measured on all eight targets above).

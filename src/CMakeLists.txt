@@ -130,6 +130,34 @@ add_library(ninfer_qpn_build_fact INTERFACE)
 target_compile_definitions(ninfer_qpn_build_fact INTERFACE NINFER_HAVE_QPN=1)
 target_link_libraries(ninfer_artifact PUBLIC ninfer_qpn_build_fact)
 
+# ---------------------------------------------------------------------------
+# THE fp16-PLANE BUILD FACT (dl/fp16route, F-736)
+# ---------------------------------------------------------------------------
+# A SECOND INTERFACE TARGET RATHER THAN A SECOND -D ON THE ONE ABOVE, and the reason is the
+# same reason the two facts are two facts: NINFER_HAVE_QPN is true because
+# ops/linear/qpn/qpn_host.cu is in a target, and NINFER_HAVE_BF16_FP16_MMA is true because
+# ops/linear/bf16/bf16_mma_fp16.cu is -- two source lines, two families, two answers. Folding
+# them onto one target would make "the QPN kernel is in this binary" and "the bf16 fp16 kernel
+# is in this binary" indistinguishable to every reader, and the first thing that would break is
+# the fail-closed half: a control that removes ONE source line must be able to move ONE fact.
+#
+# ITS REACH IS THE SAME REACH ninfer_qpn_build_fact HAS, by the same mechanism rather than by a
+# second link line: ninfer_ops links ninfer_artifact PUBLICly, and an INTERFACE target's
+# INTERFACE_COMPILE_DEFINITIONS propagate through a PUBLIC link, so every ninfer_ops TU -- the
+# engine's own route-decision TU among them -- receives -DNINFER_HAVE_BF16_FP16_MMA=1 without
+# anything further. (The QPN block above records the measured defect that a PRIVATE link does
+# NOT deliver this: five ninfer_artifact TUs got the -D while src/targets/registry.cpp did not.)
+#
+# IT IS NOT A SWITCH A CALLER MAY FLIP. A hand-written -DNINFER_HAVE_BF16_FP16_MMA=1 with the
+# source line above removed yields a route naming a kernel the binary does not contain; the tie
+# that makes that impossible is in tests/test_bf16_fp16_plane.cpp, which links ninfer_ops AND
+# takes the ADDRESS of ops::detail::launch_bf16_fp16_mma, so the definition and the object file
+# arrive together or the test does not link. Same shape, same purpose, as the QPN tie one block
+# up.
+add_library(ninfer_fp16_plane_build_fact INTERFACE)
+target_compile_definitions(ninfer_fp16_plane_build_fact INTERFACE NINFER_HAVE_BF16_FP16_MMA=1)
+target_link_libraries(ninfer_artifact PUBLIC ninfer_fp16_plane_build_fact)
+
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
@@ -140,7 +168,6 @@ add_library(ninfer_ops STATIC
   ops/launcher/mtp_proposal_topk.cu
   ops/split_attention.cu
   ops/launcher/bidirectional_gqa_attention.cu
-  ops/launcher/dspark_markov_argmax.cu
   ops/launcher/dspark_markov_argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
@@ -225,6 +252,8 @@ add_library(ninfer_ops STATIC
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
   ops/launcher/mtp_round.cu
+  ops/launcher/speculative_accept_tree.cu
+  ops/launcher/speculative_accept_tree.cu
   ops/launcher/speculative_round.cu
   ops/launcher/position.cu
   ops/launcher/prepare_ragged_prefix.cu
@@ -317,6 +346,26 @@ add_library(ninfer_ops STATIC
   ops/linear/bf16/bf16_gemm_mma.cu
   ops/linear/bf16/bf16_small_t.cu
   ops/linear/bf16/bf16_dispatch.cpp
+  # ---------------------------------------------------------------------------
+  # THE fp16-PLANE TENSOR-CORE ARM FOR A BF16 WEIGHT PLANE (dl/fp16route, F-736).
+  # ---------------------------------------------------------------------------
+  # The kernel TU and the engine-side route decision, added HERE and defined side by side with
+  # NINFER_HAVE_BF16_FP16_MMA on the same target (ninfer_ops) -- so the claim and the thing that
+  # makes it true cannot be read apart, which is the arrangement the QPN block above states.
+  #
+  # WHY IT IS NOT OPTIONAL AND NOT A SWITCH. Without these two lines, rungs 70 and 75 have an
+  # fp16 tensor core and a route that names the FFMA/SIMT kernel -- the wall the owner asked to
+  # be removed. With them the tables answer mma-fp16-plane for BF16 on those two rungs, and the
+  # tie is tests/test_bf16_fp16_plane.cpp, which links this archive and takes the address of
+  # ops::detail::launch_bf16_fp16_mma: removing a line while leaving the definition is a LINK
+  # ERROR rather than a route naming a kernel the binary does not contain.
+  #
+  # WHAT IT DOES NOT TOUCH: NVFP4, whose op-time route is decided in
+  # ops/linear/nvfp4/nvfp4_dispatch.cpp and whose 18 sim cells must stay byte-identical to
+  # their PRE state (F-722); and the four groupwise-int formats, which need a kernel that
+  # DECODES their own bytes to fp16 and are therefore a per-format kernel rather than a flag.
+  ops/linear/bf16/bf16_mma_fp16.cu
+  ops/linear/bf16/bf16_fp16_route.cpp
   ops/linear/fp8/fp8_format.cpp
   ops/linear/fp8/fp8_gemv.cu
   ops/linear/fp8/fp8_small_t.cu
@@ -545,6 +594,56 @@ ninfer_cuda_archive(ninfer_ops)
 # consumed export, not a layering inversion.
 target_link_libraries(ninfer_ops PUBLIC ninfer_core ninfer_artifact PRIVATE ninfer_nvfp4_tma)
 
+# ---------------------------------------------------------------------------
+# THE gfx906 PORT LAYER'S COMPILE FLOOR -- opt-in, default OFF, one place.
+#   (landed by dl/_orch/landq/gfx906port/ ; 28 files on disk, 0 of them wired)
+# ---------------------------------------------------------------------------
+# WHY AN OPTION, AND NOT A PLAIN ADDITION.  Measured by the line that landed the
+# 28 files (dl/gfx906port/REPORT.md sections 3 and 4):
+#   * 12 of the 28 refuse BY CONSTRUCTION on any non-AMD compiler: the 11 stand-ins
+#     under src/compat/gfx906/include/ and src/core/hip_compat.h open with
+#     '#error "hip_compat.h is only for NINFER_GFX906_COMPAT builds"' (or die on
+#     <hip/hip_runtime.h>).  Adding them unconditionally turns THIS build red.
+#   * the TUs that reach src/ops/linear/gfx906/q_gemv_gfx906.cuh need the AMD
+#     helper gfx906_reduce_sum32, which exists only on the AMD side -- the append
+#     to src/ops/common/warp.cuh in this same entry (item 0003).
+#   * that header includes <cuda_runtime.h>, and the entire mechanism of the
+#     stand-in directory is to be searched BEFORE CUDA's own include path.  Only a
+#     gfx906 build should make that decision.
+# SO: default OFF means the block below expands to NOTHING, and a default
+# configure produces byte-identical flags.make for every existing object.  That is
+# the property that makes this item free in the batch; see
+# dl/cmakebatch/logs/invalidation_probe.txt for the measured before/after diff.
+#
+# WHY THE SOURCES ARE LISTED ONE PER LINE: this file has no GLOB by design
+# (see the ninfer_ops comment above).  A new source is a build-boundary decision.
+#
+# WHY gfx906_stubs.cpp IS DELIBERATELY NOT IN THE LIST.  It is a fork-shaped file:
+# it exists to REPLACE the FP8 / NVFP4 / sparse-MoE families that the fork DELETED,
+# and this tree still compiles all of them.  Wiring it here would put two
+# definitions of the same entry points in one archive.  Named, not silent:
+# dl/cmakebatch/REPORT.md item 0001, and the gate tools in gates.sh.
+#
+# WHAT IT ADMITS: six translation units and one include path, all inside
+# ninfer_ops.  It admits no artifact, opens no gate, changes no dispatch.  The
+# port layer's own A/B levers are env-gated and unchanged
+# (src/ops/linear/gfx906/stage8_route.h).
+option(NINFER_ENABLE_GFX906_COMPAT "Compile the gfx906 port layer into ninfer_ops. Needs a HIP/ROCm toolchain; on a CUDA-only host it must stay OFF." OFF)
+if(NINFER_ENABLE_GFX906_COMPAT)
+  # BEFORE, because that is the mechanism: '#include <cuda_runtime.h>' must reach
+  # src/compat/gfx906/include/cuda_runtime.h and not CUDA's own header.
+  target_include_directories(ninfer_ops BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/compat/gfx906/include)
+  target_compile_definitions(ninfer_ops PRIVATE NINFER_GFX906_COMPAT=1)
+  target_sources(ninfer_ops PRIVATE
+    ops/attn_input_proj/q4_q5/q4_q5_attn_input_tiled_gfx906.cu
+    ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_tiled_gfx906.cu
+    ops/linear/gfx906/q4_tiled_gfx906.cu
+    ops/linear/gfx906/q5_tiled_gfx906.cu
+    ops/linear/gfx906/w8_tiled_gfx906.cu
+    ops/linear_add/q5/q5_linear_add_tiled_gfx906.cu)
+endif()
+
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
   text/unicode.cpp
@@ -611,6 +710,34 @@ add_subdirectory(targets/qwen3_5_9b)
 # recognition branch compiles; no sources are added until stage (b).
 add_subdirectory(targets/qwen4_exp)
 add_subdirectory(targets/gemma4_31b)
+
+# ---------------------------------------------------------------------------
+# SPARK X2.5 IS NOT IN THIS TREE YET, AND THIS IS NOT A PRETENCE THAT IT IS.
+# ---------------------------------------------------------------------------
+# dl/sparkintel/REPORT.md measured the converter half DONE (290/290 planned keys,
+# 290/290 shapes, four cross-file gates green, and the front door routes to
+# spark-x2.5-4b / accepted) and the C++ half EMPTY: src/targets/spark_x2_5_4b/
+# does not exist, while tools/archkit/archkit_target.py:121-132 enumerates the
+# EIGHT files that target needs -- six of them HUMAN-authored engine glue
+# (variant.{h,cpp}, load/bindings.{h,cpp}, package.cpp, export/.../package.h).
+# Writing those is a target-port job, not a build-wiring job.  It is NOT in this
+# batch; it is named in dl/cmakebatch/REPORT.md item 0002.
+#
+# WHAT THIS LINE BUYS: the day those eight files exist, the ONLY file that has to
+# move is src/targets/registry.{h,cpp} -- the build wiring moves by itself,
+# because the guard below asks the filesystem the one question that decides it.
+#
+# WHY NOT A PLAIN add_subdirectory(targets/spark_x2_5_4b): it fails CONFIGURE,
+# hard: 'add_subdirectory given source "targets/spark_x2_5_4b" which is not an
+# existing directory'.  Reproduced verbatim as counter-control A2 in
+# dl/cmakebatch/REPORT.md.  That is the whole reason for the guard.
+#
+# AND WHY IT IS INERT TODAY, MEASURED: the guard is false, so nothing is added;
+# the batch's before/after flags.make diff is empty (invalidation_probe.sh), and
+# item 0002 reverts alone (revert.py --item 0002) with byte-exact discipline.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/targets/spark_x2_5_4b/CMakeLists.txt")
+  add_subdirectory(targets/spark_x2_5_4b)
+endif()
 
 # FlashNext (Qwen3.8-Flash-Next / qwen4_exp): the imported qwen3_8_flash_next target and its
 # vision encoder dependency. BOUNDARY NOTE: this file is the FALLBACK agent's region; that
@@ -680,6 +807,53 @@ if(NINFER_BUILD_SERVE)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
     PRIVATE ninfer_media_acquire CUDA::cudart)
+endif()
+
+# ---------------------------------------------------------------------------
+# THE TEST-ONLY VENDOR-AXIS BUILD KEY (option NINFER_ENABLE_VENDOR_SIM, root CMakeLists.txt,
+# DEFAULT OFF)
+# ---------------------------------------------------------------------------
+# NINFER_VENDOR_SIM_ENABLED is the FIRST of the three keys src/core/vendor_sim.h requires (the
+# other two are the NINFER_SIM_VENDOR / NINFER_SIM_VENDOR_ACK environment pair). It is a SECOND,
+# SEPARATE key from NINFER_ARCH_SIM_ENABLED on purpose -- vendor_sim.h:92-95 -- because reusing the
+# arch key would mean a binary already audited for the V100 simulator silently acquired a second
+# axis, and that is a widening of a landed gate.
+#
+# WHY THIS BLOCK EXISTS NOW. vendor_sim.h -- and root CMakeLists.txt:263-269 -- state the condition
+# in advance: the option gated the TEST binary ONLY, because "NOTHING in src/ includes
+# vendor_sim.h ... So the vendor key is consumed by tests/CMakeLists.txt alone, and THE DAY AN
+# ENGINE CONSUMER LANDS, AN if(NINFER_ENABLE_VENDOR_SIM) BLOCK LANDS IN src/CMakeLists.txt WITH
+# IT." That day is this entry: src/targets/registry.cpp includes core/vendor_sim.h now, because the
+# load-time by-name gate (src/core/amdsafe_gate.h) is switched on by the vendor axis and the vendor
+# view is what supplies that axis.
+#
+# WHY A LIST OF TARGETS AND NOT add_compile_definitions(). The same measured reason as the arch
+# block below it: the key's only possible effect is on a TU that includes vendor_sim.h, and exactly
+# one engine TU does.
+#
+# WHY IT SITS ABOVE THE ARCH BLOCK AND NOT AT EOF. MEASURED: landq/hipshim item 0009 anchors on
+# `endif()\n` with rfind, i.e. it inserts before the file's LAST endif(), which is the arch-sim
+# block's. An edit that appends at EOF therefore makes the two mutually non-applicable in one of
+# the two orders. Placed here, both edits are anchored on strings the other one does not touch, so
+# they compose in EITHER order and to the SAME bytes.
+#
+# It is a separate if() rather than a default-ON for the same reason as the arch block: the shipping
+# default must be PROVABLE by inspection, and root CMakeLists.txt:271-273 measures exactly that
+# check -- with the option off, `strings <shipping binary> | grep -c NINFER_SIM_VENDOR` is 0.
+if(NINFER_ENABLE_VENDOR_SIM)
+  message(STATUS "NInfer: the TEST-ONLY vendor-axis capability override is BUILT IN "
+                 "(NINFER_ENABLE_VENDOR_SIM=ON). A binary from this tree can be told to answer "
+                 "the capability and format tables AS IF the vendor were an AMD class, by "
+                 "NINFER_SIM_VENDOR=<gfx target> + NINFER_SIM_VENDOR_ACK. Nothing is translated, "
+                 "compiled or executed for the target: the kernels that run are still this "
+                 "binary's own, and only the TABLE ANSWER is simulated. On that axis the "
+                 "load-time by-name gate src/core/amdsafe_gate.h refuses, by name, any load path "
+                 "the manifest does not carry.")
+  foreach(_vendor_target ninfer_engine)
+    if(TARGET ${_vendor_target})
+      target_compile_definitions(${_vendor_target} PUBLIC NINFER_VENDOR_SIM_ENABLED=1)
+    endif()
+  endforeach()
 endif()
 
 # ---------------------------------------------------------------------------

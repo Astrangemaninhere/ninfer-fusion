@@ -47,7 +47,7 @@ struct D256KVCacheProfile {
     // the unpacked tiers; product::e8_kv_row_code_bytes() for the packed e8 family.
     std::int32_t code_leading_extent;
     // ⚠ THE V PLANE HAS ITS OWN EXTENT, AND FOR THIS FAMILY IT IS *NOT* code_leading_extent.
-    // `product/kv_e8_width.h:131-137` is the rule: "the V plane is NOT a function of the
+    // `product/kv_e8_width.h:133-139` is the rule: "the V plane is NOT a function of the
     // width: this family narrows K only ... the shipped V is i4 at 4 bits + the same g64
     // FP16 scale plane, i.e. the W4 geometry" -- so a W3 row has a 96-byte K plate and a
     // 128-byte V plate, and a W2 row 64 and 128. A consumer that derives ONE extent and

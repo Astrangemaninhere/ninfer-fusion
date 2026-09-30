@@ -222,6 +222,14 @@ std::string build_ft_spec(const std::vector<std::pair<int, double>>& energy,
         // a small measured set makes the two boundaries meet.
         rk4v4_hi = std::max(rk4v4_hi, rk4v4_lo);
     }
+    // kvfix (F893): THE BYTE-NEUTRAL BOUNDARY IS REFUSED, BY NAME. The four readings this
+    // rests on are on the constant's declaration in serve/kv_auto_relayout.h. The condition
+    // is exactly "the proxy would place at least one MEASURED layer on iso4e": with
+    // rk4v4_hi == rk4v4_lo there is no such boundary, so a table too small to separate the
+    // pair is returned unchanged and this guard is not a blanket disable.
+    if (rk4v4_hi > rk4v4_lo) {
+        throw std::invalid_argument(kFtByteNeutralBoundaryWithheld);
+    }
     for (int i = 0; i < n; ++i) {
         const char* tier = i < rk4v4_lo ? "rk4v4" : (i < rk4v4_hi ? "iso4e" : "nvfp4");
         parts.push_back(std::to_string(measured[static_cast<std::size_t>(i)].first) + ":" + tier);
@@ -321,8 +329,24 @@ std::string KvAutoRelayout::decide_once(const std::vector<std::pair<int, double>
     // Gap 1: 0 unless the axis is armed AND the free VRAM has moved a whole
     // layer's worth of savings away from (or towards) its baseline.
     const int vram_shift = observe_vram_shift();
-    const std::string candidate = build_ft_spec(energy, config_.full_attn_layers,
-                                                config_.deep_frac, vram_shift);
+    // kvfix (F893): a WITHHELD per-layer table is a REFUSAL, not a silent no-op. It is
+    // printed by name, once per distinct reason, and NOTHING is landed -- the loop keeps
+    // running and the applied table keeps whatever it had. The catch has to live HERE and
+    // not at the apply lambda in apps/serve/main.cpp: that lambda is only reached once a
+    // candidate EXISTS, so the throw would escape decide_once(), unwind loop()'s thread and
+    // call std::terminate -- a refusal turned into a crash.
+    std::string candidate;
+    try {
+        candidate = build_ft_spec(energy, config_.full_attn_layers,
+                                  config_.deep_frac, vram_shift);
+    } catch (const std::exception& withheld) {
+        if (withheld_reported_ != withheld.what()) {
+            withheld_reported_ = withheld.what();
+            std::fprintf(stderr, "[ft] %s\n", withheld_reported_.c_str());
+        }
+        return {};
+    }
+    withheld_reported_.clear();
     if (candidate.empty()) { return {}; }
 
     // Semantic comparison: only a real table change counts.

@@ -1,0 +1,126 @@
+{
+  "accessors_measured": 77,
+  "generated": [
+    {
+      "bytes": 4060,
+      "path": "impl/spec_contract.h"
+    },
+    {
+      "bytes": 650,
+      "path": "impl/spec_contract_check.cpp"
+    },
+    {
+      "bytes": 914,
+      "path": "impl/config.h.skeleton"
+    },
+    {
+      "bytes": 868,
+      "path": "impl/variant.h.skeleton"
+    },
+    {
+      "bytes": 862,
+      "path": "impl/variant.cpp.skeleton"
+    },
+    {
+      "bytes": 926,
+      "path": "impl/load/bindings.h.skeleton"
+    },
+    {
+      "bytes": 932,
+      "path": "impl/load/bindings.cpp.skeleton"
+    },
+    {
+      "bytes": 900,
+      "path": "impl/package.cpp.skeleton"
+    },
+    {
+      "bytes": 926,
+      "path": "export/ninfer/targets/minicpm5_1b/package.h.skeleton"
+    },
+    {
+      "bytes": 870,
+      "path": "CMakeLists.txt.skeleton"
+    },
+    {
+      "bytes": 985,
+      "path": "tests/test_load_plan.cpp.skeleton"
+    },
+    {
+      "bytes": 588,
+      "path": "registry_insert.tsv"
+    },
+    {
+      "bytes": 2927,
+      "path": "adapt_report.md"
+    }
+  ],
+  "insertion_points": [
+    {
+      "anchor": "add_subdirectory(targets/qwen3_6)",
+      "anchor_line": "654",
+      "file": "src/CMakeLists.txt",
+      "insert": "add_subdirectory(targets/minicpm5_1b)",
+      "kind": "NEW-ROW"
+    },
+    {
+      "anchor": "#include <ninfer/targets/qwen3_6_27b/package.h>",
+      "anchor_line": "5",
+      "file": "src/targets/registry.h",
+      "insert": "#include \"ninfer/targets/minicpm5_1b/package.h\"",
+      "kind": "NEW-ROW (include block)"
+    },
+    {
+      "anchor": "using Qwen3_6_27B    = qwen3_6_27b::Package;",
+      "anchor_line": "20",
+      "file": "src/targets/registry.h",
+      "insert": "using Minicpm5_1B = minicpm5_1b::Package;",
+      "kind": "NEW-ROW (using block)"
+    },
+    {
+      "anchor": "constexpr TargetRegistration kTargetRegistrations[] = {",
+      "anchor_line": "295",
+      "file": "src/targets/registry.cpp",
+      "insert": "{\"minicpm5_1b\", ...},   // plus the Loaded<>/<T>Instance pair in registry.h",
+      "kind": "NEW-ROW"
+    }
+  ],
+  "marker": "ARCHKIT_SCAFFOLD_MINICPM5_1B_POST_176d84cb9458f80d",
+  "spec": "/home/user/pipeline_sbx/tools/archkit/specs/minicpm5_1b_spec.json",
+  "spec_sha256_16": "176d84cb9458f80d",
+  "target_id": "minicpm5_1b",
+  "zero_reference_accessors": [
+    "attention_bias",
+    "attention_k_eq_v",
+    "final_logit_softcapping_enabled",
+    "full_attention_interval",
+    "full_head_dim",
+    "full_kv_heads",
+    "full_query_heads",
+    "full_rope_theta",
+    "full_rotary_dim",
+    "gdn_conv_kernel",
+    "has_dense_ffn",
+    "head_dim_at",
+    "headwise_attn_output_gate",
+    "hidden_activation",
+    "kv_heads_at",
+    "kv_rows_at",
+    "max_ctx",
+    "mlp_bias",
+    "per_layer_scalar",
+    "qk_norm_tensors_present",
+    "qk_scale_factor",
+    "query_heads_at",
+    "query_projection_rows",
+    "query_rows_at",
+    "sliding_head_dim",
+    "sliding_kv_heads",
+    "sliding_query_heads",
+    "sliding_rope_theta",
+    "sliding_rotary_dim",
+    "sliding_window_at",
+    "swa_attention_index",
+    "swa_attention_layers",
+    "tie_word_embeddings"
+  ]
+}

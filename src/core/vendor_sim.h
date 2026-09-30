@@ -400,6 +400,72 @@ struct VendorView {
                       "naming the option alone would send you to a tool you are not running. "
                       "Use the route that matches how you build; either one reaches a "
                       "vendor-axis run.";
+        // ---------------------------------------------------------------------------------
+        // ⭐ THE TERMS THIS REFUSAL NEVER EVALUATED -- AND WHY SAYING ONLY "not-built-in" IS
+        //    WRONG FOR THE INPUTS THAT ACTUALLY OCCUR (the shape dl/truthmsg repaired one file
+        //    over: "it was not merely incomplete, it was wrong for the reachable inputs").
+        // ---------------------------------------------------------------------------------
+        // MEASURED 2026-09-23, in THIS tree, by driving the ladder over a 14-input table in both
+        // worlds (poc29/probe_frontdoor.cpp --mode bothworlds): the three tests above return at
+        // the FIRST term, so on a default build (kVendorSimBuiltIn == false) the acknowledgement
+        // and the value are NEVER COMPARED, and EVERY non-empty vendor request -- a bare typo, a
+        // value that is not a row of the ladder, a missing acknowledgement, the arch axis's
+        // acknowledgement used by mistake -- comes back with THE SAME sentence, naming the BUILD
+        // FACT as the cause. The remedy it prints ("reconfigure with -DNINFER_ENABLE_VENDOR_SIM=ON
+        // ... or add -DNINFER_VENDOR_SIM_ENABLED=1") is TRUE and, for most of those inputs, NOT
+        // THE OPERATIVE TERM: a reader who does exactly what this message says gets A DIFFERENT
+        // REFUSAL after the rebuild and learns only then what was actually wrong. A refusal that
+        // names a term it did not establish is the defect class this fleet has a rule against, and
+        // the fix is the one that rule prescribes: SAY WHAT WAS NOT COMPARED, AND PRINT THE VALUES.
+        //
+        // BEHAVIOUR IS UNCHANGED BY THIS BLOCK: same condition, same refusal value (NotBuiltIn),
+        // same status (Refused), same return, same fail-closed consequence. It appends TEXT -- a
+        // shadow verdict computed from the SAME predicates the later branches use, in the SAME
+        // order (acknowledgement before value, vendor_sim.h's own stated order at the (c) comment
+        // above), so this paragraph cannot drift from what the later branches would have said.
+        {
+            const bool            ack_in_place  = (ack_env == kVendorSimAckPhrase);
+            const bool            gfx_shaped    = vendor_env.size() >= 3 && vendor_env.substr(0, 3) == "gfx";
+            const VendorClass     named_shadow  = vendor_class_from_name(vendor_env);
+            const AmdRung*        rung_shadow   = gfx_shaped ? amd_rung(vendor_env) : nullptr;
+            std::string           shadow;
+            if (!ack_in_place) {
+                shadow = "missing-acknowledgement";
+            } else if (gfx_shaped && rung_shadow == nullptr) {
+                shadow = "not-in-vendor-ladder";
+            } else if (!gfx_shaped) {
+                shadow = named_shadow == VendorClass::Intel
+                             ? "no-table-for-vendor"
+                             : (named_shadow != VendorClass::Unknown
+                                    ? "vendor-class-where-a-target-belongs"
+                                    : "unknown-vendor");
+            } else {
+                shadow = "none -- the three terms THIS layer can see would all hold, so the fourth "
+                         "term (the physical vendor class, settled only at the load door) would be "
+                         "the remaining question";
+            }
+            view.reason += " ⭐ WHAT THIS MESSAGE DOES NOT TELL YOU, AND CANNOT: the test above "
+                           "returns at the FIRST term, so the acknowledgement and the value were NOT "
+                           "COMPARED when this sentence was written, and for most inputs they are "
+                           "what is actually wrong. Printing them here instead of leaving them "
+                           "unread. The acknowledgement value in this process is ";
+            view.reason += ack_env.empty() ? std::string("UNSET") : ("\"" + std::string(ack_env) + "\"");
+            view.reason += " (the term is satisfied only by \"";
+            view.reason += kVendorSimAckPhrase;
+            view.reason += "\"); the value in this process is \"" + std::string(vendor_env) +
+                           "\", and against the value term's comparison set (the six kAmdLadder "
+                           "rows gfx906 gfx908 gfx90a gfx942 gfx1100 gfx1201) it is ";
+            view.reason += (gfx_shaped && rung_shadow != nullptr) ? "A ROW OF IT"
+                                                                  : "NOT a row of it";
+            view.reason += ". HAD THE BUILD KEY BEEN PRESENT, THIS REQUEST WOULD HAVE BEEN REFUSED "
+                           "AS: ";
+            view.reason += shadow;
+            view.reason += ". So the sentence above names the FIRST term in the ladder's order and "
+                           "NOT necessarily the one you must fix first: fix the build key and you "
+                           "will be told the rest. Nothing about the outcome changes -- the request "
+                           "is refused either way and this process still refuses to answer for the "
+                           "real card's own vendor.";
+        }
         return view;
     }
 
@@ -502,7 +568,15 @@ struct VendorView {
                       "class names are nvidia amd intel (none of which is a target), and AMD "
                       "targets are the gfx-prefixed rows of kAmdLadder. Refusing rather than "
                       "defaulting, because the capability set this value implies is what the tables "
-                      "will be asked about.";
+                      "will be asked about. THE VALUES THAT WOULD BE ACCEPTED, spelled out so you "
+                      "do not have to go and find them: "
+                      "NINFER_SIM_VENDOR=gfx906 (Vega20 / GCN5.1, MI50 / MI60 / Radeon VII), or "
+                      "gfx908 (CDNA1, MI100), or gfx90a (CDNA2, MI200 / MI210 / MI250 / MI250X), or "
+                      "gfx942 (CDNA3, MI300A / MI300X), or gfx1100 (RDNA3, RX 7900 XTX / W7900), or "
+                      "gfx1201 (RDNA4, RX 9070 / RX 9070 XT). Every one of them must ALSO be "
+                      "acknowledged with NINFER_SIM_VENDOR_ACK=I-UNDERSTAND-THIS-VENDOR-IS-NOT-ON-" 
+                      "THIS-BOX, and the binary must have been built with NINFER_ENABLE_VENDOR_SIM "
+                      "(CMake) or -DNINFER_VENDOR_SIM_ENABLED=1 (hand compile).";
         return view;
     }
 
@@ -645,6 +719,185 @@ struct VendorView {
 }
 
 // ---------------------------------------------------------------------------
+// THE FRONT-DOOR ADJUDICATION -- THE SAME LADDER, ASKED AT AN ENTRY POINT
+// ---------------------------------------------------------------------------
+// WHY THIS EXISTS, WITH THE MEASUREMENT. `vendor_view_for_device()` above has exactly ONE engine
+// consumer: the model-load door (`src/targets/registry.cpp`, `construct_target()`), which calls it
+// once per load and throws when the view is not usable. MEASURED 2026-09-23, pure read, in this
+// tree: `grep -rn 'vendor_sim\|SIM_VENDOR\|vendor_view\|VendorClass' src/serve/ apps/` = 0 hits, so
+// NEITHER front end names this axis anywhere and the load door is the ONLY way it is ever reached.
+// The consequence is that on every path which does not load a model -- `--help`
+// (apps/serve/main.cpp:59-61), `--kv-score-table show` (:64-77), an argv refusal (:50-57), and the
+// whole window in which a server is listening but has not loaded -- a request set in the
+// environment produced NO output at all: not an acceptance, not a refusal, not a word. "Refused, or
+// accepted, or silent" must not be a three-valued answer to a two-valued question, and silence is
+// the one outcome a fail-closed axis reads as "fine".
+//
+// WHAT THIS DOOR SETTLES, AND WHAT IT DOES NOT -- STATED, NOT FAKED. The ladder has four terms: the
+// build fact, the value, the acknowledgement, and `physical`. This header holds NO detector and NO
+// CUDA call on purpose (G1-V/(2) above: on this box a detector reports INVERTED, so a class read
+// from one would be a FALSE ATTRIBUTION), so at an entry point the fourth term is NOT KNOWABLE.
+// `VendorClass::Unknown` is therefore passed as `physical` -- which also means G4-V's no-op term
+// cannot fire here -- and every adjudication reports `physical_term_settled == false` and says so
+// in its own text. The load door remains the ONLY place the fourth term is settled. A front-door
+// verdict of "the three visible terms hold" is NOT a licence to run.
+//
+// ⭐ THE SET-AND-EMPTY HOLE, WHICH IS WHY THIS IS A CLOSED KEYSPACE AND NOT A BOOL.
+// G1-V's prose enumerates what a stray value produces -- "with (a) absent it is refused by the
+// build fact; with (c) absent it is refused by the acknowledgement; with a value not in the ladder
+// it is refused by the table. NO REFUSAL IS SILENT." There is a FIFTH reachable input those three
+// cases do not cover and that sentence therefore reads as covering:
+//
+//     NINFER_SIM_VENDOR=            (exported EMPTY -- a typo, a re-export, or
+//                                    NINFER_SIM_VENDOR="$UNSET_VARIABLE" in a shell)
+//
+// `vendor_view_for_device_impl()`'s first test is `if (vendor_env.empty())`, so a SET-AND-EMPTY
+// value is read as "nobody asked": status Disabled, refusal NotRequested, and the announce block
+// below returns without printing. MEASURED here, both worlds: it produces NEITHER a refusal NOR a
+// request. That is the one shape where the sentence above is not true, and it is reachable from a
+// shell without any assignment being wrong-looking -- which is exactly the class of defect this
+// tree already has a word for. `SetButEmpty` is a separate outcome so that the fifth case has a
+// NAME and a printed value instead of being folded into "unset".
+// ---------------------------------------------------------------------------
+enum class VendorDoorOutcome : std::uint8_t {
+    NotRequested = 0,     // neither name is in the environment. THE ONE SILENT OUTCOME, correct
+    SetButEmpty,          // a name IS set and its value is empty: neither request nor refusal
+    Refused,              // the ladder refused; `view.refusal` names WHICH term failed
+    ThreeTermsInPlace,    // the three visible terms hold; the FOURTH is not settled here
+};
+
+[[nodiscard]] inline std::string_view vendor_door_outcome_name(VendorDoorOutcome outcome) noexcept {
+    switch (outcome) {
+    case VendorDoorOutcome::NotRequested: return "not-requested";
+    case VendorDoorOutcome::SetButEmpty: return "set-but-empty-value";
+    case VendorDoorOutcome::Refused: return "refused";
+    case VendorDoorOutcome::ThreeTermsInPlace: return "three-terms-in-place-fourth-not-settled";
+    }
+    return "unreachable";
+}
+
+// The adjudication record. It carries the RAW environment values and every term this door
+// compared, so a caller that acts on it and a reader who only reads the printed text are reading
+// the same facts.
+struct VendorDoorAdjudication {
+    VendorDoorOutcome outcome = VendorDoorOutcome::NotRequested;
+    bool built_in  = false; // kVendorSimBuiltIn -- the FIRST of the three keys, printed not implied
+    bool vendor_env_set = false;
+    bool ack_env_set    = false;
+    std::string vendor_env = {}; // verbatim, including a value no row of the ladder accepts
+    std::string ack_env    = {}; // verbatim; "unset" is reported as unset, never as ""
+    // ALWAYS false from this door, and that is its contract rather than a default: the fourth term
+    // is settled only where a CUDA device has already answered.
+    bool physical_term_settled = false;
+    VendorView view = {}; // the ladder's own verdict over the three visible terms
+};
+
+// The loud text. EVERY value this door compared is printed, and the term it could NOT compare is
+// named as such -- a verdict that names only the fourth of four terms is the defect this fleet
+// already paid for once (dl/truthmsg's `host_kv_extent_store.h:331`).
+[[nodiscard]] inline std::string render_vendor_door_adjudication(const VendorDoorAdjudication& a) {
+    if (a.outcome == VendorDoorOutcome::NotRequested) { return {}; }
+    std::string out = "ninfer: *** VENDOR-AXIS REQUEST AT THE ENTRY POINT [";
+    out += vendor_door_outcome_name(a.outcome);
+    out += "] -- TEST ONLY ***\n";
+    out += "  every value this door compared, printed verbatim:\n";
+    out += "    NINFER_SIM_VENDOR      = ";
+    if (!a.vendor_env_set) {
+        out += "unset";
+    } else {
+        out += "\"" + a.vendor_env + "\"";
+    }
+    out += "\n    NINFER_SIM_VENDOR_ACK  = ";
+    if (!a.ack_env_set) {
+        out += "unset";
+    } else {
+        out += "\"" + a.ack_env + "\"";
+    }
+    out += "\n    the phrase the ack term is compared against = \"";
+    out += kVendorSimAckPhrase;
+    out += "\"\n    the value term's comparison set (kAmdLadder rows, src/core/arch_caps.h) = ";
+    for (std::size_t i = 0; i < kAmdLadderSize; ++i) {
+        if (i != 0) { out += " "; }
+        out += kAmdLadder[i].target;
+    }
+    out += "\n    the build key NINFER_VENDOR_SIM_ENABLED (CMake option NINFER_ENABLE_VENDOR_SIM) = ";
+    out += a.built_in ? "1" : "0";
+    out += "\n    THE TERM THAT FAILED / IS IN QUESTION = ";
+    out += vendor_door_outcome_name(a.outcome);
+    out += " (ladder refusal value: ";
+    out += vendor_refusal_name(a.view.refusal);
+    out += ", ladder status: ";
+    out += ninfer::caps::sim_status_name(a.view.status);
+    out += ")";
+    out += "\n    THE TERM THIS DOOR CANNOT SETTLE = the physical vendor class. This header holds "
+           "no detector and no CUDA call (G1-V/(2)), so the fourth term is settled at the LOAD "
+           "door, where a CUDA device has already answered; physical_term_settled=false.\n";
+    if (!a.view.reason.empty()) {
+        out += "  the ladder's own reason, verbatim: ";
+        out += a.view.reason;
+        out += "\n";
+    }
+    if (a.outcome == VendorDoorOutcome::SetButEmpty) {
+        out += "  ⚠ THIS IS THE SET-AND-EMPTY CASE. The name IS in the environment and its value is "
+               "EMPTY, and the ladder reads an empty value as \"nobody asked\" -- so this request "
+               "would otherwise leave NO TRACE ANYWHERE. If a vendor was meant to be requested, "
+               "the value must be one of the rows printed above; if not, unset the name so that "
+               "\"nothing was asked\" and \"something empty was asked\" stay distinguishable.\n";
+    }
+    if (a.outcome == VendorDoorOutcome::ThreeTermsInPlace) {
+        out += "  ⚠ WHAT THIS VERDICT DOES NOT SAY: the three terms THIS door can see hold. The "
+               "fourth term (the physical class) has not been read, so this is NOT a statement "
+               "that a run under the override would be honoured -- only the load door can decide "
+               "that, and it decides it per artifact, by name.\n";
+    }
+    return out;
+}
+
+// The producer. It reads the environment on EVERY call (never latched, per the entry point's own
+// contract) and prints nothing for the one outcome where silence is the correct answer.
+[[nodiscard]] inline VendorDoorAdjudication vendor_door_adjudication() noexcept {
+    const char* vendor = std::getenv(std::string(kVendorSimEnv).c_str());
+    const char* ack    = std::getenv(std::string(kVendorSimAckEnv).c_str());
+    VendorDoorAdjudication a;
+    a.built_in       = kVendorSimBuiltIn;
+    a.vendor_env_set = vendor != nullptr;
+    a.ack_env_set    = ack != nullptr;
+    a.vendor_env     = vendor == nullptr ? std::string{} : std::string(vendor);
+    a.ack_env        = ack == nullptr ? std::string{} : std::string(ack);
+    if (!a.vendor_env_set) {
+        // Nobody asked. This is the default of every shipping run and it is silent on purpose.
+        a.outcome = VendorDoorOutcome::NotRequested;
+        return a;
+    }
+    if (a.vendor_env.empty()) {
+        // THE FIFTH CASE, NAMED -- see the block comment above. The ladder's own words for this
+        // view are adopted rather than invented (Disabled / NotRequested), so nothing here is a
+        // second vocabulary for one fact; what is new is that the case has a NAME at this door.
+        a.outcome      = VendorDoorOutcome::SetButEmpty;
+        a.view.status  = SimStatus::Disabled;
+        a.view.refusal = VendorRefusal::NotRequested;
+        return a;
+    }
+    a.view    = vendor_view_for_device_impl(VendorClass::Unknown, kVendorSimBuiltIn, a.vendor_env,
+                                            a.ack_env);
+    a.outcome = a.view.failed() ? VendorDoorOutcome::Refused : VendorDoorOutcome::ThreeTermsInPlace;
+    return a;
+}
+
+// The front door a caller actually writes: adjudicate, print, return. The announcement is keyed on
+// the OUTCOME through src/core/announce_once.h, so a SECOND, DIFFERENT outcome in one process is
+// announced too -- G2-V's property, one surface over.
+[[nodiscard]] inline VendorDoorAdjudication vendor_door_adjudicate_and_announce() noexcept {
+    const VendorDoorAdjudication a = vendor_door_adjudication();
+    if (a.outcome == VendorDoorOutcome::NotRequested) { return a; }
+    if (ninfer::detail::announce_once_keyed(a.outcome)) {
+        const std::string text = render_vendor_door_adjudication(a);
+        std::fputs(text.c_str(), stderr);
+    }
+    return a;
+}
+
+// ---------------------------------------------------------------------------
 // THE TABLE ANSWER UNDER A VENDOR VIEW -- "answer as if the vendor were an AMD class"
 // ---------------------------------------------------------------------------
 // The question, exactly: which of this tree's SHIPPED KERNELS can execute `format` on the view's
@@ -654,6 +907,29 @@ struct VendorView {
 // kPtxFamilyAmdStatus, not kAmdFormatBlockers, not kAmdLdsBlockerSites. That is stated here because
 // a reader will otherwise assume the EXTERNAL-UNPROBED apparatus feeds this answer: it does not, it
 // feeds the refusal PROSE only.
+// ---------------------------------------------------------------------------
+// GAP-2 CLOSED BY NAME: THE MARKER G2-LOUD REQUIRES IS IN THE TEXT, NOT ONLY IN A FIELD.
+// ---------------------------------------------------------------------------
+// WHY. src/core/arch_sim.h:39-42 states the arch axis's property G2 LOUD in one sentence: "every
+// route/gate answer produced under the simulator carries a SIMULATED marker in its text."
+// MEASURED 2026-09-22 (dl/amdland, logs/cap/t_gfx1201.out): the vendor axis did NOT have that
+// property -- `text-with-SIMULATED=0` over all twelve formats of all six kAmdLadder targets. The
+// marker existed in the stderr banner and in the `simulated` bool field of the struct below, and
+// NEITHER OF THOSE TRAVELS WITH THE TEXT. arch_caps.h:2240's own comment invites a caller to
+// print `text` unconditionally ("Empty for every other verdict, so a caller may print it
+// unconditionally in the same shape render_fallback_notice() uses"), so the one surface a caller
+// is INVITED to print was the one surface that could arrive without the marker: a forwarded,
+// pasted or logged per-format AMD verdict would read as a plain answer about a real card.
+//
+// WHAT IT IS NOT: not a second verdict, not a warning, not a refusal, and not a substitute for
+// the verdict word -- it PREFIXES the text, so the assertion that the text NAMES the verdict
+// (tests/test_vendor_sim.cpp, GAP 3 walk) still holds. The only writer of
+// `VendorFormatAnswer::text` is vendor_format_answer() below, so the marker has ONE home.
+inline constexpr std::string_view kVendorSimulatedAnswerMarker =
+    "[SIMULATED VENDOR -- TEST ONLY: this answer came from a simulated vendor view keyed on "
+    "NINFER_SIM_VENDOR, NOT from the card on this machine, and NOTHING is translated or executed "
+    "for the target]\n";
+
 struct VendorFormatAnswer {
     bool answered = false; // false when no vendor query was made (the view is Disabled, or refused)
     AmdFormatVerdict verdict = AmdFormatVerdict::UnknownTarget;
@@ -731,6 +1007,10 @@ struct VendorFormatAnswer {
         // silence is not allowed through.
         answer.text = render_vendor_verdict_text(answer.verdict);
     }
+    // GAP-2, CLOSED AT THE SAME SURFACE, AND AFTER the fill above so that the marker prefixes
+    // whichever text this answer ended up with -- the arch table's own render or this header's
+    // fill. See kVendorSimulatedAnswerMarker for why the marker has to be in the TEXT.
+    answer.text = std::string(kVendorSimulatedAnswerMarker) + answer.text;
     // ⭐ THE ONE PLACE `admitted` IS DECIDED, AND THE HONEST VALUE FOR THIS TREE IS `false` FOR
     // EVERY FORMAT. There is no AMD kernel in this tree -- kAmdLadder's gfx906 row says it in the
     // tree's own words ("The upstream ENGINE has no gfx906 path") -- so no format is admissible on

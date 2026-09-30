@@ -549,6 +549,15 @@ STRINGS = {
     'imp.gaps.verdict_ok': {
         'zh': '结论: 可以通过 —— 已生成 config.h, 没有 new_op 缺口',
         'en': 'VERDICT: CLEAR — config.h generated, no new_op gaps'},
+    # A measured list whose entries are all `covered`. This is the arm the two
+    # true-green controls pin; an open `hook` is engine work adapt.py has only
+    # written as patch text, and it does NOT reach this sentence any more.
+    'imp.gaps.verdict_hooks': {
+        'zh': '结论: 未接线 —— 没有 new_op 缺口, 但有 {n} 个引擎钩子未接线, 接线并编译'
+              '通过之前不能 serve: {hooks}',
+        'en': 'VERDICT: HOOKS OPEN — no new_op gap, but {n} engine hook(s) are not '
+              'wired; not servable until they are applied and the tree compiles: '
+              '{hooks}'},
     # ---- UNMEASURED. A manifest with no `gaps` LIST is not a gap-free manifest. ----
     # The reader (model_import.manifest_gap_state) routes EVERY shape of the absence
     # here -- no key at all, an explicit null, a non-list, or a gaps list that the
@@ -706,7 +715,30 @@ STRINGS = {
               '需要在叶子里接线',
         'en': 'headwise attention output gate ({mode}): the linear + sigmoid_gate_mul '
               'pieces already exist; the leaf needs wiring'},
-    'imp.gap.attn_qk_norm': {'zh': 'q/k norm 叶子接线', 'en': 'q/k norm: wire the leaf'},
+    'imp.gap.attn_qk_norm': {'zh': 'qk_norm', 'en': 'qk_norm'},
+    # The three detector shapes that had no row (see model_import._GAP_ACTION_ROWS).
+    'imp.gap.attn_qk_norm_absent': {
+        'zh': '该家族**无条件**对 q/k 做 rmsnorm, 而这个模型没有 qk_norm 权重 => '
+              '需要引擎侧 qk_norm_enabled() 门 (默认关), 由 config.h 打开。',
+        'en': 'this family rmsnorms q/k UNCONDITIONALLY, and this model carries no '
+              'qk_norm weights => the engine needs a qk_norm_enabled() gate (default '
+              'off) that config.h turns on.'},
+    'imp.gap.attn_head_geometry': {
+        'zh': '头几何 {q}q/{kv}kv@{hd}: 引擎的 gqa 分派表已注册 => 无需新算子; 未注册则'
+              '按 q_heads 反推 KV 头, 会落进别的实例 (属 new_op)。',
+        'en': 'head geometry {q}q/{kv}kv@{hd}: covered when the engine\'s gqa dispatch '
+              'table registers it; otherwise KV heads are inferred from q_heads and it '
+              'lands in a different instance (that is a new_op).'},
+    'imp.gap.mlp_act_gated': {
+        'zh': 'gated MLP 激活 {act}({mode}): 对应的 <act>_mul 共享算子已存在并登记进构建 '
+              '(ops/wrapper/), 在叶子里接线即可。',
+        'en': 'gated MLP activation {act}({mode}): the matching <act>_mul shared operator '
+              'already exists and is in the build (ops/wrapper/); the leaf just has to '
+              'call it.'},
+    'imp.gap.mlp_act_gated_new_op': {
+        'zh': 'gated MLP 激活 {act}({mode}): 引擎树里没有对应的 <act>_mul 算子, 需要一次内核实现。',
+        'en': 'gated MLP activation {act}({mode}): the engine has no <act>_mul operator '
+              'for it, so this needs one kernel to land.'},
     'imp.gap.attn_hybrid_hd': {
         'zh': '异构注意力头几何: global head_dim={ghd} (kv={gkv}) vs local head_dim={lhd}',
         'en': 'heterogeneous attention head geometry: global head_dim={ghd} (kv={gkv}) vs '
@@ -938,7 +970,7 @@ STRINGS = {
               "  热=正在生成的位置 (必须高精度, 只许 bf16/fp16/int8)\n"
               "  尾=最近一段 (精度尾, 不能低于热层)\n"
               "  冷=更老的内容 (可压到 int4/iso4/iso4e/rk4v4 省显存)\n"
-              "例: hot=bf16,tail=fp16,cold=iso4e。留空 = 引擎默认。\n"
+              "例: hot=bf16,cold=iso4e (tail= 引擎按名拒绝: 无尾层)。留空 = 引擎默认。\n"
               "契约已定, 引擎接入此参数后自动生效。",
         'en': "Quantisation precision for each of the three KV-cache tiers, comma "
               "separated, any combination:\n"
@@ -946,7 +978,7 @@ STRINGS = {
               "bf16/fp16/int8)\n"
               "  tail = the most recent stretch (precision at most one step below hot)\n"
               "  cold = older content (can be squeezed to int4/iso4/iso4e/rk4v4 to save VRAM)\n"
-              "Example: hot=bf16,tail=fp16,cold=iso4e. Empty = engine default.\n"
+              "Example: hot=bf16,cold=iso4e (tail= is refused by name: no tail tier). Empty = engine default.\n"
               "The contract is settled; it takes effect once the engine wires this "
               "parameter in."},
     'tips.snvfp4mode': {

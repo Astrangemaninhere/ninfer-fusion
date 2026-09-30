@@ -45,7 +45,7 @@
 |---|---|---|---|
 | `--kv-dtype` | 给**整个** KV 栈一个存储档（`bf16/int8/fp8/nvfp4/iso4e/iso3/rk4v4/e8`） | `:378` | 默认 `BFloat16`（`apps/cli/options.h:37`）；拼写表 `:93-107`；废弃别名 `iso3`、`e8` 在 `:104-105`。**与位上限互斥**（`:872-879`） |
 | `--kv-layer-storage SPEC` | 直接给逐层存储表，绕过求解器 | `:491` | 与 `--kv-bit-budget` 互斥（`:859-863`）、与 K/V 位宽互斥（`:880-884`）、与 `--kv-codec-preference` 互斥（`:936-941`） |
-| `--kv-bit-budget SPEC` | 每个 KV 元素的位上限；或逐层区间 `"0-7:8,8-63:4.5"` | `:381` | 默认 `0.0` = 未命名（`apps/cli/options.h:55`）；区间形式在 `:384-395` |
+| `--kv-bit-budget SPEC` | 每个 KV 元素的位上限；或逐层区间 `"0-7:8,8-15:4.5"`（区间必须铺满全部 full-attention 层；本 variant 是 16 层，不是 64 层） | `:381` | 默认 `0.0` = 未命名（`apps/cli/options.h:55`）；区间形式在 `:384-395` |
 | `--kv-bits B` | K/V 的 **JOINT** 上限（全栈一个） | `:403` | 默认 `0.0`（`apps/cli/options.h:67`）；与 `--kv-k-bits/--kv-v-bits` 互斥（`:914-919`） |
 | `--kv-k-bits BK` / `--kv-v-bits BV` | **SPLIT** 形式：K、V 各自逐层分层 | `:408` / `:412` | 默认 `0.0`（`apps/cli/options.h:68-69`） |
 | `--kv-bits-mode joint\|split\|ceiling` | SPLIT 请求的**读法** | `:416` | 默认 `Split`（`apps/cli/options.h:71`）；无 K/V 请求即拒绝（`:885-891`）；给了 `--kv-bits` 时只接受 `joint`（`:942-949`） |

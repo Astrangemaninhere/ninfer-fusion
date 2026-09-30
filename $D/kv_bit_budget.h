@@ -1,3 +1,27 @@
+// ===========================================================================================
+// kvfix (F893) -- THIS FILE IS A STALE MIRROR, AND IT IS TRACKED.  READ THE LIVE ONE.
+// ===========================================================================================
+// `$D/` was created by an unexpanded shell variable (the literal name `$D`) and it is IN THE
+// GIT INDEX -- `git ls-files -- '$D'` lists these three files.  They are copies of the live KV
+// surfaces taken 2026-09-20 and NEVER UPDATED, so they still carry the PRE-repair spellings:
+//   * `$D/kv_bit_budget.h` keeps the `--kv-bit-budget 0-7:8,8-63:4.5` example, which the engine
+//     refuses by name ("ranges must tile layers 0..15 in order"); the LIVE file at
+//     src/product/kv_bit_budget.h:1163 carries the corrected, layer-count-agnostic
+//     `0-7:8,8-15:4.5`.
+//   * `$D/kv_formats.h` keeps the `--kv-tier-formats hot=bf16,tail=fp16,cold=iso4e` example,
+//     which the engine refuses by name ("this engine has no tail tier"); the LIVE file at
+//     src/kvcfg/kv_formats.h:5 carries `hot=bf16,cold=iso4e` and names the gap in place.
+// MEASURED CONSEQUENCE: a whole-tree grep for either spelling still finds it HERE, so a reader
+// concludes the tree ships an example the engine refuses.  Two lines of this record did exactly
+// that (dl/namedmech's F-855 triage B1/E3, which counted "NINE places"; dl/kvadv F-892 carried
+// it forward).  The live count is ZERO.
+// THE FIX, AND WHY IT IS ONLY THIS BANNER: the tree's own convention is set out at
+// src/kvcfg/kv_formats.h:38 -- "就地删名会把这个缺口藏起来, 故此处只标注事实" (deleting the name in
+// place would HIDE the gap, so only the fact is annotated here).  Nothing is deleted, renamed or
+// rewritten; the mirror is named at the top of its own files so the next grep's reader sees it.
+// The live file for this mirror is: src/product/kv_bit_budget.h (1486 lines live; this mirror is 145150 B from 2026-09-20)
+// ===========================================================================================
+
 #pragma once
 
 // Fractional KV bit-budget allocator (the C++ side).

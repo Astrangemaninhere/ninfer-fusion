@@ -75,8 +75,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     // live window gives the row the same single-split association, which is the property the
     // contract is about, and this one is by definition at or above all of them
     // (validate_envelope refuses a max_visible_keys above it).
-    const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible,
-                                                    ops::kGqaAttentionMaximumVisibleKeys};
+    const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
                            build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
@@ -99,8 +98,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         // FIX-A: same pin as the bridge above, for the same reason: this is the AR step the
         // draft runs once per proposal token, so there are k of them per round and each one
         // used to partition its keys from the live window.
-        const ops::GqaExecutionEnvelope envelope{visible, visible,
-                                                 ops::kGqaAttentionMaximumVisibleKeys};
+        const ops::GqaExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
                                  envelope, next_hidden, logits, next_draft);
         extract_proposal_lattice(static_cast<std::uint32_t>(i));

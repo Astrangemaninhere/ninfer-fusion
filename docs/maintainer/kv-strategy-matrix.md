@@ -33,9 +33,15 @@
    （§97）：`--kv-dtype bf16/int8/nvfp4` 三者的载荷逐项相同；逐层表 `all:int8` 才是 1.83×。
    而 bf16 是逐层表的"未设置"哨兵值 → **当前无法启用 bf16 KV**，所以本表缺少真正的
    无损基线（"bf16"行实为 nvfp4）。速度差异也在 ±5%（27B 权重带宽主导）。
-   ⚠️ **已推翻 [RK4V4-CONTROL 2026-09-18 vs PATCHSET/RK4V4-CONTROL/REPORT.md]**：bf16 KV **今天可以启用**——`--kv-layer-storage 0-15:bf16` 得到
-   `kv cache dtype bf16`、8.50 GiB、27/27；`0-15:fp8` 同样可用（`fp8-e4m3-row256`、4.75 GiB、27/27）。
-   所以本表缺无损基线的原因是**当初没测**，不是"无法启用"。
+   ⚠️ **已推翻 [RK4V4-CONTROL 2026-09-18 vs PATCHSET/RK4V4-CONTROL/REPORT.md]**：bf16 是逐层表的"未设置"哨兵值这一条**不成立**——`--kv-layer-storage 0-15:bf16` 在**那个 fixture 与那个 pin 上**
+   得到 `kv cache dtype bf16`、8.50 GiB、27/27。
+   ⚠️ **[dl/backlog item1-R2]** 本行原文把 `0-15:bf16` 与 `0-15:fp8` 并列表述为"两者今天都可用"，这一并列必须拆开：
+   在 pin `8c566fba8843b15b3a4632e009d5cd936a6981d8db93f64a498639c3d0bd15` 上，配 `examples/cli/messages/long_niah_64k.json`，
+   **`--kv-layer-storage 0-15:fp8` 这个拼写被引擎的 cold-host window 守卫按名拒绝**（layer 0 声明 `sliding_window_tokens = 646720`，
+   而 fp8 的 decode 路径不读该字段；`ninfer-perplexity --kv-dtype fp8` 被同一守卫以同样方式拒绝）。
+   ⇒ **bf16 那一半是 fixture 相关的读数；fp8 那一半在本 pin 上不可复现**。要看复现，**fixture 与 pin 必须和读数一起引用**，
+   否则读者无从判断哪一半在生效。原文那句并列在 pin 上是错的；而**bf16 今天无法启用 的推理同样不成立**，
+   因为哨兵值不是 bf16 不能用的原因（真正的原因是**当初没测**）。
 2. **rk4v4 只在前 8 个全注意力层可用（长上下文）**：完整实证地图见 `_TODO.md` §96。
    ⚠️ **本条规则已被控制重测推翻 [RK4V4-CONTROL 2026-09-18 vs PATCHSET/RK4V4-CONTROL/REPORT.md]**：`{0..12}:rk4v4 → 9/27` 而 `{0..13}:rk4v4`（**多一层**）
    `→ 27/27`，且 rk4v4 在第 **15** 层于两个不同集合里都是 27/27；下面那行 `0-7:rk4v4 = 8/8`
@@ -95,11 +101,33 @@ s.t. Σbits ≤ B·L`」，而 `src/product/kv_bit_budget.h` 现在声明的是*
 
 ## 5. 复现
 
-⚠️ **本节所引的四个矩阵/探针脚本已不在树上**（[TABLEREGEN 2026-09-18] 在 `sh/` 与
-`sh2/` 两侧都查过）：`_kv_matrix_v3.sh`、`_kv_quality.sh`、`_rk4v4_probe.sh`、`_rk4v4_iso4e.sh`
-**全部缺失**（它们名下的 CSV `/home/user/kv_matrix_v3.csv`、`/home/user/kv_quality.csv`
-也不存在）。所以本表的**速度/载荷/针刺三列今天无法用本文档的命令复现**——文档点名一个
-已死的生成器，和表格断言一个已死的档位是同一类缺陷。
+⚠️ **[dl/backlog item2-scope] 本节原文是一次 SCOPE 错误，不是脚本缺失。** [TABLEREGEN 2026-09-18] 只在
+`sh/` 与 `sh2/` 两侧查过，就断言四个脚本全部缺失；它们实际在 **`research/scripts/`**。
+本次在 pin `8c566fba8843b15b3a4632e009d5cd936a6981d8db93f64a49863958d0bd15` 上逐项复核：
+
+| 脚本 | 状态 | 字节 |
+|---|---|---|
+| `_kv_matrix_v3.sh` | **PRESENT**（`research/scripts/`） | 3,733 |
+| `_kv_matrix_57k.sh` | **PRESENT**（`research/scripts/`）——**本文档从未点名它** | 2,525 |
+| `_kv_quality.sh` | ABSENT | — |
+| `_rk4v4_probe.sh` | ABSENT | — |
+| `_rk4v4_iso4e.sh` | ABSENT | — |
+
+CSV 侧同样被原文说错：`/home/user/kv_matrix_v3.csv` **PRESENT**（737 B），其第 1 行逐字就是
+本文档 §4 引用的设备头 `# device=NVIDIA GeForce RTX 5090 D model=qwen3.8-27b ctx=65536 needle_ctx=32768 needles=8`；
+`/home/user/kv_quality.csv` **PRESENT**（371 B）——**脚本不在而它的 CSV 在**。
+
+⚠ **第二处更正，§4 的"追加成一张跨设备表"与脚本不符。** 在 USE SITE 读重定向（脚本把路径拼成
+变量，grep 一个字面文件名是查不到的）：`_kv_matrix_v3.sh:13` 是 `OUT=${KV_OUT:-/home/user/kv_matrix_v3.csv}`，
+`:28` 是 `echo "# device=..." > "$OUT"`——**单箭头 `>`，整表每次运行被截断**。照 §4 的命令跑第二台设备
+会覆盖第一台的 CSV。跨设备表只能人工指定 `KV_OUT=` 分开保存后再合并。`_kv_matrix_57k.sh` 根本不写 CSV
+（只写 `LOG`），§4 的追加程序对它不适用。
+
+⇒ **本表的三列可以复现**，命令见下（**不要复用默认 `KV_OUT`**）：
+
+```
+KV_OUT=/home/user/kv_matrix_v3.<device>.csv bash research/scripts/_kv_matrix_v3.sh
+```
 
 第 3 节那张位预算表**可以**一条命令重生成，而且**不再用** `tools/archkit/kv_bit_budget.py`
 ——该文件自己的头声明它的阶梯已经从权威（`src/product/kv_bit_budget.h` 的

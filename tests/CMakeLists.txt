@@ -202,6 +202,33 @@ ninfer_add_test(ninfer_arch_generic_fallback_test
   LIBRARIES ninfer_artifact ninfer_ops)
 target_compile_definitions(ninfer_arch_generic_fallback_test PRIVATE NINFER_ARCH_SIM_ENABLED=1)
 
+# ---------------------------------------------------------------------------
+
+# THE FILE src/core/arch_sim.h:26 NAMES. That header's own sentence reads "THE FOUR GUARD
+# PROPERTIES (each is pinned by a test in tests/test_arch_sim.cpp)" and, MEASURED 2026-09-22
+# (dl/simrun2), that file did NOT exist: `ls tests/test_arch_sim.cpp` -> No such file or
+# directory, `grep -rn 'test_arch_sim' tests/` -> empty. The guards WERE pinned (the target
+# above, plus tests/test_sim_no_support.cpp), so the coverage was real and the POINTER was
+# wrong. This target is what makes the header's sentence true.
+#
+# WHAT IT ADDS BEYOND THE TARGET ABOVE, and why it is not a duplicate: the RUNG BOUNDARY. The
+# ladder has 12 rows and the low row is sm_70, so the rungs this operator cannot buy anywhere
+# -- K40 = sm_35, and the Maxwell sm_50/52/53 the CUDA 12.8 chain can still build -- are
+# REFUSED BY NAME ("has no row in kArchLadder, so simulating it would mean inventing a
+# capability set"). The two checks that matter are on the two edits a later "make the
+# simulator reach more cards" line would make, NEITHER of which is a build break:
+#   (a) coerce an unlisted number to a listed one (sm_35 silently answered as sm_70);
+#   (b) add a ladder row with no MEASURED evidence behind it.
+# Both are asserted red against shadow-header mutants (dl/simrun2/logs/red_controls.txt).
+#
+# NOTHING HERE RELAXES A GUARD. The build key is set on this target for the same reason it is
+# set on the one above: the simulator needs a build-time key as well as its two environment
+# keys, and the one binary that can be simulated is the one whose job is to test it.
+ninfer_add_test(ninfer_arch_sim_test
+  SOURCES test_arch_sim.cpp
+  LIBRARIES ninfer_core ninfer_artifact)
+target_compile_definitions(ninfer_arch_sim_test PRIVATE NINFER_ARCH_SIM_ENABLED=1)
+
 # THE VENDOR-AXIS CAPABILITY OVERRIDE (src/core/vendor_sim.h) and the keyed add-only announce set
 # it is built on (src/core/announce_once.h). A SEPARATE BINARY from the arch-sim test above, on
 # purpose: the two axes have SEPARATE BUILD KEYS, so a binary that can be talked into simulating a
@@ -321,6 +348,35 @@ ninfer_add_test(ninfer_kv_tier_formats_test
 # it is cited, not included).
 ninfer_add_test(ninfer_sum_dir_test
   SOURCES test_sum_dir.cpp)
+# F738 injectchan: THE INGRESS SURFACE (src/spec/inject_channel.h), as a header-only host test.
+# Same shape as ninfer_sum_dir_test above and ninfer_turn_recall_journal_test below -- the test
+# program lives in src/spec/ beside the header it measures (src/spec/inject_channel_test.cpp), the
+# header is std-only with no CUDA in its include graph, and the test drives the EXACT functions the
+# engine calls (parse_spec / admit_against_engine / bake / overlap_with_chunk / first_collision /
+# Coverage), so the whole declaration surface and all 24 refusal names are exercised with no
+# device, no artifact and no fixture. What it therefore does NOT cover is the engine's three
+# remaining acts -- the cudaMemcpy into the input-embedding matrix, a vision collision as it
+# arises in a real chunk, and the completeness verdict against a real prefill; those are the
+# engine arms in dl/injectchan/REPORT.md. It also counts its own population (24 enumerators vs the
+# names actually provoked) so that a refusal no case can reach FAILS the test as a dead guard
+# rather than passing as covered.
+ninfer_add_test(ninfer_inject_channel_test
+  SOURCES ${PROJECT_SOURCE_DIR}/src/spec/inject_channel_test.cpp)
+
+# F745 injectbind: THE ROW->CONTEXT BINDING (src/spec/sum_dir_inject.h), as a header-only host test.
+# ---------------------------------------------------------------------------
+# The binding that turns a `sum_dir` ROW into the declaration `src/spec/inject_channel.h` consumes.
+# It CALLS the ingress's own `admit_against_engine()` and `bake()`, so the ten declaration-side
+# refusals it can provoke are provoked by the ingress's code and not by a second spelling of its
+# rules. It is a host test for the same reason the ingress's is -- both headers are std-only -- so
+# the ten NEW row-side refusal names, the position-independence self-test (`sum_dir.h:90-96`), the
+# one-target rule (`sum_dir_vector.h:361`) and the spec round trip through the engine's own parser
+# are all exercised with plain g++ and no device. It counts its own population (ten new names, one
+# case each) AND takes a census over the ingress's enum, so every name is either provoked or
+# declared unreachable WITH A REASON and an undeclared one fails. What it does NOT cover is the
+# model arms, which are in dl/injectbind/REPORT.md.
+ninfer_add_test(ninfer_sum_dir_inject_test
+  SOURCES ${PROJECT_SOURCE_DIR}/src/spec/sum_dir_inject_test.cpp)
 # The recall UNIT's identity and the overlap arithmetic over it
 # (src/spec/recall_identity.h), and the syntax boundary a recall has to land on
 # (src/spec/stop_boundary.h). Both are std-only host headers, so both are header-only host
@@ -798,6 +854,15 @@ ninfer_add_test(ninfer_ple_seam_window_test
   LIBRARIES ninfer_engine ninfer_core)
 ninfer_add_test(ninfer_ple_carrier_test
   SOURCES test_ple_carrier.cpp)
+# The first test that CALLS ple_stage_declaration()
+# (targets/qwen4_exp/impl/ple_ngram.h:107). That function was declared, defined and
+# compiled into ninfer_engine with no caller at all, test or engine. Host-only: no
+# sidecar, no CUDA, no GPU, and NO SKIP_RETURN_CODE, because nothing here is opt-in
+# -- so a skip could only mean "green without running". It links ninfer_engine for
+# ple_ngram.cpp and ninfer_ops for PleStageDecl::validate() (ops/ple/ple_layout.cpp).
+ninfer_add_test(ninfer_ple_stage_declaration_test
+  SOURCES test_ple_stage_declaration.cpp
+  LIBRARIES ninfer_engine ninfer_ops)
 # The rank axis itself (core/shard_rank_axis.h) and the virtual-device guard
 # (core/virtual_device.h). Both are host-only and take every input as a PARAMETER, so the three
 # arithmetic structures that had no rank dimension, and the guard's whole refusal space, are
@@ -1348,6 +1413,31 @@ ninfer_add_test(ninfer_kv_paging_preallocation_test
 ninfer_add_test(ninfer_kv_storage_coverage_test
   SOURCES test_kv_storage_coverage.cpp)
 
+
+# SITE A OVER THE WHOLE KvCacheStorage DOMAIN, TWO-SIDED, PLUS A PER-TIER DEMAND PIN.
+#
+# tests/test_kv_storage_coverage.cpp covers SITE A indirectly, and its own output says which part it
+# cannot reach: "site A compared 7 of 15 enumerators (the rest are refused by name, so they have no
+# DType to compare against)". Those seven are exactly codes 0..6. The five INTEGRATE4 tiers
+# (Fp8KeyNvfp4Value, RotatedInt8KeyInt4ValueGroup64, RotatedInt4KeyInt4ValueGroup64, RK4V4E8,
+# RK2V4E8 -- codes 10..14) are refused by src/product/kv_storage_dtype.h, so check 3 SKIPS them, and
+# no other ruler in this tree reaches SITE A for any of them either (test_kv_operator_name.cpp never
+# calls requirements_for_kv_storage; src/ops/kv/e8_width_contract_test.cpp pins codes 6/8/9 only;
+# test_device_capabilities.cpp walks only 0,1,3,4,5,6,7). MEASURED: with those five arms set back to
+# the bare kernel-image baseline, all three of the tree's capability bars stayed green.
+#
+# The new file pins BOTH halves, and neither is decoration: the two-sided domain invariant
+# (named-but-refused == 0 AND unnamed-but-silent == 0) cannot see a tier that is ANSWERED WITH THE
+# WRONG DEMAND, and the per-tier literal pins cannot see a code that STOPPED BEING ANSWERED at all.
+# MEASURED in dl/kvcover/: two mutants are invisible to the first half and red on the second, and one
+# mutant is the mirror image.
+#
+# HOST-ONLY, and registered exactly like ninfer_kv_storage_coverage_test above -- the default
+# ninfer_core link is what puts the CUDA include root on the line for core/device_capabilities.h.
+# No NEEDS_SOURCE_DIR: the test reads no source file (0 occurrences of NINFER_SOURCE_DIR).
+ninfer_add_test(ninfer_kv_storage_capability_pin_test
+  SOURCES test_kv_storage_capability_pin.cpp)
+
 # ---------------------------------------------------------------------------
 # THE ENGINE'S SHARD CONTRACT (src/core/shard_plan.h section 6).
 #
@@ -1545,3 +1635,57 @@ add_test(NAME ninfer_k40_operator_gate_test
          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/k40gate/opcheck.py
                  ${PROJECT_SOURCE_DIR})
 
+
+# ===========================================================================
+# THE SEMANTIC CANDIDATE CHANNEL (line `semchan`, 2026-09-23). TWO BARE `add_executable`s: NO
+# ninfer library and NO CUDA, deliberately -- the same shape and the same reason as
+# `ninfer_recall_restore_first_test` (:1141) and `ninfer_recall_prefill_budget_test` (:1120) above.
+# Both compile against `src/spec/semchan_symbol_key.h` plus the spec headers it READS
+# (`spec/sum_dir.h`, `spec/sum_dir_reach.h`), all of them std-only with ZERO occurrences of "cuda"
+# (MEASURED in dl/semchan/logs/09_api.txt: cuda_occurrences=0 for both), so these targets build and
+# run without touching the engine's device link at all.
+#
+# WHAT THE FIRST PINS. `program_impl.h:15723-15724` requires a semantic channel to be "in the
+# candidate-set UNION, never in place of this arbiter". This target is the executable half of that
+# sentence: it drives the channel AND the REAL arbiter (`sum_dir_recall_span_reachable`, the same
+# selector the engine compiles into program_impl.h) over ONE adversarial directory in ONE process,
+# and asserts (a) the channel's rank 1 is WRONG, (b) the channel's candidate SET still contains the
+# true page, (c) the arbiter's OWN `anchor_page` field is the true page, and (d) the union carries
+# that anchor through unchanged. Then the provenance arms: two blocks on ONE page with DIFFERENT
+# origins must BOTH reach the union, because resolving them would be the channel deciding.
+#
+# WHAT THE SECOND PINS. `tests/semchan_symbol_key_compile_check.cpp` builds in its NOT-FED form
+# here, so the admitted query-key path is exercised by a green target. Its FED form -- the symbol key
+# handed to `sum_dir_query_key_from_ids`, which MUST NOT compile -- is driven from
+# `dl/semchan/sh/50_compile_pair.sh` and deliberately NOT from this file: a build system required to
+# fail is a build system nobody can run. See also the M6/M7/M8 compile-time arms in
+# `dl/semchan/sh/40_mutants.sh`, which are the same device over mutated header images.
+# ===========================================================================
+add_executable(ninfer_semchan_symbol_key_test test_semchan_symbol_key.cpp)
+target_include_directories(ninfer_semchan_symbol_key_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME ninfer_semchan_symbol_key_test COMMAND ninfer_semchan_symbol_key_test)
+
+add_executable(ninfer_semchan_compile_check_test semchan_symbol_key_compile_check.cpp)
+target_include_directories(ninfer_semchan_compile_check_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME ninfer_semchan_compile_check_test COMMAND ninfer_semchan_compile_check_test)
+
+# THE fp16-PLANE BUILD FACT'S TIE (dl/fp16route, F-736)
+# ---------------------------------------------------------------------------
+# IT LINKS ninfer_ops AND TAKES THE ADDRESS of ops::detail::launch_bf16_fp16_mma, which is the
+# launcher defined in src/ops/linear/bf16/bf16_mma_fp16.cu -- the source src/CMakeLists.txt adds
+# on the same lines that define NINFER_HAVE_BF16_FP16_MMA. So the definition and the object file
+# have to arrive together: removing that source line while leaving the definition is a LINK
+# ERROR here rather than a route that names a kernel the binary does not contain. Same shape,
+# same purpose, as the tie the target above provides for ops::qpn::gemm_qpn.
+#
+# IT NEEDS NO GPU: the launcher's address is taken and never called, and the rest of the test
+# asks the two tables questions. That is what makes it runnable everywhere the archive links.
+ninfer_add_test(ninfer_bf16_fp16_plane_test
+  SOURCES test_bf16_fp16_plane.cpp
+  LIBRARIES ninfer_artifact ninfer_ops)

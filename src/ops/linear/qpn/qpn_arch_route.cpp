@@ -86,6 +86,19 @@ QpnArchRoute decide(int physical_sm, std::int32_t m, std::int32_t n, std::int32_
 
 } // namespace
 
+bool nvfp4_w4a4_channel_available(int physical_sm) {
+    // No device answer at all: keep the native route, which is the behaviour every caller had
+    // before this function existed. (A host-side workspace plan runs before the device is bound.)
+    if (physical_sm <= 0) { return true; }
+    const caps::ArchView view = caps::arch_view_for_device(physical_sm);
+    // A refused simulation is the fail-closed state: nothing is answered for the real device
+    // either, so the caller must not take the native route on the strength of this answer.
+    if (!view.usable()) { return false; }
+    const caps::ArchRung* rung = caps::arch_rung(view.effective_sm);
+    if (rung == nullptr) { return false; }
+    return caps::covers(rung->caps, caps::Cap::Mxf4Nvfp4BlockScale);
+}
+
 int current_device_sm() {
     static const int kSm = [] {
         int device = 0;

@@ -501,12 +501,14 @@ def main() -> int:
     # 本文件已把这条纪律写在上面 ("我们没写它"和"那里什么都没有"是两个不同断言),
     # unlink 会让第二个断言变真。
     _blocked = [need for need, tier, _ in gaps if tier == 'new_op'] if measured else []
+    withheld = False
     if header is not None and _blocked:
         (out_dir / 'config.h.BLOCKED').write_text(
             header + '\n#error "auto-adapt: unresolved new_op gaps (%s) -- config.h '
                      'withheld as config.h.BLOCKED; the engine has no kernel/binding for '
                      'these yet"\n' % '; '.join(_blocked), encoding='utf-8')
         refused = 'unresolved new_op gaps: %s' % '; '.join(_blocked)
+        withheld = True
         print('adapt.py: WITHHELD %s/config.h as config.h.BLOCKED: %s' % (out_dir, refused))
         header = None
     if header is not None:
@@ -517,7 +519,21 @@ def main() -> int:
     # kinds could not be read is written as `"gaps": null` + `"gaps_measured": false`,
     # which the reader (tools/gui/model_import.manifest_gap_state) renders as
     # UNMEASURED -- never as "no gaps".
-    manifest = {'model_id': model_id, 'gaps_measured': measured, 'spec': spec}
+    # THE HEADER OUTCOME IS RECORDED, because it is the one fact about this artifact
+    # set that a directory listing cannot establish. `"config_h": "refused"` and
+    # `"config_h": "withheld"` are different outcomes (the first leaves NO header and
+    # prints "do not consume it" about a leftover; the second leaves config.h.BLOCKED)
+    # and BOTH are invisible to a reader that only lists the directory -- which is how
+    # a refused gemma4-31b header and a withheld ornith header each rendered as
+    # `头文件: 清单目录里有 config.h`. tools/gui/model_import.header_file_state() reads
+    # this field first. The key is additive: every reader in this tree ignores keys it
+    # does not know, and `manifest_gap_state()` only refuses on a top-level key spelled
+    # `measured`.
+    manifest = {'model_id': model_id, 'gaps_measured': measured, 'spec': spec,
+                'config_h': ('written' if header is not None
+                             else ('withheld' if withheld else 'refused'))}
+    if header is None and refused:
+        manifest['config_h_note'] = refused
     if measured:
         manifest['gaps'] = [{'need': a, 'tier': b, 'action': c} for a, b, c in gaps]
     else:

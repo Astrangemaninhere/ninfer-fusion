@@ -32,7 +32,7 @@
 //     `block_identity`". The column therefore stores the row's own `block_identity` next to each
 //     vector, and `set()` TAKES that identity from the directory instead of accepting it from the
 //     caller -- the same discipline as `SumDir::append()` computing the digest itself
-//     (sum_dir.h:1372-1383: "an API taking a caller-supplied identity would be an API through
+//     (sum_dir.h [text: an API taking a caller-supplied identity; = :1599 on 2026-09-25]: "an API taking a caller-supplied identity would be an API through
 //     which position could sneak back in").
 //   * `SumDir::sort_rows()` permutes its rows (sum_dir.h:1447-1478) and re-derives every row's
 //     `summary_index`. A row-indexed column would silently re-point at that moment. So the column
@@ -94,7 +94,7 @@ enum class SumDirVectorMissing : std::uint8_t {
 //
 // WHY `RequireEmbedding` IS THE DEFAULT, and it is a deliberate departure from the
 // `SumDirByteAxisPolicy` precedent: there, the default was the setting that "changes no observable
-// behaviour until a caller asks for something else" (sum_dir.h:563-569), because a caller ALREADY
+// behaviour until a caller asks for something else" (sum_dir.h [text: PriceWhenAbsent = 1; = :682 on 2026-09-25]), because a caller ALREADY
 // existed. Here none does -- the summarizer that writes catalogue lines is the very pass the engine
 // does not have (see the report) -- so the compatibility argument does not apply, and defaulting to
 // `RequireCatalogue` would re-block vector recall on the model call it is supposed to be free of.

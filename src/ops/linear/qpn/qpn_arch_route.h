@@ -72,6 +72,25 @@ struct QpnArchRoute {
 // "no row" and answer conservatively for.
 [[nodiscard]] int current_device_sm();
 
+// DOES THIS RUNG CARRY THE NATIVE NVFP4 W4A4 CHANNEL (`kind::mxf4nvf4`, m16n8k64 block scale)?
+//
+// This is the query nvfp4_dispatch.cpp's W4A4-vs-A16 decision was missing, and the reason the table
+// could not name NVFP4's tensor-core-free kernel: `resolve_route()` was SHAPE-BLIND and RUNG-BLIND,
+// so an admitted NVFP4 artifact on sm_86 would have reached launch_nvfp4_w4a4 -- whose instruction
+// those ISAs do not have.
+//
+// IT ANSWERS FOR THE SAME RUNG THE GATE ANSWERS FOR: `caps::arch_view_for_device(physical_sm)`,
+// i.e. the test-only simulator's `effective_sm` when one is honoured, and the card's own number
+// otherwise. That is deliberate: the gate (src/targets/registry.cpp, at the artifact load door) and
+// the op must not be able to disagree about which rung they are on -- the drift the two deciders in
+// this area exist to prevent.
+//
+// THREE-STATE, FAIL-CLOSED ON THE AXIS THAT MATTERS: a REFUSED simulation answers `false` for
+// everything (nothing may be claimed for the real device either), an unreadable device answers
+// `true` so that a host-side plan made before the device is bound keeps today's route, and a KNOWN
+// rung answers the covers() fact.
+[[nodiscard]] bool nvfp4_w4a4_channel_available(int physical_sm);
+
 // THE DECISION. One call per NVFP4 W4A16 op invocation.
 //
 // The test-only override is read ONCE per process (arch_view_for_device() has its own latch

@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace {
@@ -57,6 +59,25 @@ int check(bool condition, const char* message) {
     if (condition) { return 0; }
     std::cerr << message << '\n';
     return 1;
+}
+
+// The environment IS the engine's reader's front end (bandwidth_detail::env_raw is std::getenv),
+// so setting it through the process environment is the same switch the operator sets -- there is
+// no test-only override to drift from it. Same shape as tests/test_prefill_chunk_mode.cpp.
+void set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    ::setenv(name, value, 1);
+#endif
+}
+
+void unset_env(const char* name) {
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    ::unsetenv(name);
+#endif
 }
 
 using ninfer::runtime::BandwidthGovernor;
@@ -237,6 +258,113 @@ int test_choice_contract() {
     return failures;
 }
 
+// ---- a NUMERIC environment request is read by the same rule as the tri-state ----------------
+// Every case is TWO-SIDED, which is the only shape that can fail: an unreadable value must be
+// refused AND the refusal must NAME the variable and QUOTE the offending value, and the
+// documented values must still resolve QUIETLY and be READ. A reader that refused everything
+// satisfies the first half and fails the second; one that accepted everything fails the first.
+// ON THE PRE-IMAGE HEADER every "was accepted instead of refused" line below fails -- the silent
+// readers returned the default for all of them -- and main() returns 1.
+int test_env_numeric_refused_by_name() {
+    const char* kDbl = "NINFER_FT_BW_TOL_HI";
+    const char* kInt = "NINFER_FT_BW_STREAK";
+    const struct {
+        const char* name;
+        const char* value;
+    } unreadable[] = {
+        {kDbl, "abc"}, {kDbl, "0"},   {kDbl, "-1"},  {kDbl, "1.5x"}, {kDbl, " 1.5"}, {kDbl, "1.5 "},
+        {kDbl, "inf"}, {kDbl, "nan"}, {kDbl, "1e"},  {kInt, "0"},    {kInt, "-2"},   {kInt, "2.5"},
+        {kInt, "2 "},  {kInt, "two"}, {kInt, "0x10"}, {kInt, "99999999999"},
+    };
+    int failures = 0;
+    for (const auto& one : unreadable) {
+        unset_env(kDbl);
+        unset_env(kInt);
+        set_env(one.name, one.value);
+        bool threw = false;
+        std::string what;
+        try {
+            const BandwidthGovernor::Tuning tuning = BandwidthGovernor::from_env();
+            (void)tuning;
+        } catch (const std::exception& error) {
+            threw = true;
+            what  = error.what();
+        }
+        {
+            const std::string message = std::string(one.name) + "=" + one.value +
+                                        " was accepted instead of refused; a value that cannot be "
+                                        "read must not be promoted to a meaning";
+            failures += check(threw, message.c_str());
+        }
+        {
+            const std::string message = std::string("the refusal for ") + one.name + "=" +
+                                        one.value +
+                                        " does not name the variable it came from: " + what;
+            failures += check(what.find(one.name) != std::string::npos, message.c_str());
+        }
+        {
+            const std::string message = std::string("the refusal for ") + one.name + "=" +
+                                        one.value +
+                                        " does not quote the offending value: " + what;
+            failures += check(what.find(one.value) != std::string::npos, message.c_str());
+        }
+        unset_env(one.name);
+    }
+
+    // The accepted side must still be quiet, and it must be READ rather than replaced by a default.
+    {
+        unset_env(kDbl);
+        unset_env(kInt);
+        set_env(kDbl, "2.5");
+        set_env(kInt, "3");
+        bool threw = false;
+        BandwidthGovernor::Tuning tuning;
+        try {
+            tuning = BandwidthGovernor::from_env();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        failures += check(!threw, "a documented numeric value was refused");
+        failures += check(tuning.tol_hi == 2.5, "NINFER_FT_BW_TOL_HI=2.5 was not read");
+        failures += check(tuning.streak == 3, "NINFER_FT_BW_STREAK=3 was not read");
+        unset_env(kDbl);
+        unset_env(kInt);
+    }
+
+    // An empty value is "unset", not a refusal: the old reader's default must not have moved.
+    set_env(kDbl, "");
+    set_env(kInt, "");
+    {
+        bool threw = false;
+        BandwidthGovernor::Tuning tuning;
+        try {
+            tuning = BandwidthGovernor::from_env();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        failures += check(!threw, "an EMPTY numeric knob is refused instead of defaulting");
+        failures += check(tuning.tol_hi == 1.35 && tuning.streak == 2,
+                          "an empty value changed the DEFAULTS");
+    }
+    unset_env(kDbl);
+    unset_env(kInt);
+
+    // The trace switch is the same reader family and the same rule.
+    unset_env("NINFER_FT_BW_TRACE");
+    set_env("NINFER_FT_BW_TRACE", "trace");
+    {
+        bool threw = false;
+        try {
+            (void)ninfer::runtime::bandwidth_detail::env_flag("NINFER_FT_BW_TRACE");
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        failures += check(threw, "NINFER_FT_BW_TRACE=trace was read as OFF instead of refused");
+    }
+    unset_env("NINFER_FT_BW_TRACE");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -245,6 +373,7 @@ int main() {
     failures += test_throttle_and_recover();
     failures += test_prefill_chunk_scaling();
     failures += test_choice_contract();
+    failures += test_env_numeric_refused_by_name();
     if (failures == 0) { std::cout << "BANDWIDTH_GOVERNOR_TEST PASS\n"; }
     return failures == 0 ? 0 : 1;
 }

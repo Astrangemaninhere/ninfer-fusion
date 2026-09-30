@@ -174,6 +174,29 @@ namespace detail {
 using detail::kv_rowscale_fnv1a48;
 using detail::kv_rowscale_hex48;
 
+// [dl/backlog item15-axis] ONE AXIS THIS FINGERPRINT DOES NOT CARRY, AND IT IS UNMEASURED.
+// `--prefill-chunk` (and its `--prefill-chunk-mode`) is in NEITHER KvRowScaleConfigKnobs
+// above NOR the text built below. CALIBER AND POPULATION STATED, because a count over the
+// wrong span is this session's most-repeated failure: `grep -ci chunk` over the WHOLE of
+// src/product/kv_rowscale_persist.h (1,265 lines) = 0, and 0 over the fingerprint body
+// (:168-215) as well; the file's only "prefill" mentions (:69, :1110, :1131, :1148) are
+// ordering notes, not fingerprint inputs. dl/dedup measured the CONSEQUENCE as a reading
+// and left the CAUSE open (ledger F690): two runs of the same prompt at the same positions
+// differed in 64/1024 V rows and 0/1024 K rows while differing in chunk size AND row-scale
+// state AT ONCE, so NO ATTRIBUTION to chunking is made here.
+// IS THE OMISSION DELIBERATE? The header's rule for what belongs above is a CRITERION, not
+// an enumeration -- "Every knob that changes what the rotated K domain is quantized to has
+// to be in here" -- and the rope regime was added at :153-160 because it was "the last
+// operator-visible knob that REACHES THE CAPTURED K". Chunking is not an operator-visible
+// K-domain knob the way --yarn is, and there is no argument anywhere in this file that says
+// it cannot reach the captured K. So this is an UNDOCUMENTED limitation, not a deliberate
+// exclusion -- stated as a limitation rather than as a defect, because whether it MOVES THE
+// BYTES IS NOT MEASURED. The settling experiment (~20 s of engine plus a byte compare, and
+// it needs a GPU turn this line could not take) is named in dl/dedup/FINDING_config_
+// dependent_kv_bytes.md. IF it moves them, chunking belongs in BOTH the struct above and
+// the text below, for the reason the rope regime is at :153-160. This comment is a LABEL:
+// no behaviour, and no acceptance rule, is changed by it.
+//
 // Canonical text, then one hash.  snprintf (not iostreams) keeps the spelling of
 // the doubles locale- and library-independent, so the fingerprint of a given
 // command line is the same on every machine that reads a table.
@@ -291,12 +314,93 @@ using detail::kv_rowscale_hex48;
     return std::filesystem::path(artifact.string() + kKvRowScaleTableSuffix);
 }
 
+// THE CONFIGURATION-SCOPED SPELLING OF THE SAME TABLE (this line's change).
+//
+// WHY IT EXISTS. kv_rowscale_table_path() keys the sidecar on the ARTIFACT alone, so
+// EVERY KV configuration of one model shares one file name. Two measured consequences,
+// neither of them a wrong answer and both of them a wrong RECORD:
+//   * a run whose configuration has to capture OVERWRITES the table the other
+//     configuration is still calibrated against (finish() writes config.table), so the
+//     readings of the run that lost the file can no longer be reconstructed from disk;
+//   * alternating between two configurations re-calibrates on every switch, because
+//     each switch finds a table whose tag names the other configuration.
+// Naming the table after the configuration it was baked for fixes both: the shared name
+// stops being a WRITE target while remaining a READABLE one.
+//
+// HOW THE FINGERPRINT IS SPELLED, AND WHY THERE IS NO SECOND ALGORITHM. The twelve
+// digits are kv_rowscale_hex48(config.fingerprint) -- the SAME value
+// kv_rowscale_make_tag() already writes into the NINFERKVRS1 tag as its "rs1.<12 hex>"
+// tail. Name and tag are therefore two spellings of one number, which is what lets a
+// reader compare them without hashing anything. Nothing here computes a fingerprint; it
+// only spells the one it was handed.
+//
+// WHY APPENDED AND NOT SPLICED. `<artifact>.kvrowscale.bin.<12 hex>` keeps the
+// historical name a strict prefix, so every path that keys on the exact legacy spelling
+// is untouched and the migration is an ADD rather than a rename. It also cannot collide
+// with the four names the loop derives from the table (.d, .skip, .rejected,
+// .words.bin): each of those is a different length than twelve, and none of them is
+// spelled with hex digits alone.
+[[nodiscard]] inline std::filesystem::path kv_rowscale_scoped_table_path(
+    const std::filesystem::path& table, std::uint64_t fingerprint) {
+    return std::filesystem::path(table.string() + "." + kv_rowscale_hex48(fingerprint));
+}
+
+// THE OPERATOR'S ESCAPE HATCH, read from the environment. The loader's own contract is
+// that the environment is consulted once and the decision it carries is not revisited;
+// this is that decision.
+//   unset / empty / "on" / "1" / "auto"  -> scoped (this line's default)
+//   "off" / "legacy" / "0"               -> the historical single-file behaviour, which
+//                                           the loop then NAMES in its own report
+// Anything else is scoped: a typo must not silently restore the shared write target,
+// because that is the behaviour the scoping exists to stop.
+[[nodiscard]] inline bool kv_rowscale_scope_opted_out() {
+    const char* raw = std::getenv("NINFER_KV_ROWSCALE_SCOPE");
+    if (raw == nullptr) { return false; }
+    const std::string value(raw);
+    return value == "off" || value == "legacy" || value == "0";
+}
+
 [[nodiscard]] inline std::filesystem::path kv_rowscale_records_path(const std::filesystem::path& table) {
     return std::filesystem::path(table.string() + ".d");
 }
 
 [[nodiscard]] inline std::filesystem::path kv_rowscale_skip_note_path(const std::filesystem::path& table) {
     return std::filesystem::path(table.string() + ".skip");
+}
+// THE CONFIGURATION-SCOPED SPELLING OF THE SAME NOTE (this entry's change).
+//
+// WHY IT EXISTS, AND WHY IT IS THE SAME DEFECT THE TABLE ALREADY FIXED.  The table's own
+// scoping (kv_rowscale_scoped_table_path, above) exists because one shared name made
+// "<artifact>.kvrowscale.bin" a WRITE target for every KV configuration of one model.  This
+// note is derived from that same table path -- `.skip` is one of the four names the loop
+// derives from the table -- so it inherited exactly the same defect, and the asymmetry was
+// inside this one file: the table's name carried the twelve hex digits and its note's did not.
+// Consequence, MEASURED on this box (dl/kvhallu/REPORT.md, its R25 sample, 2026-09-23): two
+// configurations' calibration memos sat on ONE unscoped pair of names -- the table on disk was
+// tagged rs1.cc9660ac5f0a while the note beside it recorded config 6188a0eb9dd3.
+//
+// HOW THE FINGERPRINT IS SPELLED, AND WHY THERE IS NO SECOND ALGORITHM.  The twelve digits are
+// kv_rowscale_hex48(fingerprint) -- the SAME value kv_rowscale_make_tag() already writes into
+// the NINFERKVRS1 tag and the same one the scoped TABLE name carries, so name and tag cannot
+// disagree.  Appended, never spliced: `<table>.skip.<12 hex>` keeps the historical name a
+// strict prefix, so the migration is an ADD rather than a rename.
+//
+// WHY IT CANNOT COLLIDE with the table's own scoped name or the other derived names: the
+// table's scoped name is `<table>.<12 hex>` and this one is `<table>.skip.<12 hex>` -- one has
+// the `.skip` infix and the other does not -- while `.d`, `.rejected`, `.words.bin` and
+// `.skip.stale` are each a different length than twelve digits.
+[[nodiscard]] inline std::filesystem::path kv_rowscale_scoped_skip_note_path(
+    const std::filesystem::path& note, std::uint64_t fingerprint) {
+    return std::filesystem::path(note.string() + "." + kv_rowscale_hex48(fingerprint));
+}
+
+// The stale spelling FOR THE NOTE THAT WAS ACTUALLY READ.  For the legacy name this is
+// byte-identical to kv_rowscale_skip_note_stale_path() just below (`<table>.skip.stale`), so
+// the historical branch is unchanged; for the scoped name it is `<table>.skip.<12 hex>.stale`,
+// which keeps the move-aside evidence addressed to the configuration it belongs to.
+[[nodiscard]] inline std::filesystem::path kv_rowscale_skip_note_stale_path_for(
+    const std::filesystem::path& note) {
+    return std::filesystem::path(note.string() + ".stale");
 }
 
 [[nodiscard]] inline std::filesystem::path kv_rowscale_rejected_path(const std::filesystem::path& table) {
@@ -477,6 +581,20 @@ struct KvRowScalePersistConfig {
     std::filesystem::path table;
     std::filesystem::path records;
     std::uint64_t fingerprint = 0;
+    // THE EXPLICIT-INPUT MODE (this line's change). Both fields carry the historical
+    // meaning when they are left alone, so a caller that names neither -- every unit
+    // test, and every caller that predates these two lines -- gets today's behaviour
+    // byte for byte. That is what makes the change lazy rather than global.
+    //   scoped_table non-empty : read THIS table first (priority 1 of 3) and write ONLY
+    //                            it; config.table becomes a read-only legacy fallback
+    //                            (priority 2), honoured while its tag still names this
+    //                            run's configuration.
+    //   scope_opted_out        : the operator asked for the historical behaviour with
+    //                            NINFER_KV_ROWSCALE_SCOPE=off, so the shared name is read
+    //                            AND written exactly as before -- and the report NAMES
+    //                            the choice instead of leaving it invisible.
+    std::filesystem::path scoped_table;
+    bool scope_opted_out = false;
     bool recalibrate = false;
     bool graphs_enabled = true;
     std::int64_t run_start_unix = 0;
@@ -530,23 +648,166 @@ namespace detail {
     return true;
 }
 
-// "<fingerprint> <reason>", one line.  The note is only honoured while the
-// fingerprint still matches, so any change to the KV configuration re-arms the
-// loop without anyone deleting a file.
+// The CRC the NINFERKVRS1 header already carries, recomputed from the bytes so a report
+// can quote it without trusting a parse. Payload only: the 64-byte header is excluded,
+// exactly as kv_rowscale_build_table() computes that field.
+[[nodiscard]] inline std::uint32_t kv_rowscale_blob_crc(const std::string& blob) {
+    if (blob.size() <= 64) { return 0; }
+    return ninfer::ops::detail::crc32_reflected(
+        reinterpret_cast<const unsigned char*>(blob.data() + 64), blob.size() - 64);
+}
+
+// THE READ PRIORITY, STATED ONCE. Both halves of the loop (the pre-flight and the commit
+// point) used to read <table> directly and each re-derived the applicability gate. With
+// two candidate names there would be two chances to state the order differently, so the
+// order lives here and both halves call it.
+//
+//   1. the configuration-scoped name -- this run's own file, if it exists;
+//   2. the legacy shared name -- ONLY while its tag still names this run's configuration
+//      (kv_rowscale_table_usable is what enforces that, and it is not relaxed here);
+//   3. nothing usable -> the caller bakes, byte for byte as it did before this helper
+//      existed. That third arm is the path with no behaviour change at all.
+//
+// blob/path describe the best candidate that was READ, whether or not it passed the
+// gates, because the commit point's classification (foreign producer / foreign geometry
+// / foreign configuration) reads those two fields to decide what may be moved aside.
+struct KvRowScaleTableLookup {
+    std::string blob;            // the bytes the gates ran on
+    std::filesystem::path path;  // where those bytes were read from ("" = none read)
+    std::int64_t mtime = 0;      // that file's stamp, for the staleness gate
+    bool scoped = false;         // read from the configuration-scoped name
+    bool usable = false;         // passed kv_rowscale_table_usable
+    std::string error;           // why it did not ("" when nothing was read)
+};
+
+[[nodiscard]] inline KvRowScaleTableLookup kv_rowscale_lookup_table(
+    const KvRowScalePersistConfig& config) {
+    KvRowScaleTableLookup out;
+    if (!config.scoped_table.empty()) {
+        std::string blob;
+        if (kv_rowscale_read_file(config.scoped_table, blob)) {
+            out.blob   = blob;
+            out.path   = config.scoped_table;
+            out.mtime  = kv_rowscale_mtime_unix(config.scoped_table);
+            out.scoped = true;
+            if (kv_rowscale_table_usable(blob, config, out.error)) {
+                out.usable = true;
+                return out;
+            }
+        }
+    }
+    {
+        std::string blob;
+        if (kv_rowscale_read_file(config.table, blob)) {
+            std::string err;
+            if (kv_rowscale_table_usable(blob, config, err)) {
+                out.blob   = blob;
+                out.path   = config.table;
+                out.mtime  = kv_rowscale_mtime_unix(config.table);
+                out.scoped = false;
+                out.usable = true;
+                out.error.clear();
+                return out;
+            }
+            // The scoped candidate, where there was one, is the more interesting
+            // refusal: it is the file this configuration itself wrote. Keep it.
+            if (out.path.empty()) {
+                out.blob   = blob;
+                out.path   = config.table;
+                out.mtime  = kv_rowscale_mtime_unix(config.table);
+                out.scoped = false;
+                out.error  = err;
+            }
+        }
+    }
+    return out;
+}
+
+// THE NOTE'S READ PRIORITY, STATED ONCE -- the same shape the TABLE's lookup already uses
+// (kv_rowscale_lookup_table), and for the same reason: with two candidate names, re-deriving
+// the order at each call site is how the two halves of the loop come to disagree about which
+// file the decision was read from.
+//
+//   1. the configuration-scoped name -- this run's own memo, and only when the caller named a
+//      scoped table at all (config.scoped_table non-empty).  A caller that names none keeps the
+//      single historical candidate and therefore today's behaviour byte for byte.
+//   2. the legacy shared name -- the historical read, unchanged, and still honoured only while
+//      the note's OWN recorded fingerprint names this configuration.  That content check is NOT
+//      relaxed here: it is what already stopped a foreign configuration's memo from deciding
+//      anything, and this entry adds a name, not a second rule.
+//   3. neither -> the loop arms a capture / bakes the table, exactly as it did before.
+struct KvRowScaleSkipNoteLookup {
+    bool applies = false;        // a note was read AND its fingerprint names this config
+    std::filesystem::path path;  // the file the decision came from ("" = none read)
+    std::string reason;          // the note's own reason text, trailing newlines stripped
+};
+
+// The candidate list, in priority order, in ONE place.
+[[nodiscard]] inline int kv_rowscale_skip_note_candidates(
+    const KvRowScalePersistConfig& config, std::filesystem::path (&out)[2]) {
+    const std::filesystem::path legacy = kv_rowscale_skip_note_path(config.table);
+    if (config.scoped_table.empty() || config.scope_opted_out) {
+        out[0] = legacy;
+        return 1;
+    }
+    out[0] = kv_rowscale_scoped_skip_note_path(legacy, config.fingerprint);
+    out[1] = legacy;
+    return 2;
+}
+
+// WHERE THIS RUN WRITES THE NOTE -- always priority 1 of the list the read uses, so no run can
+// destroy the memo another configuration is still reading.  The lazy arms (no scoped table
+// named, or the operator's retreat) keep the historical single name, which is what makes this
+// change inert for every caller that predates it.
+[[nodiscard]] inline std::filesystem::path kv_rowscale_skip_note_write_path(
+    const KvRowScalePersistConfig& config) {
+    if (config.scope_opted_out || kv_rowscale_scope_opted_out() || config.scoped_table.empty()) {
+        return kv_rowscale_skip_note_path(config.table);
+    }
+    return kv_rowscale_scoped_skip_note_path(kv_rowscale_skip_note_path(config.table),
+                                             config.fingerprint);
+}
+
+// "<fingerprint> <reason>", one line.  The note is only honoured while the fingerprint still
+// matches, so any change to the KV configuration re-arms the loop without anyone deleting a
+// file.  It returns WHICH candidate decided, because the loop NAMES that path in its report and,
+// when the note is contradicted, moves THAT file aside.
+[[nodiscard]] inline KvRowScaleSkipNoteLookup kv_rowscale_lookup_skip_note(
+    const KvRowScalePersistConfig& config) {
+    KvRowScaleSkipNoteLookup out;
+    std::filesystem::path candidates[2];
+    const int count = kv_rowscale_skip_note_candidates(config, candidates);
+    for (int i = 0; i < count; ++i) {
+        std::string text;
+        if (!kv_rowscale_read_file(candidates[i], text)) { continue; }
+        if (text.size() < 12) { continue; }
+        std::uint64_t stored = 0;
+        try {
+            stored = std::stoull(text.substr(0, 12), nullptr, 16);
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (stored != config.fingerprint) { continue; }
+        out.applies = true;
+        out.path    = candidates[i];
+        out.reason  = text.size() > 13 ? text.substr(13) : std::string("no reason recorded");
+        while (!out.reason.empty() &&
+               (out.reason.back() == '\n' || out.reason.back() == '\r')) {
+            out.reason.pop_back();
+        }
+        return out;
+    }
+    return out;
+}
+
+// The two-argument reading of the same question, kept so that a caller asking only "does a note
+// apply?" is answered by the ONE implementation above rather than by a second copy of the
+// priority order.
 [[nodiscard]] inline bool kv_rowscale_skip_note_applies(const KvRowScalePersistConfig& config,
                                                        std::string& reason) {
-    std::string text;
-    if (!kv_rowscale_read_file(kv_rowscale_skip_note_path(config.table), text)) { return false; }
-    if (text.size() < 12) { return false; }
-    std::uint64_t stored = 0;
-    try {
-        stored = std::stoull(text.substr(0, 12), nullptr, 16);
-    } catch (const std::exception&) {
-        return false;
-    }
-    if (stored != config.fingerprint) { return false; }
-    reason = text.size() > 13 ? text.substr(13) : std::string("no reason recorded");
-    while (!reason.empty() && (reason.back() == '\n' || reason.back() == '\r')) { reason.pop_back(); }
+    const KvRowScaleSkipNoteLookup note = kv_rowscale_lookup_skip_note(config);
+    if (!note.applies) { return false; }
+    reason = note.reason;
     return true;
 }
 
@@ -565,41 +826,74 @@ namespace detail {
     } else {
         std::string reason;
         const std::int64_t artifact_mtime = detail::kv_rowscale_mtime_unix(config.artifact);
-        const std::int64_t table_mtime    = detail::kv_rowscale_mtime_unix(config.table);
-        std::string blob;
-        std::string err;
+        // Read priority 1 -> 2 -> 3, stated once in detail::kv_rowscale_lookup_table.
+        // With --recalibrate the table is not read at all, exactly as before.
+        const detail::KvRowScaleTableLookup lookup =
+            config.recalibrate ? detail::KvRowScaleTableLookup{}
+                               : detail::kv_rowscale_lookup_table(config);
+        // The note's own read priority (detail::kv_rowscale_lookup_skip_note), read ONCE here so the
+        // branch below and the report it writes name the SAME file.
+        detail::KvRowScaleSkipNoteLookup note_lookup;
+        if (!config.recalibrate) { note_lookup = detail::kv_rowscale_lookup_skip_note(config); }
         if (config.recalibrate) {
             plan   = KvRowScalePlan::Capture;
             reason = "--recalibrate: capturing again and overwriting the table";
-        } else if (detail::kv_rowscale_skip_note_applies(config, reason)) {
+        } else if (note_lookup.applies) {
+            reason = note_lookup.reason;
             plan = KvRowScalePlan::NothingToCalibrate;
             report = "[kvrowscale] nothing to calibrate: " + reason +
-                     " (note " + kv_rowscale_skip_note_path(config.table).string() +
+                     " (note " + note_lookup.path.string() +
                      "); using the baked table";
-        } else if (!detail::kv_rowscale_read_file(config.table, blob)) {
+        } else if (lookup.path.empty()) {
+            // Arm 3 of the priority, and the one whose text is deliberately unchanged:
+            // "no table anywhere" has to read the same as it read before this line
+            // existed, or a log diff would suggest a behaviour change there is none of.
             plan   = KvRowScalePlan::Capture;
             reason = "no persisted table at " + config.table.string();
-        } else if (!detail::kv_rowscale_table_usable(blob, config, err)) {
+        } else if (!lookup.usable) {
             plan   = KvRowScalePlan::Capture;
-            reason = "persisted table not applicable (" + err + ")";
-        } else if (artifact_mtime > table_mtime) {
+            reason = "persisted table not applicable (" + lookup.error + ")";
+        } else if (artifact_mtime > lookup.mtime) {
             plan   = KvRowScalePlan::Capture;
-            reason = "table baked " + detail::kv_rowscale_time_text(table_mtime) +
+            reason = "table baked " + detail::kv_rowscale_time_text(lookup.mtime) +
                      " is older than the artifact (" + detail::kv_rowscale_time_text(artifact_mtime) +
                      ")";
         } else {
             plan = KvRowScalePlan::UsePersisted;
-            report = "[kvrowscale] persisted table " + config.table.string() + " accepted: baked " +
-                     detail::kv_rowscale_time_text(table_mtime) + ", fingerprint " +
-                     detail::kv_rowscale_hex48(config.fingerprint) + "; capture skipped";
+            // THE NAMED READING (R25): path, fingerprint and crc on ONE line, for the
+            // file that was actually read -- which, once two names exist, is no longer
+            // always the historical one, and the two readings must not be confusable.
+            char reading[384];
+            std::snprintf(reading, sizeof(reading),
+                          "[kvrowscale] persisted table %s accepted: baked %s, fingerprint %s, "
+                          "crc=%08x%s; capture skipped",
+                          lookup.path.string().c_str(),
+                          detail::kv_rowscale_time_text(lookup.mtime).c_str(),
+                          detail::kv_rowscale_hex48(config.fingerprint).c_str(),
+                          detail::kv_rowscale_blob_crc(lookup.blob),
+                          lookup.scoped
+                              ? " [configuration-scoped name]"
+                              : " [legacy shared name, tag still names this configuration]");
+            report = reading;
         }
         if (plan == KvRowScalePlan::Capture) {
+            // NAME THE TARGET, not the historical name: which file this run is about to
+            // replace is the whole subject of the change.
+            const std::filesystem::path target =
+                config.scoped_table.empty() ? config.table : config.scoped_table;
             report = "[kvrowscale] one-shot calibration: " + reason + "; this run captures into " +
-                     config.records.string() + " and writes " + config.table.string() +
+                     config.records.string() + " and writes " + target.string() +
                      (config.graphs_enabled
                           ? " (CUDA graphs must be off for this run: the capture synchronizes the "
                             "producing stream)"
                           : "");
+        }
+        if (config.scope_opted_out) {
+            report += (report.empty() ? std::string() : std::string("\n")) +
+                      "[kvrowscale] explicit input DISABLED (NINFER_KV_ROWSCALE_SCOPE=off): the "
+                      "shared name " + config.table.string() + " is both the read source and the "
+                      "write target for this run, so a capture here overwrites whichever "
+                      "configuration baked that file last";
         }
     }
     config.plan = plan;
@@ -632,7 +926,13 @@ namespace detail {
     // are read here for the same reason the geometry is: the commit point must re-decide
     // EVERYTHING the pre-flight decided, or the pre-flight's decision is not a gate.
     const std::int64_t artifact_mtime = detail::kv_rowscale_mtime_unix(config.artifact);
-    const std::int64_t table_mtime    = detail::kv_rowscale_mtime_unix(config.table);
+    // THE SAME READ PRIORITY THE PRE-FLIGHT USED (detail::kv_rowscale_lookup_table).
+    // With two candidate names, re-deriving the order here instead of calling the one
+    // statement of it is exactly how the two halves would come to disagree about which
+    // file the run was calibrated against.
+    const detail::KvRowScaleTableLookup lookup =
+        config.recalibrate ? detail::KvRowScaleTableLookup{}
+                           : detail::kv_rowscale_lookup_table(config);
 
     // THE .skip NOTE IS PART OF THE DECISION, HERE TOO.  begin() honoured it and this
     // half did not, so the note's stated purpose -- "keep the loop from arming a capture
@@ -641,8 +941,9 @@ namespace detail {
     // capture.  Read it first: when it AGREES with the live stack its own reason is what
     // the operator should see; when the live stack contradicts it, the contradiction is
     // NAMED rather than silently resolved in either direction.
-    std::string note_reason;
-    const bool note_applies = detail::kv_rowscale_skip_note_applies(config, note_reason);
+    const detail::KvRowScaleSkipNoteLookup note = detail::kv_rowscale_lookup_skip_note(config);
+    std::string note_reason = note.reason;
+    const bool note_applies = note.applies;
 
     // The KV tier in front of us has no rotated / quantized domain: nothing to
     // measure, and the note keeps the loop from arming a capture on every run.
@@ -653,7 +954,8 @@ namespace detail {
                 " no full-attention layer resolves to the NVFP4 tier that reads the row scale"
                 " (resolved per-layer KV store: " + std::string(store_spec) + ")\n";
             std::string err;
-            (void)detail::kv_rowscale_write_file_atomic(kv_rowscale_skip_note_path(config.table), note, err);
+            (void)detail::kv_rowscale_write_file_atomic(
+                detail::kv_rowscale_skip_note_write_path(config), note, err);
         }
         out.plan   = KvRowScalePlan::NothingToCalibrate;
         out.report = "[kvrowscale] nothing to calibrate: no full-attention layer of this stack "
@@ -665,7 +967,7 @@ namespace detail {
             out.report += "\n[kvrowscale] the .skip note recorded by an earlier run of this "
                           "configuration agrees: " +
                           note_reason + " (note " +
-                          kv_rowscale_skip_note_path(config.table).string() + ")";
+                          note.path.string() + ")";
         }
         config.plan = out.plan;
         return out;
@@ -680,22 +982,32 @@ namespace detail {
         // drifts, and silently honouring the note would leave a calibratable
         // configuration permanently uncalibrated.
         std::error_code ec;
-        std::filesystem::rename(kv_rowscale_skip_note_path(config.table),
-                                kv_rowscale_skip_note_stale_path(config.table), ec);
+        // THE FILE THAT WAS READ is the file that moves: with two candidate names, renaming the
+        // historical spelling unconditionally would leave the contradicted scoped note in place and
+        // move a file that may not exist.
+        const std::filesystem::path note_stale = kv_rowscale_skip_note_stale_path_for(note.path);
+        std::filesystem::rename(note.path, note_stale, ec);
         out.report = "[kvrowscale] the .skip note for this KV configuration says '" + note_reason +
                      "' but this stack DOES resolve a live NVFP4 domain (resolved per-layer KV "
                      "store: " + std::string(store_spec) + "): the note is contradicted" +
                      (ec ? " (and could not be moved aside: " + ec.message() + ")" :
                            " and was moved aside to " +
-                               kv_rowscale_skip_note_stale_path(config.table).string()) +
+                               note_stale.string()) +
                      "; continuing with the capture decision";
     }
 
-    std::string blob;
-    std::string err;
+    std::string blob = lookup.blob;
+    std::string err  = lookup.error;
     bool usable = false;
-    if (!config.recalibrate && detail::kv_rowscale_read_file(config.table, blob) &&
-        detail::kv_rowscale_table_usable(blob, config, err)) {
+    // ⚠ THE CONJUNCT THAT WAS ALMOST LOST. The pre-image's outer test was
+    // `read_file(table, blob) && table_usable(blob, config, err)`, and BOTH halves of it
+    // matter: the geometry block below must run only for a table that PASSED the
+    // applicability gate. `lookup.path` is set even for a candidate that FAILED it (the
+    // classification further down reads the blob), so testing the path instead made a
+    // fingerprint-mismatched table -- another configuration's calibration -- pass the
+    // geometry checks and be applied. The probe caught it; the condition is
+    // `lookup.usable`, which is the pre-image's conjunct spelled once.
+    if (lookup.usable) {
         // Geometry, exactly as the loader will check it: a table baked for
         // another model must never be applied (the loader would throw, and the
         // loop's job is to recapture instead of failing the run).
@@ -705,12 +1017,12 @@ namespace detail {
             !ninfer::ops::kv_rowscale_sidecar_check(sidecar, layers, kv_heads, head_dim,
                                                    config.model_hash, parse_err)) {
             err = parse_err;
-        } else if (artifact_mtime > table_mtime) {
+        } else if (artifact_mtime > lookup.mtime) {
             // THE SAME FLOOR THE PRE-FLIGHT APPLIES, APPLIED HERE TOO.  Not usable does
             // NOT mean "stale" (see the classification below: a configuration-fingerprint
             // mismatch is the valid state of a DIFFERENT configuration and is left in
             // place), so the reason is spelled out where the classification reads it.
-            err = "stale: the table was baked " + detail::kv_rowscale_time_text(table_mtime) +
+            err = "stale: the table was baked " + detail::kv_rowscale_time_text(lookup.mtime) +
                   " and the artifact was written " +
                   detail::kv_rowscale_time_text(artifact_mtime) +
                   ", so the table describes an artifact that is no longer the one on disk";
@@ -720,12 +1032,23 @@ namespace detail {
     }
     if (usable) {
         out.plan       = KvRowScalePlan::UsePersisted;
-        out.apply_spec = config.table.string();
-        out.report     = "[kvrowscale] using persisted table " + config.table.string() + " (baked " +
-                         detail::kv_rowscale_time_text(detail::kv_rowscale_mtime_unix(config.table)) +
-                         ", fingerprint " + detail::kv_rowscale_hex48(config.fingerprint) +
-                         ", geometry " + std::to_string(layers) + "x" + std::to_string(kv_heads) +
-                         "x" + std::to_string(head_dim) + "): capture skipped";
+        // APPLY WHAT WAS READ, not what the historical name would have been.
+        out.apply_spec = lookup.path.string();
+        // THE NAMED READING (R25), carrying the same three facts the pre-flight printed:
+        // the path actually read, the fingerprint the tag agreed on, the crc recomputed
+        // from the payload -- plus the geometry the loader is about to check.
+        char reading[384];
+        std::snprintf(reading, sizeof(reading),
+                      "[kvrowscale] using persisted table %s (baked %s, fingerprint %s, crc=%08x, "
+                      "geometry %ux%ux%u)%s: capture skipped",
+                      lookup.path.string().c_str(),
+                      detail::kv_rowscale_time_text(lookup.mtime).c_str(),
+                      detail::kv_rowscale_hex48(config.fingerprint).c_str(),
+                      detail::kv_rowscale_blob_crc(lookup.blob), layers, kv_heads, head_dim,
+                      lookup.scoped
+                          ? " [configuration-scoped name]"
+                          : " [legacy shared name, tag still names this configuration]");
+        out.report = reading;
         config.plan = out.plan;
         return out;
     }
@@ -755,16 +1078,29 @@ namespace detail {
                          kv_rowscale_tag_fingerprint(sidecar.tag, stored) &&
                          stored != config.fingerprint;
     }
+    // WHICH FILE MAY BE MOVED ASIDE. The rename heals a genuinely stale table, but it is a
+    // WRITE to whatever name it names. In scoped mode the shared legacy name is not this
+    // run's to move: it may be the calibration another configuration is still using, and
+    // it is not a name this run ever writes. A shared-name candidate is therefore LEFT IN
+    // PLACE and the choice is NAMED rather than made silently.
+    const std::filesystem::path aside_from =
+        lookup.path.empty() ? config.table : lookup.path;
+    const bool may_move_aside = config.scoped_table.empty() || lookup.scoped;
     if (!config.recalibrate && foreign_config) {
-        out.report = "[kvrowscale] persisted table " + config.table.string() +
+        out.report = "[kvrowscale] persisted table " + aside_from.string() +
                      " was baked for another KV configuration and was left in place, not moved "
                      "aside (" + err + ")";
-    } else if (!config.recalibrate && !blob.empty()) {
+    } else if (!config.recalibrate && !blob.empty() && may_move_aside) {
         std::error_code ec;
-        std::filesystem::rename(config.table, kv_rowscale_rejected_path(config.table), ec);
-        out.report = "[kvrowscale] persisted table " + config.table.string() +
+        std::filesystem::rename(aside_from, kv_rowscale_rejected_path(aside_from), ec);
+        out.report = "[kvrowscale] persisted table " + aside_from.string() +
                      " is not applicable (" + err + "); moved aside to " +
-                     kv_rowscale_rejected_path(config.table).string();
+                     kv_rowscale_rejected_path(aside_from).string();
+    } else if (!config.recalibrate && !blob.empty()) {
+        out.report = "[kvrowscale] persisted table " + aside_from.string() +
+                     " is not applicable (" + err + ") and was LEFT IN PLACE: it is the shared "
+                     "legacy name, which this run never writes (this run's own name is " +
+                     config.scoped_table.string() + ")";
     }
 
     if (config.graphs_enabled && !config.recalibrate) {
@@ -878,8 +1214,14 @@ inline void kv_rowscale_persist_finish() {
                                          config.model_hash, tag, identity, blob, err)) {
                 report = "[kvrowscale] no table written: " + err;
             } else {
+                // THE WRITE TARGET (this line's change). In scoped mode the table -- and
+                // its .words.bin sibling -- go to this configuration's own name, so the
+                // shared name another configuration is calibrated against is never the
+                // file this run replaces.
+                const std::filesystem::path write_path =
+                    config.scoped_table.empty() ? config.table : config.scoped_table;
                 const std::filesystem::path words_path =
-                    std::filesystem::path(config.table.string() + ".words.bin");
+                    std::filesystem::path(write_path.string() + ".words.bin");
                 std::string words_blob;
                 words_blob.resize(words.size() * 2);
                 for (std::size_t i = 0; i < words.size(); ++i) {
@@ -887,21 +1229,28 @@ inline void kv_rowscale_persist_finish() {
                     words_blob[2 * i + 1] = static_cast<char>((words[i] >> 8) & 0xFFu);
                 }
                 std::string write_err;
-                if (!detail::kv_rowscale_write_file_atomic(config.table, blob, write_err)) {
+                if (!detail::kv_rowscale_write_file_atomic(write_path, blob, write_err)) {
                     report = "[kvrowscale] no table written: " + write_err;
                 } else {
                     (void)detail::kv_rowscale_write_file_atomic(words_path, words_blob, write_err);
                     char buffer[512];
+                    // The write line carries the SAME three facts every reading carries
+                    // (path, fingerprint, crc) so a bake can be matched to the file it
+                    // produced without a second command, and it names which of the two
+                    // names it just wrote.
                     std::snprintf(
                         buffer, sizeof(buffer),
                         "[kvrowscale] wrote %s: geometry %ux%ux%u words=%zu identity=%d "
-                        "crc=%08x tag=%s (stamped by the run that produced the frames)",
-                        config.table.string().c_str(), config.layers, config.kv_heads,
+                        "crc=%08x tag=%s fingerprint=%s (stamped by the run that produced the "
+                        "frames)%s",
+                        write_path.string().c_str(), config.layers, config.kv_heads,
                         config.head_dim, words.size(), identity ? 1 : 0,
                         ninfer::ops::detail::crc32_reflected(
                             reinterpret_cast<const unsigned char*>(blob.data() + 64),
                             blob.size() - 64),
-                        tag.c_str());
+                        tag.c_str(), detail::kv_rowscale_hex48(config.fingerprint).c_str(),
+                        config.scoped_table.empty() ? " [legacy shared name]"
+                                                   : " [configuration-scoped name]");
                     report = buffer;
                     char detail_buffer[512];
                     std::snprintf(detail_buffer, sizeof(detail_buffer),

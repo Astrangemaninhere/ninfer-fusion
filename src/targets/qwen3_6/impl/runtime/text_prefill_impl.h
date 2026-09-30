@@ -70,6 +70,11 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent,
                          std::uint32_t mtp_tree_paths, std::uint32_t mtp_tree_depth) {
     card.set_sampling(sampling);
+    // --stage-layers: the SAME resolution the ordinary decode path does (decode_impl.h), so a
+    // prefill walks the stage's layers and not the whole stack. Without this the prefill would
+    // run every layer and the decode only some, which is a pipeline that is not a pipeline.
+    card.set_stage_layers_spec(execution.stage_layers_spec, execution.stage_handoff_dir,
+                               execution.stage_handoff_cut);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);

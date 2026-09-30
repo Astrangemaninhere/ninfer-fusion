@@ -131,6 +131,46 @@ def select(members: Mapping[str, TensorMeta], declared_algo: str | None = None) 
     scale2 = members.get("weight_scale_2")
     algo = (declared_algo or "").upper()
 
+    # --- packed sub-8-bit integer codes (the ``pack-quantized`` spelling) ----
+    # The code plane is named ``weight_packed`` and its own dtype is a 32-bit
+    # integer word, which is in DIRECT_DTYPES; a group like that must not be
+    # carried verbatim just because its words happen to be a directly
+    # representable dtype.  No layout in tools/artifact/layouts.py holds packed
+    # integer codes, so the missing mechanism is named here.  The code plane is
+    # read by tools/convert/dequant/int3.py, which takes the packing unit from
+    # the checkpoint's own declaration rather than from a key or a directory
+    # name.
+    packed = members.get("weight_packed")
+    if packed is not None and (
+        members.get("weight_scale") is not None
+        or members.get("weight_shape") is not None
+    ):
+        packed_dtype = _canonical_dtype(packed.dtype)
+        companions = sorted(
+            name
+            for name in ("weight_scale", "weight_shape", "weight_zero_point",
+                         "weight_g_idx", "input_global_scale")
+            if members.get(name) is not None
+        )
+        detail = (
+            f"packed code plane {packed_dtype}{tuple(packed.shape)} with "
+            f"companions {companions}"
+        )
+        shape_meta = members.get("weight_shape")
+        if shape_meta is not None and len(shape_meta.shape) == 1:
+            detail += f"; declared logical shape {tuple(shape_meta.shape)}"
+        return Refusal(
+            "F-PACKED-INT",
+            detail,
+            "a layout for packed sub-8-bit integer codes, plus the packing "
+            "unit: layouts.py holds only whole-word layouts "
+            "(contiguous-le-v1 / blockscale-k16-m128x4-v1 / row-scale-v1) and "
+            "no packed-integer geometry, and the unit itself must come from "
+            "the checkpoint's declaration (tools/convert/dequant/int3.py "
+            "reads it; the front door would have to pass it here)",
+        )
+
+
     # --- dispatch on the CODE tensor's own dtype, not on the presence of a
     #     scale companion: a plain BF16/FP32 tensor has nothing to decode, and
     #     deciding that first is what keeps ordinary modules (embeddings, norms,

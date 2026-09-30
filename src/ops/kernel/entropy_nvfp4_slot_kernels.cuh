@@ -199,7 +199,7 @@ __global__ void entropy_nvfp4_slot_decode_half_kernel(const std::uint8_t* __rest
     const std::uint8_t* slot   = slots + static_cast<std::int64_t>(slot_id) * slot_bytes;
     std::uint8_t* stream_dst =
         dst + static_cast<std::int64_t>(item) * half_bytes + stream * kEntropyNvfp4SlotStreamBytes;
-    if (!entropy_nvfp4_slot_decode_stream(slot, half, stream, stream_dst)) {
+    if (!entropy_nvfp4_slot_decode_stream(slot, slot_bytes, half, stream, stream_dst)) {
         for (int i = 0; i < kEntropyNvfp4SlotStreamBytes; ++i) { stream_dst[i] = 0; }
     }
 }
@@ -221,7 +221,7 @@ __global__ void entropy_nvfp4_slot_decode_half_grid_kernel(const std::uint8_t* _
     std::uint8_t* stream_dst =
         dst + static_cast<std::int64_t>(head * 2 + half) * half_bytes +
         stream * kEntropyNvfp4SlotStreamBytes;
-    if (!entropy_nvfp4_slot_decode_stream(slot, half, stream, stream_dst)) {
+    if (!entropy_nvfp4_slot_decode_stream(slot, slot_bytes, half, stream, stream_dst)) {
         for (int i = 0; i < kEntropyNvfp4SlotStreamBytes; ++i) { stream_dst[i] = 0; }
     }
 }
@@ -230,9 +230,20 @@ __global__ void entropy_nvfp4_slot_decode_half_grid_kernel(const std::uint8_t* _
 // slot into the matching paged scale plane. Grid = (kv_heads, page_count);
 // each 64-thread block copies 16-byte vectors. slots uses the host-cold
 // layout: page stride = slot_page_stride, head stride = slot_bytes.
+//
+// `physical_page` is the page the SCATTER DESTINATION lives in, and it arrives BY VALUE. It used
+// to be `const std::int32_t* page_ids`, dereferenced below as `page_ids[page]`, while every
+// caller in the tree handed this kernel a HOST stack array that no step ever copied to the
+// device -- so that 4-byte read read a host address. compute-sanitizer named exactly that on the
+// byte leg (`Invalid __global__ read of size 4 bytes ... +0x110 in
+// entropy_nvfp4_slot_kernels.cuh:246`, 256/256 threads; dl/coldcrash/REPORT.md). `page_count` is
+// 1 at every call site, so one scalar carries the whole logical->physical map, and the launcher
+// now REFUSES `page_count != 1` by name rather than reinterpreting it. The logical page is still
+// `blockIdx.y`: that is the SOURCE index in the host-cold slot layout, and it is a different
+// number from the physical page the destination lives in.
 __global__ void entropy_nvfp4_slot_scales_scatter_kernel(
     const std::uint8_t* __restrict__ slots, int slot_bytes, int slot_page_stride,
-    const std::int32_t* __restrict__ page_ids, int scale_page_stride,
+    std::int32_t physical_page, int scale_page_stride,
     std::uint8_t* __restrict__ scales) {
     constexpr int ScaleBytes = 1024;
     const int head            = static_cast<int>(blockIdx.x);
@@ -243,7 +254,7 @@ __global__ void entropy_nvfp4_slot_scales_scatter_kernel(
         slots + static_cast<std::int64_t>(page) * slot_page_stride +
         static_cast<std::int64_t>(head) * slot_bytes + (slot_bytes - ScaleBytes) + vec * 16;
     std::uint8_t* dst =
-        scales + static_cast<std::int64_t>(page_ids[page]) * scale_page_stride +
+        scales + static_cast<std::int64_t>(physical_page) * scale_page_stride +
         static_cast<std::int64_t>(head) * ScaleBytes + vec * 16;
     const uint4 value = load_vec<uint4>(src);
     store_vec(dst, value);

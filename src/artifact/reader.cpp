@@ -105,6 +105,13 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "Q4G64_F16S") { return NumericFormat::Q4G64_F16S; }
     if (name == "Q5G64_F16S") { return NumericFormat::Q5G64_F16S; }
     if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
+    // The wire format carries formats as NAMES, so an ordinal is never persisted
+    // (artifact/reader.h's own note) and these three names are a compatible addition:
+    // an artifact written by the new tree reads on the old one only if the old one does
+    // not meet these names, which is the ordinary forward-compatibility contract.
+    if (name == "Q1G64_F16S") { return NumericFormat::Q1G64_F16S; }
+    if (name == "Q2G64_F16S") { return NumericFormat::Q2G64_F16S; }
+    if (name == "Q3G64_F16S") { return NumericFormat::Q3G64_F16S; }
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }

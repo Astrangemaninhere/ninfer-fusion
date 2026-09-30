@@ -4,6 +4,11 @@
 #include "ops/kernel/gqa_isoquant_rot_gate.h"
 #include "ops/kernel/gqa_isoquant_row_scale_loader.h"
 #include "product/kv_component_switch.h"
+// [F1255 kvaxisA] THE ONE READER of `NINFER_KV_AXIS3_NARROW_PAGES`, and the third axis' own pricing.
+// The reader lives in the plan header (`kv_axis3_narrow_pages_from_env`) because the PLAN and the
+// POOL must price the SAME two rungs of the SAME table -- two readers of one env var is the
+// two-readings-of-one-knob defect `program_impl.h`'s GAP-BUDGET-READING note forbids.
+#include "product/kv_block_descent.h"
 // For product::e8_kv_code_bytes_per_8: the code plane's own row arithmetic, so the two
 // narrower e8 arms below cannot be a lookalike of the derivation the ladder row and the
 // cold table are priced from (product/kv_e8_width.h).
@@ -310,7 +315,16 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::span<const bool> layer_residual,
                               std::span<const std::uint32_t> layer_windows,
                               std::int32_t table_rows, std::uint32_t physical_page_groups,
-                              const KvLayerDropSpec& layer_drop) {
+                              const KvLayerDropSpec& layer_drop,
+                              // [F1255 kvaxisA] THE THIRD AXIS' DECLARED CAPACITY FOR *THIS* CACHE.
+                              // It is a PARAMETER rather than an env read inside this function for the
+                              // reason `layer_dtypes_set` above is: a caller that does not want the
+                              // axis must be able to say so, and the MTP cache's narrow class would
+                              // add a second object's saving to a plan whose `layers` is the TEXT
+                              // stack's -- so the two currencies would stop being one number. The
+                              // ONE reader of the knob is `product::kv_axis3_narrow_pages_from_env()`,
+                              // called by `plan_decoder_state` below: text gets it, MTP gets 0.
+                              std::uint32_t axis3_narrow_pages) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -385,6 +399,28 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     std::array<std::uint32_t, 64> window_flags{};
     std::array<std::uint32_t, 64> plane_base{};
     std::array<bool, 64> dropped_flags{};
+    // [F1255 kvaxisA] THE THIRD AXIS' OWN TABLES, filled below and carried onto the layout.
+    std::array<std::uint32_t, 64> narrow_base{};
+    std::array<std::uint32_t, 64> narrow_pages_of{};
+    // THE CAPACITY IS THE CALLER'S, handed in through the argument list (see the note on the
+    // parameter). 0 (unset / empty / unparseable) IS THE PRE-IMAGE POOL: every plane is allocated at
+    // `physical_page_groups` and this function emits byte-for-byte the geometry it emitted before
+    // the third axis existed.
+    if (axis3_narrow_pages >= physical_page_groups) {
+        // A narrow class as large as the pool leaves NO resident page at all, so nothing could ever
+        // be written hot. Refused by name rather than silently clamped: the endpoint is the caller's
+        // to spell, not this function's to guess.
+        throw std::invalid_argument(
+            "NINFER_KV_AXIS3_NARROW_PAGES must leave at least one resident page: asked for " +
+            std::to_string(axis3_narrow_pages) + " narrow pages of a " +
+            std::to_string(physical_page_groups) + "-page pool");
+    }
+    // The pool's OWN page space shrinks by the narrow class, because the narrow pages are addressed
+    // through the block table's class sentinel and never through a DeviceKVPageHandle. A resident
+    // handle's index therefore stays inside every resident plane's extent -- which is the invariant
+    // `DeviceKVPagePool` validates at construction.
+    const std::uint32_t resident_page_groups =
+        axis3_narrow_pages == 0 ? physical_page_groups : physical_page_groups - axis3_narrow_pages;
     std::uint32_t dropped_count = 0;
     std::uint32_t plane_cursor = 0;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
@@ -408,10 +444,53 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
             geometry.planes.push_back({DType::BF16, head_dim, kv_heads, 256});
             geometry.planes.push_back({DType::BF16, head_dim, kv_heads, 256});
         } else if (selected == DType::I8) {
-            geometry.planes.push_back({DType::I8, head_dim, kv_heads, 256});
-            geometry.planes.push_back({DType::I8, head_dim, kv_heads, 256});
-            geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
-            geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
+            if (axis3_narrow_pages == 0) {
+                geometry.planes.push_back({DType::I8, head_dim, kv_heads, 256});
+                geometry.planes.push_back({DType::I8, head_dim, kv_heads, 256});
+                geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
+                geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
+            } else {
+                // [F1255 kvaxisA] ⭐⭐ THE THIRD AXIS, EMITTED. This layer now carries TWO plane
+                // sets: the resident one, sized for the pages that stay hot, and the NARROW one,
+                // sized for the pages its cells may descend into. The narrow set is the NVFP4 plane
+                // pair -- codes [head_dim/2, 64, kv_heads, N] U8 and scales [head_dim/16, 64,
+                // kv_heads, N] E4M3FN -- which is the rung `kv_cell_modes.h` already prices at
+                // 9216 B/head-page against int8's 16896, and whose reader (the cold branch of the
+                // i8 kernels) and writer (the requant op) the tree already owns.
+                //
+                // WHY THE WIDE SET SHRINKS AND NOT MERELY COEXISTS: a plane is ONE storage region
+                // (core/paged_kv_cache.cpp, plan_device_kv_page_pool), so a narrow class only
+                // REDUCES `kv cache payload` if the wide set gives the pages back. The pool's page
+                // SPACE is therefore `physical_page_groups - N`, and the logical capacity
+                // (`logical_page_capacity`, from --max-context) is untouched: a page the sequence
+                // needs beyond the resident space is a cell whose class is the narrow one.
+                narrow_pages_of[layer] = axis3_narrow_pages;
+                narrow_base[layer]     = plane_cursor + 4U;
+                // The narrow scale plane's group is the NVFP4 tier's own (16), read from the same
+                // resolver the nvfp4 arm below uses -- not a literal, so the two plane sets cannot
+                // disagree about the rung they are pricing.
+                const std::int32_t narrow_group = kv_layer_quant_group(DType::NVFP4);
+                geometry.planes.push_back(
+                    {DType::I8, head_dim, kv_heads, 256, resident_page_groups});
+                geometry.planes.push_back(
+                    {DType::I8, head_dim, kv_heads, 256, resident_page_groups});
+                geometry.planes.push_back(
+                    {DType::FP16, head_dim / group, kv_heads, 256, resident_page_groups});
+                geometry.planes.push_back(
+                    {DType::FP16, head_dim / group, kv_heads, 256, resident_page_groups});
+                geometry.planes.push_back(
+                    {DType::U8, head_dim / 2, kv_heads, 256, axis3_narrow_pages});
+                geometry.planes.push_back(
+                    {DType::U8, head_dim / 2, kv_heads, 256, axis3_narrow_pages});
+                geometry.planes.push_back(
+                    {DType::FP8_E4M3FN, head_dim / narrow_group, kv_heads, 256,
+                     axis3_narrow_pages});
+                geometry.planes.push_back(
+                    {DType::FP8_E4M3FN, head_dim / narrow_group, kv_heads, 256,
+                     axis3_narrow_pages});
+                plane_cursor += 8U;
+                continue;
+            }
         } else if (selected == DType::E8Kv) {
             // Rk4v4 tier: packed 4-bit E8-lattice K codes + i4 V codes (two per
             // byte) with per-64 FP16 scales (int8-kernel path).
@@ -480,7 +559,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
-            builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
+            builder, DeviceKVPagePoolSpec{.page_group_count = resident_page_groups,
                                           .geometry         = std::move(geometry)}),
         .execution_tables = plan_kv_execution_tables(
             builder,
@@ -497,6 +576,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .layer_plane_base = plane_base,
         .layer_dropped = dropped_flags,
         .layer_dropped_count = dropped_count,
+        // [F1255 kvaxisA] THE THIRD AXIS, CARRIED. Appended, so no pre-image field moves.
+        .layer_narrow_base = narrow_base,
+        .layer_narrow_pages = narrow_pages_of,
+        .narrow_pages_per_layer = axis3_narrow_pages,
     };
 }
 
@@ -1200,7 +1283,12 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 layer_dtypes, layer_dtypes_set, layer_residual, layer_windows,
                                 spec.kv_table_rows, spec.text_physical_page_groups,
-                                text_layer_drop);
+                                text_layer_drop,
+                                // ⭐ THE ONE READER OF `NINFER_KV_AXIS3_NARROW_PAGES`, and the TEXT
+                                // cache is the object it sizes. `descent_fill_axis3_face` prices the
+                                // same knob over the same 16 layers, so `kv cache payload` and
+                                // `axis3[realizable_saved_bytes=...]` are one number.
+                                product::kv_axis3_narrow_pages_from_env());
     layout.text_kv.kv_v_codec = spec.kv_v_codec;
     if (spec.enable_mtp) {
         // MTP layers carry no per-layer table, so an empty table AND an empty mask:
@@ -1208,7 +1296,14 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    {}, {}, {}, {}, spec.kv_table_rows,
-                                   spec.mtp_physical_page_groups, KvLayerDropSpec{});
+                                   spec.mtp_physical_page_groups, KvLayerDropSpec{},
+                                   // [F1255 kvaxisA] THE MTP CACHE KEEPS THE PRE-IMAGE POOL. The
+                                   // plan's `layers` is the TEXT stack's 16, so a narrow class here
+                                   // would add a second object's saving to a number denominated in
+                                   // the text layers -- the two currencies would stop being one
+                                   // number. It costs bytes the text axis does not claim, and that
+                                   // is the honest direction for the mismatch to run.
+                                   0U);
         // MTP layers inherit the resolved global dtype: plan_cache() is handed an empty
         // span and resolves every slot to the pool-wide dtype, so the table it returns is
         // authoritative for them too. (This used to read "...through
@@ -1263,7 +1358,11 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
       layer_sliding_windows_(layout.layer_sliding_windows),
       layer_plane_base_(layout.layer_plane_base),
       layer_dropped_(layout.layer_dropped), dropped_layers_(layout.layer_dropped_count),
-      kv_v_codec_(layout.kv_v_codec) {
+      kv_v_codec_(layout.kv_v_codec),
+      // [F1255 kvaxisA] the third axis, carried from the layout rather than re-read from the knob.
+      layer_narrow_base_(layout.layer_narrow_base),
+      layer_narrow_pages_(layout.layer_narrow_pages),
+      narrow_pages_per_layer_(layout.narrow_pages_per_layer) {
     cold_slot_used_.assign(max_cold_pages_, 0);
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
         if (layout.cold_slots[layer].region.bytes != 0) {
@@ -1347,6 +1446,13 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
     // every layer (decoder_state.cpp:363); the real bound is `layer < layers_`.
     const std::uint32_t window =
         layer < layers_ ? layer_sliding_windows_[layer] : 0U;
+    // [F1259 kvfill] THE NARROW SET, EXPOSED. `layer_narrow_base_` is the layout's own plane index
+    // (kvaxisA wrote it at plan time, decoder_state.cpp:468) and `layer_narrow_pages_` is the
+    // capacity the pool actually allocated, so a reader cannot drift from the storage. A layer
+    // without a narrow class yields EMPTY tensors, which is the pre-image view exactly.
+    const bool narrow = layer < layers_ && layer_narrow_pages_[layer] != 0 &&
+                        layer_dtype == DType::I8;
+    const std::size_t nbase = layer_narrow_base_[layer];
     return PagedKVLayerView{
         .k_pages       = pages_.plane(base),
         .v_pages       = pages_.plane(base + 1),
@@ -1372,6 +1478,12 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .v_dtype       = kv_layer_v_dtype(layer_dtypes_[layer], kv_v_codec_),
         .v_quant_group = kv_layer_v_quant_group(layer_dtypes_[layer]),
         .sliding_window_tokens = window,
+        .k_narrow_pages       = narrow ? pages_.plane(nbase) : Tensor(),
+        .v_narrow_pages       = narrow ? pages_.plane(nbase + 1) : Tensor(),
+        .k_narrow_scale_pages = narrow ? pages_.plane(nbase + 2) : Tensor(),
+        .v_narrow_scale_pages = narrow ? pages_.plane(nbase + 3) : Tensor(),
+        .narrow_page_capacity =
+            narrow ? static_cast<std::int32_t>(layer_narrow_pages_[layer]) : 0,
     };
 }
 
@@ -1410,6 +1522,10 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
     // every layer (decoder_state.cpp:363); the real bound is `layer < layers_`.
     const std::uint32_t window =
         layer < layers_ ? layer_sliding_windows_[layer] : 0U;
+    // [F1259 kvfill] see layer_view above: the narrow class' planes, exposed (empty when absent).
+    const bool narrow = layer < layers_ && layer_narrow_pages_[layer] != 0 &&
+                        layer_dtype == DType::I8;
+    const std::size_t nbase = layer_narrow_base_[layer];
     return PagedKVBatchLayerView{
         .k_pages       = pages_.plane(base),
         .v_pages       = pages_.plane(base + 1),
@@ -1435,6 +1551,12 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .v_dtype       = kv_layer_v_dtype(layer_dtypes_[layer], kv_v_codec_),
         .v_quant_group = kv_layer_v_quant_group(layer_dtypes_[layer]),
         .sliding_window_tokens = window,
+        .k_narrow_pages       = narrow ? pages_.plane(nbase) : Tensor(),
+        .v_narrow_pages       = narrow ? pages_.plane(nbase + 1) : Tensor(),
+        .k_narrow_scale_pages = narrow ? pages_.plane(nbase + 2) : Tensor(),
+        .v_narrow_scale_pages = narrow ? pages_.plane(nbase + 3) : Tensor(),
+        .narrow_page_capacity =
+            narrow ? static_cast<std::int32_t>(layer_narrow_pages_[layer]) : 0,
     };
 }
 

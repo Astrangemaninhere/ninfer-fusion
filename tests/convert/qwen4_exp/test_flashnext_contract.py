@@ -39,15 +39,18 @@ LIVE_INDEX = Path(os.environ.get(
     "Qwen3.8-Flash-Next-ABLITERATED-NVFP4/model.safetensors.index.json",
 ))
 
-# Measured on the real index (296,475 keys) on 2026-09-17. Pinned so that a
+# Measured on the real index (296,475 keys) on 2026-09-17, re-pinned 2026-09-22
+# (FN-SRC) for the idx_norm alias: matched +12, missing -12, unexpected -12.
+# Pinned so that a
 # contract edit which changes coverage shows up as a diff instead of drifting.
 LIVE_SOURCE_KEYS = 296_475
-LIVE_MATCHED = 74_174
-LIVE_MISSING = 346
+LIVE_MATCHED = 74_294
+LIVE_MISSING = 334
 LIVE_COMPANIONS = 221_184        # 512 experts x 48 layers x 3 tensors x 3 cohorts
 LIVE_QUANTISED = 73_728          # 512 experts x 48 layers x 3 tensors
-LIVE_UNEXPECTED = 753            # all named in the residue report
-LIVE_AMBIGUOUS = 36              # layer.N.gdn.dt_bias <- dt_bias AND A_log
+LIVE_UNEXPECTED = 633            # all named in the residue report
+                                 # (681 - 36 in_proj_b keys - 12 indexer k_layernorm keys)
+LIVE_AMBIGUOUS = 0               # a_log and dt_bias are separate entries
 
 _FAILURES: list[str] = []
 
@@ -116,7 +119,10 @@ def test_layer_isolation() -> None:
 def test_audit_terminates_and_is_complete_on_a_full_synthetic_model() -> None:
     print("test_audit_terminates_and_is_complete_on_a_full_synthetic_model")
     keys = _synthetic_full()
-    check(len(C.E) == 74_520, "contract is still 74,520 entries", str(len(C.E)))
+    check(len(C.E) == 74_628,
+          "contract is still 74,628 entries "
+          "(74,520 + 36 a_log + 36 in_proj_a + 36 in_proj_b)",
+          str(len(C.E)))
     rep = C.audit(keys)
     check(rep["missing_count"] == 0, "no engine left without a source",
           str(rep["missing_engines"][:3]))
@@ -178,17 +184,47 @@ def test_unbound_regions_are_named() -> None:
           "both regions reported with a count", str(rep["unbound_regions"]))
 
 
-def test_ambiguous_alias_is_reported() -> None:
-    print("test_ambiguous_alias_is_reported")
-    keys = _synthetic_full() + [
-        "model.layers.0.linear_attn.A_log",     # the dt_bias alias also matches this
-    ]
-    rep = C.audit(keys)
-    check(len(rep["ambiguous_aliases"]) >= 1, "the dt_bias/A_log alias is ambiguous",
+def test_a_log_and_dt_bias_are_separate_entries() -> None:
+    """A_log is its own operator, not a second alias of dt_bias.
+
+    This test USED to assert the fold as the expected state:
+        check("layer.0.gdn.dt_bias" in rep["ambiguous_aliases"][0], ...)
+    The fold is gone, so the same measurement now has to come out the other way; this is
+    the fixed-side reading of the identical check.
+    """
+    print("test_a_log_and_dt_bias_are_separate_entries")
+    rep = C.audit(_synthetic_full())
+    check(rep["ambiguous_aliases"] == [],
+          "no contract entry is satisfied by two source keys",
           str(rep["ambiguous_aliases"][:1]))
-    check(rep["complete"] is False, "ambiguity blocks 'complete'")
-    check("layer.0.gdn.dt_bias" in rep["ambiguous_aliases"][0],
-          "and the engine is named")
+    check("layer.0.gdn.a_log" not in rep["missing_engines"],
+          "the a_log engine has its own source")
+    check("layer.0.gdn.dt_bias" not in rep["missing_engines"],
+          "the dt_bias engine keeps its own source")
+    a_log = C._expected_source_keys(
+        next(e for e in C.E if e["engine"] == "layer.0.gdn.a_log"))
+    check(a_log[0] == "model.layers.0.linear_attn.A_log",
+          "the a_log entry binds the checkpoint's A_log FIRST", repr(a_log))
+    dt_bias = C._expected_source_keys(
+        next(e for e in C.E if e["engine"] == "layer.0.gdn.dt_bias"))
+    check("model.layers.0.linear_attn.A_log" not in dt_bias,
+          "while dt_bias no longer accepts A_log", repr(dt_bias))
+    in_proj_a = C._expected_source_keys(
+        next(e for e in C.E if e["engine"] == "layer.0.gdn.in_proj_a"))
+    check("model.layers.0.linear_attn.in_proj_a.weight" in in_proj_a,
+          "and in_proj_a has a contract home", repr(in_proj_a))
+    in_proj_b = C._expected_source_keys(
+        next(e for e in C.E if e["engine"] == "layer.0.gdn.in_proj_b"))
+    check("model.layers.0.linear_attn.in_proj_b.weight" in in_proj_b,
+          "and in_proj_b has a contract home", repr(in_proj_b))
+    check(all("A_log" not in k and "dt_bias" not in k for k in in_proj_b),
+          "in_proj_b is not folded onto any bias entry", repr(in_proj_b))
+    # The real checkpoint carries BOTH keys per layer; the live gate measures that.
+    rep = C.audit(_synthetic_full() + ["model.layers.0.linear_attn.A_log",
+                                       "model.layers.0.linear_attn.dt_bias"])
+    check(rep["ambiguous_aliases"] == [],
+          "both real keys present, still no ambiguity",
+          str(rep["ambiguous_aliases"][:1]))
 
 
 def test_unknown_prefix_is_still_rejected() -> None:

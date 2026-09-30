@@ -43,6 +43,19 @@ QuantGeometry quant_geometry(NumericFormat format) {
         return {64, 32, 16};
     case NumericFormat::W8G32_F16S:
         return {32, 32, 0};
+    case NumericFormat::Q1G64_F16S:
+        // 1 bit per element: 8 bytes of base plane per 64-element group, no high plane.
+        // {group_size, base_bytes_per_group, high_bytes_per_group} = {64, 8, 0} == 1.00 bit.
+        return {64, 8, 0};
+    case NumericFormat::Q2G64_F16S:
+        // 2 bits per element: {64, 16, 0} == 2.00 bit.  Same shape as Q4G64_F16S with the
+        // base plane halved, which is what makes this a case list edit and not a new layout.
+        return {64, 16, 0};
+    case NumericFormat::Q3G64_F16S:
+        // 3 bits per element, SPLIT across both planes: {64, 16, 8} == 2 + 1 bit.  The split
+        // is the K-quant shape (4-bit base + 1..2-bit high) taken one rung down, and it is
+        // why the struct's two-plane form is worth keeping rather than flattening to `bits`.
+        return {64, 16, 8};
     default:
         throw ArtifactError("row-split-k128-v1 requires a grouped quantized format");
     }
@@ -90,6 +103,13 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "FP8_E4M3FN_ROW_F32S";
     case NumericFormat::U4Z8G16_F16S:
         return "U4Z8G16_F16S";
+    case NumericFormat::Q1G64_F16S:
+        return "Q1G64_F16S";
+    case NumericFormat::Q2G64_F16S:
+        return "Q2G64_F16S";
+    case NumericFormat::Q3G64_F16S:
+        return "Q3G64_F16S";
+
     case NumericFormat::Count:
         // Not a format: the enum's own count (artifact/reader.h). Named so that this switch, which
         // has no `default:` on purpose, stays exhaustive under -Wswitch -- and so that a REAL

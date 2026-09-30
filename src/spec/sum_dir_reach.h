@@ -298,6 +298,25 @@ struct SumDirReachResult {
     std::uint32_t candidates  = 0; // |T|: matches at the strongest evidence level
     std::uint32_t alternatives = 0; // admissible pages NOT in the run: other pages the covering
                                     // family found, so no found page is silently dropped
+    // ---------------------------------------------------------------------------------------
+    // THE SAME FACT, BY NAME -- and this is the ADDITIVE SEAM, written where the fact is produced
+    // (section 7d below states why it may not be `appended_pages`).
+    //
+    // `alternatives` above is a COUNT, and a count cannot be handed to a candidate-set union.
+    // `spec/semchan_wire.h` said so itself: "It never adds `alternatives` to the set, because the
+    // result struct does not name those pages and inventing them would be this file deciding by
+    // position". These fields are that gap closed at its source -- the pages the count counts, by
+    // number, in first-found order, produced by the same loop that increments the count.
+    //
+    // BOUNDED, WITH THE BOUND NAMED: `fanout_cap` pages, the same bound the run itself is held to,
+    // so this container can never be the reason a pass holds more than one pass may hold.
+    //   * `alternatives` stays EXACT and unchanged -- the count is never truncated to make the
+    //     container fit, because a truncated count is a claim and this header does not make claims;
+    //   * the container is a bounded PREFIX and says so through `alternatives_over_bound`, so a
+    //     reader can never read "these pages" as "all the pages" when it is not.
+    std::vector<std::uint32_t> alternative_pages;
+    std::uint32_t alternatives_bound      = 0;     // the bound the prefix above was taken under
+    bool          alternatives_over_bound = false; // true <=> the prefix is NOT the whole set
     std::uint32_t pages       = 0;
     std::uint32_t first_page  = 0;
     std::uint32_t last_page   = 0;
@@ -578,6 +597,55 @@ sum_dir_reach_already_recalled_pages(const std::vector<std::uint32_t>& row_pages
     return already_recalled;
 }
 
+// ---------------------------------------------------------------------------
+// ===========================================================================================
+// 7d. THE ROUTE THIS HEADER REFUSES BY NAME -- AND IT IS THE ONE THAT LOOKS RIGHT
+// ===========================================================================================
+//
+// A candidate SOURCE that wants to reach the candidate set has two routes available to it, and one
+// of them is wrong in a way that is invisible from the caller's side:
+//
+//   `appended_pages`      -- section 7b's LOOP GUARD. It is an EXCLUSION set: a page handed to it
+//                            is SKIPPED by the selector's own `std::find` guard. So a candidate
+//                            source that rides it does not add recall, it DELETES the page it
+//                            names. MEASURED TWICE ON THIS TREE, independently:
+//                              * `dl/kvmemoracle` arm M2 (`logs/31_counts.txt`): the live channel's
+//                                pages fed to `appended_pages` turned the arbiter into
+//                                `status=refused-everything anchor=0` for 4 of 4 sources;
+//                              * `dl/kvwire` arm `naive-exclusion` (its own re-take, this leg).
+//   `alternative_pages`   -- this header's own field, above. ADDITIVE by construction: it is
+//                            produced by the same loop that counts `alternatives`, i.e. it is the
+//                            arbiter's own answer about pages it FOUND and could not carry.
+//
+// THE SINGLE CHOKE POINT, so the wrong route is a refusal a reader can see rather than a deletion
+// nobody sees. This is the ONLY function in this header that will turn "pages the family found"
+// into a loop-guard list, and there is no branch in it that returns a page. A caller that wants to
+// append its candidates has to call it and receives an EMPTY list plus the reason -- so the naive
+// wiring is a no-op with a log line, not a silent hole in the candidate set.
+[[nodiscard]] inline std::vector<std::uint32_t> sum_dir_reach_loop_guard_from_found_pages(
+    const SumDirReachResult& result, std::string* why = nullptr) {
+    static_cast<void>(result);
+    if (why != nullptr) {
+        *why =
+            "REFUSED: `appended_pages` is an EXCLUSION set -- the selector skips every hit whose "
+            "page is in it (section 7b, and the `std::find` guard in the selector's body). A page "
+            "handed to it is DELETED from the candidate set, not added to it, so a candidate "
+            "SOURCE that rides the loop guard removes the very recall it was wired to add. The "
+            "additive route is `SumDirReachResult::alternative_pages` plus the provider's own "
+            "`RecallRequest`, which this header cannot move because it is handed the result as "
+            "`const`. Measured: dl/kvmemoracle M2 refused-everything 4/4; dl/kvwire arm "
+            "`naive-exclusion`.";
+    }
+    return {};
+}
+
+// A NAME for the property, so a reader can find it without reading the selector body. It is not a
+// mechanism -- the mechanism is the guard itself and the arm that measures it -- and it is written
+// here rather than asserted in a `static_assert` precisely because a `static_assert` on a literal
+// `true` would look like a proof while proving nothing.
+inline constexpr const char* kSumDirReachAppendedPagesAreAnExclusionSet =
+    "appended_pages excludes (section 7b + the selector's std::find guard); alternative_pages adds";
+
 // THE SELECTOR. Signature shape is the sibling of `sum_dir_recall_span_for_term`, plus the three
 // inputs the old one had no way to express (`appended_pages`, the budget, and the family's k_min).
 // `scan` is an optional out-parameter so the arm can read the selector's own evidence.
@@ -818,10 +886,22 @@ sum_dir_reach_already_recalled_pages(const std::vector<std::uint32_t>& row_pages
     // auditable at the boundary between "in the span" and "found but not in the passage".
     {
         std::vector<std::uint32_t> seen;
+        result.alternatives_bound = fanout_cap;
         for (const SumDirReachEvidence& item : evidence) {
             if (std::find(seen.begin(), seen.end(), item.page) != seen.end()) { continue; }
             seen.push_back(item.page);
-            if (item.page < first_page || item.page > last_page) { ++result.alternatives; }
+            if (item.page < first_page || item.page > last_page) {
+                ++result.alternatives;
+                // THE NAME, RECORDED BESIDE THE COUNT, AT THE SAME SITE AND UNDER THE SAME
+                // PREDICATE -- so the two can never disagree about which pages are alternatives.
+                // Bounded by `fanout_cap`; the overflow is NAMED and the count is left EXACT.
+                if (result.alternative_pages.size() <
+                    static_cast<std::size_t>(result.alternatives_bound)) {
+                    result.alternative_pages.push_back(item.page);
+                } else {
+                    result.alternatives_over_bound = true;
+                }
+            }
         }
     }
     result.window        = best_length;
@@ -1061,6 +1141,32 @@ sum_dir_reach_already_recalled_pages(const std::vector<std::uint32_t>& row_pages
            " cap=" + std::to_string(result.fanout_cap) +
            " budget=" + std::to_string(result.budget_blocks);
     if (!result.refusal.empty()) { out += " -- " + result.refusal; }
+    return out;
+}
+
+// THE ALTERNATIVES' OWN LINE, and it is deliberately a SECOND line rather than more text on
+// `sum_dir_reach_line` above. `sum_dir_reach_line` is read by the tests and by the run's log, and
+// its text is the contract that "the seam changed nothing" is measured against -- so the seam's
+// new field gets its own label on its own line, and the existing line stays byte-for-byte what it
+// was. Nothing is combined: the COUNT and the NAMED set are printed as the two different facts
+// they are, and the run's span is printed beside them so "outside the run" is readable off the
+// line instead of inferred.
+[[nodiscard]] inline std::string sum_dir_reach_alternatives_line(const SumDirReachResult& r) {
+    std::string out = "[recall-alternatives] count=" + std::to_string(r.alternatives);
+    out += " named=" + std::to_string(r.alternative_pages.size());
+    out += " bound=" + std::to_string(r.alternatives_bound);
+    out += " over_bound=";
+    out += (r.alternatives_over_bound ? "1" : "0");
+    out += " run=[" + std::to_string(r.first_page) + "," + std::to_string(r.last_page) + "]";
+    out += " pages=[";
+    for (std::size_t i = 0; i < r.alternative_pages.size(); ++i) {
+        out += (i == 0U ? "" : ",");
+        out += std::to_string(r.alternative_pages[i]);
+    }
+    out += "]";
+    if (r.alternatives_over_bound) {
+        out += " NOTE=the named set is a BOUNDED PREFIX of the count; the count is exact";
+    }
     return out;
 }
 

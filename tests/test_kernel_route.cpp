@@ -103,11 +103,32 @@ void test_soundness_invariant() {
             for (const ProblemShape& shape : {kDecode, kVerify, kPrefill}) {
                 const RouteChoice choice = select_route(rung.sm, format, shape);
                 if (choice.outcome != RouteOutcome::Selected) { continue; }
+                // THE FOURTH DISJUNCT (dl/oldkernel). Until the SIMT arm existed there were
+                // three ways for a Selected route to be justified and a tensor-core-free floor
+                // was expressible by NONE of them: Cap is six tensor-core bits, so a rung with
+                // caps == Cap::None has no bit that covers any format's floor, and the third
+                // disjunct is QPN-specific. Adding the arm WITHOUT this clause would have made
+                // this check -- correctly -- fail, which is why the arm and this clause are one
+                // change. The clause is NOT a blanket "SIMT is fine": simt_floor_executable() is
+                // the same fail-closed predicate the ARM calls, so the two cannot disagree.
+                // THE FIFTH DISJUNCT (dl/fp16route, F-736). The fp16-plane arm is the fourth
+                // way a Selected route can be justified, and like the SIMT clause above it is
+                // the SAME fail-closed predicate the arm itself calls
+                // (caps::fp16_plane_executable), so the arm and its justification cannot
+                // disagree. It is NOT a blanket "fp16 tensor cores are fine": that predicate
+                // requires the format's row to declare this arm, the rung to have Cap::Fp16Mma,
+                // AND the rung's MEASURED channel lowering to be hardware -- which is exactly
+                // {70, 75} today, and it is fail-closed on a rung with no measured row.
                 const bool justified =
                     (floor == Cap::None) || ninfer::caps::covers(rung.caps, floor) ||
                     (choice.route == KernelRoute::QpnW4a16 &&
                      ninfer::caps::fp16_fallback_executable(rung.sm, format,
-                                                           ninfer::caps::kQpnInBuild));
+                                                           ninfer::caps::kQpnInBuild)) ||
+                    (choice.route == KernelRoute::ConservativeSimt &&
+                     ninfer::caps::simt_floor_executable(rung.sm, format)) ||
+                    (choice.route == KernelRoute::MmaFp16Plane &&
+                     ninfer::caps::fp16_plane_executable(rung.sm, format,
+                                                        ninfer::caps::kFp16PlaneInBuild));
                 check(justified,
                       "SOUNDNESS: a Selected route is not justified by the rung's "
                       "capabilities: " + describe(rung.sm, format, shape, choice));
@@ -186,20 +207,52 @@ void test_unknown_sm_never_throws_and_always_warns() {
           "sm_75 has a ladder row and must not warn about an unknown arch");
 }
 
-void test_every_rung_has_fp16_mma_so_the_no_tensor_core_branch_is_unreachable() {
-    // kernel_route.h has a branch for "the rung has no tensor core at all". With the ladder
-    // as it stands that branch is UNREACHABLE, and this pins that fact instead of pretending
-    // the branch is covered. If a future rung drops fp16 mma, this check fails first and says
-    // which rung, so the branch's coverage becomes a deliberate decision rather than an
-    // accident.
+void test_the_no_tensor_core_branch_is_reachable_on_exactly_the_pre_volta_rows() {
+    // kernel_route.h has a branch for "the rung has no tensor core at all". Until 2026-09-24 it
+    // was UNREACHABLE and this test pinned that fact, with a message that said: if a future rung
+    // drops fp16 mma, this check fails first and says which rung, so the branch's coverage
+    // becomes a DELIBERATE DECISION rather than an accident. That is what happened: F702
+    // (dl/archrow) added six rows below sm_70 (sm_50/52/53 Maxwell, sm_60/61/62 Pascal), all of
+    // them Cap::None because `mma` requires .target sm_70 -- measured, tools/archkit/
+    // _GPU_MATRIX.md section 3.3. So the decision is recorded the other way round now, in three
+    // clauses, so neither half can drift:
+    //   (1) the ONLY rungs without fp16 mma are the six pre-Volta ones (the branch is reachable
+    //       on exactly those and nowhere else);
+    //   (2) every one of them is Cap::None -- NOT some other tensor-core bit either, because a
+    //       bit is an instruction-set claim;
+    //   (3) the branch ANSWERS on them: a named refusal that states its reason category and the
+    //       floor's own kernel citation (the F702 change to kernel_route.h; the branch used to
+    //       say only "Missing capability, not a missing table row").
+    int without_fp16 = 0;
     for (std::size_t r = 0; r < kArchLadderSize; ++r) {
-        check(has_cap(kArchLadder[r].caps, Cap::Fp16Mma),
-              std::string("the no-tensor-core branch of select_route is currently "
-                          "unreachable, and rung sm_") +
-                  std::to_string(kArchLadder[r].sm) + " (" +
-                  std::string(kArchLadder[r].label) +
-                  ") broke that: it has no fp16 mma, so it now exercises the branch");
+        const auto& rung = kArchLadder[r];
+        if (has_cap(rung.caps, Cap::Fp16Mma)) { continue; }
+        ++without_fp16;
+        check(rung.sm < 70,
+              std::string("rung sm_") + std::to_string(rung.sm) + " (" +
+                  std::string(rung.label) +
+                  ") has no fp16 mma and is NOT pre-Volta: the set of tensor-core-free rungs "
+                  "changed, and the no-tensor-core branch of select_route now answers for it "
+                  "too -- which is a deliberate decision this check must record, not a drift");
+        check(rung.caps == Cap::None,
+              std::string("rung sm_") + std::to_string(rung.sm) +
+                  " must claim NO tensor-core bit at all, not a smaller one");
+        const RouteChoice choice = select_route(rung.sm, NumericFormat::NVFP4, kVerify);
+        check(choice.outcome == RouteOutcome::NoKernelInTree && choice.route == KernelRoute::None,
+              std::string("sm_") + std::to_string(rung.sm) +
+                  " must take the no-tensor-core refusal, got " +
+                  describe(rung.sm, NumericFormat::NVFP4, kVerify, choice));
+        check(choice.why.find("REASON CATEGORY: UNMET FORMAT FLOOR") != std::string::npos,
+              std::string("sm_") + std::to_string(rung.sm) +
+                  " must say WHICH CATEGORY of refusal this is, got: " + choice.why);
+        check(choice.why.find("nvfp4_w4a4_mma.cuh:308") != std::string::npos,
+              std::string("sm_") + std::to_string(rung.sm) +
+                  " must name the floor's kernel site, got: " + choice.why);
     }
+    check(without_fp16 == 6,
+          "expected exactly the six pre-Volta rows (sm_50/52/53/60/61/62) to lack fp16 mma, "
+          "found " + std::to_string(without_fp16) +
+              ": this count is the branch's coverage, so a change here is a decision");
 }
 
 // ---------------------------------------------------------------------------
@@ -295,20 +348,51 @@ void test_v100_verdicts() {
         }
     }
 
-    // The honest refusals. groupwise-int on sm_70 has NO fp16 route in this tree, and the
-    // reason must name the missing kernel rather than the card.
+    // V100 against the groupwise-int formats, and V100 against bf16. BOTH PINS BELOW READ
+    // `NoKernelInTree` UNTIL 2026-09-25 AND BOTH WERE ALREADY STALE WHEN dl/fp16route (F-736)
+    // FOUND THEM -- measured, not argued: dl/floorfix (F-720) MOVED the tensor-core-free arm
+    // above the graded refusals so that a rung whose floor is unmet is rescued instead of
+    // refused, and these two spans were not updated with it. The PRE grid of this line
+    // (dl/fp16route/out/grid_PRE_qpn.tsv, one row per (rung, format, shape)) reads
+    //   sm=70 format=W8G32_F16S m=8  -> Selected conservative-simt
+    //   sm=70 format=BF16       m=8  -> Selected conservative-simt
+    // which is what the assertions below pinned as a refusal. So the truthful pin is no longer
+    // "a named refusal": for the groupwise-int formats it is the FFMA kernel F-720 gave them,
+    // and for BF16 it is now the fp16 tensor-core arm this line ADDED. The `mma_s8` sentence
+    // those pins used to look for survives only in the no-tensor-core `default:` arm, which is
+    // unreachable for a format that has a simt_kernel_evidence column -- that is the residual
+    // F-720 left behind, and it is reported rather than deleted here.
     const RouteChoice w8 = select_route(kVolta, NumericFormat::W8G32_F16S, kVerify);
-    check(w8.outcome == RouteOutcome::NoKernelInTree,
-          "V100 x groupwise-int must be a named refusal, got " +
-              describe(kVolta, NumericFormat::W8G32_F16S, kVerify, w8));
-    check(w8.why.find("mma_s8") != std::string::npos,
-          "V100 x groupwise-int must name the missing kernel (mma_s8 port), got: " + w8.why);
+    check(w8.outcome == RouteOutcome::Selected &&
+              w8.route == KernelRoute::ConservativeSimt &&
+              w8.kernel.find("w8_rowsplit_gemm_simt.cuh:149") != std::string::npos,
+          "V100 x groupwise-int is the FFMA rescue F-720 added, and the route must NAME that "
+          "kernel file, got " + describe(kVolta, NumericFormat::W8G32_F16S, kVerify, w8));
 
-    // bf16 on Volta: no bf16 mma exists on sm_70 at all.
+    // bf16 on Volta: Volta has no bf16 mma at all, and it DOES have fp16 mma -- so the answer
+    // is the fp16 tensor-core arm over the artifact's own bf16 plane, which is the whole point
+    // of dl/fp16route. The kernel citation is asserted because that is the predicate this
+    // project reads ("read the citation, not the word").
     const RouteChoice bf16 = select_route(kVolta, NumericFormat::BF16, kVerify);
-    check(bf16.outcome == RouteOutcome::NoKernelInTree,
-          "V100 x bf16 must refuse (Volta has no bf16 mma), got " +
-              describe(kVolta, NumericFormat::BF16, kVerify, bf16));
+    check(bf16.outcome == RouteOutcome::Selected &&
+              bf16.route == KernelRoute::MmaFp16Plane &&
+              bf16.kernel.find("bf16_mma_fp16.cuh") != std::string::npos,
+          "V100 x bf16 must take the fp16 tensor-core arm over the bf16 plane (Volta HAS fp16 "
+          "mma and has no bf16 mma), got " + describe(kVolta, NumericFormat::BF16, kVerify, bf16));
+    // ... and the same rung must NOT have been handed a tensor-core route it cannot execute:
+    // below sm_70 nothing assembles `mma`, so the arm's own predicate must be false there.
+    for (const int sub : {50, 52, 53, 60, 61, 62}) {
+        const RouteChoice low = select_route(sub, NumericFormat::BF16, kVerify);
+        check(low.route != KernelRoute::MmaFp16Plane,
+              "sm_" + std::to_string(sub) +
+                  " has NO tensor core and must not be handed the fp16-plane arm, got " +
+                  describe(sub, NumericFormat::BF16, kVerify, low));
+        check(low.outcome == RouteOutcome::Selected &&
+                  low.route == KernelRoute::ConservativeSimt,
+              "sm_" + std::to_string(sub) +
+                  " must keep the FFMA/SIMT route -- FFMA IS its native route and that is not a "
+                  "defect, got " + describe(sub, NumericFormat::BF16, kVerify, low));
+    }
 
     // And the same questions at the other end of the ladder, so a fix for V100 cannot
     // silently break the native target.
@@ -658,9 +742,20 @@ void test_qpn_arm_is_graded_by_the_measured_mma_lowering() {
     }
     for (const NumericFormat format : {NumericFormat::Q4G64_F16S, NumericFormat::W8G32_F16S}) {
         const RouteChoice choice = select_route(70, format, kVerify);
-        check(choice.outcome != RouteOutcome::Selected,
-              "sm_70 has no bf16 mma, so the groupwise-int advice does not apply there and "
-              "the route must not be Selected, got " +
+        // THE INVERSION, MEASURED RATHER THAN PATCHED. This pin read `!= Selected` -- "the
+        // requantize advice does not apply on sm_70, so the route must not be Selected" -- and it
+        // was TRUE only while sm_70 refused these formats outright. F-720 gave sm_70 the
+        // tensor-core-free arm, so sm_70 IS Selected now, just not on mma-bf16: the route it
+        // gets is the FFMA rescue, which is neither "requantize" nor a tensor-core claim. So the
+        // property worth pinning is not the outcome but the ROUTE: sm_70 must not be told
+        // mma-bf16, because it has no bf16 mma.
+        check(choice.route != KernelRoute::MmaBf16,
+              "sm_70 has no bf16 mma, so the requantize-to-bf16 advice does not apply there, got " +
+                  describe(70, format, kVerify, choice));
+        check(choice.outcome == RouteOutcome::Selected &&
+                  choice.route == KernelRoute::ConservativeSimt,
+              "sm_70 x groupwise-int must be Selected on the FFMA rescue (the only executable "
+              "route there, and not a tensor-core claim), got " +
                   describe(70, format, kVerify, choice));
     }
 
@@ -765,7 +860,7 @@ int main() {
     int groups = 0;
     test_soundness_invariant();                                                    ++groups;
     test_unknown_sm_never_throws_and_always_warns();                               ++groups;
-    test_every_rung_has_fp16_mma_so_the_no_tensor_core_branch_is_unreachable();     ++groups;
+    test_the_no_tensor_core_branch_is_reachable_on_exactly_the_pre_volta_rows();    ++groups;
     test_v100_verdicts();                                                          ++groups;
     test_m_split_and_geometry();                                                   ++groups;
     test_non_tensor_core_formats_have_no_route();                                  ++groups;

@@ -442,7 +442,23 @@ public:
     [[nodiscard]] bool can_pin_source(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
-        return page.device_replica.has_value() && page.writer_references == 0 &&
+    // [HOST-GATE] `writer_references == 0` REMOVED -- the SAME term as the note directly
+    // above, and it had to go with it.  This predicate is the SECOND gate on that path,
+    // not a separate policy: HostKVExtentStore::prepare (host_kv_extent_store.h:98)
+    // re-tests it one step after can_cold_host_prepare admits the page, and prepare's
+    // nullopt is read by the consumer as `break` (program_impl.h:13529) -- so relaxing
+    // only the first predicate would have moved the refusal here and the pages released
+    // would STILL have been zero.
+    // The other three consumers, and why removing the term is safe rather than a bet:
+    //   active_snapshot_shape (:1434) reaches this predicate only inside its
+    //   `writers == 0` branch, so the term was already satisfied when it was tested;
+    //   prepare_prefix_fork (:1240) shares it with the Host tier and is relaxed with it --
+    //   the ONE page of a retained prefix that can still be written is the partial TAIL,
+    //   and that page is COPIED, never shared (materialize_transfer_destination, :1252),
+    //   while every full retained page is required to be fully committed (:1239-1241) and
+    //   commit_coverage (:606-612) refuses any coverage above kPagedKVPageSize.
+    // ⚠ Reasoning from the code, not a measurement: I ran neither a fork nor a checkpoint.
+        return page.device_replica.has_value() &&
                !page.destination_pinned &&
                page.source_pins != std::numeric_limits<std::uint32_t>::max();
     }
@@ -859,10 +875,27 @@ public:
     // (:485-495) -- so a page a second address still maps is not unrecoverable here.  That is the
     // whole difference from the COLD POOL, whose restore source is the owning sequence's cold_pages
     // slot, which is why can_cold_transfer above keeps `references == 1`.
+    // [HOST-GATE] `writer_references == 0` REMOVED -- the same term, and the same reason,
+    // as the [SPILL-GATE] note on can_cold_transfer above: the paged store keeps the
+    // writer flag until page RELEASE.  activate() sets it on every unique page
+    // (logical_kv_store.h:1182-1184) and the ONLY sites that clear it are deactivate()
+    // (:1201-1202) and commit_active_snapshot() (:1558/:1565).  A pass invoked from the
+    // prefill chunk loop (program_impl.h:17508) therefore ran with EVERY candidate page
+    // holding the writer flag, this predicate was unsatisfiable, and the Host tier paid
+    // its full 12288 MB pin and released ZERO pages.
+    // MEASURED, 1/16th scale (--kv-capacity 16384 --cold-host-bytes 5g, 8192-token
+    // window): the run died at required_pages=288 entitlement=256 with evicted=0 and
+    // free=0->0, while the read-free gate was provably open from chunk 5 -- 160 pages
+    // were retirable at the frontier it died on.  The flag is not a currency guard and
+    // never was: the content epoch and the committed-coverage pair are, and BOTH are
+    // re-checked where they matter -- can_attach_host_replica (:706) on the publish side,
+    // reserve_device_replica (:463) on the restore side.  What keeps a released page safe
+    // is the read-free window gate the pass checks BEFORE this predicate
+    // (program_impl.h:13504, cold_host_page_is_read_free).
     [[nodiscard]] bool cold_host_device_replica_releasable(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
-        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
+        return page.references != 0 && page.source_pins == 0 &&
                !page.destination_pinned && page.device_replica.has_value() &&
                !page.cold_compressed;
     }
@@ -1664,11 +1697,65 @@ public:
         address.page_count = target;
     }
 
+    // frontierinv (dl/_orch/landq/frontierinv/01-frontiernamed): TWO CONTRACTS, TWO NAMES, AND THE
+    // NUMBERS ON THE LINE.
+    //
+    // WHY. This one throw used to carry the OR of two independent predicates behind one bare
+    // message, so from outside the engine the failure was unattributable. The operator's whole
+    // reading was
+    //     [engine] engine failure class=invariant phase=decode reason: KV committed frontier is invalid
+    //     error: KV committed frontier is invalid
+    // and the two possible causes need opposite investigations: one is a caller that went
+    // BACKWARDS, the other is a caller that did not map far enough. Measured as a user-visible,
+    // INTERMITTENT stop on the pin already on disk:
+    // dl/ladderrung/REPORT.md sections 10.2/10.3/12 -- NEW 2 of 6 trigger-argv runs and, the part
+    // that decides ownership, PRE 1 of 5 on a BYTE-FROZEN pre-change binary, 0 of 12 once the
+    // recall/cold axis is stripped. A stop that comes and goes on a frozen binary is not a
+    // regression of any one landing, which is why the message -- not the predicate -- is what this
+    // entry fixes.
+    //
+    // THE TWO CONTRACTS, NAMED, AND WHY NEITHER IS CLAMPED INTO A PASS.
+    //   clause A `frontier < address.committed_frontier` -- the caller went BACKWARDS. The store's
+    //     committed frontier is a FLOOR: only destructive_truncate may lower it (:1718), because
+    //     that is the one call that also dematerializes the pages it releases (:1706-1712).
+    //     Clamping here instead would silently accept a commit of KV that a truncate has already
+    //     given back: the store cannot tell "the caller means to re-extend" from "the caller lost a
+    //     rollback", and those two want opposite handling.
+    //   clause B `pages_for_tokens(frontier) > address.page_count` -- the frontier is NOT COVERED.
+    //     Coverage is delegated by contract, and the contract is written down at the funnel that
+    //     owns it -- program_impl.h:11837-11842, "THE COVERAGE INVARIANT IS GUARANTEED AT THE LAST
+    //     MOMENT BEFORE IT IS CHECKED ... the one funnel every frontier-advancing mapping site goes
+    //     through" -- enforced in ensure_sequence_kv_mapped. Clamping here is impossible for a
+    //     mechanical reason, not a stylistic one: the loop below (:1677-1683) calls
+    //     membership(address, page) for every page up to final_changed_page, and past page_count
+    //     that membership is uninitialized.
+    // So the throw is CORRECT and the message was the defect. This entry changes the message only.
+    //
+    // WHAT IT DOES NOT DO. It does not change the accept/reject set. The two tests are the same two
+    // tests, on the same values, in the same left-to-right order, with the same short-circuit
+    // (pages_for_tokens is still evaluated only when the first test is false), and the exception
+    // type is unchanged. The old phrase is kept as a PREFIX so every existing grep -- this line's
+    // own battery and dl/ladderrung/* alike -- still matches it.
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
         Address& address = require_active(handle);
-        if (frontier < address.committed_frontier ||
-            pages_for_tokens(frontier) > address.page_count) {
-            throw std::invalid_argument("KV committed frontier is invalid");
+        if (frontier < address.committed_frontier) {
+            throw std::invalid_argument(
+                "KV committed frontier is invalid: clause A -- the frontier REGRESSED. "
+                "requested_tokens=" + std::to_string(frontier) +
+                " committed_tokens=" + std::to_string(address.committed_frontier) +
+                " requested_pages=" + std::to_string(pages_for_tokens(frontier)) +
+                " committed_pages=" + std::to_string(pages_for_tokens(address.committed_frontier)) +
+                " mapped_pages=" + std::to_string(address.page_count));
+        }
+        const std::uint32_t required_pages = pages_for_tokens(frontier);
+        if (required_pages > address.page_count) {
+            throw std::invalid_argument(
+                "KV committed frontier is invalid: clause B -- the frontier is NOT COVERED. "
+                "requested_tokens=" + std::to_string(frontier) +
+                " required_pages=" + std::to_string(required_pages) +
+                " mapped_pages=" + std::to_string(address.page_count) +
+                " committed_tokens=" + std::to_string(address.committed_frontier) +
+                " short_pages=" + std::to_string(required_pages - address.page_count));
         }
         if (frontier == address.committed_frontier) { return; }
         const std::uint32_t page_size          = static_cast<std::uint32_t>(kPagedKVPageSize);

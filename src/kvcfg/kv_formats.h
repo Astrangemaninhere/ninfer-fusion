@@ -2,7 +2,7 @@
 // kv_formats.h — KV 分层精度自由组合的引擎侧契约 (C++ 孪生, 与
 // tools/gui/kv_tiers.py 同语法同规则; 改动必须两边同步 + 跑对拍测试)。
 //
-//   语法:  --kv-tier-formats hot=bf16,tail=fp16,cold=iso4e
+//   语法:  --kv-tier-formats hot=bf16,cold=iso4e   (tail= 未实现: 引擎无尾层, 本文件 :11-19 与 product/kv_tier_formats.h 都记着这次缺口)
 //   模式:  nvfp4-mode fusion|pure  (pure 只允许经典格式, 对照归因用)
 //   规则:  热层 >= int8; 尾层 >= 热层; pure 禁 iso/rk4v4 系
 //   语义:  热=活动页, 尾=近期高精度窗 (kv-tail-tokens), 冷=老化出窗
@@ -324,7 +324,7 @@ static_assert(has_resident_codec(KvFormat::Rk3v4) && !is_readable_codec(KvFormat
               "rk3v4/rk2v4 are WRITABLE AND NOT READABLE: their codec, K plate layout and "
               "append arm all exist, and no attention arm reads a 3-bit or 2-bit K plate");
 
-// 解析 "hot=bf16,tail=fp16,cold=iso4e" (可省略层); 空串 = 全默认。
+// 解析 "hot=bf16,cold=iso4e" (可省略层; tail= 只在等于热层时被接受, 其余按名拒绝); 空串 = 全默认。
 // 失败返回错误文案 (err), 成功返回配置。与 kv_tiers.py::parse 同规则。
 inline std::optional<KvTierFormats> parse_tier_formats(std::string_view spec,
                                                        Nvfp4Mode mode,

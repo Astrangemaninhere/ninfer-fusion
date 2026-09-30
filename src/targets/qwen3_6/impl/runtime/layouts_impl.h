@@ -333,11 +333,115 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }();
         std::array<std::uint32_t, 64> layer_windows{};
         std::size_t windowed_layers = 0;
+        // ================= WINDOWDOMAIN (dl/tierbug, F742) =============================
+        // THE DECLARED WINDOW IS DECLARED ONLY WHERE THE TIER READS IT.
+        //
+        // WHAT WAS WRONG. `is_swa_attention(i)` is the TARGET's policy, and on
+        // qwen3_6_27b it is true on all 16 paged layers (impl/config.h:54). The
+        // window table was therefore 16/16 non-zero whatever KV tier the plan ran,
+        // and the domain refusal below (kv_sliding_window_domain_error) then fired
+        // on the PLAN's tiers. The engine's OWN registered per-layer table puts
+        // DType::E8Kv (rk4v4) on {0,1,3,4,6,7} (impl/variant.cpp:53-58), and rk4v4's
+        // decode path does NOT read the field: gqa_attention_decode_e8.cu's own
+        // copy of launch_tc_partial_i8_e8 omits the argument, so the kernel takes
+        // its defaulted `sliding_window = 0` (gqa_attention_decode_i8.cuh:83-86).
+        // Measured on the pin: `ninfer` with NO KV FLAGS AT ALL answered rc=1 and
+        // graded 0/27, twice, refused by this guard at layer 0 (dl/kvcomb, F-725).
+        // A default configuration that cannot start is a defect, not a slow one.
+        //
+        // WHY THIS FIX AND NOT THE OTHER TWO, in the engine's own terms. The
+        // refusal's own remedy sentence offers three: --kv-dtype nvfp4|iso4e, a
+        // per-layer SPEC naming one of them, or "clear the variant's
+        // sliding_window". The first two change the KV TIER, i.e. they change
+        // QUALITY: the registered table is the measured-best mix at short context
+        // (13.3k zh, ctx 4096: ppl 1.020 against 1.706 for all-nvfp4, variant.cpp)
+        // and accuracy comes first. Making rk4v4's decode read the field is a
+        // numerics change on the compute path, and it would repair only the DECODE
+        // half of the census while the PREFILL half stays full attention
+        // (kv_component_switch.h:300-330) -- which is the silent corruption the
+        // two-phase census exists to prevent.
+        //
+        // WHY IT IS NOT A CAPABILITY LOSS. The declaration has exactly one
+        // consumer, the Cold Host tier, whose admission predicate is
+        // `cold_host_layers_are_windowed` (all_of, cold_host_tier.h:96-101). On a
+        // plan that mixes an honouring tier with a non-honouring one that predicate
+        // is FALSE in both readings: before, the refusal aborted the process;
+        // after, the window table has a zero, the tier admits nothing, the program
+        // already says so by name ("[cold] --cold-policy host admits nothing: no
+        // layer has a sliding window ..."), and the S3 release census
+        // (kv_window_tier_release_safe, program_impl.h:13076) still refuses to
+        // retire a single page. The plan loses nothing it could do: the Cold Host
+        // tier was inert on it either way.
+        //
+        // AND IT IS BIT-IDENTICAL ON THE COMPUTE PATH **ONLY FOR THE TIERS WHOSE DECODE
+        // DOES NOT READ THE FIELD** (F1227 CORRECTION). `sliding_window == 0` is the
+        // kernels' contract for "the field is not read", byte-identical to
+        // `window = last_pos + 1` (gqa_attention_decode_i8.cuh:83-86 is that default).
+        // That sentence was written when the honoured set was the decode census; three
+        // of those tiers (ISO3, BF16, I8) DO read the field in decode now
+        // (gqa_attention_decode_iso3.cuh:250, gqa_attention_decode_bf16.cuh:166,
+        // gqa_attention_decode_i8.cuh:215), so for them "not installed" is NOT
+        // bit-identical: their decode becomes full attention, which is the same
+        // behaviour as the PREFILL that never applied the window. The plan is
+        // self-consistent after this change and it was not before -- and the change is
+        // visible only above the window length, where the two phases used to disagree.
+        // No kernel, no plane geometry and no allocation moves.
+        //
+        // KEPT LOUD: the layers that lose the declaration are named, with the tier that
+        // caused it, the PHASE that refuses it, and the flag that re-arms the tier.
+        std::string window_undeclared;
+        std::string window_undeclared_tiers;
+        std::size_t window_undeclared_layers = 0;
         for (std::int32_t i = 0;
              i < static_cast<std::int32_t>(TextConfig::full_attention_layers()); ++i) {
-            layer_windows[static_cast<std::size_t>(i)] =
-                TextConfig::is_swa_attention(i) ? kv_window.tokens : 0U;
-            if (layer_windows[static_cast<std::size_t>(i)] != 0U) { ++windowed_layers; }
+            const std::size_t slot = static_cast<std::size_t>(i);
+            const bool slot_explicit = plan.layer_kv_dtypes_set[slot];
+            const DType slot_dtype   = product::kv_resolve_slot_dtype(
+                plan.kv_dtype, plan.layer_kv_dtypes[slot], slot_explicit);
+            const bool declared_here = TextConfig::is_swa_attention(i);
+            const bool honoured_here = product::kv_window_tier_honoured(slot_dtype);
+            layer_windows[slot] = (declared_here && honoured_here) ? kv_window.tokens : 0U;
+            if (declared_here && !honoured_here) {
+                if (!window_undeclared.empty()) {
+                    window_undeclared += ",";
+                    window_undeclared_tiers += ",";
+                }
+                window_undeclared += std::to_string(i);
+                window_undeclared_tiers += std::string(ninfer::dtype_name(slot_dtype));
+                ++window_undeclared_layers;
+            }
+            if (layer_windows[slot] != 0U) { ++windowed_layers; }
+        }
+        if (window_undeclared_layers != 0U) {
+            // THE SENTENCE THIS PRINTS IS THE WHOLE POINT OF THE TWO-PHASE PREDICATE, and
+            // it is FALSE for the tiers that reach it if it is not written per phase: the
+            // decode kernel of ISO3/BF16/I8 DOES read `sliding_window_tokens` now. What
+            // does not read it is their PREFILL. So the window is not installed at all
+            // (a bound applied by one phase and not the other is silent above the window
+            // length), the affected layers keep window 0 = full attention in BOTH phases,
+            // and the arming advice names the one tier whose prompt kernel reads the field
+            // -- NVFP4 (gqa_attention_prefill_nvfp4.cuh:1097). Spark-x2.5-4b is the case
+            // this reads on today: 27 of 36 layers at 512 tokens, bf16, decode honoured,
+            // prefill absent (dl/musesparkfix, F1227).
+            std::fprintf(stderr,
+                         "[kv-window] THE DECLARED WINDOW IS NOT INSTALLED on %zu of %d paged "
+                         "layer(s) [%s], whose KV tier(s) are [%s]: this tier's DECODE kernel "
+                         "applies sliding_window_tokens and its PREFILL (prompt) kernel does "
+                         "not, so a window installed here would bound one phase and not the "
+                         "other. Those layers keep window 0 = FULL ATTENTION in BOTH phases "
+                         "(the tier's own contract for the field, and self-consistent). The "
+                         "Cold Host tier admits nothing on this plan (it requires EVERY entry "
+                         "non-zero: cold_host_page_is_read_free) and retires no page. TO "
+                         "INSTALL IT, put those layers on a tier whose PREFILL reads the "
+                         "field -- nvfp4 today (gqa_attention_prefill_nvfp4.cuh:1097 is "
+                         "`(sliding_window > 0 && KVDType == DType::NVFP4)`; the ISO4E "
+                         "instance of the same template gets window 0, and the bf16/i8 prompt "
+                         "kernels have no such parameter): --kv-dtype nvfp4, or a per-layer "
+                         "--kv-layer-storage SPEC naming it. The PREFILL side is the missing "
+                         "half; product/kv_component_switch.h carries the per-tier census.\n",
+                         window_undeclared_layers,
+                         static_cast<int>(TextConfig::full_attention_layers()),
+                         window_undeclared.c_str(), window_undeclared_tiers.c_str());
         }
         // OBSERVABILITY: the effective window, PER PAGED LAYER, WITH ITS UNIT, and
         // with the source it came from. Unconditional on purpose -- an instrument
@@ -396,14 +500,77 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              ? "0 = FULL ATTENTION (reads whole cache)"
                              : "windowed");
         }
+        // ============ THE BINDING'S PRECONDITION, AS A NUMBER (F1227 / F1207) ============
+        // THE COMMENT THIS REPLACES. targets/muse_glimmer_30b/impl/load/bindings.cpp binds
+        // all 52 of muse's layers to the full-attention leaf and states its reason in words:
+        // "the 39 sliding layers run as full for the acceptance phase (short contexts:
+        // window is not clipped)". That sentence is a statement about a NUMBER -- how long a
+        // sequence may grow before the two mechanisms stop agreeing -- and a sentence in a
+        // loader is not a check. This is the one site in the engine where the number meets
+        // the plan, so it is reported here, unconditionally, in the same block and the same
+        // unit as the window table itself.
+        //
+        // WHICH LAYERS COUNT: declared sliding (is_swa_attention) AND bound to the
+        // full-attention leaf (is_full_attention) AND with NO window installed by THIS plan
+        // (layer_windows == 0, i.e. no tier in this plan makes the PREFILL read the field)
+        // AND with a non-zero declared window. Those layers attend the whole cache in BOTH
+        // phases; the model's own topology would have clipped at the declared window, so the
+        // two agree exactly while every sequence stays at or below it. A layer whose plan
+        // window is NON-ZERO is deliberately NOT counted: there both KV phases clip at that
+        // window, which is the model's own semantics at every length.
+        {
+            const std::uint32_t declared_window =
+                static_cast<std::uint32_t>(TextConfig::sliding_window);
+            std::uint32_t regime_tokens = 0U;
+            std::string   regime_layers;
+            std::size_t   regime_count = 0U;
+            for (std::size_t i = 0;
+                 i < static_cast<std::size_t>(TextConfig::full_attention_layers()); ++i) {
+                const auto layer = static_cast<std::int32_t>(i);
+                if (!TextConfig::is_swa_attention(layer) ||
+                    !TextConfig::is_full_attention(layer) || layer_windows[i] != 0U ||
+                    declared_window == 0U) {
+                    continue;
+                }
+                if (regime_tokens == 0U || declared_window < regime_tokens) {
+                    regime_tokens = declared_window;
+                }
+                if (!regime_layers.empty()) { regime_layers += ","; }
+                regime_layers += std::to_string(i);
+                ++regime_count;
+            }
+            if (regime_count != 0U) {
+                std::fprintf(stderr,
+                             "[kv-regime] %zu of %d paged layer(s) [%s] DECLARE a sliding "
+                             "window of %u TOKENS and are BOUND to the full-attention leaf "
+                             "(is_swa_attention && is_full_attention), and THIS PLAN "
+                             "installs NO window on them (see the [kv-window] report above). "
+                             "They therefore attend the whole cache in BOTH phases, which "
+                             "matches the model's own topology only while every sequence "
+                             "stays at or below %u TOKENS -- above it the model would have "
+                             "clipped and this plan does not. Keep sequences <= %u tokens, "
+                             "or put those layers on a tier whose PREFILL reads the field; "
+                             "any reading taken outside this regime belongs to a topology "
+                             "the model does not have (F1207 / F1227).\n",
+                             regime_count,
+                             static_cast<int>(TextConfig::full_attention_layers()),
+                             regime_layers.c_str(), regime_tokens, regime_tokens,
+                             regime_tokens);
+            }
+        }
         // ================= end runtime window override ======================
-    // SEPARATION (window2): a declared sliding window that a KV tier cannot honour is
-    // REFUSED BY NAME here, before the spec below commits it to the device. On the
-    // bf16 / fp8 / i8 / simt_ffma / small-t decode paths the kernels hard-code full
-    // attention, so the Cold Host tier would release a page that is then read anyway:
-    // silent corruption, not a quality loss. product/kv_component_switch.h holds the
-    // domain and the evidence. Refuses only where the tier can actually release a page,
-    // i.e. only when every entry of the window table is non-zero.
+    // SEPARATION (window2), RESTATED FOR THE TWO-PHASE PREDICATE (F1227): a window table
+    // that could let the Cold Host tier release a page which a later phase reads anyway is
+    // REFUSED BY NAME here, before the spec below commits it to the device: silent
+    // corruption, not a quality loss. The refusal keys on the same conjunction the install
+    // site uses (kv_sliding_window_domain_error -> kv_window_tier_honoured), so a plan whose
+    // tiers cannot honour the field in BOTH phases no longer arrives here with a non-zero
+    // table -- the install already zeroed those layers, the all-zero branch in the function
+    // below makes the refusal inert, and the [kv-window] report above names every layer and
+    // tier that lost the declaration. This call is therefore the SECOND gate, and it is
+    // kept deliberately: the window table is an input to this function as well as its
+    // output, and a producer that fills it any other way still meets this refusal.
+    // product/kv_component_switch.h holds the domain and the evidence.
     if (const std::string window_refusal = product::kv_sliding_window_domain_error(
             std::span<const std::uint32_t>(
                 layer_windows.data(),
@@ -1174,7 +1341,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,8]");
+        throw std::invalid_argument("max_concurrency must be in [1,16]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     // An explicit --kv-capacity may floor the device page pool below max_context
@@ -1254,6 +1421,21 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             throw std::invalid_argument(
                 "DFlash2 draft window must be 0 (default 7) or in [1,15]");
         }
+        // [F-1019] F-1006's COMPLEMENTARITY, CLOSED. The DFlash arm below refuses
+        // `options.enable_vision` by name; this arm -- the SIBLING SPELLING of the same unvalidated
+        // pair -- had no vision check at all. With the silent substitution in the qwen3_6_27b
+        // package removed (P3b there), `--spec auto --vision` on a DFlash2 artifact now RESOLVES to
+        // DFlash2, so this arm is the one that must refuse it. The reason category is the same one
+        // the DFlash arm states: a POLICY refusal, not an artifact limit -- 9 of the 91 readable
+        // `.ninfer` artifacts carry a complete DFlash2 head and a complete vision tower at once,
+        // and what does not exist is a validation of the two together.
+        if (options.enable_vision) {
+            throw std::invalid_argument(
+                "DFlash2 and Vision are not co-validated as a pair: refusing to run an "
+                "unvalidated combination. This is a policy refusal, not an artifact limit -- "
+                "one artifact does carry the DFlash2 draft head and the vision tower at once "
+                "(dl/unlock/logs/20_artifact_census.txt).");
+        }
         break;
     case SpeculativeBackend::DFlash:
         if (kMaximumDFlashDraftTokens == 0) {
@@ -1264,7 +1446,16 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             throw std::invalid_argument("DFlash draft window must be in [1,15]");
         }
         if (options.enable_vision) {
-            throw std::invalid_argument("DFlash and Vision cannot be enabled together");
+            // landq/unlock -- a POLICY refusal whose old wording ("cannot be enabled together")
+            // read like a physical law. The draft head and the vision tower do coexist in one
+            // artifact (byte caliber: 9 of the 91 readable .ninfer artifacts on this box carry
+            // the four dflash2/* entry objects and all five vision/* entry objects), so what is
+            // missing is a VALIDATED PAIR, not a possibility. The refusal stays; the category
+            // is now stated.
+            throw std::invalid_argument(
+                "DFlash and Vision are not co-validated as a pair: refusing to run an "
+                "unvalidated combination. This is a policy refusal, not an artifact limit -- "
+                "one artifact does carry the draft head and the vision tower at once.");
         }
         break;
     case SpeculativeBackend::Auto:
@@ -1384,6 +1575,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_v_codec          = inputs.kv_v_codec;
     impl->kv_rotation_off     = inputs.kv_rotation_off;
     impl->kv_row_scale_spec   = inputs.kv_row_scale_spec;
+    // --stage-layers: the spec and its boundary travel from the inputs to the plan unchanged,
+    // in the same block as the per-layer row-scale spec because both are operator text that
+    // downstream code parses rather than interprets.
+    impl->stage_layers_spec   = inputs.stage_layers_spec;
+    impl->stage_handoff_dir   = inputs.stage_handoff_dir;
+    impl->stage_handoff_cut   = inputs.stage_handoff_cut;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -1468,6 +1665,32 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     // stops being distinguishable from one that left it unset.
     std::array<bool, 64> budget_storage_set = options.kv_layer_storage_set;
 
+    // ===================================================================================
+    // F903 / kvcompose -- THE PIN SET, FROZEN BEFORE ANY RESOLUTION TOUCHES THE TABLE.
+    // ===================================================================================
+    // THE CONSTRUCTION THAT IS BEING REPLACED, and why IT could not compose. The old schema
+    // had ONE boolean for TWO different facts:
+    //     storage_explicit == "a table is present"  AND  "the table is COMPLETE, so no
+    //                          ceiling may run over it".
+    // A ceiling resolves into the WHOLE table (deploy_kv_budget_spec replaces table and mask
+    // for all 64 slots), so once `storage_explicit` was true the only way to keep the ceiling
+    // from being "accepted and read by nothing" was to REFUSE the pair. That is what the CLI
+    // did (`--kv-bit-budget and --kv-layer-storage are mutually exclusive`) and it is why the
+    // pair read as non-composable -- not because a ceiling and a table cannot describe one
+    // stack, but because this function had one slot for two facts.
+    // THE ENGINE ALREADY HAD THE VOCABULARY: EngineOptions::kv_layer_storage_set is exactly
+    // "WHICH slots the per-layer spec actually WROTE" (include/ninfer/types.h:621-646), and
+    // the file already relies on that distinction for the extra capabilities a WRITTEN bf16
+    // slot requires. The two facts were never separated HERE.
+    // THE PIN SET separates them: kv_pin_set is the mask the OPERATOR'S --kv-layer-storage
+    // arrived with, frozen at this point, before --kv-tier-formats may fill it (it fills all
+    // 64) and before either ceiling may replace the table. Its consequence, stated exactly:
+    //   * a ceiling now runs over the WHOLE stack, exactly as it does when no table was given;
+    //   * the pins are applied OVER that result, on the slots they name;
+    //   * so both knobs are READ, on different slots, in ONE run. That is composition.
+    const std::array<KvCacheStorage, 64> kv_pin_table = budget_storage_table;
+    const std::array<bool, 64> kv_pin_set = budget_storage_set;
+
     // --kv-tier-formats / --nvfp4-mode: the KV tier vocabulary (hot/tail/cold +
     // nvfp4 mode). Resolved HERE, not at the parse site, for the same reason as
     // --kv-bit-budget below: `hot` is the resident format of every full-attention
@@ -1515,6 +1738,111 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     const std::uint32_t cold_pages = effective_cold_pages(
         options.cold_policy, options.cold_keep_tokens, options.max_cold_pages);
 
+    // F903: how many pins can reach the pool at all. A slot at or past this target's
+    // full-attention count parses, is accepted, and changes nothing on this model -- the
+    // inert-slot report far below says so, and counting it here would make the composition
+    // condition lie about how much of the stack the operator actually pinned.
+    std::size_t pin_count = 0;
+    for (std::int32_t l = 0; l < full_layers; ++l) {
+        if (kv_pin_set[static_cast<std::size_t>(l)]) { ++pin_count; }
+    }
+    // THE WHOLE COMPOSITION CONDITION, in one line: a proper, NON-EMPTY subset of the stack
+    // was named. Both ends matter -- empty means there are no pins (and the ceiling's own
+    // plan is the table, the pre-F903 behaviour), and the FULL stack means there is nothing
+    // left for the ceiling to decide, which is refused below by name rather than accepted
+    // and ignored.
+    const bool pin_and_solve = pin_count != 0 &&
+                               pin_count < static_cast<std::size_t>(full_layers);
+    // The pins, applied OVER whatever a ceiling just resolved. ONE implementation, called by
+    // BOTH ceiling entries after their own deploy, so neither can forget it and the two
+    // entries cannot drift.
+    const auto apply_kv_pins = [&]() {
+        for (std::size_t i = 0; i < kv_pin_set.size(); ++i) {
+            if (!kv_pin_set[i]) { continue; }
+            budget_storage_table[i] = kv_pin_table[i];
+            budget_storage_set[i]   = true;
+        }
+        return pin_count;
+    };
+    // The pinned runs, as the operator would spell them, for the report line. A run is
+    // maximal and ascending, so `0,2-3` is one pin set and cannot be confused with `0-3`.
+    const auto kv_pin_runs_text = [&]() {
+        std::string runs;
+        for (std::int32_t l = 0; l < full_layers; ++l) {
+            if (!kv_pin_set[static_cast<std::size_t>(l)]) { continue; }
+            std::int32_t last = l;
+            while (last + 1 < full_layers && kv_pin_set[static_cast<std::size_t>(last + 1)]) {
+                ++last;
+            }
+            if (!runs.empty()) { runs += ','; }
+            runs += std::to_string(l);
+            if (last != l) { runs += '-'; runs += std::to_string(last); }
+            l = last;
+        }
+        return runs;
+    };
+    // THE COMPOSED SPEC, one entry per layer, so the `hot=` field of a ceiling's own report
+    // line reports the table that will be BUILT rather than the ceiling's plan with the pins
+    // left out -- which would be a FALSE READING produced by this very line. The digits are
+    // scanned by hand (no <cstdlib>) and the result is RE-PARSED with the tree's own parser
+    // and compared slot by slot against the final table, so a name that does not round-trip is
+    // REPORTED as roundtrip=false instead of being printed as a fact.
+    const auto kv_pins_composed_spec = [&](const std::string& budget_spec) {
+        std::string out;
+        std::size_t cursor = 0;
+        while (cursor < budget_spec.size()) {
+            const std::size_t comma = budget_spec.find(',', cursor);
+            const std::string item =
+                budget_spec.substr(cursor, comma == std::string::npos
+                                              ? std::string::npos
+                                              : comma - cursor);
+            const std::size_t colon = item.rfind(':');
+            if (colon != std::string::npos) {
+                const std::string ranges = item.substr(0, colon);
+                const std::size_t dash = ranges.find('-');
+                const auto number = [](const std::string& text, std::size_t from,
+                                       std::size_t to) {
+                    std::int32_t value = 0;
+                    for (std::size_t i = from; i < to && i < text.size(); ++i) {
+                        const char c = text[i];
+                        if (c < '0' || c > '9') { break; }
+                        value = value * 10 + (c - '0');
+                    }
+                    return value;
+                };
+                const std::int32_t first = number(ranges, 0, ranges.size());
+                const std::int32_t last =
+                    dash == std::string::npos
+                        ? first
+                        : number(ranges, dash + 1, ranges.size());
+                const std::string tier = item.substr(colon + 1);
+                for (std::int32_t l = first; l <= last && l < full_layers; ++l) {
+                    if (!out.empty()) { out += ','; }
+                    out += std::to_string(l);
+                    out += ':';
+                    out += kv_pin_set[static_cast<std::size_t>(l)]
+                               ? std::string(kv_storage_name(
+                                     kv_pin_table[static_cast<std::size_t>(l)]))
+                               : tier;
+                }
+            }
+            if (comma == std::string::npos) { break; }
+            cursor = comma + 1;
+        }
+        return out;
+    };
+    // The round-trip, run on the FINAL table, so the printed spec cannot be a second spelling
+    // of something else. Returns false when the parser disagrees with the table it names.
+    const auto kv_pins_spec_roundtrips = [&](const std::string& text) {
+        const auto parsed = product::parse_kv_layer_storage_spec(text);
+        for (std::int32_t l = 0; l < full_layers; ++l) {
+            const std::size_t i = static_cast<std::size_t>(l);
+            if (parsed.set[i] != budget_storage_set[i]) { return false; }
+            if (parsed.set[i] && parsed.table[i] != budget_storage_table[i]) { return false; }
+        }
+        return true;
+    };
+
     // Two spellings of the same ceiling cannot be merged: they would describe different
     // stacks, and the allocation would depend on which one happened to be applied last.
     if (options.kv_kv_bits_explicit && options.kv_bit_budget_explicit) {
@@ -1535,27 +1863,29 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             "--kv-bit-budget, or drop the flag");
     }
 
-    // res-kv5 FIX (--kv-dtype dropped by a ceiling): --kv-dtype is ITSELF a table
-    // provider -- layouts_impl.h `layer_overrides.fill(kv_profile.dtype)` fills every
-    // slot with one global tier -- and BOTH ceiling entries below REPLACE that whole
-    // table (deploy_kv_budget_spec sets storage_explicit = true), which is exactly what
-    // makes the `else if (options.kv_cache_explicit)` branch further down unreachable.
-    // Accepted together, --kv-dtype is therefore read by nothing. Measured on the
-    // pre-fix arm: `--kv-bit-budget 4.5 --kv-dtype int8` came out identical in dtype
-    // AND payload to `--kv-bit-budget 4.5` alone (per-layer 0-9:rk4v4-group64
-    // 10-15:nvfp4-group16, 278.00 MiB), while `--kv-dtype int8` alone is int8-group64 /
-    // 528.00 MiB. Two table providers that describe different stacks cannot be merged,
-    // so this is a contradiction and it is refused here -- where BOTH front ends meet --
-    // in the same shape as the --kv-bit-budget x --kv-layer-storage rule just above.
+    // res-kv5 FIX (--kv-dtype dropped by a ceiling), RE-STATED by F903 now that the
+    // construction has changed -- the rule and the measurement behind it are UNCHANGED.
+    // The reason is --kv-dtype's SCOPE and not "a ceiling cannot coexist with a table":
+    // --kv-dtype `layer_overrides.fill(kv_profile.dtype)` names the GLOBAL tier for every
+    // layer, and a ceiling TILES every full-attention layer, so there is no slot left for the
+    // global tier to be the default of and the dtype would be read by nothing. Measured on
+    // the pre-fix arm: `--kv-bit-budget 4.5 --kv-dtype int8` came out identical in dtype AND
+    // payload to `--kv-bit-budget 4.5` alone (per-layer 0-9:rk4v4-group64 10-15:nvfp4-group16,
+    // 278.00 MiB), while `--kv-dtype int8` alone is int8-group64 / 528.00 MiB.
+    // WHAT F903 ADDS IS THE OTHER HALF OF THE SENTENCE, which the old text did not carry and
+    // which cost the operator a working configuration: --kv-layer-storage names a SUBSET of
+    // the stack, and a subset DOES compose with either ceiling (the ceiling solves the whole
+    // stack and the named slots override it, see the pin set above). The composition is not
+    // unavailable; it is spelled with the knob that can name a subset.
     if (options.kv_cache_explicit &&
         (options.kv_bit_budget_explicit || options.kv_kv_bits_explicit)) {
         throw std::invalid_argument(
             "--kv-dtype and --kv-bit-budget/--kv-bits are mutually exclusive: --kv-dtype "
-            "pins the global KV tier and a ceiling is resolved into exactly the per-layer "
-            "table that would replace it, so one of the two would be read by nothing. "
-            "Measured: --kv-bit-budget 4.5 --kv-dtype int8 deployed the same per-layer "
-            "table as --kv-bit-budget 4.5 alone (278.00 MiB), while --kv-dtype int8 alone "
-            "is 528.00 MiB. Give one of them.");
+            "pins the GLOBAL KV tier (every layer) and a ceiling tiles every layer, so the "
+            "dtype would be read by nothing. Measured: --kv-bit-budget 4.5 --kv-dtype int8 "
+            "deployed the same per-layer table as --kv-bit-budget 4.5 alone (278.00 MiB), "
+            "while --kv-dtype int8 alone is 528.00 MiB. Use --kv-layer-storage to name the "
+            "layers you mean -- a SUBSET composes with the ceiling -- or give one of them.");
     }
     // ONE deployment path for BOTH budget entries: the allocator's spec becomes the
     // per-layer storage table, "cold" is NOT a --kv-layer-storage tier, so a cold-planned
@@ -1598,9 +1928,33 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         return deployed;
     };
 
-    if (options.kv_bit_budget_explicit && !storage_explicit) {
+    // F903: this guard used to read `&& !storage_explicit`, i.e. "a table was given, so the
+    // ceiling is skipped" -- and THAT is what made the CLI refuse the pair: an accepted flag
+    // that is read by nothing is this project's worst outcome, so the door was closed rather
+    // than the seam opened. With a PIN SET the ceiling has work to do even when a table is
+    // present, so it runs, and the pins are applied over its plan. The ONE case that still
+    // cannot compose is a table that names EVERY layer; it is refused below, by name.
+    if (options.kv_bit_budget_explicit && (!storage_explicit || pin_and_solve)) {
+        if (storage_explicit && !pin_and_solve && pin_count != 0) {
+            throw std::invalid_argument(
+                "--kv-bit-budget with a --kv-layer-storage table that names EVERY "
+                "full-attention layer: the ceiling would resolve into a table that already "
+                "exists, i.e. be accepted and read by nothing. Name FEWER layers with "
+                "--kv-layer-storage (the named slots then OVERRIDE the ceiling and the rest "
+                "is solved by it), or drop the ceiling.");
+        }
+        // F911 / SLIDERWIRE-COMPOSE-COMPLETE: THE REFUSAL THAT STOOD HERE IS GONE, and it is
+        // gone because the plumbing it named was added rather than because the check was
+        // removed. F903 left this sentence and the one above it as the last named residual of
+        // the composition -- "kv_bit_budget_scored_ranges takes no candidate_order, and the fix
+        // is one parameter in that header". The parameter now exists (defaulted, empty == the
+        // shipped order, so every other call site is byte-identical) and the caller below hands
+        // it the operator's own --kv-codec-preference. The preference is now READ on both
+        // spellings of the ceiling instead of being accepted-and-ignored on one of them, and
+        // `accepted and read by nothing` is the outcome this project refuses, so removing the
+        // guard without the parameter would have been a fault rather than a repair.
         // Two forms of the same knob: a single ceiling for every full-attention layer, or
-        // separable per-range ceilings ("0-7:8,8-63:4.5") which the DP minimises per range
+        // separable per-range ceilings ("0-7:8,8-15:4.5", 16-layer examples) which the DP minimises per range
         // (globally optimal: additive objective, per-range constraints).
         // Two-score path: when a quality weight is given, the per-tier penalty becomes the
         // weighted sum of the measured quality and speed columns, and the same DP resolves it.
@@ -1609,7 +1963,15 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         // comes first for a concrete reason: the range form leaves options.kv_bit_budget_bits
         // at 0, so a scored run that ignored the ranges would resolve every layer against a
         // zero-bit ceiling instead of the ceiling the operator actually gave.
-        const bool scored_active = options.kv_quality_weight >= 0.0;
+        // THE ABSENT WEIGHT IS THE QUALITY END (product/kv_bit_budget.h
+        // kKvQualityWeightQualityEnd) -- the same one-word change product/kv_kv_bits.h
+        // kv_bits_solve_plane makes for the K/V spelling of the ceiling, applied to THIS (the
+        // --kv-bit-budget) spelling. The scored table therefore runs by default, and because the
+        // default table's quality column IS the shipped penalty column row for row (static_assert
+        // in product/kv_bit_budget.h) the default plan is unchanged. The explicit-flag refusal at
+        // :1528 keeps reading the RAW sentinel, so an absent flag still does not demand a ceiling.
+        const double kv_weight = product::kv_quality_weight_resolved(options.kv_quality_weight);
+        const bool scored_active = true;
         const bool ranges_given = !options.kv_bit_budget_ranges.empty();
         const std::int32_t rk4v4_limit = product::kKvBitBudgetE8LayerLimit;
         const std::int32_t cold_cap = static_cast<std::int32_t>(cold_pages);
@@ -1631,13 +1993,16 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                                }());
             }
             if (!ranges_given) {
+                // F903 / SLIDERWIRE-COMPOSE: the operator's candidate order travels INTO
+                // the fit. Empty is the shipped order and byte-identical to the pre-F903
+                // call, which is what keeps every existing run where it was.
                 scored = product::kv_bit_budget_solve_scored(
-                    full_layers, options.kv_bit_budget_bits, scores, options.kv_quality_weight,
-                    rk4v4_limit, cold_cap);
+                    full_layers, options.kv_bit_budget_bits, scores, kv_weight,
+                    rk4v4_limit, cold_cap, options.kv_codec_preference);
                 // Gap D: the REAL provenance of the two columns, printed from the one
                 // place that decides it (product/kv_kv_bits.h kv_scores_provenance). The old
                 // text called BOTH columns "measured" while the table it prints is described
-                // as provisional at product/kv_bit_budget.h:718-725, so the report line was
+                // as provisional at product/kv_bit_budget.h [text: "Provisional default score table"; = :1270 on 2026-09-26], so the report line was
                 // the false half of a contradiction in the tree.
                 std::fputs(product::kv_scores_provenance(options.kv_tier_scores).line.c_str(),
                            stderr);
@@ -1648,7 +2013,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                              "(the weighted ladder picks the best plan that FILLS the "
                              "ceiling from below; it can no longer trade bits away for a "
                              "lower penalty)\n",
-                             options.kv_quality_weight, scored.requested_bits,
+                             kv_weight, scored.requested_bits,
                              scored.achieved_bits, scored.shortfall_bits, scored.penalty,
                              scored.spec.c_str());
             }
@@ -1665,15 +2030,15 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                 product::kv_bit_budget_parse_ranges(options.kv_bit_budget_ranges, full_layers);
             spec = scored_active
                        ? product::kv_bit_budget_scored_ranges(
-                             full_layers, ranges, scores, options.kv_quality_weight, rk4v4_limit,
-                             cold_cap)
+                             full_layers, ranges, scores, kv_weight, rk4v4_limit,
+                             cold_cap, options.kv_codec_preference)
                        : product::kv_bit_budget_spec_ranges(full_layers, ranges, rk4v4_limit,
                                                             cold_cap);
             if (scored_active) {
                 std::fprintf(stderr,
                              "[kv-score] quality_weight=%.2f ranges=%s spec=%s (the weighted "
                              "speed/quality ladder ran inside each range's own ceiling)\n",
-                             options.kv_quality_weight, options.kv_bit_budget_ranges.c_str(),
+                             kv_weight, options.kv_bit_budget_ranges.c_str(),
                              spec.c_str());
             }
         } else if (scored_active) {
@@ -1697,6 +2062,28 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         // the per-layer table, "cold" keeps a HOT NVFP4 window and is routed to the cold
         // pool, and this line reports both against the pool that will really exist.
         const KvDeployedSpec deployed = deploy_kv_budget_spec(spec);
+        // F903 THE COMPOSITION, AT ITS ONE POINT. deploy_kv_budget_spec just replaced the
+        // table AND the mask with the ceiling's own plan for every slot; the pins are applied
+        // OVER it here. The ORDER is the semantics and is deliberate: solve first, pin
+        // second, so a pinned slot can never be re-solved away by the objective.
+        const std::size_t pinned_applied = apply_kv_pins();
+        // THE COMPOSED SPEC is what the `hot=` field must show, or the line would report the
+        // ceiling's plan with the pins left out -- a false reading produced by this fix.
+        const std::string composed_hot = kv_pins_composed_spec(deployed.hot_spec);
+        const bool composed_ok = kv_pins_spec_roundtrips(composed_hot);
+        // The report line the composition needs, printed BEFORE the ceiling's own line so a
+        // reader cannot take `achieved` as the deployed table's average: it is the CEILING's
+        // fit over all layers, and the pinned slots are not that. Stated, not implied.
+        // PRINTED ONLY WHEN SOMETHING WAS PINNED: a run with no pins must keep the byte-exact
+        // stderr every existing gate was calibrated on, so the no-pin path is untouched.
+        if (pinned_applied != 0) {
+            std::fprintf(stderr,
+                         "[kv-pin] --kv-layer-storage pinned=%zu of %d full-attention layer(s) runs=%s; those slots OVERRIDE the ceiling's plan and the remaining %d are the ceiling's own. `achieved`/`shortfall` on the line below describe the CEILING'S FIT OVER ALL %d, not the deployed table, whose average includes the pinned slots. `hot=` below IS the deployed table (pins merged in) and roundtrip=%s.\n",
+                         pinned_applied, static_cast<int>(full_layers),
+                         kv_pin_runs_text().c_str(),
+                         static_cast<int>(full_layers) - static_cast<int>(pinned_applied),
+                         static_cast<int>(full_layers), composed_ok ? "true" : "false");
+        }
         std::fprintf(stderr,
                      "[kv-bit-budget] full_attention_layers=%d bits=%.2f ranges=%s "
                      "cold_pages=%u cold_placed=%s hot=%s achieved=%.2f shortfall=%.2f "
@@ -1709,7 +2096,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                                                           : options.kv_bit_budget_ranges.c_str(),
                      static_cast<unsigned>(cold_pages),
                      deployed.cold_ranges.empty() ? "-" : deployed.cold_ranges.c_str(),
-                     deployed.hot_spec.c_str(), budget_achieved, budget_shortfall,
+                     composed_hot.c_str(), budget_achieved, budget_shortfall,
                      static_cast<unsigned>(cold_pages));
     }
 
@@ -1725,7 +2112,16 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     // A layer whose K and V requirements meet no single tier is refused BY INDEX with the
     // missing cell named, and the refusal carries the deployable joint plan, so the operator
     // is never left without a runnable spec. Nothing is substituted silently.
-    if (options.kv_kv_bits_explicit && !storage_explicit) {
+    // F903: the same guard, the same reason, the other ceiling. --kv-bits/--kv-k-bits/
+    // --kv-v-bits composes with a --kv-layer-storage PIN SET exactly as --kv-bit-budget does.
+    if (options.kv_kv_bits_explicit && (!storage_explicit || pin_and_solve)) {
+        if (storage_explicit && !pin_and_solve && pin_count != 0) {
+            throw std::invalid_argument(
+                "--kv-bits/--kv-k-bits/--kv-v-bits with a --kv-layer-storage table that names "
+                "EVERY full-attention layer: the ceiling would resolve into a table that "
+                "already exists, i.e. be accepted and read by nothing. Name FEWER layers with "
+                "--kv-layer-storage, or drop the ceiling.");
+        }
         const std::int32_t rk4v4_limit = product::kKvBitBudgetE8LayerLimit;
         const std::int32_t cold_cap = static_cast<std::int32_t>(cold_pages);
         // The score tables. The joint entry fits against ONE table; the split entry may be
@@ -1800,6 +2196,19 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             throw std::invalid_argument(kv_plan.refusal);
         }
         const KvDeployedSpec deployed = deploy_kv_budget_spec(kv_plan.spec);
+        // F903: the SAME pin application as the --kv-bit-budget entry, through the SAME
+        // lambda, so the two ceiling spellings cannot drift on what a pin means.
+        const std::size_t pinned_applied = apply_kv_pins();
+        const std::string composed_hot = kv_pins_composed_spec(deployed.hot_spec);
+        const bool composed_ok = kv_pins_spec_roundtrips(composed_hot);
+        if (pinned_applied != 0) {
+            std::fprintf(stderr,
+                         "[kv-pin] --kv-layer-storage pinned=%zu of %d full-attention layer(s) runs=%s; those slots OVERRIDE this ceiling's plan and the remaining %d are the ceiling's own. `hot=` below IS the deployed table (pins merged in) and roundtrip=%s.\n",
+                         pinned_applied, static_cast<int>(full_layers),
+                         kv_pin_runs_text().c_str(),
+                         static_cast<int>(full_layers) - static_cast<int>(pinned_applied),
+                         composed_ok ? "true" : "false");
+        }
         std::fprintf(stderr,
                      "[kv-bits] deployed mode=%s full_attention_layers=%d cold_pages=%u "
                      "cold_placed=%s hot=%s (cold residency needs --cold-policy window|disk; "
@@ -1807,7 +2216,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                      product::kv_bits_mode_name(kv_plan.mode), static_cast<int>(full_layers),
                      static_cast<unsigned>(cold_pages),
                      deployed.cold_ranges.empty() ? "-" : deployed.cold_ranges.c_str(),
-                     deployed.hot_spec.c_str(), static_cast<unsigned>(cold_pages));
+                     composed_hot.c_str(), static_cast<unsigned>(cold_pages));
     }
 
     // Both fp8 spellings name the SAME target tier: KvCacheStorage carries an old
@@ -1949,6 +2358,16 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     const bool mtp_adaptive = options.speculative.backend == SpeculativeBackend::Mtp &&
                               options.speculative.draft_tokens == 0 &&
                               options.speculative.draft_tree_paths == 0;
+    // mtpadapt (dl/_orch/landq/mtpadapt/01-laddertop): THE WIDEST RUNG AN ADAPTIVE CAPTURE
+    // LADDER MAY CARRY. Not this artifact's draft maximum -- the rung the MEASURED width model
+    // selects. See the effective_mtp_ladder note below for the measurement behind the value.
+    //
+    // 2 is the throughput argmax of Phi(k) = AL(k)*1000/(a + b*k) with the cost constants the
+    // criterion itself is calibrated on (mtp_window_cut.h: kMtpRoundCostBaseMs /
+    // kMtpRoundCostPerColumnMs, measured for this artifact class), and it is also where this
+    // record's own fixed-width sweep peaked (111.5 tok/s at k=2 against 107.8 at 3, 108-110 at 4,
+    // 59 at 9-10, 44.5 at 15).
+    constexpr std::uint32_t kMtpAdaptiveLadderTopRung = 2;
     // Clamped to this target's MTP draft domain (kMaximumMtpDraftTokens is a per-target
     // constant; 27b raised it to kMtpDecodeMaximumDrafts). A target too narrow for the first
     // rung degrades to a single rung at its own maximum, i.e. the widest legal fixed width.
@@ -1960,6 +2379,80 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         }
         if (ladder.empty()) {
             ladder.push_back(kMaximumMtpDraftTokens != 0 ? kMaximumMtpDraftTokens : 1U);
+        }
+        // mtpadapt / 01-laddertop: SIZE THE CAPTURE LADDER BY THE COST MODEL, NOT BY THE ARTIFACT.
+        //
+        // WHY. `draft_window` for an adaptive run is `effective_mtp_ladder.back()`, resolved a few
+        // lines below, and the MTP decode FRAME is `draft_window + 1` columns wide. The round's
+        // target-verify work follows the FRAME, not the rung the criterion picks. Measured on this
+        // artifact (SC_004096, ctx 20480, --max-new 64, greedy, --kv-dtype nvfp4, bin
+        // 42b7855bae90b35d, --spec mtp, NINFER_MTP_ROUND_LOG=1): the SAME implemented width of 2
+        // columns costs 35.3 ms/round of device wait plus 5-10 ms of host when the frame is 16
+        // wide, against 15.9 + 1.4 ms/round when the frame is 3 wide, and a 4-point fit over the
+        // fixed and adaptive arms gives
+        //     round(ms) = 10.963 + 1.868*(draft_window + 1) + 1.45*(launch_width - 1)
+        // with a maximum residual of 0.9 ms. A ladder top of 15 therefore charges ~24 ms/round
+        // for five rungs -- and pays the widest one on every round -- to express a decision that
+        // lands on the narrowest one.
+        //
+        // WHAT THIS KEEPS AND WHAT IT REMOVES. Every rung up to kMtpAdaptiveLadderTopRung stays,
+        // so the criterion is still evaluated per round and the width is still SELECTED: mtp_ladder
+        // is still non-empty, the profile width key is still live, and `adaptive_window` still
+        // reports true. Only the rungs the cost model never selects are dropped. A single-rung
+        // ladder additionally takes the |ladder| > 1 deferral off the capture path (program_impl.h
+        // gates it on `graph_capture_ceiling != 0 && rungs.size() > 1`), so the rung is captured up
+        // front exactly as a fixed-k run captures its own single rung, and no `[graphs] extended
+        // MTP ladder rung` print and no per-crossing cudaStreamSynchronize can occur at all.
+        //
+        // REVERSIBILITY. Removing this block restores the artifact-maximum ladder byte for byte
+        // (see revert.py, which restores the whole pre-image).
+        while (ladder.size() > 1 && ladder.back() > kMtpAdaptiveLadderTopRung) {
+            ladder.pop_back();
+        }
+        // ladderrung (dl/_orch/landq/ladderrung/01-ladderfloor): THE TOP IS ALSO THE FLOOR THE
+        // ACTIVE PROPOSAL HEAD DEMANDS.
+        //
+        // WHY. When `draft_tokens == 0` the package's own rewrite feeds kMtpShortlistMinimumDrafts
+        // (5) to resolved_proposal_head (qwen3_6_27b/impl/package.cpp), so an adaptive run on an
+        // artifact that DECLARES the shortlist head resolves `proposal_head = Optimized` --
+        // measured on the shipping pin:
+        //   "proposal head auto-resolved head=optimized reason=mtp-at-or-above-minimum (profile=3,
+        //    backend=1, window=0, declared shortlist head=present)"
+        // program_impl.h:11258-11260 then sets head_floor = kMtpShortlistMinimumDrafts and floors
+        // EVERY chosen rung at it, and its single write point (:11277-11280) refuses a rung that is
+        // outside the captured ladder -- the ladder THIS lambda returns.
+        //
+        // So the clamp above can strip the ladder below the floor the same run will demand: a top
+        // of 2 leaves {2} while the floor asks for 5, and the run stops mid-decode with
+        //     error: MTP target width is not a rung of the captured ladder
+        // Measured (dl/ladderrung/REPORT.md): bin 4771a95999ce90df, `--spec mtp` with NO
+        // --draft-tokens, rc=1 in 3/3 runs -- and 4/4 with the recall axis stripped -- against rc=0
+        // for the frozen pre-image 42b7855bae90b35d on the same argv. The narrowed ladder is what
+        // makes widths below the floor POSSIBLE, so the two decisions are not independent: a ladder
+        // whose top is under the floor has to carry the floor's own rung.
+        //
+        // WHAT THIS DOES NOT DO. It does not move the floor -- the Optimized head's drafts leak into
+        // the emitted tokens below kMtpShortlistMinimumDrafts (startup_features.h:74, 88/160
+        // positions at k=3), so lowering it would change tokens, not only speed -- and it does not
+        // change the head. It only keeps the rung the floor will demand, taken from the same
+        // decision ladder and the same target domain the clamp above already reads.
+        //
+        // THE PRICE, NAMED. A floor-bearing ladder ends at 5, so `draft_window` and the decode
+        // frame (draft_window + 1 = 6) are that much wider than the k=2 ladder's 3: the round cost
+        // folows the frame, and dl/_orch/landq/mtpadapt/01-laddertop priced 1.868 ms per frame
+        // column. Rungs above the floor are still dropped, so the clamp's own saving survives on
+        // every rung it removed.
+        if (!ladder.empty() && options.speculative.proposal_head == ProposalHead::Optimized) {
+            const std::uint32_t floor_rung = qwen3_6::kMtpShortlistMinimumDrafts;
+            const std::uint32_t clamped_top = ladder.back();
+            if (clamped_top < floor_rung) {
+                for (const std::uint32_t width : kMtpWindowLadder) {
+                    if (width > clamped_top && width <= floor_rung &&
+                        width <= kMaximumMtpDraftTokens) {
+                        ladder.push_back(width);
+                    }
+                }
+            }
         }
         return ladder;
     }();
@@ -2002,6 +2495,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_rotation_off     = options.kv_rotation_explicit && options.kv_rotation_off,
         .kv_row_scale_spec   = options.kv_row_scale_explicit ? options.kv_row_scale_spec
                                                              : std::string{},
+        .stage_layers_spec   = options.stage_layers_spec,
+        .stage_handoff_dir   = options.stage_handoff_dir,
+        .stage_handoff_cut   = options.stage_handoff_cut,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,

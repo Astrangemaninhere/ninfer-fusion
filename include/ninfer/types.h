@@ -21,7 +21,40 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency               = 8;
+// maxconc (dl/_orch/landq/maxconc): THE MAXIMUM CONCURRENCY, AND THE ARGUMENT FOR 16.
+//
+// This constant is the engine's LANE CEILING, not a hint. It is the extent of every
+// fixed-size per-lane array in the runtime (the round's ingress/egress transfer PODs, the
+// scheduler's membership sets, the resource manager's lane table) and it is the bound the
+// CLI and serve front ends refuse above. dl/relaymeasure (ledger F693) measured that the
+// aggregate decode throughput STOPS RISING AT 8 and that adding tasks past 8 through 8 lanes
+// is flat (274-290 tok/s) while costing ceil(N/8) waves -- so this number is what caps the
+// total, and lifting it is the only way to reach the aggregate the owner asked for.
+//
+// WHY 16. It is the largest value the OP LAYER can serve, and that ceiling is not this one:
+//   src/ops/common/sampling_workspace.h:26  kSamplerMaxColumns = 16
+//     -- the registered sampling and speculative routes use at most sixteen columns, and
+//        sampling_workspace_capacity_bytes() RETURNS 0 above it, so a larger lane count
+//        would silently size the sampler workspace to zero rather than fail.
+//   src/ops/wrapper/gqa_attention.cpp:21     kMaximumVerifyTokens = 16
+//   six plan files                           kVerifyWidthCeiling  = 16
+// 16 is also the next point on the owner's own measured ladder (N = 8, 16, 32).
+//
+// THIS CONSTANT IS NOT THE WHOLE BOUND. The lane count becomes the batch dimension of a
+// decode round (decode_impl.h slices every ingress array to batch_size; text_context_impl.h
+// takes batch = ids.ne[0]), and the ops assert their OWN batch ceilings with literal 8s that
+// do not name this constant. Those were lifted to 16 in the SAME change -- see
+// dl/_orch/landq/maxconc/README.md -- because raising this line alone would turn a clean
+// startup refusal into a runtime abort inside gqa_attention / causal_conv1d / gdn_input_proj.
+//
+// MEMORY. The whole kMaximumConcurrency-sized array surface of the engine, summed over every
+// array and every element type with measured sizeofs, is 24,936 B at 8 and 49,872 B at 16
+// (delta +24,936 B = +24.4 KiB per engine). The bound is not purchased with memory.
+//
+// Flash-Next keeps its own literal 8 (qwen3_8_flash_next/impl/runtime_plan.cpp:59): it
+// captures one decode graph per B per block bucket, so its ceiling is a capture cost, and its
+// independent guard still refuses >8 at startup.
+inline constexpr std::uint32_t kMaximumConcurrency               = 16;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
@@ -413,7 +446,7 @@ struct EngineOptions {
     // because no model knowledge exists there. Mutually exclusive with an explicit
     // kv_layer_storage (checked in serve_options.cpp).
     double kv_bit_budget_bits = 0.0;
-    // Separable form of the same budget ("0-7:8,8-63:4.5"): distinct ceilings per layer
+    // Separable form of the same budget ("0-7:8,8-15:4.5", tiling every full-attention layer): distinct ceilings per layer
     // range, minimised per range (globally optimal because the objective is additive and
     // the constraints are per-range). Empty means the single-ceiling form above.
     std::string kv_bit_budget_ranges;
@@ -559,6 +592,16 @@ struct EngineOptions {
     // temp dir. Under HostThenDisk this bounds only the overflow rung.
     std::string cold_disk_path;
     std::uint64_t cold_disk_bytes     = 32ULL << 30;
+    // qwen4_exp (FlashNext) PLE n-gram sidecar root: the directory holding
+    // ple-manifest.json plus ple/ple-bf16-*.bin. Empty = PLE off, which is the
+    // default and the behaviour of every build before this field existed; the
+    // runtime then looks for ple-root/ next to the artifact and otherwise runs
+    // the text-only path untouched. A NON-EMPTY root that holds no manifest is a
+    // startup contradiction, not a skip -- the PLE residual is ADDITIVE, so a
+    // silently absent stage changes the arithmetic without any symptom. Same
+    // three-state split tests/ops/ple_table_e2e_test.cu makes for its own root:
+    // unset -> skip, set-and-valid -> run, set-and-empty -> refuse.
+    std::string ple_sidecar_root;
     // W13 weight host-offload budget (bytes of weight payload that may leave the
     // device arena). DELIBERATELY a separate budget from cold_host_bytes (KV cold
     // tier): different lifetimes and failure modes. 0 = off. See
@@ -594,13 +637,30 @@ struct EngineOptions {
     // (product/kv_component_switch.h), called from plan_cache()
     // (targets/qwen3_6/impl/state/decoder_state.cpp).
     //
-    // LAST MEMBER ON PURPOSE: a field appended at the end cannot move any existing
+    // APPENDED AT THE END ON PURPOSE: a field appended at the end cannot move any existing
     // field's offset, so an object compiled before this change still reads every
     // field it knows about where it expects it. That keeps the "default all-false
     // means nothing changed" claim checkable against binaries built from the
     // previous revision (objdump-able, and it survives the incremental-rebuild
     // hazard the acceptance notes warn about).
     std::array<bool, kKvLayerStorageSlots> kv_layer_storage_set{};
+    // --stage-layers SPEC / --stage-handoff DIR / --stage-handoff-cut: the PIPELINE stage
+    // partition this run walks, where the boundary hidden state between two stages crosses, and
+    // the negative-control switch that silences the producer. Appended after the field above
+    // for the reason that field's own comment states -- no existing offset moves, so "empty
+    // spec means nothing changed" is checkable against a binary built from the previous
+    // revision.
+    //
+    // EMPTY SPEC IS THE FLAG ABSENT, i.e. ONE STAGE, i.e. axis `none`, and it is byte-for-byte
+    // a run from before these fields existed. The grammar, the refusals and the axis check live
+    // in core/stage_plan.h -- ONE implementation, called by the front door
+    // (apps/cli/options.cpp) AND by the runtime
+    // (targets/qwen3_6/impl/runtime/text_context_impl.h), which is where the artifact's own
+    // layer count is known and where plan_shards() can therefore be asked whether the spec is
+    // a world the rank axis derives.
+    std::string stage_layers_spec;
+    std::string stage_handoff_dir;
+    bool stage_handoff_cut = false;
 };
 
 enum class SamplingMode : std::uint8_t {

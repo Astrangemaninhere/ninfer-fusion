@@ -237,24 +237,38 @@ enum class KvComponentSwitch : std::uint8_t {
 // ---------------------------------------------------------------------------
 // `PagedKVLayerView::sliding_window_tokens` is the ONLY bound the Cold Host tier has:
 // `cold_host_page_is_read_free()` releases a device page to the host on the strength of
-// it. But of the six KV decode tiers, two read that field and four do not:
+// it. The field has TWO consumers per tier, not one -- a DECODE kernel and a PREFILL
+// kernel -- and they do not agree with each other. Re-censused by content (F1227) rather
+// than by citation; the numbers below are the current lines, grepped:
 //
-//   HONOUR IT  gqa_attention_decode_nvfp4.cuh:259  token_begin = window_full - sliding_window
-//              gqa_attention_decode_iso3.cuh:132   the same three lines
-//              NOTE, AND THIS IS THE LOAD-BEARING CORRECTION: the prompt kernel is NOT
-//              an unconditional reader of this field. gqa_attention_prefill_nvfp4.cuh:1097 is
-//              `const int window = (sliding_window > 0 && KVDType == DType::NVFP4) ? sliding_window : 0;`
-//              so an ISO3 prefill -- the launcher instantiates the SAME template with
-//              KVDType == ISO3 (ops/launcher/gqa_attention_prefill.cu:195 -> :201) -- gets
-//              window 0 and therefore FULL ATTENTION, while an ISO3 decode is window
-//              attention (gqa_attention_decode_iso3.cuh:250). The DECODE census below is
-//              correct; what it is NOT is a census of every reader. A page that may LEAVE
-//              THE DEVICE needs the two-phase census: kv_window_tier_release_safe() below.
-//   IGNORE IT  gqa_attention_decode_bf16.cuh:153   window = last_pos + 1
-//              gqa_attention_decode_fp8.cuh:131    the same
-//              gqa_attention_decode_i8.cuh:202     the same
-//              gqa_attention_simt_ffma.cuh:394     the same
-//              gqa_attention_decode.cuh:359        gqa_small_t_reduce_window(last_pos, ...)
+//   DECODE READS IT  gqa_attention_decode_nvfp4.cuh:413
+//                          token_begin = (sliding_window > 0) ? window_full - sliding_window : 0
+//                    gqa_attention_decode_iso3.cuh:250   the same line
+//                    gqa_attention_decode_bf16.cuh:166    the same line, same clamp
+//                    gqa_attention_decode_i8.cuh:215      the same line
+//                    gqa_attention_decode.cuh:341-361, :494  the small-T family's count/origin
+//   DECODE IGNORES IT  gqa_attention_decode_fp8.cuh (no reader at all)
+//                    gqa_attention_simt_ffma.cuh (its own gate, :1114)
+//   PREFILL READS IT gqa_attention_prefill_nvfp4.cuh:1097 -- and ONLY on KVDType == DType::NVFP4:
+//                      `const int window = (sliding_window > 0 && KVDType == DType::NVFP4) ? sliding_window : 0;`
+//                    That single line is the whole of the prefill census. `sliding_window`
+//                    appears nowhere else under ops/kernel/gqa_attention_prefill*.
+//   PREFILL IGNORES IT
+//                    * ISO3 / FP8_E4M3FN: the launcher instantiates the SAME template with
+//                      KVDType == ISO3 (ops/launcher/gqa_attention_prefill.cu:195 -> :201),
+//                      the condition above is false, `window` is 0 and :1098 takes
+//                      `visible_start = 0` => the prompt pass is FULL ATTENTION.
+//                    * BF16: gqa_attention_prefill_bf16.cuh:132-137 -- the kernel has NO
+//                      sliding_window parameter at all, so there is nothing to pass it.
+//                    * I8: gqa_attention_prefill_i8.cuh -- same shape, no reader.
+//                    * SIMT FFMA: refused by name at gqa_attention_simt_ffma.cuh:1385-1409.
+//
+// So the correct predicate is a CONJUNCTION over the two phases, and before F1227 the
+// function below was the decode census wearing the name of the whole answer: a tier whose
+// decode reads the field installed a window that the same tier's prompt pass ignored. That
+// is the spark_x2_5_4b shape (27 of 36 layers at 512 tokens: installed, honoured in decode,
+// absent from the bf16 prefill) and it is invisible at or below the window length, because
+// there the clip is a no-op in both phases.
 //
 // On an ignoring tier the consequence is NOT a quality loss: the tier releases a page on
 // the strength of a window the kernel never applies, and the kernel then reads a page that
@@ -268,62 +282,84 @@ enum class KvComponentSwitch : std::uint8_t {
 // inert -- `cold_host_page_is_read_free`, :81-91, returns false on the first zero it sees).
 // muse_glimmer_30b declares 2048 on 39 of its 52 layers and is therefore inert, not
 // refused; a table of all zeros (every other variant today) is likewise inert.
-[[nodiscard]] inline bool kv_window_tier_honoured(DType resolved) noexcept {
+// THE DECODE CENSUS, AND NOTHING ELSE. "Does this tier's DECODE kernel read
+// sliding_window_tokens?" -- the question the name of the OLD function answered with this
+// body. It is not a census of every reader; see kv_window_tier_prefill_honoured below.
+[[nodiscard]] inline bool kv_window_tier_decode_honoured(DType resolved) noexcept {
     // i8win ADDS I8, and the evidence is the kernel: gqa_attention_decode_i8.cuh now derives
-    // token_begin from the field (the max(0, window_full - sliding_window) clamp). What that
-    // DOES NOT buy is release safety -- the INT8 prefill does not apply the window -- so I8
-    // stays OUT of kv_window_tier_release_safe below, which is the predicate the page-release
-    // decision uses (program_impl.h:13076); no page is ever released on I8's behalf.
-    // The census of `sliding_window_tokens` readers, and nothing else.
+    // token_begin from the field (the max(0, window_full - sliding_window) clamp, :215).
     //
     // bf16win ADDS BF16, and the evidence for it is the kernel, not this comment: the bf16
-    // decode kernel now derives token_begin from the field
-    // (gqa_attention_decode_bf16.cuh, `const int window_full = last_pos + 1;` followed by
-    // the max(0, window_full - sliding_window) clamp). What that DOES NOT buy is release
-    // safety: the bf16 PREFILL does not apply the window -- the prefill kernel has no bf16
-    // instance at all (gqa_attention_prefill_nvfp4.cuh:953 static_asserts KVDType in
-    // {NVFP4, FP8_E4M3FN, ISO3}), so its DType::NVFP4-only window condition
-    // (that file's `window = (sliding_window > 0 && KVDType == DType::NVFP4) ? ... : 0`) is
-    // never reached on bf16. bf16 therefore stays OUT of kv_window_tier_release_safe below,
-    // which is the predicate the page-release decision uses
-    // (program_impl.h:13076) -- so no page is ever released on bf16's behalf.
-    // i8win: I8 IS added here. The comment block above claimed it while this return was
-    // left untouched, and the acceptance run caught the discrepancy by name
-    // (`--kv-layer-storage 0-15:int8` still answered `cold-host window: layer 0 ...`).
+    // decode kernel derives token_begin from the field (gqa_attention_decode_bf16.cuh:166,
+    // `const int window_full = last_pos + 1;` followed by the max(0, ...) clamp).
+    //
+    // i8win: I8 IS added here. A comment block claimed it while this return was left
+    // untouched, and the acceptance run caught the discrepancy by name
+    // (`--kv-layer-storage 0:16:int8` still answered `cold-host window: layer 0 ...`).
     return resolved == DType::NVFP4 || resolved == DType::ISO3 || resolved == DType::BF16 ||
            resolved == DType::I8;
+}
+
+// THE PREFILL CENSUS. "Does this tier's PROMPT kernel read the same field?" One tier does,
+// and the proof is a single line of the shared prompt TU (see the table above):
+//   NVFP4 -- gqa_attention_prefill_nvfp4.cuh:1097, `window` non-zero only for NVFP4.
+//   every other tier -- 0 there, or no parameter to pass at all.
+// The list below must be edited together with that file, and the two cannot drift silently:
+// a tier added here that the kernel does not honour installs a window the prompt pass
+// ignores, which is the defect this split exists to make loud.
+[[nodiscard]] inline bool kv_window_tier_prefill_honoured(DType resolved) noexcept {
+    return resolved == DType::NVFP4;
+}
+
+// `kv_window_tier_honoured` now means WHAT ITS NAME SAYS: honoured in BOTH phases. This is
+// the predicate an INSTALL site needs, because a window installed on the strength of one
+// phase is a bound the other phase does not apply, and the disagreement is silent exactly
+// where it matters -- above the window length, which no short-context probe can reach.
+//
+// The install site is targets/qwen3_6/impl/runtime/layouts_impl.h (the `honoured_here`
+// expression in the per-layer window loop); it feeds the layer window table AND the named
+// report of the layers whose declaration did not survive. Before F1227 that expression read
+// the DECODE census, so a bf16 / i8 / ISO3 plan installed a window its own prompt pass
+// ignored, and the report never fired for the tiers that most needed it.
+[[nodiscard]] inline bool kv_window_tier_honoured(DType resolved) noexcept {
+    return kv_window_tier_decode_honoured(resolved) &&
+           kv_window_tier_prefill_honoured(resolved);
 }
 
 // ---------------------------------------------------------------------------
 // THE RELEASE CENSUS: THE PHASES THAT CAN STILL READ A PAGE AFTER IT LEAVES
 // ---------------------------------------------------------------------------
-// `kv_window_tier_honoured` above answers "does the declared window bound what an
-// attention kernel reads". It is the right predicate for the install-time refusal and for
-// the DECODE phase. It is NOT the predicate a page-release decision may use, because a
-// released page is read by whichever kernel runs NEXT, and the prompt kernel that reaches
-// an ISO3 layer does not apply the window:
+// `kv_window_tier_honoured` above answers "does EVERY phase that will read this layer
+// apply the declared window". That is ALSO the question a page-release decision has to
+// answer, because a released page is read by whichever kernel runs NEXT -- and the prompt
+// kernel that reaches an ISO3 layer does not apply the window:
 //   prefill gqa_attention_prefill_nvfp4.cuh:1097 -- `window` is 0 unless
 //           KVDType == DType::NVFP4, and :1098 then takes `visible_start = 0`.
 //   launch  ops/launcher/gqa_attention_prefill.cu:195
 //           `} else if (cache.dtype == DType::ISO3) {` -> :201
 //           `gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, DType::ISO3>`.
-// So on ISO3 the window is honoured by the decode kernel and NOT by the prompt kernel: a
-// page retired on ISO3's window is read by the next prefill that covers it. That is the
-// class this header names above -- "a released page would be read anyway: SILENT
-// CORRUPTION, not a quality loss" -- so it is refused by name at the release boundary
-// instead of being trusted to a phase the caller remembers to check.
+// So a page retired on ISO3's window is read by the next prefill that covers it: the class
+// named above as SILENT CORRUPTION, refused by name at the release boundary instead of
+// being trusted to a phase the caller remembers to check.
 //
 // PER TIER, AND WHY EACH ANSWER IS WHAT IT IS:
-//   NVFP4 -- release-safe. Decode reads the field (gqa_attention_decode_nvfp4.cuh:381) and
+//   NVFP4 -- release-safe. Decode reads the field (gqa_attention_decode_nvfp4.cuh:413) and
 //            the prompt kernel's NVFP4 instance reads it too (:1097).
-//   ISO3  -- NOT release-safe. Decode reads it (gqa_attention_decode_iso3.cuh:250); the
-//            prompt kernel's ISO3 instance does not. It stays out until the prefill side
-//            applies the window as well -- making the kernel do that is a numerics change
-//            on the compute path and is deliberately NOT this predicate's job.
-//   the other four tiers -- already refused at install by kv_sliding_window_domain_error
-//            below, so they cannot reach a release site at all.
+//   ISO3 / BF16 / I8 -- NOT release-safe. Their decode reads it
+//            (gqa_attention_decode_iso3.cuh:250, gqa_attention_decode_bf16.cuh:166,
+//            gqa_attention_decode_i8.cuh:215); their prompt kernel does not. They stay out
+//            until the prefill side applies the window as well -- making the kernel do that
+//            is a numerics change on the compute path and is deliberately NOT this
+//            predicate's job.
+//   the other tiers -- not in the decode census either, so they cannot reach a release site
+//            on a window's strength at all.
+//
+// WRITTEN THROUGH `kv_window_tier_honoured` AND NOT BESIDE IT (F1227). The release question
+// and the install question are the same conjunction over the same two censuses, and this
+// header already carried the cost of keeping two answers by hand: BF16 sat under "IGNORE IT"
+// in prose while the code admitted it. One census, two readers.
 [[nodiscard]] inline bool kv_window_tier_release_safe(DType resolved) noexcept {
-    return resolved == DType::NVFP4;
+    return kv_window_tier_honoured(resolved);
 }
 
 // Empty when every layer the window is declared on resolves to a tier that honours it

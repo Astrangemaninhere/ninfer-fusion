@@ -1,3 +1,4 @@
+#include "core/vendor_sim.h"
 #include "product/kv_kv_bits.h"
 #include "product/load_progress/load_progress.h"
 #include "serve/console_log.h"
@@ -45,6 +46,19 @@ std::string format_bytes(std::size_t bytes) {
 
 int main(int argc, char** argv) {
     ninfer::serve::ServeOptions options;
+    // THE VENDOR AXIS IS ADJUDICATED AT THIS DOOR, BEFORE EVERY EXIT PATH IN THIS FUNCTION.
+    // v2 (servewire, on serveaxis' coordinates): poc29's apps/serve/main.cpp patch put this
+    // call AFTER the last catch block, and two of the four zero-GPU front doors return from
+    // INSIDE those catches (apps/serve/main.cpp:53 and :56), so they never reached it. A MOVE,
+    // not an addition: above the `try` is before every exit path in main().
+    // Why the axis needs such a door: the engine's only consumer of NINFER_SIM_VENDOR /
+    // NINFER_SIM_VENDOR_ACK is src/targets/registry.cpp's construct_target(), i.e. the
+    // model-load path, and `grep -rn 'vendor_sim|SIM_VENDOR|vendor_view' src/serve/ apps/` =
+    // 0 hits, so every path that loads no model said NOTHING about a request set in the
+    // environment. This door prints every value it compared and prints nothing when nothing
+    // was asked (VendorDoorOutcome::NotRequested is the one silent outcome).
+    (void)ninfer::caps::vendor_door_adjudicate_and_announce();
+
     try {
         options = ninfer::serve::parse_serve_options(argc, argv);
     } catch (const std::invalid_argument& exception) {

@@ -94,9 +94,15 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  * Append every K/V row to a paged growing cache laid out at its OWN e8 tier extent.
  *
  * THIS IS THE ADMISSION FOR THE PACKED e8 FAMILY, AND IT IS A SEPARATE OVERLOAD ON PURPOSE.
- * `cache.dtype` selects both the K row extent and the arm: E8K3Kv is a 96-byte K plate and
- * E8K2Kv a 64-byte one, beside a V plate that this family does NOT narrow (128 B/row at every
- * width -- product/kv_e8_width.h:131-137). The extents are not restated here; they are read
+ * `cache.dtype` selects both the K row extent and the arm, and the pair is now spelled PER
+ * PLANE (line dl/e8names, marker F1194; the plane vocabulary is product/kv_e8_width.h's
+ * `E8KvPlaneFormat`): `E8KvB3B4` is K at format B3 -- a 96-byte K plate -- beside V at
+ * format B4, and `E8KvB2B4` is K at B2, a 64-byte plate, beside the SAME B4 V. That is the
+ * sentence the legacy names `E8K3Kv` / `E8K2Kv` could not write: their `v4` is a literal and
+ * not a choice, so neither name has a position in which a V could ever differ. Both legacy
+ * names are KEPT as aliases and are equal by value. The V plate beside BOTH arms is the
+ * shipped 128 B/row plate and this family does not narrow it. The extents are not restated
+ * here; they are read
  * from `d256_kv_cache_profile(cache.dtype)`, the same table the unpacked tiers are checked
  * against, so this overload cannot admit a width the geometry of record does not publish.
  *
@@ -111,7 +117,9 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  *     `scale_leading_extent`. A pool at any other extent, including the unpacked 256 or the
  *     4-bit tier's 128 K plate, is refused rather than written.
  *
- * E8Kv (the shipped 4-bit tier) is NOT served here: its K plate is the packed i4 codec at
+ * E8Kv (the shipped 4-bit tier; on the plane axis it is `E8KvB4B4`, or `e8-b4/e8-b4` -- B4 on
+ * BOTH planes, which is why its K plate is 128 B/row and its V is the same 128 B/row plate)
+ * is NOT served here: its K plate is the packed i4 codec at
  * 128 B/row and writing a 96/64-byte lattice plate into it is the corruption the extent check
  * refuses. E8Kv appends through the gqa e8 prefill launch. A non-e8 dtype keeps the exact
  * behaviour of the overload above (it is forwarded to it).

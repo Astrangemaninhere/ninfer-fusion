@@ -159,7 +159,7 @@ __device__ __forceinline__ void gqa_prefill_mxf4_stage_k_cold(
     constexpr int Bc = kNvfp4PrefillBc;
     if (tid < kEntropyNvfp4SlotStreamsPerHalf) {
         std::uint8_t* dst = k_pk + tid * kEntropyNvfp4SlotStreamBytes;
-        if (!entropy_nvfp4_slot_decode_stream(slot, half, tid, dst)) {
+        if (!entropy_nvfp4_slot_decode_stream(slot, slot_bytes, half, tid, dst)) {
             for (int i = 0; i < kEntropyNvfp4SlotStreamBytes; ++i) { dst[i] = 0; }
         }
     }
@@ -237,10 +237,10 @@ __device__ __forceinline__ void gqa_prefill_nvfp4_stage_kv(__nv_bfloat16* dst,
 // tail (both halves).
 template <typename Geometry, bool Iso3>
 __device__ __forceinline__ void gqa_prefill_nvfp4_cold_decode_kv(
-    __nv_bfloat16* dst, const std::uint8_t* slot, const std::uint8_t* scale_tail, int half,
-    int k0, int valid_start, int max_query_abs, int stream) {
+    __nv_bfloat16* dst, const std::uint8_t* slot, int slot_bytes, const std::uint8_t* scale_tail,
+    int half, int k0, int valid_start, int max_query_abs, int stream) {
     std::uint8_t packed[kEntropyNvfp4SlotStreamBytes];
-    if (!entropy_nvfp4_slot_decode_stream(slot, half, stream, packed)) {
+    if (!entropy_nvfp4_slot_decode_stream(slot, slot_bytes, half, stream, packed)) {
         for (int i = 0; i < kEntropyNvfp4SlotStreamBytes; ++i) { packed[i] = 0; }
     }
     for (int byte_index = 0; byte_index < kEntropyNvfp4SlotStreamBytes; ++byte_index) {
@@ -1141,8 +1141,9 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                                            int half, int k0i) {
             if (ptid < kEntropyNvfp4SlotStreamsPerHalf) {
                 gqa_prefill_nvfp4_cold_decode_kv<Geometry, false>(
-                    k_s, k_slot, entropy_nvfp4_slot_scales(k_slot, cold_slot_bytes), half, k0i,
-                    visible_start, max_query_abs, ptid);
+                    k_s, k_slot, cold_slot_bytes,
+                    entropy_nvfp4_slot_scales(k_slot, cold_slot_bytes), half, k0i, visible_start,
+                    max_query_abs, ptid);
             }
         };
         for (int kb = 0; kb < n_block64; ++kb) {
@@ -1213,8 +1214,9 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                 if (ptid >= kEntropyNvfp4SlotStreamsPerHalf &&
                     ptid < 2 * kEntropyNvfp4SlotStreamsPerHalf) {
                     gqa_prefill_nvfp4_cold_decode_kv<Geometry, VVDType == DType::ISO3>(
-                        v_s0, v_slot, entropy_nvfp4_slot_scales(v_slot, cold_slot_bytes), 0, k0,
-                        visible_start, max_query_abs, ptid - kEntropyNvfp4SlotStreamsPerHalf);
+                        v_s0, v_slot, cold_slot_bytes,
+                        entropy_nvfp4_slot_scales(v_slot, cold_slot_bytes), 0, k0, visible_start,
+                        max_query_abs, ptid - kEntropyNvfp4SlotStreamsPerHalf);
                 }
                 gqa_prefill_bar_sync(1, ProducerThreads);
             } else {
@@ -1266,8 +1268,9 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                 if (ptid >= kEntropyNvfp4SlotStreamsPerHalf &&
                     ptid < 2 * kEntropyNvfp4SlotStreamsPerHalf) {
                     gqa_prefill_nvfp4_cold_decode_kv<Geometry, VVDType == DType::ISO3>(
-                        v_s1, v_slot, entropy_nvfp4_slot_scales(v_slot, cold_slot_bytes), 1,
-                        k0 + Bc, visible_start, max_query_abs,
+                        v_s1, v_slot, cold_slot_bytes,
+                        entropy_nvfp4_slot_scales(v_slot, cold_slot_bytes), 1, k0 + Bc,
+                        visible_start, max_query_abs,
                         ptid - kEntropyNvfp4SlotStreamsPerHalf);
                 }
                 gqa_prefill_bar_sync(1, ProducerThreads);

@@ -9,6 +9,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/bidirectional_gqa_attention.h"
+#include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/swa.h"
@@ -25,6 +26,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
@@ -41,6 +43,17 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // --stage-layers: the pipeline stage partition this run walks, the directory the boundary
+    // payload crosses through, and the negative control that silences the producer. DECLARED
+    // LAST so the ExecutionCore aggregate initialisations in program_impl.h can name them
+    // positionally, each reading the single copy of these three values taken from the plan
+    // (program.h:760-762) and never a second copy of its own. The defaults are the
+    // flag-absent state, in which every reader in
+    // TextContext is a no-op and the run is byte-for-byte what it was before this field
+    // existed. See core/stage_plan.h.
+    std::string stage_layers_spec;
+    std::string stage_handoff_dir;
+    bool stage_handoff_cut = false;
 };
 
 struct PrefillContext {

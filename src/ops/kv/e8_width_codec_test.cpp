@@ -943,6 +943,221 @@ int main() {
               "rows were added, NOT by widening the default arm");
     }
 
+    // ------------------------------------------ 10. THE PLANE AXIS (dl/e8vaxis, F1166)
+    // Sections 1-9 treat the family as a K-plane family with a CONSTANT V. This section is the
+    // edit: E8 becomes a FORMAT selectable independently on K and on V, and the floor is e8 at 2
+    // bits on BOTH planes. Three properties, and each one is a bar rather than a claim:
+    //   10.1 the axis is TOTAL, and the shipped K answers do not move;
+    //   10.2 the V plane REUSES the K plane's codec -- proved by BIT IDENTITY, not by
+    //        inspection, because "it is the same codec" is exactly the kind of statement that is
+    //        true of the source and false of the bytes;
+    //   10.3 ⭐ THE ROTATION INVARIANT: one 64-group's stored bytes must not depend on HOW MANY
+    //        ROWS the call was given. That is the exactness doctrine's row-locality rule, and it
+    //        is asserted rather than assumed because `e8_lattice_hadamard64()` is a prerequisite
+    //        worth 0.89 dB at 2 bits and 0.72 dB at 3 bits, and a rotation that leaked across
+    //        rows would leave every aggregate number in this file plausible.
+    std::printf("\n--- 10. the plane axis: e8 as a format on K AND on V (F1166) ---\n");
+    {
+        // Section-local PRNG, for the reason section 8 gives about itself: reusing another
+        // section's would make this section's data depend on how many draws that section made.
+        std::uint32_t p10 = 0x9E3779B9u;
+        const auto r10 = [&p10]() -> std::uint32_t {
+            p10 ^= p10 << 13; p10 ^= p10 >> 17; p10 ^= p10 << 5; return p10;
+        };
+        const auto u10 = [&r10]() -> float {   // [-1, 1)
+            return (static_cast<float>(r10() & 0xFFFFFFu) / 8388608.0f) - 1.0f;
+        };
+
+        // 10.1 TOTALITY, and the shipped answers do not move.
+        struct FRow {
+            E8KvWidth      w;
+            E8KvPlaneFormat f;
+        };
+        const FRow frows[3] = {{E8KvWidth::W4, E8KvPlaneFormat::B4},
+                               {E8KvWidth::W3, E8KvPlaneFormat::B3},
+                               {E8KvWidth::W2, E8KvPlaneFormat::B2}};
+        for (int i = 0; i < 3; ++i) {
+            char msg[240];
+            std::snprintf(msg, sizeof(msg),
+                          "10.1 w%d: the K plane's codec of record is UNCHANGED by the axis",
+                          static_cast<int>(frows[i].w));
+            check(e8_kv_plane_codec_of_record(E8KvPlane::K, frows[i].f) ==
+                      e8_kv_plane_codec_of_record(frows[i].w),
+                  msg);
+            std::snprintf(msg, sizeof(msg),
+                          "10.1 format B%d's plane is the SAME %d B/head-page as w%d's",
+                          static_cast<int>(frows[i].f),
+                          static_cast<int>(e8_kv_plane_format_bytes(frows[i].f)),
+                          static_cast<int>(frows[i].w));
+            check(e8_kv_plane_format_bytes(frows[i].f) == e8_kv_k_plane_bytes(frows[i].w), msg);
+        }
+        check(e8_kv_plane_codec_of_record(E8KvPlane::V, E8KvPlaneFormat::B4) ==
+                  E8KvPlaneCodec::I4,
+              "10.1 V at B4 is the shipped i4 codec, NAMED rather than silently defaulted");
+        check(e8_kv_plane_codec_of_record(E8KvPlane::V, E8KvPlaneFormat::B2) ==
+                      E8KvPlaneCodec::Lattice &&
+                  e8_kv_plane_codec_of_record(E8KvPlane::V, E8KvPlaneFormat::B3) ==
+                      E8KvPlaneCodec::Lattice,
+              "10.1 THE PLANE AXIS: V at B2/B3 is the SAME lattice codec K uses");
+        check(e8_kv_plane_codec_of_record(E8KvPlane::K, E8KvPlaneFormat::B4) !=
+                      E8KvPlaneCodec::Lattice &&
+                  e8_kv_plane_codec_of_record(E8KvPlane::V, E8KvPlaneFormat::B4) !=
+                      E8KvPlaneCodec::Lattice,
+              "10.1 no 4-bit lattice on EITHER plane: the codeword has no 32-bit form");
+
+        // 10.2 THE FLOOR AS ARITHMETIC, and the V plane ENCODED BY THE K PLANE'S OWN CALL.
+        {
+            const std::int32_t rows = 8;
+            const std::size_t n = static_cast<std::size_t>(kE8KvHeadDim) * rows;
+            std::vector<float> px(n);
+            for (std::int32_t r = 0; r < rows; ++r) {
+                for (std::int32_t g = 0; g < e8_kv_groups_per_row(); ++g) {
+                    float* gv = px.data() + static_cast<std::size_t>(r) * kE8KvHeadDim +
+                                g * kE8KvScaleGroup;
+                    for (std::int32_t i = 0; i < kE8KvScaleGroup; ++i) { gv[i] = u10() * 0.5f; }
+                }
+            }
+            const E8KvPlaneFormat lf[2] = {E8KvPlaneFormat::B2, E8KvPlaneFormat::B3};
+            for (int li = 0; li < 2; ++li) {
+                const E8KvPlaneFormat f = lf[li];
+                const std::size_t ncode =
+                    static_cast<std::size_t>(e8_kv_plane_format_row_code_bytes(f)) * rows;
+                const std::size_t nscale =
+                    static_cast<std::size_t>(e8_kv_groups_per_row()) * rows;
+                std::vector<std::uint8_t> ck(ncode), cv(ncode);
+                std::vector<std::uint16_t> sk(nscale), sv(nscale);
+                const bool okk =
+                    e8_kv_encode_plane_format_as(E8KvPlane::K, f, px.data(), rows, ck.data(),
+                                                 sk.data());
+                const bool okv =
+                    e8_kv_encode_plane_format_as(E8KvPlane::V, f, px.data(), rows, cv.data(),
+                                                 sv.data());
+                char msg[280];
+                std::snprintf(msg, sizeof(msg),
+                              "10.2 B%d: the V plane's ENCODE is BIT-IDENTICAL to the K plane's "
+                              "-- same lattice, same tables, same rotation, no new mathematics",
+                              static_cast<int>(f));
+                check(okk && okv && std::memcmp(ck.data(), cv.data(), ncode) == 0 &&
+                          std::memcmp(sk.data(), sv.data(), nscale * 2) == 0,
+                      msg);
+                std::vector<float> xk(n, 0.0f), xv(n, 0.0f);
+                const bool okkd = e8_kv_decode_plane_format_as(E8KvPlane::K, f, ck.data(),
+                                                               sk.data(), rows, xk.data());
+                const bool okvd = e8_kv_decode_plane_format_as(E8KvPlane::V, f, ck.data(),
+                                                               sk.data(), rows, xv.data());
+                std::snprintf(msg, sizeof(msg),
+                              "10.2 B%d: the V plane's DECODE is bit-identical to the K plane's "
+                              "on the same stored bytes",
+                              static_cast<int>(f));
+                check(okkd && okvd && std::memcmp(xk.data(), xv.data(), n * sizeof(float)) == 0,
+                      msg);
+                // ... and both are the codec of record's OWN bytes, so "the K codec" is not a
+                // paraphrase of a third thing that happens to agree.
+                std::vector<std::uint8_t> c_direct(ncode);
+                std::vector<std::uint16_t> s_direct(nscale);
+                const bool okd = e8_kv_encode_plane_lattice(e8_kv_lattice_width_of(f), px.data(),
+                                                            rows, c_direct.data(),
+                                                            s_direct.data());
+                std::snprintf(msg, sizeof(msg),
+                              "10.2 B%d: and BOTH are the codec of record's own "
+                              "e8_kv_encode_plane_lattice(w) bytes",
+                              static_cast<int>(f));
+                check(okd && std::memcmp(ck.data(), c_direct.data(), ncode) == 0 &&
+                          std::memcmp(sk.data(), s_direct.data(), nscale * 2) == 0,
+                      msg);
+            }
+            // THE FLOOR, numerically: 4608 + 4608 over two planes of one head-page.
+            check(e8_kv_pair_bytes(E8KvPlaneFormat::B2, E8KvPlaneFormat::B2) == 9216 &&
+                      e8_kv_pair_bits_x100(E8KvPlaneFormat::B2, E8KvPlaneFormat::B2) == 225,
+                  "10.2 e8 at 2 bits on BOTH planes is 9216 B/head-page = 2.25 b/el per plane");
+        }
+
+        // 10.3 THE ROTATION INVARIANT: THE OUTPUT DOES NOT DEPEND ON THE ROW COUNT.
+        {
+            // One 256-element row, encoded three ways: as the ONLY row of a 1-row plane, as row 0
+            // of a 9-row plane, and as row 5 of that same 9-row plane. All three must store the
+            // SAME bytes and decode to the same values. The codec's rotation is per-64-group and
+            // INSIDE the call (`e8_lattice_hadamard64(y)` on the group's own 64 floats, in
+            // e8_kv_encode_plane_lattice's group loop), so this holds BY CONSTRUCTION -- and that
+            // is exactly why it is worth an assertion: a refactor that hoisted the rotation to
+            // the plane level, or that let a group share state with its neighbour, would keep
+            // every aggregate number in this file plausible while moving real bytes.
+            std::vector<float> one(kE8KvHeadDim);
+            for (std::int32_t i = 0; i < kE8KvHeadDim; ++i) {
+                one[static_cast<std::size_t>(i)] = u10() * 0.7f;
+            }
+            std::vector<float> many(static_cast<std::size_t>(kE8KvHeadDim) * 9, 0.0f);
+            const int dup[2] = {0, 5};
+            for (int di = 0; di < 2; ++di) {
+                for (std::int32_t i = 0; i < kE8KvHeadDim; ++i) {
+                    many[static_cast<std::size_t>(dup[di]) * kE8KvHeadDim +
+                         static_cast<std::size_t>(i)] = one[static_cast<std::size_t>(i)];
+                }
+            }
+            const int other[7] = {1, 2, 3, 4, 6, 7, 8};
+            for (int oi = 0; oi < 7; ++oi) {
+                for (std::int32_t i = 0; i < kE8KvHeadDim; ++i) {
+                    many[static_cast<std::size_t>(other[oi]) * kE8KvHeadDim +
+                         static_cast<std::size_t>(i)] = u10() * 0.7f;
+                }
+            }
+            for (const E8KvWidth w : {E8KvWidth::W2, E8KvWidth::W3}) {
+                const std::int32_t cbr = e8_kv_row_code_bytes(w);
+                const std::int32_t gpr = e8_kv_groups_per_row();
+                std::vector<std::uint8_t> c1(static_cast<std::size_t>(cbr));
+                std::vector<std::uint16_t> s1(static_cast<std::size_t>(gpr));
+                std::vector<std::uint8_t> c9(static_cast<std::size_t>(cbr) * 9);
+                std::vector<std::uint16_t> s9(static_cast<std::size_t>(gpr) * 9);
+                const bool ok1 = e8_kv_encode_plane_lattice(w, one.data(), 1, c1.data(), s1.data());
+                const bool ok9 = e8_kv_encode_plane_lattice(w, many.data(), 9, c9.data(), s9.data());
+                char msg[280];
+                std::snprintf(msg, sizeof(msg),
+                              "10.3 w%d: row 0's stored CODE bytes are the same in a 1-row plane "
+                              "and in a 9-row plane (the rotation cannot leak across rows)",
+                              static_cast<int>(w));
+                check(ok1 && ok9 &&
+                          std::memcmp(c1.data(), c9.data(), static_cast<std::size_t>(cbr)) == 0,
+                      msg);
+                std::snprintf(msg, sizeof(msg),
+                              "10.3 w%d: and row 0's stored SCALE words are the same too",
+                              static_cast<int>(w));
+                check(std::memcmp(s1.data(), s9.data(), static_cast<std::size_t>(gpr) * 2) == 0,
+                      msg);
+                std::snprintf(msg, sizeof(msg),
+                              "10.3 w%d: ROW 5 of the 9-row plane is byte-identical to the "
+                              "1-row plane -- the property is per row, not only for row 0",
+                              static_cast<int>(w));
+                check(std::memcmp(c1.data(), c9.data() + 5 * cbr, static_cast<std::size_t>(cbr)) ==
+                              0 &&
+                          std::memcmp(s1.data(), s9.data() + 5 * gpr,
+                                      static_cast<std::size_t>(gpr) * 2) == 0,
+                      msg);
+                // THE DECODE DIRECTION, so the invariant is pinned on both sides of the plane.
+                std::vector<float> x1(static_cast<std::size_t>(kE8KvHeadDim), 0.0f);
+                std::vector<float> x9(static_cast<std::size_t>(kE8KvHeadDim) * 9, 0.0f);
+                const bool okd1 = e8_kv_decode_plane_lattice(w, c1.data(), s1.data(), 1, x1.data());
+                const bool okd9 = e8_kv_decode_plane_lattice(w, c9.data(), s9.data(), 9, x9.data());
+                std::snprintf(msg, sizeof(msg),
+                              "10.3 w%d: and the DECODE of row 0 agrees between the 1-row and "
+                              "the 9-row plane",
+                              static_cast<int>(w));
+                check(okd1 && okd9 &&
+                          std::memcmp(x1.data(), x9.data(),
+                                      static_cast<std::size_t>(kE8KvHeadDim) * sizeof(float)) == 0,
+                      msg);
+            }
+        }
+
+        // 10.4 THE SHIPPED W4 ROW IS NOT REACHABLE THROUGH THE PLANE-AXIS SEAM WITH A LATTICE,
+        // and it IS reachable as the SCALAR codec. The pre-image's 8.1 and 8.2 already pin the
+        // first half through e8_kv_encode_plane_as(); this pins it through the seam this line
+        // ADDED, so the new door is not a way around the old wall.
+        check(e8_kv_plane_codec_of_record(E8KvPlane::K, E8KvPlaneFormat::B4) ==
+                  E8KvPlaneCodec::Scalar,
+              "10.4 (K, B4) is the SCALAR codec, and the plane-axis seam routes it to "
+              "e8_kv_encode_plane(W4) -- the control arm, not a 4-bit lattice");
+    }
+
     std::printf("\n== %d/%d ==\n", g_ok, g_total);
     return g_ok == g_total ? 0 : 1;
 }

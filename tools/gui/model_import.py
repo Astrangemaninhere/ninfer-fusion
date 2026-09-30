@@ -29,11 +29,17 @@ tools/archkit/out/<model-id>/, and find_manifest() accepts both names:
 
   * tools/archkit/adapt.py      -> manifest.json, carrying gaps [{need, tier,
     action}] plus config.h next to it when a header could be emitted. This is the
-    only writer that has an operator catalogue. It does NOT withhold the header
-    under a `config.h.BLOCKED` name: a `new_op` gap is reported in the manifest
-    while config.h is still written (measured on out/ornith-1.5-9b-q4-k-m/), and
-    the refusal path (unreadable layer kinds, geometry with no dense-FFN width)
-    writes no header at all and records the reason in the manifest. Which header
+    only writer that has an operator catalogue. IT DOES WITHHOLD THE HEADER: when a
+    measured gap list carries a `new_op` entry, and when it refuses for an
+    unreadable layer-kind sequence or a geometry with no dense-FFN width, the header
+    is either withheld as `config.h.BLOCKED` or not written at all -- and the
+    manifest now records which of the three happened in its `config_h` field
+    ("written" / "withheld" / "refused"), which is the only channel by which a LATER
+    reader can tell. This paragraph used to assert the opposite ("It does NOT
+    withhold the header under a `config.h.BLOCKED` name"), and adapt.py gained that
+    writer on 2026-09-15 17:23 while this file was last edited 2026-09-17 20:10 --
+    so the sentence was a claim about a tree the reader had stopped looking at,
+    which is what made a withheld header render as a present one. Which header
     file the report names is therefore read off the disk -- see
     header_file_state().
   * tools/archkit/gen_target.py -> manifest.json (arch_manifest.json before S55),
@@ -295,8 +301,21 @@ class ModelScan:
     weight_bytes: int = 0                 # stored weight bytes (~ lower bound for memory)
     quant_name: str = ""                  # quantisation description
     gguf_types: dict = field(default_factory=dict)   # gguf: type_id -> tensor count
+    #: The source's OWN quantisation spelling, read with the SAME rule the CLI uses
+    #: (import_model.py `quant.get("quant_method") or quant.get("quant_algo") or "unknown"`).
+    #: tools/convert/source_registry.facts_from_scan READS this key; before this field
+    #: existed the seam saw "" for EVERY source the GUI handed it, so the modelopt row
+    #: could never be claimed from the GUI and a modelopt checkpoint was handed to the
+    #: bf16 converter (measured, dl/flowopen/_route_probe.py arm 3).
+    quant_method: str = ""
     hidden_size: int = 0                  # hf text_config.hidden_size (geometry check)
     n_layers: int = 0                     # hf text_config.num_hidden_layers
+    #: Draft blocks.  ``None`` means UNDECLARED and must not be read as 0 --
+    #: facts_from_scan carries the same distinction, and source_registry.route refuses
+    #: to guess (its own words: routing an undeclared geometry "is the F1065 defect").
+    #: For GGUF the value is already read into ``layer_kv`` (GGUF_LAYER_KV_SUFFIXES)
+    #: and then discarded; this field is where it belongs.
+    nextn_layers: "int | None" = None
     issues: list = field(default_factory=list)       # non-fatal problems found while scanning
     unreadable: bool = False              # the file exists but cannot be read at all
     config_error: str = ""                # config.json could not be parsed (why)
@@ -1094,6 +1113,19 @@ _GAP_ACTION_ROWS = (
     (re.compile(r"^attention:sliding_window\((\d+)\)$"),
      "imp.gap.attention_swa", ("window",)),
     (re.compile(r"^attn:qk_norm$"), "imp.gap.attn_qk_norm", ()),
+    # The three shapes adapt.py's detectors emit but this table had no row for, so
+    # they printed `【译表未收录此缺口类型; <tier> 的原样处置】` with adapt.py's raw
+    # Chinese as the action. Measured: 4 of 11 detector needs fell back (this one,
+    # `mlp:act=gelu(gated)` and both head geometries). The two rows below it that
+    # look like they should have matched and cannot: `^attn:qk_norm$` requires the
+    # `$` right after `qk_norm`, and `^mlp:act=(\w+)$` cannot match `gelu(gated)`
+    # because of the parentheses. An unread table is not a translated one.
+    (re.compile(r"^attn:qk_norm=absent$"), "imp.gap.attn_qk_norm_absent", ()),
+    (re.compile(r"^attn:head_geometry\((\d+)q/(\d+)kv@(\d+)\)$"),
+     "imp.gap.attn_head_geometry", ("q", "kv", "hd")),
+    (re.compile(r"^mlp:act=(\w+)\((\w+)\)$"),
+     {"default": "imp.gap.mlp_act_gated", "new_op": "imp.gap.mlp_act_gated_new_op"},
+     ("act", "mode")),
     (re.compile(r"^attn:headwise_output_gate\(([^)]*)\)$"),
      "imp.gap.attn_headwise_gate", ("mode",)),
     (re.compile(r"^attn:hybrid_global_hd=(\d+)\(kv=([^)]*)\)\s*vs\s*local hd=(\S+)$"),
@@ -1364,8 +1396,42 @@ def gap_action_text(need: str, tier: str, action: str) -> str:
     return t('imp.gaps.fallback', tier=tier_label(tier), action=action)
 
 
-def header_file_state(manifest_path) -> str:
-    """Which TextConfig header, if any, actually sits next to this manifest.
+def header_file_state(manifest_path, manifest=None) -> str:
+    """Which TextConfig header, if any, is USABLE next to this manifest.
+
+    THREE ANSWERS, AND THE ONE IN THE MIDDLE IS THE FIX. `"config.h"` / `""` /
+    `"config.h.BLOCKED"`, plus `"unknown"` for the unmeasured case the caller passes
+    in. `manifest` is the PARSED manifest when the caller has it; it carries the
+    writer's own record of what the last run did (`config_h`: written / withheld /
+    refused) and that record BEATS the directory listing, because a listing cannot
+    date a file.
+
+    TWO MEASURED DEFECTS, ONE FUNCTION. Both are the same sentence -- "a directory
+    that holds a file is not a directory whose file is usable":
+
+      * THE WITHHELD NAME WAS MASKED BY A STALE ONE. adapt.py withholds a header by
+        writing `config.h.BLOCKED` and DELIBERATELY NOT unlinking an earlier run's
+        `config.h`, so the directory a withheld run leaves behind holds BOTH names.
+        This function iterated `("config.h", "config.h.BLOCKED")` and returned the
+        FIRST hit, i.e. the stale one. Measured on the sandbox fixture whose only
+        difference from the live `out/ornith-1.5-9b-q4-k-m/` is that the live one
+        already holds that stale file: adapt.py printed
+        `WITHHELD .../config.h as config.h.BLOCKED: unresolved new_op gaps:
+        attention:linear(gdn)`, both files were on disk afterwards, and the report
+        printed `头文件: 清单目录里有 config.h` -- a green header line for a run that
+        had just withheld its header. The two files are not even the same header:
+        the stale one declares `namespace ninfer::targets::ornith_1.5_9b_q4_k_m`
+        (uncompilable -- the `.` of the model id) while the withheld one declares
+        `ornith_1_5_9b_q4_k_m`.
+      * A REFUSED HEADER WAS VOUCHED FOR BY ITS PREDECESSOR. A refusal for a missing
+        `geometry.intermediate` writes NO `config.h.BLOCKED` and NO header at all,
+        and prints "...exists from an EARLIER run and was NOT replaced ... do not
+        consume it." -- and the report went on to print `头文件: 清单目录里有 config.h`
+        for that same directory. Measured on gemma4-31b, whose 793-byte Sep-03
+        config.h is exactly such a leftover.
+
+    The withheld name is now returned even when `config.h` is also present, and the
+    writer's own `config_h` field is asked first when the caller has it.
 
     A fact about the directory, not a claim derived from the verdict. It used to be
     the expression `"config.h.BLOCKED" if blocking else "config.h"`, which was wrong
@@ -1393,9 +1459,24 @@ def header_file_state(manifest_path) -> str:
     if not manifest_path:
         return ""
     d = Path(manifest_path).parent
-    for name in ("config.h", "config.h.BLOCKED"):
-        if (d / name).is_file():
-            return name
+    # (1) WHAT THE WRITER RECORDED, when the caller brought it. A directory listing
+    # cannot date a file, so "a config.h is here" is not "the LAST run wrote one" --
+    # and those are the two facts this function is asked for.
+    if isinstance(manifest, dict):
+        wrote = manifest.get("config_h")
+        if wrote == "withheld":
+            return "config.h.BLOCKED"
+        if wrote == "refused":
+            return ""
+        if wrote == "written":
+            return "config.h" if (d / "config.h").is_file() else ""
+    # (2) NO RECORD: the withheld name outranks a present one, because it is the one
+    # that states what happened last. Iterating this pair in the other order is the
+    # masking defect described above.
+    if (d / "config.h.BLOCKED").is_file():
+        return "config.h.BLOCKED"
+    if (d / "config.h").is_file():
+        return "config.h"
     return ""
 
 
@@ -1440,6 +1521,7 @@ def import_gap_report(model_id: str, manifest_path: str = "",
     path = Path(manifest_path) if manifest_path else find_manifest(model_id)
     base = {"model_id": model_id, "manifest": str(path) if path else "", "ok": False,
             "error": "", "blocked": False, "blocking": [], "header_file": "",
+            "hooks_open": [],
             "gaps_measured": False, "verdict": "unmeasured", "gap_shape": "",
             "gui_hint_claims": [],
             "gap_count": 0, "tier_counts": {}, "tiers": [], "rows": [],
@@ -1494,7 +1576,18 @@ def import_gap_report(model_id: str, manifest_path: str = "",
         rows.append(row)
         by_tier.setdefault(tier, []).append(row)
 
+    # A MEASURED LIST HAS TWO KINDS OF UNFINISHED ENTRY, NOT ONE. `new_op` needs a
+    # kernel; `hook` needs an engine constexpr branch that adapt.py only writes as
+    # PATCH TEXT ("-> 自动生成 patch 文本 (apply 后编译)", adapt.py's own tier
+    # definition). Neither is done, so neither may render as `可以通过`. This was the
+    # last place the pipeline still said "fine" about engine work nobody had done:
+    # measured on spark-x2.5-4b, whose 8-row list carries FOUR open hooks
+    # (sliding_window(512), rope:per_type_theta, rope:partial_rotary, qk_norm=absent)
+    # and rendered `结论: 可以通过 —— 已生成 config.h, 没有 new_op 缺口` at rc 0, and at
+    # rc 0 again under `--require-servable`. `covered` stays green: it means the tree
+    # already has the operator, which is what the two true-green controls pin.
     blocking = [r["need"] for r in rows if r["tier"] == "new_op"]
+    open_hooks = [r["need"] for r in rows if r["tier"] == "hook"]
     order = [x for x in TIER_ORDER if x in by_tier]
     order += sorted(k for k in by_tier if k not in TIER_ORDER)
     report = dict(base)
@@ -1502,12 +1595,19 @@ def import_gap_report(model_id: str, manifest_path: str = "",
         "model_id": data.get("model_id") or model_id,
         "ok": True, "blocked": bool(blocking), "blocking": blocking,
         # gaps came from an actual list, so this report can be trusted to be
-        # about something. `clear` here means "a measured list with no new_op".
-        "gaps_measured": True, "verdict": "blocked" if blocking else "clear",
+        # about something. `clear` here means "a measured list whose every entry is
+        # finished" -- `covered` and nothing else. `hooks_open` is its own verdict
+        # because the remedy differs from a block (apply the hook patch vs write a
+        # kernel) and a caller may want to act on the difference; it is NOT servable,
+        # see gap_report_rc().
+        "hooks_open": open_hooks,
+        "gaps_measured": True,
+        "verdict": ("blocked" if blocking
+                    else ("hooks_open" if open_hooks else "clear")),
         # Read off the directory, not derived from the gap tiers: adapt.py does not
         # withhold the header when a new_op gap is open, and no writer in this tree
         # produces `config.h.BLOCKED` at all.
-        "header_file": header_file_state(path),
+        "header_file": header_file_state(path, data),
         "gap_count": len(rows),
         "tier_counts": {k: len(v) for k, v in by_tier.items()},
         "tiers": [{"tier": k, "label": tier_label(k), "rows": by_tier[k]} for k in order],
@@ -1556,8 +1656,17 @@ def render_gap_report_text(report: dict) -> str:
                  post=counts.get("post", 0)))
     # The verdict comes before the detail: a blocked import must never read as
     # success, and neither may an unmeasured one (handled above).
-    out.append(t('imp.gaps.verdict_blocked') if report["blocked"]
-               else t('imp.gaps.verdict_ok'))
+    # A block outranks an open hook (it is the harder stop), so the order is
+    # blocked -> hooks_open -> clear. The third arm is the ONLY one that may print
+    # the unqualified green, and it now means "every entry in a measured list is
+    # `covered`" rather than "nothing in the list is spelled new_op".
+    if report["blocked"]:
+        out.append(t('imp.gaps.verdict_blocked'))
+    elif report.get("hooks_open"):
+        out.append(t('imp.gaps.verdict_hooks', n=len(report["hooks_open"]),
+                     hooks="; ".join(report["hooks_open"])))
+    else:
+        out.append(t('imp.gaps.verdict_ok'))
     # The header line is decided by the FILE, not by the verdict: a new_op gap leaves
     # config.h in place, so "blocked" is not a reason to claim a withheld header. An
     # empty header_file means the directory holds none -- say that, and say what it
@@ -1615,7 +1724,13 @@ def gap_report_rc(report: dict, require_servable: bool = False) -> int:
         return GAP_RC_UNREADABLE
     if not report.get("gaps_measured"):
         return GAP_RC_BLOCKED if require_servable else GAP_RC_UNKNOWN
-    if report.get("blocked"):
+    if report.get("blocked") or report.get("hooks_open"):
+        # `hooks_open` reuses GAP_RC_BLOCKED rather than inventing a fourth number:
+        # the documented vocabulary is 0 clear / 1 unreadable / 2 unknown / 3 blocked,
+        # import_model.py's three-class error taxonomy is built on it, and
+        # adapt_all.py's rc 3 already means "read and judged, not servable". The
+        # distinct WORD is in the report; the number says "not servable", which is
+        # the only thing a caller can safely gate on.
         return GAP_RC_BLOCKED
     return 0
 

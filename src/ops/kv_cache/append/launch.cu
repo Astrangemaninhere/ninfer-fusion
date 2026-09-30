@@ -138,11 +138,15 @@ void launch_e8_narrow(const Tensor& k, const Tensor& v, const Tensor& positions,
     auto* scale_k = static_cast<__half*>(cache.k_scale_pages.data);
     auto* scale_v = static_cast<__half*>(cache.v_scale_pages.data);
     constexpr int kBlock = 256;
-    const auto launch = [&]<int WBits>() {
+    // [dl/e8vaxis F1166] THE PLANE AXIS REACHES THE LAUNCHER AS A SECOND TEMPLATE PARAMETER.
+    // Both arms below name `kE8AppendVBitsShippedI4` for V, so the bytes this launcher writes
+    // are UNCHANGED by the axis; a caller that wants the family's lattice on V names its width
+    // (3 or 2) instead, and then only the V plane's code extent moves.
+    const auto launch = [&]<int WBits, int VBits>() {
         const std::int64_t units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
                                    kE8AppendKGroups;
         const int grid = static_cast<int>(div_up(units, static_cast<std::int64_t>(kBlock)));
-        kv_cache_append_full_e8_lattice_kernel<Geometry, Metadata, WBits>
+        kv_cache_append_full_e8_lattice_kernel<Geometry, Metadata, WBits, VBits>
             <<<grid, kBlock, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(k.data),
                 static_cast<const __nv_bfloat16*>(v.data),
@@ -151,11 +155,11 @@ void launch_e8_narrow(const Tensor& k, const Tensor& v, const Tensor& positions,
         CUDA_CHECK(cudaGetLastError());
     };
     if (cache.dtype == DType::E8K3Kv) {
-        launch.template operator()<3>();
+        launch.template operator()<3, kE8AppendVBitsShippedI4>();
         return;
     }
     if (cache.dtype == DType::E8K2Kv) {
-        launch.template operator()<2>();
+        launch.template operator()<2, kE8AppendVBitsShippedI4>();
         return;
     }
     // E8Kv (4-bit) is NOT served here, and neither is any unpacked tier. The 4-bit K plane

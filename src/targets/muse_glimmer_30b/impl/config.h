@@ -72,6 +72,19 @@ struct TextConfig {
         return layer_kind[static_cast<std::size_t>(layer)] == 1;
     }
     [[nodiscard]] static constexpr bool qk_norm_enabled() { return true; }
+    // ---- F910: THE DOUBLE-NORM LAYER GRAPH, DECLARED WHERE ITS EVIDENCE IS ----
+    // Two tensors THIS arch's loader binds were never applied, because the shared runtime had no
+    // reader for the mode (its `attn_out_double_norm()` / `mlp_out_double_norm()` were called from
+    // nowhere and the leaf threw):
+    //   * `post_attention_layernorm` -> FullAttentionWeights::post_attn_out_norm
+    //   * `post_feedforward_layernorm` -> FullAttentionWeights::post_mlp_out_norm
+    //     (impl/load/bindings.cpp, the two "Double-norm layer graph" blocks);
+    // and `post_norm_eps = 1e-08F` above is this arch's own declaration of the post-norm epsilon,
+    // read by nothing -- the same fact seen from the other side. Before these two declarations the
+    // shared runtime took the SINGLE-norm leaf, both bound norms were silently skipped, and the
+    // launch returned rc=0 with a different answer.
+    [[nodiscard]] static constexpr bool attn_out_post_norm() { return true; }
+    [[nodiscard]] static constexpr bool mlp_out_post_norm() { return true; }
     [[nodiscard]] static constexpr bool per_layer_scalar() { return false; }
     [[nodiscard]] static constexpr bool final_logit_softcapping_enabled() {
         return final_logit_softcapping > 0.0F;

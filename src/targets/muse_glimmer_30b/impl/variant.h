@@ -97,6 +97,19 @@ struct Variant {
                                        qwen3_6::TextPhase phase,
                                        WorkspaceArena& workspace,
                                        cudaStream_t stream);
+    // The ATTENTION half of the same graph. This leaf had NO declaration anywhere while
+    // `FullAttentionWeights::post_attn_out_norm` was bound by this arch's loader and read by
+    // nobody: the norm belongs BETWEEN o_proj AND THE RESIDUAL ADD, and only the variant can place
+    // it there, because `attention_output_projection` performs both steps. It is declared HERE and
+    // not in the shared interface on purpose: an arch that does not turn the mode on must not be
+    // handed a stub that throws at runtime. The shared runtime's call is `if constexpr` on this
+    // arch's own declaration, so turning the mode on WITHOUT this leaf is a COMPILE ERROR BY NAME.
+    static void attention_output_projection_double_norm(const Tensor& attention,
+                                                        const Weight& weight,
+                                                        const Tensor& post_attn_out_norm,
+                                                        Tensor& residual, qwen3_6::TextPhase phase,
+                                                        WorkspaceArena& workspace,
+                                                        cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t

@@ -3,6 +3,9 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
+#include "ops/stream_capture.h"   // F881: the one capture-predicate reader
+// F738 injectchan: the ingress surface (src/spec/inject_channel.h + inject_ingress.h).
+#include "targets/qwen3_6/impl/runtime/inject_ingress.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
@@ -52,6 +55,67 @@
 #include <mutex>
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+// ---------------------------------------------------------------------------------------------
+// THE TWO DOUBLE-NORM LEAVES, SELECTED BY THE ARCH'S OWN DECLARATION (accfix F910).
+//
+// PRE, MEASURED AND NOT ASSUMED: `ModelConfig::attn_out_double_norm()` and
+// `ModelConfig::mlp_out_double_norm()` were DEFINED (text_context.h :285/:288) and CALLED FROM
+// NOWHERE; `MlpW::post_ff_norm` and `FullLayerW::post_attn_out_norm` were declared and NEVER
+// ASSIGNED; `Variant::post_mixer_double_norm` was declared in every variant.h and CALLED FROM
+// NOWHERE. muse_glimmer_30b, whose loader binds `post_attention_layernorm` and
+// `post_feedforward_layernorm` (impl/load/bindings.cpp, the "Double-norm layer graph" blocks) and
+// whose config.h declares `post_norm_eps = 1e-08F`, therefore took the single-norm leaf and the
+// TWO BOUND TENSORS WERE NEVER APPLIED -- rc=0 and a wrong answer, with nothing printed. That is
+// the same class as the gate's silent default: a declaration the tree carries and no reader.
+//
+// WHY THESE ARE TEMPLATES. The mode is a compile-time property of the arch, but in NON-templated
+// code the discarded branch of an `if constexpr` is still fully checked, so naming
+// `Variant::attention_output_projection_double_norm` here would be a name-lookup error for every
+// arch whose variant.h does not declare it. As templates the branch is instantiated ONLY where the
+// arch turns the mode on -- and an arch that turns it on WITHOUT declaring the leaf gets a COMPILE
+// ERROR BY NAME, which is the point: the stub cannot come back.
+//
+// AND THE DEREFERENCE IS GUARDED: an arch that declares the mode while its loader bound no tensor
+// is REFUSED BY NAME, not handed an empty Tensor.
+template <class VariantT>
+void attn_output_projection_leaf(const Tensor& attention, const Weight& weight,
+                                 const Tensor* post_attn_out_norm, Tensor& residual,
+                                 qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+                                 cudaStream_t stream) {
+    if constexpr (ModelConfig::attn_out_double_norm()) {
+        if (post_attn_out_norm == nullptr || post_attn_out_norm->data == nullptr) {
+            throw std::logic_error(
+                "attn output projection: this arch declares attn_out_post_norm() but its loader "
+                "bound no post-attention output norm (FullAttentionWeights::post_attn_out_norm is "
+                "empty), so the double-norm layer graph cannot be executed. Binding it and "
+                "declaring it are the same fact stated twice; make them agree rather than running "
+                "the single-norm leaf on a double-norm model.");
+        }
+        VariantT::attention_output_projection_double_norm(attention, weight, *post_attn_out_norm,
+                                                          residual, phase, workspace, stream);
+    } else {
+        VariantT::attention_output_projection(attention, weight, residual, phase, workspace, stream);
+    }
+}
+
+template <class VariantT>
+void post_mixer_leaf(const Tensor& hidden, const MlpW& weights, Tensor& residual,
+                     qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
+    if constexpr (ModelConfig::mlp_out_double_norm()) {
+        if (weights.post_ff_norm == nullptr || weights.post_ff_norm->data == nullptr) {
+            throw std::logic_error(
+                "post mixer: this arch declares mlp_out_post_norm() but its loader bound no MLP "
+                "output norm (MlpW::post_ff_norm is empty), so the double-norm layer graph cannot "
+                "be executed. Binding it and declaring it are the same fact stated twice; make "
+                "them agree rather than running the single-norm leaf on a double-norm model.");
+        }
+        VariantT::post_mixer_double_norm(hidden, *weights.payload, *weights.post_ff_norm, residual,
+                                         phase, workspace, stream);
+    } else {
+        VariantT::post_mixer(hidden, *weights.payload, residual, phase, workspace, stream);
+    }
+}
+
 
 // NINFER_HEADDBG=1 dumps the first BF16 values of a decode-head tensor so a degenerate (all-zero)
 // hidden or logits is visible without a debugger (_TODO.md 102: Muse decode emits token 0).
@@ -79,6 +143,17 @@ inline void debug_head_probe(cudaStream_t stream, const Tensor& tensor, const ch
     if (count == 0) { return; }
     const char* source = static_cast<const char*>(tensor.data) +
                          static_cast<std::int64_t>(column) * tensor.nb[1];
+    // F881 -- GUARD (same class as the `[accmask]` readback). This probe is a D2H plus a sync on
+    // the round's own stream, gated only by NINFER_HEAD_DEBUG, so with CUDA graphs on it would
+    // invalidate the capture and abort the process. Skipping it is named, once.
+    if (ninfer::ops::stream_is_capturing(stream)) {
+        static bool headdbg_capture_warned = false;
+        if (!headdbg_capture_warned) {
+            headdbg_capture_warned = true;
+            std::fprintf(stderr, "[headdbg] probe skipped: stream capture in flight\n");
+        }
+        return;
+    }
     __nv_bfloat16 host[8] = {};
     if (cudaMemcpyAsync(host, source, count * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
@@ -231,6 +306,17 @@ inline void gdndump_one(cudaStream_t stream, const Tensor& tensor, const std::st
                  static_cast<long long>(tensor.nb[2]), static_cast<long long>(tensor.nb[3]),
                  static_cast<int>(tensor.dtype), bytes);
     std::fflush(meta);
+    // F881 -- GUARD. The gdndump writer's D2H + sync, on the round's own stream; the note goes
+    // into the dump's own meta file so the MISSING dump is recorded where the dump would have been.
+    if (ninfer::ops::stream_is_capturing(stream)) {
+        static bool gdndump_capture_warned = false;
+        if (!gdndump_capture_warned) {
+            gdndump_capture_warned = true;
+            std::fprintf(meta, "note %s dump skipped: stream capture in flight\n", name);
+            std::fflush(meta);
+        }
+        return;
+    }
     std::vector<std::byte> host(bytes);
     if (cudaMemcpyAsync(host.data(), tensor.data, bytes, cudaMemcpyDeviceToHost, stream) !=
         cudaSuccess) {
@@ -323,6 +409,16 @@ inline void kvdump_dump_tensor(cudaStream_t stream, const Tensor& tensor, int ma
     Tensor view = tensor;
     if (max_dim3 > 0 && tensor.ne[3] > max_dim3) { view = tensor.slice(3, 0, max_dim3); }
     if (!view.is_contiguous()) { throw std::runtime_error("kvdump tensor is not contiguous: " + path); }
+    // F881 -- GUARD. `kvdump_dump_tensor` is a pure dump helper; under capture it returns and
+    // says so rather than invalidating the capture and aborting at the next CUDA_CHECK.
+    if (ninfer::ops::stream_is_capturing(stream)) {
+        static bool kvdump_capture_warned = false;
+        if (!kvdump_capture_warned) {
+            kvdump_capture_warned = true;
+            std::fprintf(stderr, "[kvdump] %s skipped: stream capture in flight\n", path.c_str());
+        }
+        return;
+    }
     std::vector<std::byte> host(view.bytes());
     CUDA_CHECK(cudaMemcpyAsync(host.data(), view.data, host.size(), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -554,6 +650,13 @@ void TextContext::set_gdn_state_action(GdnStateAction action,
 void TextContext::bind() {
     using TargetBindings = LoadedModelData;
     using TargetMlp      = MlpWeights;
+    // F738 injectchan: read the ingress declaration ONCE, here, because this is the
+    // first point at which both numbers the admission needs are known -- the model's
+    // hidden width (a property of the config) and the context capacity (a property of
+    // the KV plan). A refused declaration throws HERE, before a token is consumed.
+    inject_ingress::configure({ModelConfig::hidden,
+                               static_cast<std::int32_t>(kv_.max_context()),
+                               spec::inject::ElementType::Bf16});
     const auto bind_mlp  = [](const TargetMlp& source) { return MlpW{&source}; };
 
     embed_      = &weights_.token_embedding;
@@ -593,7 +696,19 @@ void TextContext::bind() {
             out.q_norm         = &source.query_norm;
             out.k_norm         = &source.key_norm;
             out.post_attn_norm = &source.post_attention_norm;
+            // F910: THE TWO TENSORS THE ARCH'S LOADER BINDS AND NOTHING ASSIGNED.
+            // `FullAttentionWeights` (the SHARED export template, targets/qwen3_6/export/...
+            // model_view.h) carries BOTH `post_attn_out_norm` and `post_mlp_out_norm`, and this
+            // function -- the one place a FullLayerW is filled -- assigned neither pointer, so the
+            // double-norm leaf could never have received them even if it had been called. Both
+            // assignments are UNCONDITIONAL on purpose: the fields exist for every arch, and the
+            // READER is gated by the arch's own declaration, so a single-norm arch that binds
+            // neither tensor is unaffected (its pointers point at empty Tensors and
+            // `post_mixer_leaf` never dereferences them). The refusal for "declared but not bound"
+            // lives in the leaf selector, by name.
+            out.post_attn_out_norm = &source.post_attn_out_norm;
             out.mlp            = bind_mlp(source.post_mixer);
+            out.mlp.post_ff_norm = &source.post_mlp_out_norm;
         } else {
             const std::size_t gidx = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
             GdnLayerW& out         = gdn_[gidx];
@@ -981,7 +1096,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                         Tensor& hidden, Tensor& logits) {
     const std::int32_t batch = ids.ne[0];
     if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
-        throw std::invalid_argument("ordinary decode batch size must be in [1,8]");
+        throw std::invalid_argument("ordinary decode batch size must be in [1,16]");
     }
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
     require_tensor_shape(cache_positions, DType::I32, {batch}, "ordinary decode cache positions");
@@ -1177,11 +1292,25 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
-    Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
+    // ---- (C) the attention-output gate: TWO legal shapes, chosen by the arch ----
+    // A per-channel gate is query_size rows wide and keeps the {head_dim, n_q, T}
+    // view it has always had, so ops::sigmoid_mul sees the same ne[] it always saw.
+    // A HEADWISE gate must reach the op 2-D: sigmoid_mul routes headwise BY SHAPE
+    // (src/ops/wrapper/sigmoid_mul.cpp:34-37, dispatched at :48) and the contract is
+    // stated in src/ops/launcher/sigmoid_gate_mul.h:16-19 -- x is [head_dim, H, T],
+    // gate is [H, T], one sigmoid per (head, token) over the head_dim axis.  A
+    // {head_dim, n_q, T} view of a 16-row gate makes that test `256 == 16` == false,
+    // so the pair falls to the per-element route, which ACCEPTS it and reads gate
+    // rows 16..4095 -- numbers spark_x2_5_4b/impl/variant.cpp never writes.  The
+    // shape agreement between this arch's two gate declarations is asserted at
+    // namespace scope in text_context.h (see the static_assert after kCfg).
+    Tensor gate      = ModelConfig::headwise_gate()
+                           ? projection.gate.view({ModelConfig::gate_rows(), T})
+                           : projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor k         = projection.key.view({kCfg.head_dim, kCfg.n_kv, T});
     Tensor v         = projection.value.view({kCfg.head_dim, kCfg.n_kv, T});
     Tensor q_flat    = q.view({kCfg.q_size, T});
-    Tensor gate_flat = gate.view({kCfg.q_size, T});
+    Tensor gate_flat = gate.view({ModelConfig::gate_rows(), T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
     Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
@@ -1201,17 +1330,64 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+    // ---- (A) q/k rmsnorm: the arch decides whether its checkpoint has one ----
+    // NOT an all-ones stand-in when it does not: rmsnorm divides by the RMS whatever
+    // the weight is, and a checkpoint that normalises NEITHER would have a
+    // normalisation applied to it.  On the skip branch the tensors the rope/attention
+    // path consumes ARE q and k -- ops::rope is in-place on its q/k arguments
+    // (src/ops/wrapper/rope.cpp:120-125), so aliasing them is well-defined -- and
+    // `w.q_norm` / `w.k_norm`, whose addresses FullLayerW holds unconditionally at
+    // text_context_impl.h:593-594, are never dereferenced.
+    if constexpr (ModelConfig::qk_norm()) {
+        ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
+        ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+    } else {
+        qn = q;
+        kn = k;
+    }
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    if (ctx_.yarn_enabled) {
-        ops::rope_yarn4(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    // ---- (B) one width and one base PER LAYER, not for the whole stack ----
+    // For an arch that has not opted in, these two resolve to kCfg.rotary_dim and
+    // kCfg.rope_theta -- the exact constants this line passed before -- through a
+    // compile-time NO-OP.  The width comes from the arch's own rotary_dim_at and the
+    // base from its own rope_theta_at; it is deliberately NOT taken from a sibling
+    // target.  The yarn branch keeps its full-shape requirement
+    // (src/ops/wrapper/rope.cpp:150-153 demands theta == 1e7 and D256/R64), so an
+    // arch whose per-layer thetas are not 1e7 still fails there BY NAME rather than
+    // silently rotating.
+    const int   rope_dim   = ModelConfig::rope_dim_for(fidx);
+    const float rope_theta = ModelConfig::rope_theta_for(fidx);
+    // F910: THE NoPE LEAF. A layer whose DECLARED theta is 0.0F gets NO rotation. The PRE tree
+    // rotated it by the global TextConfig::rope_theta instead, because the per-layer trigger
+    // tested `rotary_dim_at` (which muse does not declare) and muse's 13 NoPE layers fell to
+    // `TextConfig::rope_theta`. The skip is compiled ONLY for an arch that declares a per-layer
+    // theta, so every other arch emits exactly the call sequence it emitted before.
+    if constexpr (ModelConfig::rope_declares_theta()) {
+        if (ModelConfig::rope_is_nope(fidx)) {
+            // AN OBSERVATION REMOVED MUST BE NAMED, never silently dropped (the same rule
+            // dl/allons F881 applied to its suppressed D2H).
+            static std::atomic<int> nope_reported{0};
+            if (nope_reported.fetch_add(1) < 8) {
+                std::fprintf(stderr,
+                             "[nope] layer=%d declares rope_theta_at==0 -> RoPE SKIPPED (NoPE); "
+                             "before this seam the layer was rotated by the GLOBAL "
+                             "TextConfig::rope_theta=%g, a value this arch never declared for "
+                             "it\n",
+                             fidx, static_cast<double>(TextConfig::rope_theta));
+            }
+        } else if (ctx_.yarn_enabled) {
+            ops::rope_yarn4(rope_for_op, rope_dim, rope_theta, qn, kn, s);
+        } else {
+            ops::rope(rope_for_op, rope_dim, rope_theta, qn, kn, s);
+        }
+    } else if (ctx_.yarn_enabled) {
+        ops::rope_yarn4(rope_for_op, rope_dim, rope_theta, qn, kn, s);
     } else {
-        ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+        ops::rope(rope_for_op, rope_dim, rope_theta, qn, kn, s);
     }
 
     mix_probe("qn", qn);
@@ -1284,7 +1460,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     ops::sigmoid_mul(gate, a, s);
     mix_probe("attn_out", a);
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    // F910: the arch's own mode selects the leaf; the attention-output norm belongs between
+    // o_proj and the residual add, which only the variant leaf can place.
+    attn_output_projection_leaf<Variant>(a.view({kCfg.q_size, T}), *w.o_proj,
+                                         w.post_attn_out_norm, x, ph, work_, s);
     mix_probe("out_x", x);
 }
 
@@ -1433,9 +1612,219 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
-    Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    // F910: the leaf is chosen by the arch's OWN declaration, in one place, and the double-norm
+    // leaf finally has a caller (`Variant::post_mixer_double_norm` was called from nowhere).
+    post_mixer_leaf<Variant>(h, m, x, ph, work_, s);
 }
 
+
+// ---------------------------------------------------------------------------
+// --stage-layers: the boundary payload
+// ---------------------------------------------------------------------------
+// 64-bit magic, so a file this engine did not write is refused rather than read as a payload.
+// The layout is fixed and little-endian, and it is written by stage k and read by stage k+1 --
+// one producer, one consumer, no third reader.
+namespace {
+constexpr std::uint64_t kStageHandoffMagic = 0x50575057'43474E48ULL; // "PWPWCGNH"
+struct StageHandoffHeader {
+    std::uint64_t magic = 0;
+    std::int32_t layer = 0;      // the layer the producing stage's LAST step ran
+    std::int32_t stage = 0;      // which stage wrote it
+    std::uint64_t bytes = 0;
+    std::uint64_t fnv1a = 0;
+    std::uint32_t phase = 0;     // 0 = prefill, 1 = verify/decode; a payload from the wrong
+                                 // phase is a different round and must not be consumed silently
+    std::uint32_t reserved = 0;
+};
+[[nodiscard]] std::uint64_t stage_fnv1a(const void* data, std::size_t bytes) {
+    const auto* bytes_in = static_cast<const unsigned char*>(data);
+    std::uint64_t hash   = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < bytes; ++i) {
+        hash ^= static_cast<std::uint64_t>(bytes_in[i]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+[[nodiscard]] std::string stage_handoff_path(const std::string& dir, std::uint32_t stage) {
+    return dir + "/stage_" + std::to_string(stage) + ".bin";
+}
+} // namespace
+
+void TextContext::set_stage_layers_spec(std::string_view spec, std::string handoff_dir,
+                                        bool handoff_cut) {
+    stage_plan_        = multi::StagePlan{};
+    stage_handoff_dir_ = std::move(handoff_dir);
+    stage_handoff_cut_ = handoff_cut;
+    if (spec.empty()) {
+        // The flag was absent: no parse, no validation, and the layer walk is exactly what it
+        // was before core/stage_plan.h existed. The only thing that can still be wrong is a
+        // --stage-handoff with no stage set, which options.cpp already refuses by name; it is
+        // re-checked here because the runtime is reachable without going through that front
+        // door (ninfer-serve builds EngineOptions itself).
+        if (!stage_handoff_dir_.empty()) {
+            throw std::invalid_argument(
+                std::string(multi::kStageLayersHandoffRefusal) + ": " +
+                std::string(multi::kStageHandoffFlag) + " was given with no " +
+                std::string(multi::kStageLayersFlag) + ", so there is no stage boundary to carry");
+        }
+        return;
+    }
+    multi::StagePlan plan;
+    if (const std::string refusal = multi::parse_stage_layers(spec, plan); !refusal.empty()) {
+        throw std::invalid_argument(refusal);
+    }
+    // THE GEOMETRY IS THE ARTIFACT'S OWN. This is the whole reason the axis check lives HERE
+    // and not in the front door: kCfg is the loaded model's config, so plan_shards() is asked
+    // about the real layer count -- and `weight_columns` is left 0 because the pp arm of
+    // plan_shards does not read it (the weights are whole on every stage; only tp splits N, and
+    // no spec this flag accepts can ask for tp).
+    const multi::ModelGeometry geometry{
+        .text_layers    = static_cast<std::uint32_t>(kCfg.n_layers),
+        .q_heads        = static_cast<std::uint32_t>(kCfg.n_q),
+        .kv_heads       = static_cast<std::uint32_t>(kCfg.n_kv),
+        .head_dim       = static_cast<std::uint32_t>(kCfg.head_dim),
+        .weight_columns = 0U,
+    };
+    if (const std::string refusal =
+            multi::stage_layers_partition_refusal(plan, geometry.text_layers);
+        !refusal.empty()) {
+        throw std::invalid_argument(refusal);
+    }
+    if (const std::string refusal = multi::stage_plan_axis_refusal(plan, geometry);
+        !refusal.empty()) {
+        throw std::invalid_argument(refusal);
+    }
+    if (const std::string refusal = multi::stage_handoff_refusal(plan, stage_handoff_dir_);
+        !refusal.empty()) {
+        throw std::invalid_argument(refusal);
+    }
+    stage_plan_ = std::move(plan);
+    // The one reading this line adds at startup: which world was actually accepted, printed
+    // BEFORE the first token so a run's stages are a fact in the log and not an inference from
+    // the flags. A single line, so an identity run and a pp run differ by one line and nothing
+    // else -- which is what arm T2 measures.
+    std::fprintf(stderr, "[stage] accepted %s: %u stage(s) over %u text layers%s\n",
+                 std::string(spec).c_str(), stage_plan_.world_size(), geometry.text_layers,
+                 stage_plan_.uniform() ? "" : " (uneven)");
+    for (std::uint32_t i = 0; i < stage_plan_.world_size(); ++i) {
+        std::fprintf(stderr, "[stage]   stage %u: layers [%u,%u] (%u layers)\n", i,
+                     stage_plan_.stages[i].first, stage_plan_.stages[i].last,
+                     stage_plan_.stages[i].count());
+    }
+    if (!stage_handoff_dir_.empty()) {
+        std::fprintf(stderr, "[stage]   handoff dir %s%s\n", stage_handoff_dir_.c_str(),
+                     stage_handoff_cut_ ? " (PRODUCER SILENCED -- negative control)" : "");
+    }
+}
+
+void TextContext::stage_handoff_write(Tensor& x, int layer_last) {
+    if (stage_handoff_dir_.empty()) {
+        throw std::logic_error("stage boundary reached with no --stage-handoff directory: a "
+                               "multi-stage world must name where its hidden state crosses");
+    }
+    // --stage-handoff-cut: the producer is deliberately silent. The consumer is NOT told --
+    // that is the entire point of the control, and it is why the ids must move. The payload
+    // that is already in the file (from a previous run, or all zeros) is consumed as if it were
+    // this step's.
+    if (stage_handoff_cut_) { return; }
+    const std::size_t bytes = static_cast<std::size_t>(x.bytes());
+    if (bytes == 0 || x.data == nullptr) {
+        throw std::logic_error("stage boundary payload is empty");
+    }
+    std::vector<unsigned char> host(bytes);
+    if (cudaMemcpy(host.data(), x.data, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError();
+        throw std::runtime_error("stage boundary payload D2H failed");
+    }
+    StageHandoffHeader header;
+    header.magic = kStageHandoffMagic;
+    header.layer = layer_last;
+    header.stage = 0;
+    header.bytes = bytes;
+    header.fnv1a = stage_fnv1a(host.data(), bytes);
+    header.phase = 0;
+    const std::string path = stage_handoff_path(stage_handoff_dir_, 0U);
+    std::FILE* file        = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) {
+        throw std::runtime_error("stage boundary payload: cannot open " + path +
+                                 " for writing");
+    }
+    const bool wrote = std::fwrite(&header, sizeof(header), 1, file) == 1 &&
+                       (bytes == 0 || std::fwrite(host.data(), bytes, 1, file) == 1);
+    std::fclose(file);
+    if (!wrote) {
+        throw std::runtime_error("stage boundary payload: short write to " + path);
+    }
+    // The producer's FNV, on the producer's stderr. The consumer prints the FNV of what it
+    // READ, so the two numbers being equal is a reading about the payload rather than a promise
+    // about the code path -- dl/ppaxis (F-739) built this instrument and this line re-runs it.
+    std::fprintf(stderr, "[stage] producer wrote %s: layer %d, %zu B, fnv=%016llx\n", path.c_str(),
+                 layer_last, bytes, static_cast<unsigned long long>(header.fnv1a));
+}
+
+void TextContext::stage_handoff_read(Tensor& x) {
+    if (stage_handoff_dir_.empty()) {
+        throw std::logic_error("stage boundary reached with no --stage-handoff directory");
+    }
+    const std::string path = stage_handoff_path(stage_handoff_dir_, 0U);
+    std::FILE* file        = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        throw std::runtime_error(
+            "stage boundary payload " + path +
+            " does not exist. A consuming stage refuses rather than continuing from a hidden "
+            "state no stage produced -- the same loud-contradiction rule the cold tier uses.");
+    }
+    StageHandoffHeader header;
+    if (std::fread(&header, sizeof(header), 1, file) != 1) {
+        std::fclose(file);
+        throw std::runtime_error("stage boundary payload " + path + " is shorter than its header");
+    }
+    if (header.magic != kStageHandoffMagic) {
+        std::fclose(file);
+        throw std::runtime_error("stage boundary payload " + path +
+                                 " does not begin with this engine's magic: it is not a payload "
+                                 "this build wrote, and it is refused rather than consumed");
+    }
+    const std::size_t bytes = static_cast<std::size_t>(x.bytes());
+    // A SIZE MISMATCH IS A STALE PAYLOAD, NOT A CORRUPT ONE, and this is the one place where
+    // that distinction is load-bearing. The payload's size is a function of the ROUND (a prefill
+    // chunk's token count, a decode step's batch), so a producer and a consumer that disagree
+    // about which round they are in are exactly the state --stage-handoff-cut produces: the
+    // producer is silent and the consumer consumes whatever the file still holds. The reader
+    // therefore consumes what is there, zero-fills the remainder, and SAYS SO on every call --
+    // the tolerance is not silent, and the FNV line below is the tripwire that reports whether
+    // what was consumed is what was produced. In a correct world (a producer that writes the
+    // round's own shape) this path is unreachable, which is why it can afford to be tolerant and
+    // must afford to be loud.
+    const std::size_t available = header.bytes;
+    std::vector<unsigned char> host(bytes, 0U);
+    std::size_t read_back = 0;
+    if (available != 0) {
+        const std::size_t take = available < bytes ? available : bytes;
+        read_back              = std::fread(host.data(), 1, take, file);
+    }
+    std::fclose(file);
+    if (available != bytes) {
+        std::fprintf(stderr,
+                     "[stage] consumer read %s: STALE SHAPE -- the payload holds %zu B and this "
+                     "round's hidden state is %zu B, so %zu B were %s. This is the state a cut "
+                     "handoff produces; the ids are the evidence.\n",
+                     path.c_str(), available, bytes,
+                     available < bytes ? bytes - available : available - bytes,
+                     available < bytes ? "zero-filled" : "truncated");
+    }
+    const std::uint64_t read_fnv = stage_fnv1a(host.data(), bytes);
+    std::fprintf(stderr,
+                 "[stage] consumer read %s: produced at layer %d, %zu B read of %zu B, "
+                 "fnv=%016llx%s\n",
+                 path.c_str(), header.layer, read_back, bytes,
+                 static_cast<unsigned long long>(read_fnv),
+                 read_fnv == header.fnv1a ? " (== producer)" : " (STALE: != producer FNV)");
+    if (cudaMemcpy(x.data, host.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        (void)cudaGetLastError();
+        throw std::runtime_error("stage boundary payload H2D failed");
+    }
+}
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
@@ -1492,7 +1881,68 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             debug_head_probe(ctx_.stream, x, label, j);
         }
     };
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+    // --stage-layers: THE STAGE WALK. The whole point of this line's change is these four
+    // lines: the loop below used to be `for (int layer = 0; layer < kCfg.n_layers; ++layer)`,
+    // i.e. every layer of the model, always. It is now bounded by the stage the run was ASKED
+    // for, and between two stages the hidden state crosses a boundary -- through the file
+    // --stage-handoff names when one was named. With no flag, stage_count is 1 and the bounds
+    // are [0, kCfg.n_layers - 1], so the walk is the identical single walk; that equivalence is
+    // arm T2 of this line's landq entry and it is asserted rather than intended.
+    // W13 (notehook) -- resolved ONCE per walk, before the stage loop, because the answer is a
+    // property of the STREAM and not of the layer: is a capture running on the stream this walk
+    // is about to run on? `ops::stream_is_capturing` is the tree's single reader for that
+    // question (src/ops/stream_capture.h, F881) and it is asked at RUNTIME rather than threaded
+    // in, because a capture body is the graph DEFINITION and runs once while every later round
+    // of the same width is only a cudaGraphLaunch -- the caller cannot tell the two apart, and
+    // the stream can be asked.
+    product::WeightResidencyRuntime* const w13_residency = weights_.backing.weight_residency();
+    // F1059 (streamfix): THE HOOK NOW RUNS UNDER CAPTURE TOO, and it can because the fetch no
+    // longer has to be a host-side call outside the graph.
+    //
+    // notehook gated this on `!ops::stream_is_capturing(ctx_.stream)` for a real reason: the H2D
+    // rode the engine's own transfer_stream, unjoined to the capture, so issuing it from the
+    // capturing thread was the cudaErrorStreamCapture* fault (src/ops/stream_capture.h:6-11).
+    // The fetch now rides a stream the offload OWNS, and `fetch_enroll()` forks that stream into
+    // the capture the moment a capture is detected on the consuming stream, so the copies become
+    // graph NODES and each layer's record/wait pair becomes a graph EDGE -- the protocol
+    // src/core/decode_graph_peer.h:60-83 names and :326-346 implements. Both capture entry points
+    // this tree uses are on this same stream (decode_impl.h:85 and graph_impl.h:26, both
+    // `state.execution.device.stream`), which is why the predicate below is the capture query and
+    // not a threaded-in flag.
+    const bool w13_from_hook = w13_residency != nullptr;
+    if (w13_from_hook && ops::stream_is_capturing(ctx_.stream)) {
+        // NOTHING IS SKIPPED HERE ANY MORE, and this line says so once. Before F1059 this arm
+        // meant "the hook is being skipped, so a rotating arena is being read as of capture
+        // time"; now the hook runs and the fetch is enrolled, so the arena is re-filled by the
+        // graph on every replay. It is kept because a reader of this file has to be able to tell
+        // "capture, and the fetch is inside it" from "capture, and the fetch is not" without a
+        // debugger -- the rule in ops/stream_capture.h:36-39.
+        static bool w13_capture_note_printed = false;
+        if (!w13_capture_note_printed) {
+            w13_capture_note_printed = true;
+            std::fprintf(stderr,
+                         "[weight-offload] F1059: CUDA-graph capture is in flight on this stream; "
+                         "note_layer() RUNS and each layer's H2D is enrolled into the capture on "
+                         "the offload's own stream, so the arena is re-filled by graph nodes on "
+                         "every replay rather than read as of capture time. The engine's "
+                         "transfer_stream is not used by the offload at all.\n");
+        }
+    }
+    const int stage_count = stage_plan_.requested
+                                ? static_cast<int>(stage_plan_.world_size())
+                                : 1;
+    for (int stage = 0; stage < stage_count; ++stage) {
+        const int layer_first = stage_plan_.requested
+                                    ? static_cast<int>(stage_plan_.stages[stage].first)
+                                    : 0;
+        const int layer_last = stage_plan_.requested
+                                   ? static_cast<int>(stage_plan_.stages[stage].last)
+                                   : kCfg.n_layers - 1;
+        // A stage above the first does NOT compute its input: it is handed the hidden state the
+        // stage below produced, so this stage's own layer stack starts from that, not from an
+        // embedding it has no business computing.
+        if (stage != 0) { stage_handoff_read(x); }
+        for (int layer = layer_first; layer <= layer_last; ++layer) {
         // W13: the residency hook, at the layer boundary. The H2D for layer
         // L + arena_layers - 1 is issued here while layer L is being computed, so
         // the arena slot a live layer occupies is never the one being refilled.
@@ -1503,11 +1953,20 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         // a graph, where a host-side fetch would be replayed with stale data.
         // Landing W13 on decode needs the H2D lifted into the graph on a second
         // stream -- specified in scratch/w13a/DESIGN.md section 5, NOT done.
-        if (ph == Phase::Prefill) {
-            if (product::WeightResidencyRuntime* w13 = weights_.backing.weight_residency();
-                w13 != nullptr) {
-                w13->note_layer(static_cast<std::uint32_t>(layer));
-            }
+        // W13 (notehook): THE HOOK NOW RUNS IN EVERY PHASE THAT IS NOT CUDA-GRAPH CAPTURED,
+        // not in Prefill alone. The old gate was `ph == Phase::Prefill`, and it was the whole
+        // reason --weight-host-bytes was refused by name: a decode pass never entered an
+        // offloaded layer, so the arena's other strips were read stale (see the refusal in
+        // weight_residency.h, quoted verbatim in the F1048 packet). The predicate is the capture
+        // query resolved above and NOT the phase, because the phase is not what makes the fetch
+        // illegal -- the capture is.
+        //
+        // WHY THE FETCH IS ILLEGAL UNDER CAPTURE, stated where it is decided: enqueue_h2d and
+        // the event record/wait are CUDA calls issued from the capturing thread onto streams
+        // that are not part of the capture, which invalidates it (cudaErrorStreamCapture*), and
+        // a replay would re-run the node without re-running the host decision that put it there.
+        if (w13_from_hook) {
+            w13_residency->note_layer(static_cast<std::uint32_t>(layer));
         }
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1563,6 +2022,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             }
             probe(layer, "mlp");
         }
+        }
+        // Every stage but the last hands its output up. The LAST stage is the one that keeps
+        // the hidden state for the head, which is why the sampler lives there -- see
+        // set_stage_layers_spec's note on the rank-0-owns-sampling rule.
+        if (stage + 1 < stage_count) { stage_handoff_write(x, layer_last); }
     }
 }
 
@@ -1704,6 +2168,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor x = roots.residual;
             ops::embedding(ids_device, *embed_, x, s);
+            // F738 injectchan: THE CONSUMPTION POINT. The chosen tensor is written into
+            // the column of the input-embedding matrix that the declared absolute position
+            // owns -- the same tensor, the same column, the same instant a gathered
+            // token's embedding arrives at. That is what sum_dir.h:98 requires, and it is
+            // the only point at which "looks to the model like ordinary context" is a
+            // statement about arithmetic rather than about intent. Before the vision
+            // scatter on purpose: a declared column that is also a vision destination is
+            // refused by name rather than resolved by write order. A no-op, one branch
+            // deep, unless NINFER_INJECT_SPEC named a spec.
+            inject_ingress::apply(x, static_cast<std::int32_t>(base_i + t0),
+                                  local_scatter_indices, s);
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
@@ -1849,6 +2324,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
 
     prefill_split_frontier_ = -1;
+    // F738 injectchan: an admitted declaration that this run's prefill did not fully
+    // cover is refused by name rather than left as a partial injection.
+    if (finalize_at_end) { inject_ingress::finish(); }
 
     timing.begin_wait();
     ctx_.synchronize();
@@ -1898,3 +2376,4 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+

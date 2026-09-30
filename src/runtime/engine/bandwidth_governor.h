@@ -45,11 +45,14 @@
 #include "ninfer/types.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <concepts>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -78,39 +81,116 @@ inline const char* env_raw(const char* name) {
     return std::getenv(name);
 }
 
-inline bool env_flag(const char* name) {
-    const char* value = env_raw(name);
-    return value != nullptr && value[0] == '1';
-}
-
-inline double env_double(const char* name, double fallback) {
+// A NUMERIC operator request is read by the SAME rule as the tri-state below: the accepted domain
+// is the one the reader already had (strictly positive; whole for the int knob), and every byte
+// string outside it is REFUSED BY NAME rather than promoted to the default.
+//
+// WHY. Until this change `env_double`/`env_int` returned `fallback` for anything they could not
+// read, so `NINFER_FT_BW_TOL_HI=abc` and `NINFER_FT_BW_STREAK=0` ran the DEFAULT with no message
+// at all -- the shape the tri-state fix one function down removed, and the shape `env_flag` below
+// still had. MEASURED on the pre-image: dl/coldfix/logs/r8_envcheck.txt (every unreadable value
+// resolves to the default, rc=0, no message).
+//
+// CONSUMPTION RUNS TO THE END OF THE STRING, on purpose: `std::atoi("12abc")` is 12 and
+// `std::atof("1.5x")` is 1.5, so a trailing spelling error used to be read as a number. Only a
+// finite, strictly positive value that occupies the WHOLE string is a reading. A LEADING blank is
+// refused too -- `std::strtod` skips it, which would make " 1.5" readable while "1.5 " is not,
+// i.e. two rules for one request. `std::strtol` runs with base 10, so a hex literal is not a
+// reading for the int knob; a C-style hex FLOAT is still read as the number it is for the double
+// knob, and that is written here rather than pretended away.
+inline double env_positive_double(const char* name, double fallback) {
     const char* value = env_raw(name);
     if (value == nullptr || value[0] == '\0') { return fallback; }
-    const double parsed = std::atof(value);
-    return parsed > 0.0 ? parsed : fallback;
+    char* end                  = nullptr;
+    const double parsed        = std::strtod(value, &end);
+    const bool consumed_to_end = end != nullptr && end != value && *end == '\0';
+    const bool reads_as_number =
+        consumed_to_end && !std::isspace(static_cast<unsigned char>(value[0]));
+    if (!reads_as_number || !std::isfinite(parsed) || !(parsed > 0.0)) {
+        throw std::invalid_argument(
+            std::string("environment variable ") + name +
+            " must be a positive finite number with nothing before or after it, got '" + value +
+            "': an unreadable value is REFUSED rather than promoted, because a typo and a default "
+            "are indistinguishable from outside the process");
+    }
+    return parsed;
 }
 
-inline int env_int(const char* name, int fallback) {
+inline int env_positive_int(const char* name, int fallback) {
     const char* value = env_raw(name);
     if (value == nullptr || value[0] == '\0') { return fallback; }
-    const int parsed = std::atoi(value);
-    return parsed > 0 ? parsed : fallback;
+    char* end                  = nullptr;
+    const long parsed          = std::strtol(value, &end, 10);
+    const bool consumed_to_end = end != nullptr && end != value && *end == '\0';
+    const bool reads_as_number =
+        consumed_to_end && !std::isspace(static_cast<unsigned char>(value[0]));
+    if (!reads_as_number || parsed <= 0 ||
+        parsed > static_cast<long>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(
+            std::string("environment variable ") + name +
+            " must be a positive whole number with nothing before or after it, got '" + value +
+            "': an unreadable value is REFUSED rather than promoted, because a typo and a default "
+            "are indistinguishable from outside the process");
+    }
+    return static_cast<int>(parsed);
 }
 
-// Tri-state boolean: unset -> nullopt (whatever the caller's default is), an explicit off spelling
-// -> false, anything else -> true. env_flag() above keeps its strict "== \"1\"" meaning for the
-// readers that depend on it; this one exists because the flag that used to mean "on" has to be
-// able to say "off" now that the default flipped.
+// Tri-state boolean: unset (or empty) -> nullopt (whatever the caller's default is), one of the
+// four OFF spellings -> false, one of the four ON spellings -> true, and ANYTHING ELSE IS REFUSED
+// BY NAME. Case-insensitive on both sides.
+//
+// WHY THE REFUSAL, AND WHY IT IS A THROW. Until this change the final branch was `return true`, so
+// every value that was not one of seven off spellings -- "2", "maybe", "enabled", a typo, and the
+// mixed-case spellings "Off"/"No"/"False" -- was read as ON with no message at all. MEASURED:
+// `NINFER_FT_BW_GOV=2` ran to rc=0 and its trace line was, byte for byte, the default run's
+// (`[ft] bw mode=dynamic chunk=3072 capacity=3072 installed=1`, dl/recallnext/logs/r5_analyze.txt
+// RC1), and `NINFER_FT_BW_GOV=Off` was ON for the same reason. The switch has TWO front ends and
+// only one of them was checking: the CLI spells the same choice through parse_mode below, which
+// throws "prefill chunk mode must be dynamic|manual, got '...'" and exits 1 for a bad spelling. An
+// environment value is an OPERATOR REQUEST; a request that cannot be read must not be silently
+// promoted to a meaning, because a typo and a default are indistinguishable from outside the
+// process. The throw has parse_mode's shape: apps/cli/main.cpp catches std::exception, prints
+// `error: <what>` plus the usage block, and returns 1.
+//
+// Case-insensitivity is the point of the two tables, not a convenience: the reader this replaces
+// matched "off"/"OFF" but not "Off", so "Off" silently meant ON. The eight spellings below are the
+// whole accepted set; every other byte string is refused.
+inline bool env_spelling_equal(const char* value, const char* spelling) noexcept {
+    int i = 0;
+    for (; spelling[i] != '\0'; ++i) {
+        const char c = value[i];
+        if (c == '\0') { return false; }
+        const char lowered = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+        if (lowered != spelling[i]) { return false; }
+    }
+    return value[i] == '\0';
+}
+
 inline std::optional<bool> env_tristate(const char* name) {
     const char* value = env_raw(name);
     if (value == nullptr || value[0] == '\0') { return std::nullopt; }
-    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
-        std::strcmp(value, "off") == 0 || std::strcmp(value, "no") == 0 ||
-        std::strcmp(value, "FALSE") == 0 || std::strcmp(value, "OFF") == 0 ||
-        std::strcmp(value, "NO") == 0) {
-        return false;
+    static constexpr const char* kOffSpellings[] = {"0", "false", "off", "no"};
+    static constexpr const char* kOnSpellings[]  = {"1", "true", "on", "yes"};
+    for (const char* spelling : kOffSpellings) {
+        if (env_spelling_equal(value, spelling)) { return false; }
     }
-    return true;
+    for (const char* spelling : kOnSpellings) {
+        if (env_spelling_equal(value, spelling)) { return true; }
+    }
+    throw std::invalid_argument(
+        std::string("environment variable ") + name +
+        " must be one of 0|1|false|true|off|on|no|yes (case-insensitive), got '" + value +
+        "': an unreadable value is REFUSED rather than promoted, because a typo and a default are "
+        "indistinguishable from outside the process");
+}
+
+// `env_flag` joins the same rule, and it lives HERE (not above the numeric readers) because it is
+// the tri-state reader: it used to answer ON only for a string starting with '1' and OFF for
+// EVERYTHING else, so `NINFER_FT_BW_TRACE=2` was off and silent. It has exactly one consumer in
+// the tree (the governor's trace switch, ::521 below), and "unreadable" must not mean "off" here
+// either. Unset and empty are still OFF, which is what the old reader did.
+inline bool env_flag(const char* name) {
+    return env_tristate(name).value_or(false);
 }
 
 } // namespace bandwidth_detail
@@ -210,15 +290,22 @@ public:
 
     static Tuning from_env() {
         Tuning tuning;
-        tuning.tol_hi         = bandwidth_detail::env_double("NINFER_FT_BW_TOL_HI", tuning.tol_hi);
-        tuning.tol_lo         = bandwidth_detail::env_double("NINFER_FT_BW_TOL_LO", tuning.tol_lo);
-        tuning.streak         = bandwidth_detail::env_int("NINFER_FT_BW_STREAK", tuning.streak);
-        tuning.min_share      = bandwidth_detail::env_double("NINFER_FT_BW_MIN_SHARE", tuning.min_share);
-        tuning.baseline_alpha = bandwidth_detail::env_double("NINFER_FT_BW_BASE_ALPHA", tuning.baseline_alpha);
-        tuning.ema_alpha      = bandwidth_detail::env_double("NINFER_FT_BW_EMA_ALPHA", tuning.ema_alpha);
-        tuning.window_ns      = static_cast<std::uint64_t>(
-            bandwidth_detail::env_double("NINFER_FT_BW_WINDOW_MS", 50.0) * 1.0e6);
-        tuning.max_credit     = bandwidth_detail::env_double("NINFER_FT_BW_MAX_CREDIT", tuning.max_credit);
+        tuning.tol_hi =
+            bandwidth_detail::env_positive_double("NINFER_FT_BW_TOL_HI", tuning.tol_hi);
+        tuning.tol_lo =
+            bandwidth_detail::env_positive_double("NINFER_FT_BW_TOL_LO", tuning.tol_lo);
+        tuning.streak =
+            bandwidth_detail::env_positive_int("NINFER_FT_BW_STREAK", tuning.streak);
+        tuning.min_share =
+            bandwidth_detail::env_positive_double("NINFER_FT_BW_MIN_SHARE", tuning.min_share);
+        tuning.baseline_alpha = bandwidth_detail::env_positive_double("NINFER_FT_BW_BASE_ALPHA",
+                                                                     tuning.baseline_alpha);
+        tuning.ema_alpha =
+            bandwidth_detail::env_positive_double("NINFER_FT_BW_EMA_ALPHA", tuning.ema_alpha);
+        tuning.window_ns = static_cast<std::uint64_t>(
+            bandwidth_detail::env_positive_double("NINFER_FT_BW_WINDOW_MS", 50.0) * 1.0e6);
+        tuning.max_credit =
+            bandwidth_detail::env_positive_double("NINFER_FT_BW_MAX_CREDIT", tuning.max_credit);
         if (tuning.tol_lo > tuning.tol_hi) { tuning.tol_lo = tuning.tol_hi; }
         if (tuning.min_share > 1.0) { tuning.min_share = 1.0; }
         return tuning;

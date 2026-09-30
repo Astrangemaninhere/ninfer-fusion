@@ -33,6 +33,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <optional>
@@ -381,7 +383,49 @@ struct WeightOffloadLimits {
     // read stale for every decode step. See build_weight_offload_plan()'s refusal
     // for the measured consequence.
     bool fetch_per_layer_entry = false;
+    // THE OTHER HALF OF THE SAME CONTRACT (notehook), and it is not an opinion: on this tree
+    // `use_cuda_graph` gates every CUDA-graph capture of the layer walk
+    // (src/targets/qwen3_6/impl/runtime/decode_impl.h:85, mtp_impl.h:420, dflash_impl.h:615),
+    // and a graph REPLAYS the slot addresses the arena handed out at CAPTURE time. An arena
+    // that rotates can therefore only be correct while somebody re-fetches between replays,
+    // and nothing does: the fetch is a HOST-side cudaMemcpyAsync on the transfer stream,
+    // which is illegal to issue while the consuming stream is being captured
+    // (src/ops/stream_capture.h). So a ROTATING arena plus a captured decode is the
+    // silent-stale case W13 exists to refuse, and the caller states it HERE rather than
+    // letting the plan builder guess it from a flag it cannot see.
+    bool decode_graph_captured = false;
 };
+
+// F1059/streamfix -- THE ONE KNOB THAT KEEPS THE CAPTURE REFUSAL ALIVE WHILE IT IS MEASURED.
+//
+// The plan-time refusal below exists because a ROTATING arena read by a captured decode has no
+// re-fetch between replays. `fetch_enroll()` is that re-fetch: the copies are captured as graph
+// nodes, and the slot address of a layer is `layer_index(layer) % arena_layers`
+// (WeightOffloadPlan::arena_slot_of), computed ONCE in the runtime's constructor and never
+// recomputed -- so a replay writes each layer into the SAME strip the graph was captured with.
+// Rotation is therefore reproducible at capture time, which is the condition the refusal was
+// standing in for.
+//
+// The refusal is NOT deleted here. It fires unless the operator asks for the capturable path
+// explicitly, so a tree in which `fetch_enroll()` is not implemented still refuses rather than
+// reading stale bytes in silence; and the coordinator's rule -- a guard is not removed before the
+// captured arm has been MEASURED byte-identical to its resident twin -- is obeyed by construction.
+// DEFAULTS TO TRUE, and that default is the measurement rather than the intent: with the fetch
+// enrolled, the captured arm is byte-identical to the resident arm of the same graph-on
+// configuration (41 B / 0474f45fad71764945050fde3d0340065d0d86c74b35243444b7da5c6dd9b96e on 8
+// tokens, 168 B / 994134e6fe9a53c6b9d8e8ab6a80ec315db84989714d65f214cbddb3a0e83923 on 32) --
+// offloaded == resident, which is the gate. So the capturable path is what an operator gets, and
+// `NINFER_W13_CAPTURABLE_FETCH=0` is the OPT-OUT that restores the pre-F1059 refusal.
+//
+// WHY THE OPT-OUT IS KEPT AT ALL. A refusal that can no longer be reached is a refusal that can no
+// longer be read, and the guard's message is the only place a reader learns why a rotating arena
+// under capture is dangerous. It also keeps this plan builder honest for a backend that does NOT
+// implement fetch_enroll(): that configuration must still refuse rather than read stale bytes.
+[[nodiscard]] inline bool capturable_fetch_requested() noexcept {
+    const char* raw = std::getenv("NINFER_W13_CAPTURABLE_FETCH");
+    if (raw == nullptr) { return true; }
+    return *raw != '\0' && *raw != '0';
+}
 
 // The result of classification: which spans leave the device arena, how the
 // cyclic arena is laid out, and what was actually freed.
@@ -442,10 +486,43 @@ struct WeightOffloadPlan {
 build_weight_offload_plan(const std::vector<WeightSpanSource>& sources,
                           const WeightOffloadLimits& limits) {
     WeightOffloadPlan plan;
-    if (limits.host_pinned_bytes == 0) { return plan; }
+    // =======================================================================================
+    // [F-1019] THE VALIDATION IS MOVED ABOVE THE GATE. THIS IS THE WHOLE EDIT.
+    // =======================================================================================
+    // THE DEFECT, EXACTLY. `prefetch_layers` had exactly two consumers in this file, both BELOW
+    // the `host_pinned_bytes == 0` early return (`:448` and `:563` in the pre-image). So when the
+    // host mirror is not funded, the parameter was neither USED nor CHECKED: `--weight-prefetch-layers
+    // 0` and `--weight-prefetch-layers 1` -- the two values this function's own contract calls
+    // illegal, "would let the arena slot a layer is being computed from be overwritten" -- were
+    // accepted without a word, and the run continued with a flag the operator believes is in force.
+    // That is the "accepted and ignored" shape the record calls this project's worst outcome.
+    //
+    // WHY THIS IS THE COMPLEMENT OF F-958 AND NOT A SUPERSESSION OF IT. F-958 (`dl/knobproof`)
+    // compiled and two-state-exercised a REFUSAL at the FRONT DOOR -- `src/serve/serve_options.cpp`
+    // `if` :994 / `throw` :995, copied into `apps/cli/options.cpp` :1175/:1176 and
+    // `apps/perplexity/main.cpp` :270/:271 -- and measured `--weight-prefetch-layers 4` ALONE going
+    // from ACCEPTED-AND-STORED to REFUSED. That refusal closes the CLI spelling. It does NOT close
+    // this function, which is the HOME of the parameter and is reachable from any caller that builds
+    // `WeightOffloadLimits` directly (`src/artifact/binder.cpp:198` is the only one on this tree).
+    // A front-door refusal plus an unguarded home is the same defect one layer down; this edit makes
+    // the home refuse values it already declared illegal, whatever door was used.
+    //
+    // WHAT IT DELIBERATELY DOES NOT DO. It does NOT make `prefetch_layers` a reason to build a plan:
+    // with `host_pinned_bytes == 0` there is no arena to prefetch into, so an empty plan remains the
+    // CORRECT answer and the gate stays. It also does NOT turn the early return into a throw: a
+    // caller with no host budget is a legitimate configuration, not an error, and F-958's arm A6
+    // ("`4` BEFORE `--weight-host-bytes 4G`" stays legal) is the measured proof that the ordering of
+    // argv must not change legality. Only the PARAMETER'S OWN CONTRACT is enforced here.
     if (limits.prefetch_layers < 2) {
         throw std::invalid_argument("W13 prefetch depth below 2 would let the arena slot a "
                                     "layer is being computed from be overwritten");
+    }
+    if (limits.host_pinned_bytes == 0) {
+        // The gate, now AFTER the parameter's contract is settled. Named as a reason rather than
+        // left as a bare `return plan;`, so a reader of the empty plan knows which of the two
+        // possible empties this is: no host mirror was funded, so nothing is offloadable.
+        return plan; // no host mirror funded: the correct plan is empty, and `prefetch_layers`
+                     // has still been validated above.
     }
 
     struct Grouped {
@@ -551,8 +628,21 @@ build_weight_offload_plan(const std::vector<WeightSpanSource>& sources,
     plan.arena_layers = static_cast<std::uint32_t>(plan.layers.size());
     if (limits.device_arena_bytes != 0) {
         if (limits.device_arena_bytes < plan.layer_stride) {
-            throw std::invalid_argument("--weight-device-arena-bytes cannot hold one layer strip "
-                                        "of the offloaded set");
+            // F1, MADE ACTIONABLE (notehook). The refusal stays -- an arena that cannot hold one
+            // strip cannot hold a layer, and a value silently raised to the minimum would be a
+            // flag accepted and ignored -- but it now NAMES the number it needs instead of
+            // making the operator bisect for it. NOTE the second half, because it is the part
+            // that changed: a 1-STRIP cyclic arena IS sufficient once the per-layer fetch is
+            // asserted, because every layer is entered through note_layer() before its weights
+            // are read and the join makes the consuming stream wait for THAT layer's H2D.
+            throw std::invalid_argument(
+                "--weight-device-arena-bytes cannot hold one layer strip of the offloaded set: "
+                "the widest offloaded layer strip is " + std::to_string(plan.layer_stride) +
+                " B and the arena is " + std::to_string(limits.device_arena_bytes) +
+                " B. Raise --weight-device-arena-bytes to at least " +
+                std::to_string(plan.layer_stride) +
+                " B (exactly one strip is CORRECT with the per-layer fetch asserted), or lower "
+                "--weight-host-bytes so a shallower tail fits under the arena available");
         }
         const std::uint32_t asked = static_cast<std::uint32_t>(limits.device_arena_bytes /
                                                               plan.layer_stride);
@@ -594,6 +684,13 @@ build_weight_offload_plan(const std::vector<WeightSpanSource>& sources,
         const std::uint64_t stale = plan.layers.size() > plan.arena_layers
                                         ? plan.layers.size() - plan.arena_layers
                                         : 0;
+        // (notehook) THE MESSAGE MOVED WITH THE MECHANISM. It used to say the hook "runs in the
+        // Prefill phase only"; that is no longer true of this tree -- run_layers now enters
+        // every offloaded layer through note_layer() in every phase that is not CUDA-graph
+        // captured, and the H2D is joined to the consuming stream by an event. What is still
+        // missing when this fires is the CALLER'S ASSERTION: a front end that has not read this
+        // contract must say so before it plans an offload, because the plan cannot see whether
+        // the run it belongs to ever calls the hook.
         throw std::invalid_argument(
             "weight offload cannot be numerically transparent for these layers: L" +
             std::to_string(plan.layers.front()) + "..L" + std::to_string(plan.layers.back()) +
@@ -601,12 +698,32 @@ build_weight_offload_plan(const std::vector<WeightSpanSource>& sources,
             " layers) are offloaded into a cyclic arena of " + std::to_string(plan.arena_layers) +
             " strip(s), so " + std::to_string(stale) +
             " of them have no strip of their own outside the pass that fetched them, and the "
-            "engine's residency hook (text_context_impl.h note_layer) runs in the Prefill phase "
-            "only -- their weights would be read stale in decode. Land the per-layer fetch (a "
-            "note_layer() call in every phase that is not CUDA-graph captured, with the H2D "
-            "joined to the consuming stream by an event) and assert it with "
-            "WeightOffloadLimits::fetch_per_layer_entry, or clear --weight-host-bytes to run "
-            "with every weight resident");
+            "caller did NOT assert the per-layer residency contract. The mechanism this plan "
+            "needs IS landed on this tree (note_layer() in every phase that is not CUDA-graph "
+            "captured, with the H2D joined to the consuming stream by an event -- see "
+            "WeightResidencyRuntime::note_layer and WeightResidencyDevice's event quartet), so "
+            "what is missing is the ASSERTION, not the fetch: set "
+            "WeightOffloadLimits::fetch_per_layer_entry from the run's own phase structure "
+            "(src/targets/registry.cpp does), or clear --weight-host-bytes to run with every "
+            "weight resident");
+    }
+    if (limits.decode_graph_captured && plan.arena_layers < plan.layers.size() &&
+        !capturable_fetch_requested()) {
+        // The arena rotates, and a captured decode replays the slot addresses it was captured
+        // with. REFUSED rather than run, because the wrong answer would be silent and
+        // attributed to the model -- the one failure mode W13 exists to make impossible.
+        throw std::invalid_argument(
+            "weight offload cannot be numerically transparent under CUDA-graph capture: L" +
+            std::to_string(plan.layers.front()) + "..L" + std::to_string(plan.layers.back()) +
+            " (" + std::to_string(plan.layers.size()) +
+            " layers) are offloaded into a cyclic arena of " + std::to_string(plan.arena_layers) +
+            " strip(s), so the arena ROTATES, and a captured decode graph replays the slot "
+            "addresses it was captured with while nothing re-fetches between replays -- the "
+            "offloaded layers would be read stale, silently. Re-run with --no-cuda-graph (the "
+            "layer walk is then launched eagerly and note_layer() runs on every pass), or set "
+            "NINFER_W13_CAPTURABLE_FETCH=1 to use the capturable fetch (the H2D on the offload's "
+            "own stream, forked into the capture by fetch_enroll() so each replay re-fills the "
+            "arena), or clear --weight-host-bytes to run with every weight resident");
     }
     return plan;
 }
@@ -627,6 +744,41 @@ public:
     virtual void enqueue_h2d(void* device_slot, const void* pinned, std::uint64_t bytes) = 0;
     virtual void synchronize()                            = 0;
     virtual std::uint64_t now_ns() const noexcept         = 0;
+    // THE JOIN (notehook). The H2D above is issued on the TRANSFER stream, and before this the
+    // consuming stream had no edge to it at all: note_layer() enqueued the copy and returned,
+    // so a layer's GEMMs could be submitted while its bytes were still in flight. That is a
+    // silent-precision hazard of the same kind W13's refusal is about, and it was present on
+    // the PREFILL path too -- the path that already ran.
+    //
+    // The shape is an EVENT, not a synchronize(): fetch_event_record() after a layer's spans
+    // are enqueued, consumer_wait() on the consuming stream before that layer's weights are
+    // read. Both are stream operations and neither is a host wait, so the prefetch overlap the
+    // arena exists for is preserved -- the wait on layer L is free once the copy issued
+    // `arena_layers - 1` layers earlier has landed.
+    //
+    // PURE VIRTUAL ON PURPOSE. A defaulted no-op would let a backend -- and therefore a front
+    // end -- be accepted and silently unjoined, which is the one outcome this project forbids.
+    virtual void* fetch_event_create()                      = 0;
+    virtual void  fetch_event_record(void* event)           = 0;
+    virtual void  consumer_wait(void* event)                = 0;
+    virtual void  fetch_event_destroy(void* event) noexcept = 0;
+    // THE ENROLMENT (F1059/streamfix), ONE CALL PER LAYER, issued BEFORE that layer's spans are
+    // enqueued. Its whole job is to make the fetch legal and visible when the CONSUMING stream is
+    // under `cudaStreamBeginCapture`: the backend forks its own fetch stream into that capture --
+    // publish the consumer's position with an event, make the fetch stream wait on it -- and
+    // `cudaStreamWaitEvent` PROPAGATES the capture to the stream it waits from, so every copy
+    // enqueued afterwards becomes a node of the captured graph. Without it a HOST-side fetch is
+    // simply not in the graph, which is why notehook had to refuse a rotating arena under capture.
+    //
+    // A DEFAULTED NO-OP would be the same failure mode the quartet above refuses by being pure
+    // virtual: a backend accepted and silently unenrolled. It is pure virtual for that reason.
+    //
+    // UNCONDITIONAL, and that is load-bearing rather than tidy: the wait it contributes is what
+    // orders the prefetch's WRITE against the consuming stream's READ of the strip it overwrites
+    // (slot(index + arena_layers - 1) == slot(index - 1)), and that hazard exists with no graph
+    // anywhere in the picture. Measured: a private fetch stream WITHOUT this fork left the
+    // offloaded arm byte-identical to the broken one.
+    virtual void fetch_enroll()                             = 0;
 };
 
 // Greppable counters, PleForensics style (NINFER_W13_STATS=1 prints them).
@@ -637,6 +789,7 @@ struct WeightResidencyCounters {
     std::uint64_t faults            = 0; // prefetch did not land -> synchronous fetch
     std::uint64_t h2d_bytes         = 0;
     std::uint64_t stall_ns          = 0; // time spent inside a synchronous fault
+    std::uint64_t layer_joins       = 0; // note_layer() entries that joined consumer<-fetch
 
     [[nodiscard]] std::uint64_t h2d_bytes_per_token(std::uint64_t tokens) const noexcept {
         return tokens == 0 ? 0 : h2d_bytes / tokens;
@@ -645,6 +798,7 @@ struct WeightResidencyCounters {
         return "[weight-offload] layers=" + std::to_string(layers_entered) +
                " prefetch=" + std::to_string(prefetches_issued) + " hits=" +
                std::to_string(prefetch_hits) + " faults=" + std::to_string(faults) +
+               " joins=" + std::to_string(layer_joins) +
                " h2d=" + std::to_string(h2d_bytes) + " B stall=" + std::to_string(stall_ns) +
                " ns";
     }
@@ -678,9 +832,38 @@ public:
                            plan_.layer_stride;
         }
         pinned_.assign(plan_.spans.size(), nullptr);
+        // One event per offloaded layer, created HERE so the hot path never allocates. An
+        // allocation failure is cleaned up rather than thrown through: the arena is held by a
+        // raw pointer and this constructor's failure means no destructor runs.
+        fetch_events_.assign(plan_.layers.size(), nullptr);
+        for (std::size_t i = 0; i < fetch_events_.size(); ++i) {
+            fetch_events_[i] = device_->fetch_event_create();
+            if (fetch_events_[i] == nullptr) {
+                for (void* event : fetch_events_) {
+                    if (event != nullptr) { device_->fetch_event_destroy(event); }
+                }
+                device_->device_free(arena_);
+                arena_ = nullptr;
+                throw std::runtime_error("weight offload fetch-event allocation failed");
+            }
+        }
     }
 
     ~WeightResidencyRuntime() {
+        // NINFER_W13_STATS=1: the counters below had NO reader anywhere in the tree.
+        // docs/cli.md names this variable and WeightResidencyCounters' own comment
+        // promises it, but `git grep --untracked NINFER_W13` was two hits and both were
+        // comments -- no getenv. Teardown is the one point every front end reaches, so
+        // the line lands here instead of in three callers; and because a run that
+        // offloaded nothing still prints, the line answers "did the knob do anything at
+        // all" as well as "how often did we fault in steady state".
+        if (const char* raw = std::getenv("NINFER_W13_STATS");
+            raw != nullptr && *raw != '\0' && *raw != '0') {
+            std::fprintf(stderr, "%s\n", counters_.describe().c_str());
+        }
+        for (void* event : fetch_events_) {
+            if (event != nullptr) { device_->fetch_event_destroy(event); }
+        }
         for (void* block : pinned_) {
             if (block != nullptr) { device_->pinned_free(block); }
         }
@@ -741,6 +924,14 @@ public:
             counters_.stall_ns += device_->now_ns() - start;
             ++counters_.faults;
         }
+        // THE JOIN (notehook). The consuming stream waits on the event recorded when THIS
+        // layer's spans were last enqueued -- whether that was a moment ago (a fault) or
+        // `arena_layers - 1` layers ago (the ordinary prefetch hit). Waiting on an event that
+        // has already fired is free, so this costs one record/wait pair per layer and closes the
+        // race the old code left open: `resident_` is set at ENQUEUE time, not at completion
+        // time, so without this wait a prefetched layer could be computed while still in flight.
+        device_->consumer_wait(fetch_events_[index]);
+        ++counters_.layer_joins;
         const std::size_t ahead = static_cast<std::size_t>(index) + plan_.arena_layers - 1;
         if (ahead < plan_.layers.size() && !resident_[ahead]) { fetch_layer(ahead); }
     }
@@ -763,6 +954,11 @@ private:
             if (other == index) { continue; }
             if (plan_.arena_slot_of(plan_.layers[other]) == slot) { resident_[other] = false; }
         }
+        // F1059: BEFORE the first span is enqueued, and the order matters twice over: the copies
+        // and their record have to be INSIDE the capture when one is running (a fork issued after
+        // them would enrol the stream too late to capture them), and in eager mode the wait is
+        // what keeps this copy out of the strip the consumer is still reading.
+        device_->fetch_enroll();
         std::size_t slots = 0;
         for (std::size_t s = 0; s < plan_.spans.size(); ++s) {
             if (plan_.spans[s].layer != plan_.layers[index]) { continue; }
@@ -772,6 +968,10 @@ private:
             ++slots;
         }
         if (slots == 0) { throw std::logic_error("weight offload layer has no spans"); }
+        // Record ONCE, after EVERY span of this layer has been enqueued on the transfer stream:
+        // the event is what the consuming stream waits on in note_layer(), so it has to cover
+        // the whole layer and not just its first span.
+        device_->fetch_event_record(fetch_events_[index]);
         resident_[index] = true;
         ++counters_.prefetches_issued;
     }
@@ -782,6 +982,7 @@ private:
     std::vector<std::byte*> slot_;
     std::vector<bool> resident_;
     std::vector<void*> pinned_;
+    std::vector<void*> fetch_events_; // one per offloaded layer, the join in note_layer()
     WeightResidencyCounters counters_;
 };
 

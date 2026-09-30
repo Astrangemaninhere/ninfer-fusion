@@ -30,6 +30,7 @@
 #include "ops/kernel/gqa_isoquant_row_scale.cuh"
 #include "ops/kernel/entropy_nvfp4_slot.cuh"
 #include "ops/kernel/gqa_attention_prefill_nvfp4.cuh" // gqa_iso3_nibble / gqa_iso3_decode
+#include "ops/kernel/nvfp4_ldm_free.cuh"             // the ldmatrix-free fragment loader arm
 
 #include <cstdint>
 
@@ -41,34 +42,62 @@ using namespace ninfer::ops::detail;
 constexpr float kNvfp4MinScale = 0.001953125f;                    // 2^-9, E4M3 smallest normal
 constexpr std::uint8_t kNvfp4E4M3One = 0x38u;                     // E4M3FN encoding of 1.0
 
+// THE ARM'S FOUR LOADERS (dl/nvfp4emu; the loader itself is ops/kernel/nvfp4_ldm_free.cuh).
+// `simt` is the arm's decision, handed down from the kernel's own `nvfp4_frag_ld` parameter so
+// that ONE compiled kernel serves both arms and the A/B is a launch-time choice -- the same shape
+// the SIMT FFMA family uses for its own two bodies. It is uniform across the launch, so each
+// branch below is a predicate and not a divergence.
+//
+// THE TWO ARMS ARE BIT-IDENTICAL BY CONSTRUCTION, and that is the only reason this arm may claim
+// it: the pointer handed to the ldmatrix-free loader is the very pointer whose `smem_addr()` the
+// ldmatrix arm is given, so the same bytes land in the same registers, and the `mma_*` that
+// consumes them cannot tell which arm produced them.
 __device__ __forceinline__ void gqa_nvfp4_load_a_frag(unsigned (&frag)[4], const std::uint8_t* smem,
-                                                      int lane, int k_step) {
+                                                      int lane, int k_step, bool simt) {
     const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
     const int col = (lane >> 4) * 16 + k_step * 32;
+    if (simt) {
+        nvfp4_ldm_free<false, 4>(frag, smem + row * 128 + col, lane);
+        return;
+    }
     ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], smem_addr(smem + row * 128 + col));
 }
 
 __device__ __forceinline__ void gqa_nvfp4_load_b_frag(unsigned (&frag)[2], const std::uint8_t* smem,
-                                                      int lane, int n_tile, int k_step) {
+                                                      int lane, int n_tile, int k_step,
+                                                      bool simt) {
     const int row = (lane & 7) + n_tile * 8;
     const int col = ((lane >> 3) & 1) * 16 + k_step * 32;
+    if (simt) {
+        nvfp4_ldm_free<false, 2>(frag, smem + row * 128 + col, lane);
+        return;
+    }
     ldmatrix_x2(frag[0], frag[1], smem_addr(smem + row * 128 + col));
 }
 
 // PV repack tiles use a 64-byte row stride (16-byte k-fragment per mxf4nvf4
 // m16n8k64 operand row).
 __device__ __forceinline__ void gqa_nvfp4_load_a_frag_64(unsigned (&frag)[4],
-                                                         const std::uint8_t* smem, int lane) {
+                                                         const std::uint8_t* smem, int lane,
+                                                         bool simt) {
     const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
     const int col = (lane >> 4) * 16;
+    if (simt) {
+        nvfp4_ldm_free<false, 4>(frag, smem + row * 64 + col, lane);
+        return;
+    }
     ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], smem_addr(smem + row * 64 + col));
 }
 
 __device__ __forceinline__ void gqa_nvfp4_load_b_frag_64(unsigned (&frag)[2],
                                                          const std::uint8_t* smem, int lane,
-                                                         int n_tile) {
+                                                         int n_tile, bool simt) {
     const int row = (lane & 7) + n_tile * 8;
     const int col = ((lane >> 3) & 1) * 16;
+    if (simt) {
+        nvfp4_ldm_free<false, 2>(frag, smem + row * 64 + col, lane);
+        return;
+    }
     ldmatrix_x2(frag[0], frag[1], smem_addr(smem + row * 64 + col));
 }
 
@@ -236,7 +265,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t split_units,
         int layer, float scale, float* partial_acc, float* partial_m, float* partial_l,
-        std::int32_t batch_size, bool masked, bool writes_cache) {
+        std::int32_t batch_size, bool masked, bool writes_cache, int nvfp4_frag_ld) {
+    // THE ARM'S SWITCH (dl/nvfp4emu): see nvfp4_frag_ld_selected() in
+    // ops/kernel/nvfp4_ldm_free.cuh. Uniform across the launch.
+    const bool frag_ld    = nvfp4_frag_ld != 0;
     constexpr int Wc      = WarpsPerCta;
     constexpr int RowCount = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles = (RowCount + 15) / 16;
@@ -727,14 +759,14 @@ _Pragma("unroll 1")
             }                                                                                \
             if (tid < kEntropyNvfp4SlotStreamsPerHalf) {                                     \
                 std::uint8_t* dst = stage_k_pk + tid * kEntropyNvfp4SlotStreamBytes;          \
-                if (!entropy_nvfp4_slot_decode_stream(stage_k_slot, stage_half, tid, dst)) { \
+                if (!entropy_nvfp4_slot_decode_stream(stage_k_slot, slot_bytes, stage_half, tid, dst)) { \
                     for (int i = 0; i < kEntropyNvfp4SlotStreamBytes; ++i) { dst[i] = 0; }    \
                 }                                                                            \
             } else if (tid < 2 * kEntropyNvfp4SlotStreamsPerHalf) {                          \
                 const int stream = tid - kEntropyNvfp4SlotStreamsPerHalf;                    \
                 std::uint8_t* dst = stage_v_pk + stream * kEntropyNvfp4SlotStreamBytes;       \
-                if (!entropy_nvfp4_slot_decode_stream(stage_v_slot, stage_half, stream,      \
-                                                      dst)) {                                \
+                if (!entropy_nvfp4_slot_decode_stream(stage_v_slot, slot_bytes, stage_half,  \
+                                                      stream, dst)) {                        \
                     for (int i = 0; i < kEntropyNvfp4SlotStreamBytes; ++i) { dst[i] = 0; }    \
                 }                                                                            \
             }                                                                                \
@@ -809,13 +841,13 @@ _Pragma("unroll 1")                                                             
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
                 unsigned af[4];
-                gqa_nvfp4_load_a_frag(af, q_a + producer_row_base * 128, lane, k);
+                gqa_nvfp4_load_a_frag(af, q_a + producer_row_base * 128, lane, k, frag_ld);
                 const unsigned sfa = load_vec<unsigned>(
                     q_sf + producer_row_base * 16 + (gid + (lid & 1) * 8) * 16 + k * 4);
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
                     unsigned bf[2];
-                    gqa_nvfp4_load_b_frag(bf, k_pk, lane, nt, k);
+                    gqa_nvfp4_load_b_frag(bf, k_pk, lane, nt, k, frag_ld);
                     const unsigned sfb = load_vec<unsigned>(k_sf + (gid + nt * 8) * 16 + k * 4);
                     mma_nvfp4_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
                                    af[0], af[1], af[2], af[3], bf[0], bf[1], sfa, sfb);
@@ -834,13 +866,13 @@ _Pragma("unroll 1")                                                             
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
                 unsigned af[4];
-                gqa_nvfp4_load_a_frag(af, q_a + producer_row_base * 128, lane, k);
+                gqa_nvfp4_load_a_frag(af, q_a + producer_row_base * 128, lane, k, frag_ld);
                 const unsigned sfa = load_vec<unsigned>(
                     q_sf + producer_row_base * 16 + (gid + (lid & 1) * 8) * 16 + k * 4);
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
                     unsigned bf[2];
-                    gqa_nvfp4_load_b_frag(bf, k_rpk, lane, nt, k);
+                    gqa_nvfp4_load_b_frag(bf, k_rpk, lane, nt, k, frag_ld);
                     const unsigned sfb =
                         load_vec<unsigned>(k_rsf + (gid + nt * 8) * 16 + k * 4);
                     mma_nvfp4_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
@@ -996,16 +1028,24 @@ _Pragma("unroll 1")                                                             
                 for (int k = 0; k < PVKs; ++k) {
                     unsigned pf[4];
                     const int pcol = k * 16 + a_coloff;
-                    ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
-                                smem_addr(&p_consumer[a_rowoff * Bc +
-                                                     gqa_small_t_tc_swz32(a_rowoff, pcol)]));
+                    const __nv_bfloat16* const p_row =
+                        &p_consumer[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)];
+                    if (frag_ld) {
+                        nvfp4_ldm_free<false, 4>(pf, p_row, lane);
+                    } else {
+                        ldmatrix_x4(pf[0], pf[1], pf[2], pf[3], smem_addr(p_row));
+                    }
                     for (int nt = 0; nt < 2; ++nt) {
                         unsigned vf[2];
                         const int vrow = k * 16 + b_koff + b_rin;
                         const int vcol = dg * 16 + nt * 8;
-                        ldmatrix_x2_t(vf[0], vf[1],
-                                      smem_addr(&v_bf16[vrow * D +
-                                                       gqa_small_t_tc_swz(vrow, vcol)]));
+                        const __nv_bfloat16* const v_row =
+                            &v_bf16[vrow * D + gqa_small_t_tc_swz(vrow, vcol)];
+                        if (frag_ld) {
+                            nvfp4_ldm_free<true, 2>(vf, v_row, lane);
+                        } else {
+                            ldmatrix_x2_t(vf[0], vf[1], smem_addr(v_row));
+                        }
                         float dd[4] = {acc[n0 + nt][0], acc[n0 + nt][1],
                                        acc[n0 + nt][2], acc[n0 + nt][3]};
                         mma_bf16(dd[0], dd[1], dd[2], dd[3], pf[0], pf[1], pf[2], pf[3],
@@ -1120,13 +1160,13 @@ _Pragma("unroll 1")                                                             
             __syncwarp();
 
             unsigned af[4];
-            gqa_nvfp4_load_a_frag_64(af, ra, lane);
+            gqa_nvfp4_load_a_frag_64(af, ra, lane, frag_ld);
             const unsigned sfa = load_vec<unsigned>(
                 psc_s + (consumer_row_base + (gid + (lid & 1) * 8)) * 64 + dg * 4);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
                 unsigned bf[2];
-                gqa_nvfp4_load_b_frag_64(bf, rb, lane, nt);
+                gqa_nvfp4_load_b_frag_64(bf, rb, lane, nt, frag_ld);
                 float dd[4] = {acc[2 * ddg + nt][0], acc[2 * ddg + nt][1],
                                acc[2 * ddg + nt][2], acc[2 * ddg + nt][3]};
                 mma_nvfp4_e4m3(dd[0], dd[1], dd[2], dd[3], af[0], af[1], af[2], af[3], bf[0],

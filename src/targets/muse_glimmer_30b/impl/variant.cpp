@@ -8,6 +8,7 @@
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
 
@@ -261,6 +262,21 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
         ops::linear(attention, weight, o, stream);
         ops::residual_add(o, residual, stream);
 }
+void Variant::attention_output_projection_double_norm(const Tensor& attention,
+                                                     const Weight& weight,
+                                                     const Tensor& post_attn_out_norm,
+                                                     Tensor& residual, qwen3_6::TextPhase,
+                                                     WorkspaceArena& workspace,
+                                                     cudaStream_t stream) {
+    // `attention_output_projection` above is o_proj + residual add in one step, and the
+    // post-attention layernorm has to go BETWEEN them; that is the whole reason this leaf exists.
+    auto scope = workspace.scope();
+    Tensor o   = workspace.alloc(DType::BF16, {TextConfig::hidden, attention.ne[1]});
+    ops::linear(attention, weight, o, stream);
+    Tensor on = workspace.alloc(DType::BF16, {TextConfig::hidden, attention.ne[1]});
+    ops::rmsnorm(o, post_attn_out_norm, TextConfig::post_norm_eps, true, on, stream);
+    ops::residual_add(on, residual, stream);
+}
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
                                        const MtpAttentionProjectionWeights& weights, Tensor& query,
@@ -394,13 +410,28 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         ops::residual_add(o, residual, stream);
 }
 
-void Variant::post_mixer_double_norm(const Tensor&, const PostMixerWeights&, const Tensor&,
-                                     Tensor&, qwen3_6::TextPhase, WorkspaceArena&,
-                                     cudaStream_t) {
-    // Single-norm architecture: the compile-time branch never selects this
-    // leaf (double-norm layer graphs only). Kept as a declared interface so
-    // the shared runtime compiles for every variant.
-    throw std::logic_error("post_mixer_double_norm is not enabled for this target");
+void Variant::post_mixer_double_norm(const Tensor& hidden, const PostMixerWeights& weights,
+                                     const Tensor& post_ff_norm, Tensor& residual,
+                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
+                                     cudaStream_t stream) {
+    // Muse's double-norm layer graph: the swiglu MLP exactly as `post_mixer` computes it, then
+    // `post_feedforward_layernorm` applied to the MLP OUTPUT, and only then the residual add.
+    // The epsilon and the norm shape are THIS arch's own declarations (post_norm_eps / hidden);
+    // the call shape (rmsnorm(x, weight, eps, unit_offset, out, stream)) is the one the shared
+    // runtime uses for every other norm of this model, including the qk-norms above.
+    auto scope        = workspace.scope();
+    const int cols    = hidden.ne[1];
+    Tensor gate = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
+    Tensor up   = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
+    ops::linear(hidden, weights.gate, gate, stream);
+    ops::linear(hidden, weights.up, up, stream);
+    Tensor act = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
+    ops::silu_mul(gate, up, act, stream);
+    Tensor o = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
+    ops::linear(act, weights.down, o, stream);
+    Tensor on = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
+    ops::rmsnorm(o, post_ff_norm, TextConfig::post_norm_eps, true, on, stream);
+    ops::residual_add(on, residual, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor&, const MtpPostMixerWeights&, Tensor&,

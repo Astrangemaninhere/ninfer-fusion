@@ -3,7 +3,7 @@
 """kv_tiers.py — KV 分层精度自由组合的契约 (2026-09-03 定调).
 
 三层 (热/尾/冷) x 多种 KV 量化格式, 组合不固化:
-  --kv-tier-formats hot=bf16,tail=fp16,cold=iso4e
+  --kv-tier-formats hot=bf16,cold=iso4e    (tail= 语法上可解析, 引擎按名拒绝: 无尾层)
 每层可独立选: bf16 / fp16 / int8 / int4 / iso4 / iso4e / rk4v4(4bit) / rk3v4 / rk2v4 / auto
 # rk3v4/rk2v4 = rk4v4 族的 K 平面码宽变体 (3bit / 2bit), 见 src/product/kv_e8_width.h。
 # 原注释把 rk4v4 写成 (2bit) 是错的: 出厂 rk4v4 的 K 平面是 4bit/元素 (2 码/字节, head extent
@@ -94,7 +94,7 @@ def vram_estimate_mib(spec: dict, tokens: int, layers: int, kv_heads: int,
 
 if __name__ == "__main__":
     import sys
-    for spec in sys.argv[1:] or ["hot=bf16,tail=fp16,cold=iso4e", ""]:
+    for spec in sys.argv[1:] or ["hot=bf16,cold=iso4e", ""]:
         try:
             p = parse(spec)
             print("%-40r -> %s" % (spec, p))

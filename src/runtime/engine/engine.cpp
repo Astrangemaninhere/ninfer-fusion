@@ -93,7 +93,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     // line is what makes --prefill-chunk-mode reach the mechanism rather than the options struct.
     options.prefill_chunk_mode = runtime::BandwidthGovernor::resolve_mode(options.prefill_chunk_mode);
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1,16]");
     }
 
     ContextCacheOptions& cache      = options.context_cache;
@@ -129,8 +129,70 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // sides: the previous unconditional `= 0` refused every root request, and the
         // unconditional `= concurrency` charged every run an extra slot whether or not
         // anything asked for it.
+        // [REPREFILLFAST-E7] THE POOL FOLLOWS THE LEG'S GATE -- BOTH WAYS OF SELECTING THE LEG.
+        // The paragraph above asserts "The pool follows that same conjunction -- nothing else",
+        // which was true while the conjunction was the ONE legacy key.  E4 (`program_impl.h`, the
+        // arm site) then added a SECOND way to select the rebuild leg -- `NINFER_RRFAST_ARM=rebuild`
+        // -- and did NOT update this arming.  The two halves then disagreed about what "the leg is
+        // armed" means: the arm asked for a discard destination the ingress never pledged.  Round 3
+        // measured the consequence on the shipping pin `4c33e7ba`: `NINFER_RRFAST_ARM=rebuild` with
+        // the legacy key UNSET printed `[rrfast-arm] env=rebuild spare=0 planned=1` and took
+        // `[context-append]` on 5/5 independent evaluations.  A switch that selects a leg the
+        // ingress never funds is dead code, and the LEG cannot repair it from where it runs: the
+        // pledge is made HERE, at ingress, before any sequence -- and therefore any
+        // `reserved_state` -- exists.
+        // ⚠ NOTHING MOVES FOR ANY PRE-EXISTING STATE, and that is asserted, not hoped:
+        //   neither key                      -> false, as before -> no spare, slots = 0
+        //   `NINFER_RECALL_TEXT_REBUILD` set -> true,  as before -> the spare, exactly as before
+        //   `NINFER_RRFAST_ARM=append`       -> false, as before (a VALUE test, not a presence
+        //                                       test: this is the round-1 divergence, and the
+        //                                       leg's reading of it is what criterion 4 checks)
+        //   `NINFER_RRFAST_ARM=rebuild`      -> true,  NEW      -> the leg the knob asks for can be
+        //                                       COMPLETED instead of declining on
+        //                                       `no-spare-state-slot-for-discard`
+        // The value test is spelled as the arm site spells it (`std::string(...) == "rebuild"`) so
+        // the two cannot drift about which strings select the leg; `<cstdlib>` and `<string>` are
+        // already included here.
+        const char* const recall_arm_env = std::getenv("NINFER_RRFAST_ARM");
+        const bool recall_arm_selects_rebuild =
+            recall_arm_env != nullptr && std::string(recall_arm_env) == "rebuild";
+        // [MTPADAPT-R3] THE SECOND HALF, AND THE REASON IT IS NOT OPTIONAL.
+        // The selector in `program_impl.h` (`NINFER_RRFAST_ARM=policy`) asks whether the POOL
+        // pledges the discard destination.  The pool is `max_concurrency + device_state_slots`
+        // (`layouts_impl.h`, the assignment below), so unless THIS conjunction arms
+        // `device_state_slots`, the pool holds exactly `max_concurrency`, the pledge is false on
+        // every sequence, and the selector is dead code -- true whenever it is evaluated is the
+        // failure mode, not a safety property.  The pledge is made HERE, at ingress, before any
+        // sequence exists, which is why the leg cannot repair this from where it runs: measured
+        // twice on this station (`reprefillfast` rounds 3 and 4, `spare=0` with the arm asking for
+        // it).  Same value test, same spelling as the arm site, so the two cannot drift.
+        // [MTPADAPT-R4] THE SECOND HALF OF THE DEFAULT, AND THE REASON IT IS NOT OPTIONAL.
+        // The selector in `program_impl.h` now fires on an UNSET `NINFER_RRFAST_ARM` as well as on
+        // `=policy`, and its first conjunct asks whether the POOL pledges the discard destination.
+        // The pool is `max_concurrency + device_state_slots` (`layouts_impl.h`, the assignment
+        // below), so unless THIS conjunction arms `device_state_slots` on the same values, the
+        // pledge is false on every sequence and the default is dead code.  The pledge is made HERE,
+        // at ingress, before any sequence -- and therefore any `reserved_state` -- exists, which is
+        // why the leg cannot repair this from where it runs: measured twice on this station
+        // (`reprefillfast` rounds 3 and 4, `spare=0` with the arm asking for it).  The value test
+        // is spelled as the arm site spells it, and the two halves are wired on the same two
+        // values: UNSET, or the literal string `policy`.
+        //
+        // ⚠ WHAT THIS COSTS, SAID OUT LOUD.  For any run that sets `NINFER_RECALL_TEXT`, an unset
+        // arm now reserves the pledged spare -- a whole extra StateImage slot per lane, which is
+        // `146.82 MiB` on qwen3.6-27b (the note above) -- whether or not a recall plan exists for
+        // that run.  Runs that do not set `NINFER_RECALL_TEXT` are unaffected: the outer conjunction
+        // below is unchanged, so `discard_spare_armed` stays false and `device_state_slots` stays 0.
+        // `NINFER_RRFAST_ARM=none` (or any non-`policy` value) turns the grant back off with it.
+        const bool recall_arm_env_unset = recall_arm_env == nullptr;
+        const bool recall_arm_names_policy =
+            recall_arm_env != nullptr && std::string(recall_arm_env) == "policy";
+        const bool recall_arm_selects_policy =
+            recall_arm_env_unset || recall_arm_names_policy;
         const bool discard_spare_armed = std::getenv("NINFER_RECALL_TEXT") != nullptr &&
-                                         std::getenv("NINFER_RECALL_TEXT_REBUILD") != nullptr;
+                                         (std::getenv("NINFER_RECALL_TEXT_REBUILD") != nullptr ||
+                                          recall_arm_selects_rebuild ||
+                                          recall_arm_selects_policy);
         cache.device_state_slots                = discard_spare_armed ? concurrency : 0U;
         cache.host_state_slots                  = 0;
         cache.host_kv_capacity_bytes            = 0;
@@ -314,10 +376,13 @@ public:
     using ScoreCoreMuse = runtime::CausalScoreCore<targets::MuseGlimmer30BInstance>;
     using Core9B        = runtime::EngineCore<targets::Qwen3_5_9BInstance>;
     using ScoreCore9B   = runtime::CausalScoreCore<targets::Qwen3_5_9BInstance>;
+    using CoreSpark      = runtime::EngineCore<targets::SparkX2_5_4BInstance>;
+    using ScoreCoreSpark = runtime::CausalScoreCore<targets::SparkX2_5_4BInstance>;
     using Core = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>,
                               std::unique_ptr<CoreMuse>, std::unique_ptr<ScoreCore27>,
                               std::unique_ptr<ScoreCore35>, std::unique_ptr<ScoreCoreMuse>,
-                              std::unique_ptr<Core9B>, std::unique_ptr<ScoreCore9B>>;
+                              std::unique_ptr<Core9B>, std::unique_ptr<ScoreCore9B>,
+                              std::unique_ptr<CoreSpark>, std::unique_ptr<ScoreCoreSpark>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
@@ -371,6 +436,12 @@ public:
                     }
                     return std::make_unique<Core9B>(*target_ptr, device, options,
                                                     std::move(constructed.context_cost));
+                } else if constexpr (std::is_same_v<Instance, targets::SparkX2_5_4BInstance>) {
+                    if (options.purpose == EnginePurpose::CausalScoring) {
+                        return std::make_unique<ScoreCoreSpark>(*target_ptr, device);
+                    }
+                    return std::make_unique<CoreSpark>(*target_ptr, device, options,
+                                                       std::move(constructed.context_cost));
                 } else {
                     // A new target family must be dispatched HERE, explicitly.  This branch
                     // used to be an unconditional `else` that built the Muse core, so a
@@ -487,7 +558,8 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreMuse>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore9B>>) {
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore9B>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreSpark>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -584,7 +656,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
                                  std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>> ||
                                  std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreMuse>> ||
-                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore9B>>) {
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore9B>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCoreSpark>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 auto submission =

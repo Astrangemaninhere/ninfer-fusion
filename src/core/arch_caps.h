@@ -47,6 +47,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <initializer_list>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -113,14 +114,267 @@ struct ArchRung {
 // Ascending sm. Compute capability is the only architecture fact the runtime can observe
 // (cudaDeviceProp::major/minor); the '-a' arch-accelerated suffix of a build target is NOT
 // observable at runtime -- see build_arch_note().
+// ===========================================================================
+// THE PRE-75 BLOCK: SIX ROWS BELOW sm_70, ADDED 2026-09-24 (F702, dl/archrow)
+// ===========================================================================
+// WHY THEY EXIST. The ladder's own refusal for an unlisted number says "add the row with
+// MEASURED evidence first", and TWO independent lines had already named the two halves of this
+// gap: dl/oldcard said the wall for sm_61 is the ABSENT LADDER ROW (not the attention path), and
+// dl/archstack said a row below 70 needs MEASURED evidence. This block is where those two meet.
+// The consequence it removes is measured: src/core/arch_sim.h resolves a requested rung with
+// arch_rung(), an EXACT-MATCH walk, so before this block the simulator could not express "pre-75"
+// AT ALL -- every NINFER_SIM_ARCH below 70 was refused with "has no row in kArchLadder, so
+// simulating it would mean inventing a capability set", on every physical device, and a
+// rank-guarded V100 (whose reported sm is 70) could not simulate any of the rungs below itself.
+//
+// WHAT EACH ROW CARRIES, AND THE ONE THING IT MUST NOT CARRY.
+//   * `caps` is Cap::None, and that is a MEASURED instruction-set fact rather than a hedge:
+//     ptxas rejects `mma.sync` below .target sm_70 ("Feature 'mma' requires .target sm_70 or
+//     higher"), recorded per rung for sm_50/52 and sm_61/62 in tools/archkit/_GPU_MATRIX.md
+//     section 3.3 (its own citation ops/common/mma.cuh:191 still resolves: the mma_f16_m8n8k4
+//     asm). Cap has six bits and every one of them is a tensor-core instruction family, so a
+//     rung with no tensor core has NO bit -- the vocabulary has none for SIMT/FFMA. Writing
+//     Cap::Fp16Mma here to "be generous" would be the sm_100-nvfp4 false positive in a new
+//     place, which is the bug class this table has already paid for twice.
+//   * `route` states the FORMAT FLOORS this rung misses WITH THEIR KERNEL file:line, the route
+//     table's own cells for the family, and the CALIBER of the evidence for that rung. That is
+//     the deliverable: a refusal that names WHICH floor and WHERE, not merely that it refuses.
+//   * It does NOT carry a kQpnMmaRungs row, and must not: qpn_arm_reachable() requires
+//     Cap::Fp16Mma, so the fp16 fallback arm is unreachable on all six and a lowering row would
+//     be a measurement nothing consults (kQpnMmaRungs' own comment says the same for sm_120/121).
+//
+// A BUILD FACT IS NOT SUPPORT, and these rows do not claim it. CUDA 12.8 (/mnt/g/cuda12/tk,
+// V12.8.61) lists compute_50 52 53 60 61 62 -- measured 2026-09-24, `nvcc --list-gpu-arch` on
+// that chain returns 17 arches whose first six are exactly these -- and CUDA 13.3 lists none
+// below compute_75. tools/archkit/build_arch.sh:83's LEGACY_ARCHS=(50 52 53 60 61 62 70) makes
+// the whole pre-75 block ONE tier on ONE toolchain file. _GPU_MATRIX.md's route row for this
+// family is unaffected and still reads: tensor core "none", route "pending", status "build
+// configuration only (unprobed)". Its cells are Chinese; the English above is a translation of
+// that row, not a quotation of English text.
+//
+// CITATION DRIFT, DISCLOSED BECAUSE THE REFUSAL PRINTS IT -- AND NOW CLOSED (dl/oldkernel).
+// Several file:line positions recorded in _GPU_MATRIX.md section 3.3 and in
+// kFormatRequirements.kernel_evidence did not resolve. THE ROWS BELOW always cited the LIVE
+// positions; the RECORDED ones were fixed on 2026-09-24, in ONE deliberate change, because
+// closing them moves this file's own refusal text and that move has to be stated rather than
+// discovered. Every position, OLD -> NEW, measured with a 1-based read of the live file:
+//   bf16_gemm_mma.cuh:273  -> :296     (:273 is `const int row = wn * WN + ni * 8 + ...`)
+//   ops/common/mma.cuh:33  -> :109     (:33 is a comment; :109 is mma_bf16, asm :113)
+//   ops/common/mma.cuh:90  -> :269     (:90 is inside ldmatrix_x2; :269 is mma_nvfp4_e4m3)
+//   ops/common/mma.cuh:63  -> :191     (:63 is ldmatrix_x2; :191 is the m8n8k4 asm)
+//   qpn_kernels.cuh:695    -> :729     (:695 is `const uint2 q2 =`; :729 is the m8n8k4 call)
+//   qpn_kernels.cuh:893    -> :929     (the MMA_8N8K4 macro's call site)
+//   qpn_kernels.cuh:1227   -> :1257    (:1227 is a blank comment; :1257 is skinny_fp8_qpn8)
+//   qpn_kernels.cuh:1327   -> :1357    (skinny_fp8_qpn8_mt2)
+//   memory.cuh:65          -> :126     (:65 is a brace; :126 is cp_async, guard :30,
+//                                       asm :131/:135, below-floor trap arm :141)
+//   qpn_kernels.cuh:404    -> :430     (the wmma fragment, moved by this file's own gate block)
+// WHAT THE MOVE COSTS, STATED AND NOT HIDDEN: every one of these strings sits inside a rung's
+// route text or a kFormatRequirements row, so EVERY RUNG'S REFUSAL TEXT CHANGED. That text is
+// what tests/test_kernel_route.cpp:224-229 and tests/test_arch_caps.cpp read, so those tests are
+// this move's re-verification surface. THE FLOORS' MEANINGS DID NOT CHANGE: each new position is
+// the same instruction in the same file, re-read.
+// TWO THINGS IN THIS BLOCK ARE DELIBERATELY NOT FIXED, and the reason is given rather than left
+// as an omission. (a) `grep -c __CUDA_ARCH__` on qpn_kernels.cuh returns 2 while section 3.3
+// reports 0: that is a claim in a TOOLING DOCUMENT about a HEAD that no longer exists, and the
+// file's own gate block (qpn_kernels.cuh:16-34) is its correction -- editing section 3.3's
+// prose would be editing a record of a measurement, which is not what this change is for.
+// (b) src/core/device_capabilities.h's evidence column and tests/test_device_capabilities.cpp
+// carry the SAME class of drift one table over (mma.cuh:37/46/54/63/90, memory.cuh:40,44,
+// mma.cuh:9,16 -- all pre-gate positions), and it is NOT fixed here because moving those strings
+// moves a TEST ASSERTION with them: see the report's "adjacent drift, measured and left" section,
+// which carries the full OLD -> NEW mapping so a later change is mechanical.
+//
+// WHAT IS *NOT* MISSING HERE, so these rows are not read as "nothing exists". The FFMA +
+// online-softmax attention family (src/ops/kernel/gqa_attention_simt_ffma.cuh) has a floor note
+// recording that every instruction it emits assembles from sm_50 up, and the QPN family's
+// FFMA-only SIMT band (skinny_nvfp4_qpn_simt, qpn_kernels.cuh:1015) now compiles below sm_70
+// because that file gained per-target gates (qpn_kernels.cuh:32 and :52). NEITHER IS A ROUTE ON
+// THESE RUNGS: the attention arm is selected in the ops launcher, not from a ladder capability,
+// and the QPN band is reached only through fp16_fallback_executable(), which is false here. So
+// the honest statement is "the pieces exist and no route arm reaches them" -- not "no kernel".
 inline constexpr ArchRung kArchLadder[] = {
+    // ===========================================================================
+    // THE SEVENTH PRE-75 ROW: sm_35 (Kepler GK110). ADDED 2026-09-25 (F850, dl/rung35)
+    // ===========================================================================
+    // WHY THIS ROW IS HERE, AND IT IS NOT A WIDENING. The block above (F702) records that an
+    // exact-match table refuses a buildable target that has no row, and that the ARCH SIMULATOR
+    // could not express a rung the ladder does not contain. Both halves were measured again for
+    // sm_35: dl/sg35 (F-830) measured `10 of 184` CUDA TUs emitting a real sm_35 cubin with 174
+    // reds and a link that cannot be made, and dl/simemit (F-842) measured the simulator refusing
+    // rung 35 with "sm_35 has no row in kArchLadder, so simulating it would mean inventing a
+    // capability set. Refusing; add the row with MEASURED evidence first." This block is that
+    // sentence obeyed, not overruled: the evidence exists, so the row is added.
+    //
+    // THE COUNT IS NOW SEVEN, NOT SIX, AND THIS COMMENT SAYS SO RATHER THAN EDITING F702's OWN
+    // HEADING. The F702 block is a record of a measurement taken on 2026-09-24; its "SIX ROWS"
+    // heading describes what that change added and is left standing. This one is its own dated
+    // block for the same reason the file's citation-drift note gives: editing a record of a
+    // measurement is not what a later change is for.
+    //
+    // WHAT IT DOES *NOT* BUY. Nothing is admitted by this row. The simulator's emission floor is
+    // rung 70 (dl/simemit), no sm_35 card exists on this box, and the row carries NO capability
+    // bit: Cap's six bits are all tensor-core instruction families and Maxwell/Kepler has no
+    // tensor core, so a bit here would be the sm_100-nvfp4 false positive in a new place. The row
+    // buys a NAMED refusal of the sm_52/sm_61/sm_62 shape instead of a structural absence.
+    //
+    // ITS RE-VERIFICATION SURFACE IS A TEST THAT ASSERTS THE ABSENCE IT REMOVES:
+    // tests/test_arch_caps.cpp:132 reads `arch_rung(35) == nullptr` and :332-336 expects
+    // `evaluate_artifact_formats(35, BF16)` to be UnknownArch. Both MOVE with this row, and the
+    // file's own history is the precedent (that example was sm_60 until the F702 block landed).
+    // This change does NOT silently edit them; the report names them as the follow-up.
+    //
+    {35, "Kepler GK110", "Tesla K20 / K40 / GTX 780 / Titan / Quadro K6000",
+     Cap::None,
+     "NO TENSOR CORE, MEASURED AT THIS RUNG. ptxas rejects `mma.sync` below .target sm_70 ('Feature "
+     "'mma' requires .target sm_70 or higher'); re-measured 2026-09-25 FOR THIS RUNG by dl/rung35 "
+     "with /mnt/g/cuda118/bin/ptxas -arch=sm_35 on the asm at ops/common/mma.cuh:191 "
+     "(mma_f16_m8n8k4), one instruction per module at PTX ISA .version 6.4: rc 255, cubin ABSENT, "
+     "while the SAME module at -arch=sm_70 is rc 0, cubin PRESENT -- a POSITIVE CONTROL, so the "
+     "instrument can tell the two states apart. THE FLOORS THIS RUNG MISSES, EACH WITH ITS KERNEL: "
+     "NVFP4 -> kind::mxf4nvf4, nvfp4_w4a4_mma.cuh:308 -> ops/common/mma.cuh:269 (asm :276); BF16 -> "
+     "bf16_gemm_mma.cuh:296 -> mma.cuh:109 (asm :113); Q4/Q5/Q6/W8 -> the same bf16 mma, "
+     "q4_rowsplit_gemm_mma.cuh:341, q5:385, q6:394, w8:267; FP8_E4M3FN_ROW_BF16S -> "
+     "fp8_a16_gemm_mma.cuh:206. NO LOWER FLOOR EITHER: the fp16 fallback needs Cap::Fp16Mma and a "
+     "measured HMMA.884 lowering, and neither holds here. WHY THIS ROW EXISTS AT ALL, because the "
+     "ladder's own refusal asks for it by name. dl/sg35 (F-830) measured, on the LIVE tree under "
+     "CUDA 11.8.89 + recipe R3 + the k40 shim: 10 of 184 CUDA TUs emit a REAL sm_35 cubin (10 of 10 "
+     "verified with cuobjdump -lelf) and 174 are red, so the LINK cannot be made; 165 of the 174 "
+     "carry family 1's verbatim first error ('\"= default\" cannot be specified on a friend "
+     "declaration', src/core/shard_plan.h(76)) and 170 of 174 are that one cause once "
+     "src/artifact/reader.h(180)'s sibling form is counted -- a defaulted comparison operator, "
+     "which is C++20, against a toolchain whose ceiling is C++17. Re-measured here 2026-09-25: "
+     "/mnt/g/cuda118/bin/nvcc --std=c++20 answers `nvcc fatal : Value 'c++20' is not defined for "
+     "option 'std'`, rc 1, while the construct is LIVE in the tree -- 67 `friend ... = default;` "
+     "declarations in src+include (66 operator==, 1 operator<=>), counted by dl/rung35 with a "
+     "declaration-aware scan; a single-line grep sees only 24 of them, because 43 wrap. THE WALL IS "
+     "A LANGUAGE-VERSION WALL, NOT AN ARCHITECTURE WALL, and this row records that in place of an "
+     "ISA claim. WHAT THIS ROW DOES NOT BUY, SAID PLAINLY: it does NOT buy emission. dl/simemit "
+     "(F-842) measured the simulator's emission floor at rung 70, and dl/sg35 measured that no "
+     "sm_35 card exists on this box (RTX 5090 D, compute_cap 12.0). What it buys is an HONEST NAMED "
+     "REFUSAL of the same SHAPE as sm_52/sm_61/sm_62 -- naming the weight format and the kernel "
+     "floor -- where before it there was a structural absence ('sm_35 has no row in kArchLadder, so "
+     "simulating it would mean inventing a capability set'). CALIBER: dl/sg35's census is 184 of "
+     "184 measured at compute_35 with a cold replay (741.3 s) and reproduced in a second, "
+     "independent directory with 0 verdict disagreements; there is NO tools/archkit/_GPU_MATRIX.md "
+     "section 3.2/3.3 row for sm_35 (that table's pre-75 coverage stops at 50), so this row's FIELD "
+     "evidence is dl/sg35 and its INSTRUCTION evidence is dl/rung35's own ptxas probe, not that "
+     "table. WHAT WOULD HAVE TO (FOR A FORMAT WHOSE kFormatRequirements.simt_kernel_evidence COLUMN "
+     "IS EMPTY -- the four groupwise-int formats name one and are SELECTED by select_route's "
+     "ConservativeSimt arm instead): a route arm that reaches a SIMT linear kernel here, a staged "
+     "dist, and a real Kepler card. Do NOT set a capability bit here: Cap has six bits and every "
+     "one of them is a tensor-core instruction family, and this rung has no tensor core -- a bit "
+     "here would be the sm_100-nvfp4 false positive in a new place.",
+    },
+    {50, "Maxwell GM10x", "GTX 750 / 750 Ti / 950M",
+     Cap::None,
+     "NO TENSOR CORE, MEASURED. ptxas rejects `mma.sync` below .target sm_70 ('Feature 'mma' "
+     "requires .target sm_70 or higher'); the per-rung probe of this tree's own emitters that "
+     "recorded it is tools/archkit/_GPU_MATRIX.md section 3.3, and its citation "
+     "ops/common/mma.cuh:191 still resolves (mma_f16_m8n8k4). THE FLOORS THIS RUNG MISSES, EACH "
+     "WITH ITS KERNEL (re-measured 2026-09-24): NVFP4 -> kind::mxf4nvf4, "
+     "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh:308 -> ops/common/mma.cuh:269 (asm :276); BF16 -> "
+     "ops/linear/bf16/bf16_gemm_mma.cuh:296 -> ops/common/mma.cuh:109 (asm :113); "
+     "Q4/Q5/Q6/W8 -> the same bf16 mma, q4_rowsplit_gemm_mma.cuh:341, q5:385, q6:394, w8:267; "
+     "FP8_E4M3FN_ROW_BF16S -> its A16 route, fp8_a16_gemm_mma.cuh:206. NO LOWER FLOOR EITHER: "
+     "kFormatRequirements' fallback_required column is honoured only when "
+     "fp16_fallback_executable() is true and that needs Cap::Fp16Mma plus a measured HMMA.884 "
+     "lowering; neither holds here. _GPU_MATRIX.md's route row for this family: tensor core "
+     "'none', route 'pending', status 'build configuration only (unprobed)'. CALIBER: section "
+     "3.2 records `build_arch.sh 50` configure rc=0 after the CMake pre-70 floor was made "
+     "inapplicable when a toolchain file is given; the per-TU compile sweep was NOT run for this "
+     "rung. WHAT WOULD HAVE TO (FOR A FORMAT WHOSE kFormatRequirements.simt_kernel_evidence COLUMN IS EMPTY -- the four groupwise-int formats name one and are SELECTED by select_route's ConservativeSimt arm instead): a linear/GEMM route arm that reaches a SIMT kernel on this "
+     "ISA and a staged dist on a real card. Do NOT set a capability bit here to fill the row: "
+     "the bits are instruction-set facts."},
+    {52, "Maxwell GM20x", "GTX 960 / 970 / 980 / 980 Ti",
+     Cap::None,
+     "NO TENSOR CORE, MEASURED, AND THIS IS THE OWNER'S GTX 960 RUNG. ptxas rejects `mma.sync` "
+     "below .target sm_70 ('Feature 'mma' requires .target sm_70 or higher'), recorded per rung "
+     "in tools/archkit/_GPU_MATRIX.md section 3.3 (citation ops/common/mma.cuh:191 still "
+     "resolves: mma_f16_m8n8k4). THE FLOORS THIS RUNG MISSES, EACH WITH ITS KERNEL "
+     "(re-measured 2026-09-24): NVFP4 -> kind::mxf4nvf4, nvfp4_w4a4_mma.cuh:308 -> "
+     "ops/common/mma.cuh:269 (asm :276); BF16 -> bf16_gemm_mma.cuh:296 -> mma.cuh:109 (asm "
+     ":113); Q4/Q5/Q6/W8 -> the same bf16 mma, q4_rowsplit_gemm_mma.cuh:341, q5:385, q6:394, "
+     "w8:267; FP8_E4M3FN_ROW_BF16S -> fp8_a16_gemm_mma.cuh:206. NO LOWER FLOOR EITHER: the fp16 "
+     "fallback needs Cap::Fp16Mma and a measured HMMA.884 lowering, and neither holds here. "
+     "CALIBER, and this rung has the most of the six: section 3.2 records configure rc=0 TWICE "
+     "(script path and hand-written path) and 384/385 TUs compiled, with 24 failures of which 21 "
+     "are arch-independent renames that were in flight and 3 are this block's own -- of those "
+     "three, exactly ONE was the pre-Volta GEMM wall (`using namespace nvcuda;` in the QPN TU, "
+     "which section 3.3 records and which that file has since gated at qpn_kernels.cuh:52). "
+     "WHAT WOULD HAVE TO (FOR A FORMAT WHOSE kFormatRequirements.simt_kernel_evidence COLUMN IS EMPTY -- the four groupwise-int formats name one and are SELECTED by select_route's ConservativeSimt arm instead): a route arm that reaches a SIMT linear kernel here, a staged "
+     "dist, and a real Maxwell card to probe. Do NOT set a capability bit here."},
+    {53, "Maxwell Tegra GM20B", "Tegra X1 / Jetson Nano",
+     Cap::None,
+     "NO TENSOR CORE. Same Maxwell ISA as sm_50/52, whose per-rung ptxas result is recorded in "
+     "tools/archkit/_GPU_MATRIX.md section 3.3 ('Feature 'mma' requires .target sm_70 or "
+     "higher'), so the capability set here is a FAMILY INFERENCE AND IS DISCLOSED AS ONE -- this "
+     "is the weakest-caliber row of the six and it says so. THE FLOORS THIS RUNG MISSES, EACH "
+     "WITH ITS KERNEL: NVFP4 -> kind::mxf4nvf4, nvfp4_w4a4_mma.cuh:308 -> ops/common/mma.cuh:269 "
+     "(asm :276); BF16/Q4/Q5/Q6/W8 -> bf16 mma, bf16_gemm_mma.cuh:296, q4_rowsplit_gemm_mma.cuh:"
+     "341, q5:385, q6:394, w8:267; FP8_E4M3FN_ROW_BF16S -> fp8_a16_gemm_mma.cuh:206. NO LOWER "
+     "FLOOR EITHER (the fp16 fallback needs Cap::Fp16Mma, absent). CALIBER: _GPU_MATRIX.md "
+     "section 3.2 does NOT cover this rung -- sm_53 is the one member of the pre-75 block whose "
+     "configure was never run (its row reads 'not tested; not tested'). That is exactly why the "
+     "row is a source-shape fact plus a family inference and nothing more. WHAT WOULD HAVE TO (FOR A FORMAT WHOSE kFormatRequirements.simt_kernel_evidence COLUMN IS EMPTY -- the four groupwise-int formats name one and are SELECTED by select_route's ConservativeSimt arm instead): the same three pieces as sm_50/52, plus a build of this rung at all. Do NOT read "
+     "this row as a measurement of a Jetson."},
+    {60, "Pascal GP100", "Tesla P100 / Quadro GP100",
+     Cap::None,
+     "NO TENSOR CORE. Pascal's fp16 rate is FP16x2 arithmetic, not an `mma` instruction: ptxas "
+     "rejects `mma.sync` below .target sm_70 ('Feature 'mma' requires .target sm_70 or higher'), "
+     "measured for the sibling rung sm_61 in tools/archkit/_GPU_MATRIX.md section 3.3 (citation "
+     "ops/common/mma.cuh:191 still resolves). GP100 is that same Pascal ISA, so this row is a "
+     "FAMILY INFERENCE, disclosed as one. THE FLOORS THIS RUNG MISSES, EACH WITH ITS KERNEL: "
+     "NVFP4 -> kind::mxf4nvf4, nvfp4_w4a4_mma.cuh:308 -> ops/common/mma.cuh:269 (asm :276); "
+     "BF16/Q4/Q5/Q6/W8 -> bf16 mma, bf16_gemm_mma.cuh:296, q4_rowsplit_gemm_mma.cuh:341, "
+     "q5:385, q6:394, w8:267; FP8_E4M3FN_ROW_BF16S -> fp8_a16_gemm_mma.cuh:206. NO LOWER FLOOR "
+     "EITHER. CALIBER: _GPU_MATRIX.md section 3.2 records configure rc=0 only (the hand-written "
+     "path); the per-TU sweep was not run for this rung, and its set is taken from the measured "
+     "sm_61. WHAT WOULD HAVE TO (FOR A FORMAT WHOSE kFormatRequirements.simt_kernel_evidence COLUMN IS EMPTY -- the four groupwise-int formats name one and are SELECTED by select_route's ConservativeSimt arm instead): a route arm that reaches a SIMT linear kernel here, a "
+     "staged dist, and a real card. Do NOT set a capability bit here."},
+    {61, "Pascal GP10x", "GTX 1050 / 1060 / 1070 / 1080 / Quadro P1000 / P6000",
+     Cap::None,
+     "NO TENSOR CORE, MEASURED, AND THIS IS THE OWNER'S QUADRO P1000 RUNG. Pascal GP10x has no "
+     "`mma` instruction at all: ptxas rejects `mma.sync` below .target sm_70 ('Feature 'mma' "
+     "requires .target sm_70 or higher'), measured for THIS rung in tools/archkit/_GPU_MATRIX.md "
+     "section 3.3 (its citation ops/common/mma.cuh:191 still resolves: mma_f16_m8n8k4; the same "
+     "table records ldmatrix open at sm_75, cp.async at sm_80, and __grid_constant__ refused "
+     "here). THE FLOORS THIS RUNG MISSES, EACH WITH ITS KERNEL (re-measured 2026-09-24): NVFP4 "
+     "-> kind::mxf4nvf4, ops/linear/nvfp4/nvfp4_w4a4_mma.cuh:308 -> ops/common/mma.cuh:269 "
+     "(asm :276); BF16 -> ops/linear/bf16/bf16_gemm_mma.cuh:296 -> ops/common/mma.cuh:109 (asm "
+     ":113); Q4G64_F16S/Q5G64_F16S/Q6G64_F16S/W8G32_F16S -> the same bf16 mma, "
+     "q4_rowsplit_gemm_mma.cuh:341, q5:385, q6:394, w8:267; FP8_E4M3FN_ROW_BF16S -> its A16 "
+     "route, fp8_a16_gemm_mma.cuh:206. NO LOWER FLOOR EITHER: fp16_fallback_executable() needs "
+     "Cap::Fp16Mma and a measured HMMA.884 lowering (this rung has neither), so the QPN W4A16 "
+     "fallback is not available here even though its FFMA band compiles below sm_70 now "
+     "(qpn_kernels.cuh:1015, gated at :32/:52). CALIBER: _GPU_MATRIX.md section 3.2 records "
+     "configure rc=0 and 384/385 TUs compiled, line-for-line the same result as sm_52; the "
+     "`__dp4a` this rung adds over sm_50/52 is real (qpn_kernels.cuh:611) and the attention "
+     "census that motivated the FFMA family is in that table's section 3.3. WHAT WOULD HAVE TO (FOR A FORMAT WHOSE kFormatRequirements.simt_kernel_evidence COLUMN IS EMPTY -- the four groupwise-int formats name one and are SELECTED by select_route's ConservativeSimt arm instead): a linear route arm that reaches a SIMT kernel on this ISA (the FFMA attention family "
+     "already covers the attention half and is selected in the ops launcher, not from here), a "
+     "staged dist, and the card. Do NOT set a capability bit here: a bit is an instruction-set "
+     "claim and the instruction does not exist on this target."},
+    {62, "Pascal Tegra GP10B", "Jetson TX2 / Tegra X2",
+     Cap::None,
+     "NO TENSOR CORE. Same Pascal ISA as the measured sm_61 (tools/archkit/_GPU_MATRIX.md "
+     "section 3.3: 'Feature 'mma' requires .target sm_70 or higher'), so the set here is a "
+     "FAMILY INFERENCE, disclosed as one. THE FLOORS THIS RUNG MISSES, EACH WITH ITS KERNEL: "
+     "NVFP4 -> kind::mxf4nvf4, nvfp4_w4a4_mma.cuh:308 -> ops/common/mma.cuh:269 (asm :276); "
+     "BF16/Q4/Q5/Q6/W8 -> bf16 mma, bf16_gemm_mma.cuh:296, q4_rowsplit_gemm_mma.cuh:341, "
+     "q5:385, q6:394, w8:267; FP8_E4M3FN_ROW_BF16S -> fp8_a16_gemm_mma.cuh:206. NO LOWER FLOOR "
+     "EITHER (the fp16 fallback needs Cap::Fp16Mma, absent here). CALIBER: _GPU_MATRIX.md "
+     "section 3.2 records configure rc=0 only; the per-TU sweep was not run for this rung. The "
+     "row is here for the same reason sm_87 and sm_88 are here -- a buildable target with no row "
+     "is refused by an exact-match table -- and for one more: the arch simulator cannot express a "
+     "rung the ladder does not contain. WHAT WOULD HAVE TO (FOR A FORMAT WHOSE kFormatRequirements.simt_kernel_evidence COLUMN IS EMPTY -- the four groupwise-int formats name one and are SELECTED by select_route's ConservativeSimt arm instead): the same three pieces as "
+     "sm_50/52, plus a build of this rung. Do NOT read this row as a measurement of a TX2."},
     {70, "Volta", "V100-SXM2/PCIe", Cap::Fp16Mma,
-     "fp16 mma only (qpn_kernels.cuh:696 uses mma.sync.m8n8k4). No bf16, no int8 tensor "
+     "fp16 mma only (qpn_kernels.cuh:729 uses mma.sync.m8n8k4). No bf16, no int8 tensor "
      "core, no fp8, no fp4. _GPU_MATRIX.md sm-70 row: QPN2 W4A16 runs published NVFP4/FP8 "
      "weights by expanding 4-bit codes into fp16 mma; no requantization and no fp16 weight "
      "copy needed. THE SAME ROW'S STATUS COLUMN SAYS THAT IS NOT DONE YET (it reads "
      "\"pending port\" -- the cell the citation above omits), so this row must not be read "
-     "as \"the V100 has a route\": no CMake target compiles src/ops/linear/qpn/, and "
+     "as \"the V100 has a route\": ops/linear/qpn/ IS COMPILED BY A TARGET IN THIS TREE (src/CMakeLists.txt:366; this clause used to read that no CMake target compiles it, which the build graph no longer says -- re-measured 2026-09-24), and "
      "src/core/kernel_route.h therefore refuses NVFP4 / FP8_E4M3FN_ROW_BF16S on sm_70 with a "
      "NoKernelInTree that names the missing QPN kernel. The row stays because fp16 mma is "
      "what it is -- it is the route that is pending, not the capability."},
@@ -129,7 +383,7 @@ inline constexpr ArchRung kArchLadder[] = {
      "out in mma_bf16 (sm_80 floor), so the groupwise-int profile is NOT executable here as "
      "the sources stand -- it needs the QPN fp16 path or an mma_s8 port of "
      "q4/q5/q6/w8_*_gemm_mma.cuh. The QPN fp16 path is the one named in the sm-70 row "
-     "above: it exists in src/ops/linear/qpn/ and is compiled by no target in this tree, so "
+     "above: it exists in src/ops/linear/qpn/ and IS COMPILED BY A TARGET IN THIS TREE (src/CMakeLists.txt:366, re-measured 2026-09-24; this clause used to read compiled by no target), so "
      "today it is the mma_s8 port that would have to be written first."},
     {80, "Ampere GA100", "A100 / A30", Cap::Fp16Mma | Cap::Int8Mma | Cap::Bf16Mma,
      "bf16 + int8 tensor core; no fp8, no fp4. groupwise-int (W8G32) and Q4/Q5/Q6 run "
@@ -432,6 +686,76 @@ struct FormatRequirement {
     // unmeasured rung.
     Cap fallback_required = Cap::None;
     std::string_view fallback_kernel_evidence = {};
+
+    // -----------------------------------------------------------------------
+    // THE THIRD FLOOR: the tensor-core-free FFMA/SIMT GEMM.
+    // -----------------------------------------------------------------------
+    // WHY A THIRD COLUMN AND NOT A SEVENTH Cap BIT. `required` and `fallback_required` are both
+    // Cap bits, and Cap's six bits are ALL tensor-core instruction families. A rung whose measured
+    // set is Cap::None therefore satisfies neither column, and the soundness invariant the gate
+    // and two tests enforce -- `floor == Cap::None || covers(rung->caps, floor) ||
+    // (QpnW4a16 && fp16_fallback_executable(...))` -- admits NO tensor-core-free floor at all.
+    // Until this column existed, a format whose floor an FMA-PIPE kernel satisfies had no way to
+    // say so on such a rung, so every GEMM format refused there whether or not this build shipped
+    // a kernel that card could run.
+    //
+    // WHY NOT WRITE Cap::None IN `required` INSTEAD. Because that column means "this format is
+    // never fed to a tensor-core GEMM" and is read as such at three surfaces (select_route's
+    // Cap::None arm, render_capability_report's floor gap, and the Verdict). A groupwise-int
+    // weight IS fed to a tensor-core GEMM from sm_80 up -- mma_bf16 -- so writing Cap::None there
+    // would DELETE a real floor in order to add a second one. Two floors, two columns.
+    //
+    // THE CLAIM THIS COLUMN MAKES is deliberately about a FILE and not about a card: the named
+    // kernel consumes THIS format's persisted bytes and emits no tensor-core instruction, so it is
+    // executable on any rung that can assemble it. Empty (the default) means "this format has no
+    // tensor-core-free kernel in this tree". Measured for the four rows below with this tree's own
+    // flags -- nvcc 12.8 V12.8.61, `-cubin -arch=sm_52` and `-arch=sm_61`, then `nvdisasm -c`:
+    // rc=0, ZERO HMMA/IMMA, ZERO ldmatrix, ZERO LDGSTS (the staged copy takes the synchronous
+    // cuda_pipeline arm below sm_80 and does not trap).
+    std::string_view simt_kernel_evidence = {};
+
+    // -----------------------------------------------------------------------
+    // THE FOURTH FLOOR: the fp16 TENSOR-CORE arm over THIS format's own plane.
+    // -----------------------------------------------------------------------
+    // WHY A FOURTH COLUMN, AND WHY IT IS NOT `fallback_required`. `fallback_required` is
+    // already taken: NVFP4's Cap::Fp16Mma there means the QPN W4A16 family, which consumes
+    // PACKED e2m1/e4m3 codes. A BF16 PLANE is a different kernel family reading different
+    // bytes, and writing its facts into the QPN column would make the one column answer two
+    // questions -- the drift this table's own header forbids. Two families, two columns.
+    //
+    // WHAT IS DIFFERENT ABOUT THIS ONE, AND IT IS THE WHOLE REASON IT EXISTS. The two
+    // predicates above are GATED ON THE RUNG being unable to do better (the fp16 arm) or on
+    // no tensor-core route existing at all (the SIMT arm). This one is the opposite: it is
+    // the answer where the rung HAS fp16 tensor cores and the format's declared floor names
+    // a tensor-core family the rung does NOT have -- Volta and Turing against a Cap::Bf16Mma
+    // floor, i.e. exactly rungs 70 and 75. Today those two rungs answer with the FFMA/SIMT
+    // arm; with this column they answer with a real fp16 tensor-core GEMM that consumes the
+    // SAME persisted bf16 bytes (no requantization, no fp16 weight copy).
+    //
+    // WHERE THE KERNEL IS: src/ops/linear/bf16/bf16_mma_fp16.cuh. The channel it uses is
+    // per-rung and MEASURED, in kFp16PlaneChannelRungs below -- `mma.sync.aligned.m8n8k4` on
+    // sm_70 (Volta's only fp16 tensor-core form) and `mma.sync.aligned.m16n8k8` on sm_75
+    // (Turing's native form). Empty (the default) means "this format has no fp16-plane kernel
+    // in this tree", which is every row but BF16 today.
+    Cap fp16_plane_required = Cap::None;
+    std::string_view fp16_plane_kernel_evidence = {};
+    // -----------------------------------------------------------------------
+    // THE FLOOR OF THE THIRD FLOOR (added by dl/gapclose, F-769).
+    // -----------------------------------------------------------------------
+    // The rung BELOW which the tensor-core-free kernel named in `simt_kernel_evidence` was not
+    // measured. `0` means "no separate floor": the row's evidence was taken on the rungs the row
+    // already admits, and its admission must not move by one cell because this field appeared --
+    // which is the state of every row but NVFP4, whose evidence (nvfp4_gemv / nvfp4_small_t) was
+    // censused at sm_75 and sm_80 only.
+    //
+    // WHY A FIELD AND NOT A SENTENCE. Clause 1 of simt_floor_executable() asks only "does this
+    // format's row name a tensor-core-free kernel"; that question has the same answer on every
+    // rung, so a column WITHOUT this floor admits the format on the six sub-70 rungs as well --
+    // a widening of 6 x 9 = 54 cells beyond the band, on rungs this toolchain CANNOT census
+    // (CUDA 13.3 refuses `compute_52` / `compute_61` outright: "Unsupported gpu architecture").
+    // The floor keeps the field's claim a claim about a MEASURED rung; where it is not measured
+    // the answer is the refusal it was before. IT IS A BOUND, NOT A MEASUREMENT, and it says so.
+    int simt_evidence_floor_sm = 0;
 };
 
 // ONE ROW PER FORMAT THAT HAS A FLOOR, PLUS A COMPILE-TIME GATE THAT THE ENUM IS COVERED.
@@ -451,48 +775,239 @@ struct FormatRequirement {
 // that includes this header rather than silently passing.
 inline constexpr FormatRequirement kFormatRequirements[] = {
     {artifact::NumericFormat::BF16, Cap::Bf16Mma,
-     "ops/linear/bf16/bf16_gemm_mma.cuh:273 -> ops/common/mma.cuh:33 (mma_bf16, "
-     "mma.sync.aligned.m16n8k16...bf16.bf16.f32)"},
+     "ops/linear/bf16/bf16_gemm_mma.cuh:296 -> ops/common/mma.cuh:109 (mma_bf16, "
+     "mma.sync.aligned.m16n8k16...bf16.bf16.f32)",
+     // ---------------------------------------------------------------------------------------
+     // THERE IS NO fp16 FALLBACK FOR BF16, AND THAT IS A MEASURED ABSENCE RATHER THAN AN
+     // OVERSIGHT. The fp16 avenue this table honours is
+     // fp16_fallback_executable() -> the QPN family -> mma.sync.aligned.m8n8k4, and the QPN
+     // kernels consume PACKED 4-BIT e2m1 CODES (skinny_nvfp4_qpn*) or PACKED e4m3 CODES
+     // (skinny_fp8_qpn8*), expanded inline to fp16. Neither reads a bf16 weight plane, and a
+     // grep of every arm under src/ops/linear/ finds exactly two users of the m8n8k4 fp16
+     // channel -- qpn_kernels.cuh:729 and :929 -- both inside that family. So writing
+     // Cap::Fp16Mma here would name a route to a kernel that cannot consume these bytes: the
+     // phantom this table exists to prevent, and the same failure mode as the sm_100 nvfp4 row
+     // recorded above. dl/floorfix measured it rather than inheriting F-719's reading.
+     // WHAT EXISTS INSTEAD is the TENSOR-CORE-FREE arm at the bottom of this row, and it is
+     // better on the axis the owner put first: bf16 -> FP32 FMA loses nothing (bf16 is exactly
+     // representable in fp32), whereas bf16 -> fp16 is precision-up and RANGE-down (fp16's
+     // exponent is 5 bits against bf16's 8, so |x| > 65504 saturates). See the row's own
+     // measurement note.
+     Cap::None,
+     {},
+     "ops/linear/bf16/bf16_gemv.cuh and ops/linear/bf16/bf16_small_t.cuh (bf16_gemv_kernel / "
+     "bf16_small_t_inner_kernel; BF16 x BF16 decoded to FP32 and FMA'd on the FP32 pipe into "
+     "per-row accumulators, NO tensor-core instruction) -> TUs ops/linear/bf16/bf16_gemv.cu "
+     "and ops/linear/bf16/bf16_small_t.cu, src/CMakeLists.txt:315 and :317, both unconditional. "
+     "These are not a fallback SOMEONE HAS TO WIRE: bf16_dispatch.cpp:33/:36 already selects "
+     "them BY SHAPE and WITHOUT CONSULTING THE ARCH (t == 1 -> bf16_gemv; t <= "
+     "kBf16LinearSmallTDispatchEnd -> bf16_small_t), so on this box the BF16 decode path is "
+     "this kernel on every card. MEASURED 2026-09-25 (dl/floorfix): one `-cubin` per TU with this "
+     "tree's own include/define set, then `nvdisasm -c` -- see "
+     "dl/floorfix/out/tc_free_census/census.txt, whose own rows carry the arch AND the reason one "
+     "arch is missing. The result for this pair at sm_75: rc=0, ZERO HMMA, ZERO IMMA, ZERO LDSM, "
+     "ZERO call into any emulation routine, against 80 and 33328 FMA-pipe instructions -- and the "
+     "SAME instrument reports 1088 HMMA on ops/linear/bf16/bf16_gemm_mma.cu at sm_80, so a zero "
+     "here is a reading and not a blind probe. sm_70 COULD NOT BE MEASURED and is NOT claimed: "
+     "every toolkit on this box (13.0/13.1/13.3; 12.8 is gone, only its ld.so.conf fragment "
+     "remains) rejects `-arch=sm_70` AND `-arch=compute_70` with `nvcc fatal : Unsupported gpu "
+     "architecture`. sm_75 is therefore a PROXY for sm_70 here, and the reason it is a good one "
+     "is a source fact rather than a hope: this kernel's body contains no mma/ldmatrix call at "
+     "all, and the only arch guard on its path keys NINFER_MEMORY_HAS_CP_ASYNC on "
+     "__CUDA_ARCH__ >= 800 (ops/common/memory.cuh:30), so sm_70 and sm_75 take the SAME arm. "
+     "(That census is the arm this row feeds: unlike the four groupwise-int rows, whose census "
+     "was taken at sm_52/sm_61, this row's floor is unmet on sm_70/sm_75, so the measurement had "
+     "to be taken at those rungs -- which is the measurement F-709.5 recorded as NOT TAKEN.)",
+     // ---------------------------------------------------------------------------------------
+     // THE FOURTH FLOOR, AND WHY BF16 IS THE FIRST ROW TO CARRY IT. The paragraph above is
+     // still TRUE and is NOT deleted: there is no fp16 fallback for BF16 *in the QPN sense* --
+     // the QPN kernels consume packed 4-bit e2m1 or packed e4m3, and neither reads a bf16
+     // plane. What changed is that the missing piece the route selector named ("an explicit
+     // bf16 -> fp16 weight conversion ahead of an m8n8k4 GEMM ... the missing piece for these
+     // formats is the conversion and the kernel that drives it") now EXISTS:
+     // src/ops/linear/bf16/bf16_mma_fp16.cuh. So on rungs 70 and 75 -- the two rungs that have
+     // fp16 tensor cores and NOT Cap::Bf16Mma, on the record as "the 122 refusing cells of
+     // dl/ladderacpt's census" -- a bf16 artifact is served by a real fp16 tensor-core GEMM
+     // instead of the FFMA/SIMT one.
+     //
+     // WHAT IT COSTS, NAMED RATHER THAN HIDDEN. bf16 -> fp16 is exact in the mantissa and
+     // NARROWER in range: |x| > 65504 saturates. The SIMT arm is exact where this one
+     // saturates, and the owner's first rule is precision first -- so BOTH are reported by the
+     // gate (whichever fallback this column carries is what render_fallback_notice prints) and
+     // the engine-side plan may decline it (bf16_fp16_route.h).
+     //
+     // WHAT IS NOT DONE: the SIMT column is not deleted, and no rung is moved off it where it
+     // is the only answer. On rungs 50/52/53/60/61/62 -- no tensor core at all, where FFMA IS
+     // the native route -- this arm cannot fire (kFp16PlaneChannelRungs has no row below sm_70,
+     // and nothing assembles `mma` below .target sm_70), so those six keep the FFMA route and
+     // that is not a defect.
+     Cap::Fp16Mma,
+     "ops/linear/bf16/bf16_mma_fp16.cuh:1 (bf16_mma8_kernel / bf16_mma1688_kernel; the artifact's "
+     "OWN bf16 plane is converted inline to fp16 and fed to the fp16 tensor core through "
+     "ops/common/mma.cuh's mma_f16_m8n8k4 (sm_70, Volta's only fp16 mma form) or mma_f16_m16n8k8 "
+     "(sm_75, Turing's native form). NO requantization and NO second weight copy: the persisted "
+     "bytes are read as-is. CHANNEL LOWERING IS PER RUNG AND MEASURED -- see "
+     "kFp16PlaneChannelRungs below. KERNEL CENSUS, THIS LINE, CUDA 13.3, `-cubin -arch=<a>` + "
+     "`nvdisasm -c` on a TU that instantiates BOTH kernels (dl/fp16route/logs/newkernel_*.sass): "
+     "sm_75 HMMA.884 = 64 (= 16 PTX mma sites x 4 STEPs, 0 emulation CALL) AND HMMA.1688 present; "
+     "sm_80/86/89/90/100/103/120a HMMA.884 = 0 with 16 CALLs into the same in-cubin FFMA routine the "
+     "m8n8k4 channel has always used, while HMMA.168x stays PRESENT -- which is the measurement "
+     "that makes m16n8k8 the right channel for a rung whose run may be replayed on a modern box. "
+     "sm_70 is NOT COMPILABLE here (all three toolkits reject -arch=sm_70) and is therefore NOT "
+     "censused; the sm_70 channel row is inherited from kQpnMmaRungs' own CUDA-12.8 census of the "
+     "SAME single channel, which is the same inheritance fp16_fallback_executable() performs."},
     {artifact::NumericFormat::FP32, Cap::None,
      "scale words / control payloads (artifact/reader.h:23); never a tensor-core operand"},
     {artifact::NumericFormat::I32, Cap::None,
      "control and index payloads (artifact/reader.h:24); never a tensor-core operand"},
     {artifact::NumericFormat::Q4G64_F16S, Cap::Bf16Mma,
      "ops/linear/q4/q4_rowsplit_gemm_mma.cuh:341 and q4/q4_small_t_mma.cuh:168 (mma_bf16, "
-     "NOT a 4-bit tensor core)"},
+     "NOT a 4-bit tensor core)",
+     Cap::Bf16Mma,
+     "the groupwise-int BF16 A16 route above, kept unchanged as the SECOND floor",
+     "ops/linear/q4/q4_rowsplit_gemm_simt.cuh:238 (q4_rowsplit_gemm_simt_kernel; Q4 G64 x BF16, "
+     "FP32 FMA into per-column accumulators, no tensor-core instruction) -> TU "
+     "ops/linear/q4/q4_rowsplit_gemm_simt.cu, src/CMakeLists.txt:374"},
     {artifact::NumericFormat::Q5G64_F16S, Cap::Bf16Mma,
-     "ops/linear/q5/q5_rowsplit_gemm_mma.cuh:385 (mma_bf16)"},
+     "ops/linear/q5/q5_rowsplit_gemm_mma.cuh:385 (mma_bf16)",
+     Cap::Bf16Mma,
+     "the groupwise-int BF16 A16 route above, kept unchanged as the SECOND floor",
+     "ops/linear/q5/q5_rowsplit_gemm_simt.cuh:284 (q5_rowsplit_gemm_simt_split4_kernel) and :156 "
+     "(split2); warp-per-row, 128-bit coalesced weight-plane loads, FP32 FMA, no tensor-core "
+     "instruction -> TU ops/linear/q5/q5_rowsplit_gemm_simt.cu, src/CMakeLists.txt:379"},
     {artifact::NumericFormat::Q6G64_F16S, Cap::Bf16Mma,
-     "ops/linear/q6/q6_rowsplit_gemm_mma.cuh:394 (mma_bf16)"},
+     "ops/linear/q6/q6_rowsplit_gemm_mma.cuh:394 (mma_bf16)",
+     Cap::Bf16Mma,
+     "the groupwise-int BF16 A16 route above, kept unchanged as the SECOND floor",
+     "ops/linear/q6/q6_rowsplit_gemm_simt.cuh:223 (q6_rowsplit_gemm_simt_kernel; Q6 G64 x BF16, "
+     "FP32 FMA, no tensor-core instruction) -> TU ops/linear/q6/q6_rowsplit_gemm_simt.cu, "
+     "src/CMakeLists.txt:418"},
     {artifact::NumericFormat::W8G32_F16S, Cap::Bf16Mma,
      "ops/linear/w8/w8_rowsplit_gemm_mma.cuh:267 and w8/w8_small_t_mma.cuh:230 (mma_bf16, "
-     "NOT mma_s8: the groupwise-int profile is not an int8-tensor-core route)"},
+     "NOT mma_s8: the groupwise-int profile is not an int8-tensor-core route)",
+     Cap::Bf16Mma,
+     "the groupwise-int BF16 A16 route above, kept unchanged as the SECOND floor",
+     "ops/linear/w8/w8_rowsplit_gemm_simt.cuh:149 (w8_rowsplit_gemm_simt_kernel; W8 G32 x BF16, "
+     "bytes converted to FP32 and FMA'd, no tensor-core instruction) -> TU "
+     "ops/linear/w8/w8_rowsplit_gemm_simt.cu, src/CMakeLists.txt:419. NOTE this one has NO "
+     "format-level host shape table: its callers are the per-projection TUs "
+     "(ops/attn_input_proj/w8/w8_attn_input_gemm_simt.cu, ops/linear_add/w8/"
+     "w8_linear_add_gemm_simt.cu), which is why the arm this column feeds names a KERNEL FILE "
+     "and leaves the exact-geometry decision to the caller"},
     {artifact::NumericFormat::NVFP4, Cap::Mxf4Nvfp4BlockScale,
-     "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh:308 -> ops/common/mma.cuh:90 "
+     "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh:308 -> ops/common/mma.cuh:269 "
      "(kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.e2m1.e2m1). MEASURED: that asm "
      "assembles on sm_120a/sm_121a and the 120/121 family targets only; sm_100a/sm_103a/"
      "sm_110a reject it, so this format's floor is sm_120, not sm_100.",
      // The fallback consumes the SAME packed e2m1 codes + e4m3 scales this format already
-     // stores; it does not requantize. mma.cuh:63's m8n8k4 form is the channel.
+     // stores; it does not requantize. mma.cuh:191's m8n8k4 form is the channel.
      Cap::Fp16Mma,
      "QPN W4A16: src/ops/linear/qpn/qpn_kernels.cuh -- skinny_nvfp4_qpn_simt<M> (M 1..3), "
      "skinny_nvfp4_qpn<1> (M 4..8), skinny_nvfp4_qpn<2> (M 9..16), host entry gemm_qpn in "
      "src/ops/linear/qpn/qpn_host.cu -- expands the 4-bit e2m1 codes inline into fp16 mma "
      "and needs Cap::Fp16Mma only. Its tensor-core channel is mma.sync.aligned.m8n8k4 "
-     "(qpn_kernels.cuh:695,:893; helper ops/common/mma.cuh mma_f16_m8n8k4)."},
+     "(qpn_kernels.cuh:729,:929; helper ops/common/mma.cuh mma_f16_m8n8k4). NOTE, MEASURED "
+     "2026-09-25 (dl/floorfix): this route is SELECTED BY THIS TABLE AND NOT DISPATCHABLE BY "
+     "THE ENGINE -- qpn_arch_route.h:93-108 records the two missing ports (a native -> "
+     "qpn_prepack weight converter and a bf16 -> fp16 activation/output step), and "
+     "dispatch_qpn_fallback() refuses with QpnWeightLayout::NativeBlockScale, which is the only "
+     "layout an artifact delivers. THE ENGINE'S ANSWER IS AT THE OP, not in this table, and it "
+     "is a THIRD option this catalogued list does not carry because it is not a lower FLOOR: "
+     "src/ops/linear/nvfp4/nvfp4_dispatch.cpp now takes launch_a16 -- nvfp4_gemv / "
+     "nvfp4_small_t, FP32 FMA over this artifact's own planes -- instead of throwing. Its "
+     "census is dl/floorfix/out/tc_free_census/census.txt. ",
+     // -----------------------------------------------------------------------
+     // NOTE THE COMMA JUST ABOVE, AND IT IS THE WHOLE DIFFERENCE BETWEEN THIS ROW PARSING AND NOT:
+     // the fields of this row are ADJACENT STRING LITERALS, and adjacent literals CONCATENATE. The
+     // first revision of this patch ended the QPN paragraph without one, so the tensor-core-free
+     // evidence below was glued onto the paragraph and the next initialiser landed on a
+     // `std::string_view` -- measured: `error: could not convert 'ninfer::caps::Cap::None' from
+     // 'ninfer::caps::Cap' to 'std::string_view'` at arch_caps.h:881, first build attempt.
+     // -----------------------------------------------------------------------
+     // THE THIRD FLOOR, AND THE 76..119 HOLE IS CLOSED (dl/gapclose, F-769).
+     // -----------------------------------------------------------------------
+     // THIS PARAGRAPH USED TO SAY THE HOLE "STAYS OPEN AND IS REPORTED, NOT PAPERED OVER" and
+     // named the repair. The repair is LANDED, and the two halves are ONE landing because either
+     // one alone is a false claim:
+     //   * the TABLE half (this column) is what lets the gate see the tensor-core-free kernel;
+     //   * the OP half (nvfp4_dispatch.cpp's rung-aware W4A4-vs-A16 decision) is what makes the
+     //     run take that kernel instead of falling through to launch_nvfp4_w4a4.
+     // Adding this column WITHOUT the op guard was the banned false positive -- simulated green
+     // on this sm_120a cubin while a real Ada card faulted inside launch_nvfp4_w4a4 -- and
+     // adding the op guard without this column would leave the cells refused for a route the
+     // runtime now knows how to take. Both are in the same landq item, with the census below.
+     // THE EVIDENCE, MEASURED. src/ops/linear/nvfp4/nvfp4_gemv.cu (t == 1) and
+     // nvfp4_small_t.cu (t == 2..kNvfp4LastSmallT) are reached through nvfp4_dispatch.cpp's
+     // launch_a16 and compute over THIS artifact's own [N][K/2] codes + [N][K/16] scales with
+     // FP32 FMA: no kind::mxf4nvf4, no tensor-core instruction of any family. Census, rc=0 on
+     // every rung listed, with the counter SHOWN TO MOVE on a neighbour
+     // (POSCTL-bf16_gemm_mma sm_80 -> HMMA=1088, LDSM=816):
+     //   nvfp4_gemv.cu    sm_75  rc=0  HMMA=0 IMMA=0 LDSM=0 EMCALL=0  FMA-pipe=2768
+     //   nvfp4_small_t.cu sm_75  rc=0  HMMA=0 IMMA=0 LDSM=0 EMCALL=0  FMA-pipe=206720
+     //   nvfp4_gemv.cu    sm_80  rc=0  HMMA=0 IMMA=0 LDSM=0 EMCALL=0  FMA-pipe=2768
+     // THE ISA SIDE OF THIS ROW IS *NOT* RE-MEASURED HERE, AND THE TWO INSTRUMENTS THAT CLAIMED TO
+     // WERE BROKEN. `dl/nvfp4hole/out/M2b_census.tsv` and `dl/floorfix/out/tc_free_census/rc.txt`
+     // BOTH report their ISA probe as `ops/linear/nvfp4/nvfp4_w4a4_mma.cu ... rc=1 / NO CUBIN`, and
+     // the handover read that as ptxas refusing the instruction. MEASURED 2026-09-25 by dl/gapclose:
+     // THAT PATH DOES NOT EXIST -- the asm lives in the HEADER `nvfp4_w4a4_mma.cuh`, and its
+     // instantiating TU is `nvfp4_w4a4.cu` (`ls ops/linear/nvfp4/*.cu` lists no `_mma.cu`). Both
+     // `rc=1`s are "No such file or directory". The ISA fact therefore stands on THIS ROW's own
+     // `required` column text -- ptxas rejecting kind::mxf4nvf4 on sm_100a/sm_103a/sm_110a, so the
+     // floor is sm_120 -- and on the ladder carrying Cap::Mxf4Nvfp4BlockScale on 120/121 only. It is
+     // NOT claimed here from those two census rows, and the corrected census is
+     // `dl/gapclose/scripts/b_isa.sh` (on `nvfp4_w4a4.cu`, the TU that exists).
+     // THE FLOOR, AND IT IS A BOUND RATHER THAN A MEASUREMENT: 80 is the lowest rung admitted,
+     // because 70/75 are already admitted through fp16_fallback_executable()'s QPN arm (their
+     // answer must not move) and the six sub-70 rungs CANNOT be re-censused by this toolchain
+     // (CUDA 13.3 refuses `compute_52`/`compute_61`: Unsupported gpu architecture), so they are
+     // kept OFF this column BY NAME rather than admitted on an unmeasured rung. The population
+     // this moves is the eight in-band rungs 80/86/87/88/89/90/100/103 and nothing else.
+     "ops/linear/nvfp4/nvfp4_gemv.cu and ops/linear/nvfp4/nvfp4_small_t.cu, entered through "
+     "src/ops/linear/nvfp4/nvfp4_dispatch.cpp launch_a16: FP32 FMA over the artifact's own "
+     "packed e2m1 codes and e4m3 scales, no tensor-core instruction. Census above.",
+     Cap::None,
+     {},
+     80},
     {artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S, Cap::Bf16Mma,
      "A16 route: ops/linear/fp8/fp8_a16_gemm_mma.cuh:206 (mma_bf16). A8 route: "
      "ops/linear/fp8/fp8_a8_mma.cuh:247 (mma_fp8_e4m3, kind::f8f6f4, Blackwell form). "
-     "THERE IS DELIBERATELY NO FALLBACK ROW HERE, and the reason is measured: the fp8 arm of "
-     "the QPN family (skinny_fp8_qpn8, skinny_fp8_qpn8_mt2, qpn_kernels.cuh:1227/:1327) "
-     "exists as a template but has NO HOST ENTRY -- qpn_host.cu's gemm_qpn dispatches "
-     "skinny_nvfp4_qpn_simt / <1> / <2> and nothing else, and a single-file grep finds the two "
-     "fp8 kernels mentioned NOWHERE outside the prose of this file and kernel_route.h. "
-     "Declaring them as this format's fallback would hand a pre-Ampere card a route naming a "
-     "kernel nothing can launch, which is the phantom this table exists to prevent (and it is "
-     "the same failure mode as the sm_100 nvfp4 false positive above). So an fp8 artifact "
-     "still REFUSES on sm_70/sm_75, and the missing piece is a gemm_qpn fp8 dispatch -- not "
-     "the mma channel, which the nvfp4 arm already proves works there."},
+     "THERE IS STILL NO fp16 FALLBACK ROW HERE, and F-719's reading of it was INCOMPLETE -- "
+     "dl/floorfix took the measurement and it is a SCALE MODEL mismatch, not only a missing "
+     "host entry. The fp8 arm of the QPN family (skinny_fp8_qpn8, skinny_fp8_qpn8_mt2, "
+     "qpn_kernels.cuh:1257/:1357) reads its epilogue scale as `const float* tscale` indexed "
+     "`tscale[blockIdx.x]` (qpn_kernels.cuh:1258/:1273 and :1358/:1372), i.e. ONE fp32 PER "
+     "32-OUTPUT-COLUMN TILE, while this format carries ONE BF16 PER OUTPUT ROW "
+     "(artifact/storage_layouts.cpp row_scale_geometry -> scale_word_bytes = 2; "
+     "fp8_format.cpp:46/:58 require scale_ne[0] == n and scale_nb[0] == 2). Thirty-two "
+     "distinct row scales would be read as one reinterpreted fp32 pair -- silent numerical "
+     "corruption, the failure class this table refuses on. Adding the gemm_qpn fp8 dispatch "
+     "F-719 asked for would therefore have created the phantom in a NEW way (a route that "
+     "launches and computes the wrong answer), so it was NOT added. What would have to exist "
+     "first: either a kernel that applies a PER-ROW scale (the CUDA-core arm below already "
+     "does, which is why the sm_70/sm_75 answer is a route and not a refusal), or a "
+     "prepack/requantizer that folds per-row scales into per-tile ones -- and that one owes its "
+     "own precision measurement, because it changes the numbers. The mma channel is NOT the "
+     "missing piece, as F-719 said; the scale axis is.",
+     Cap::None,
+     {},
+     "ops/linear/fp8/fp8_gemv.cuh and ops/linear/fp8/fp8_small_t.cuh (fp8_gemv_kernel / "
+     "fp8_small_t_kernel; 'Reusable row-scaled FP8 T=1 CUDA-core mainloop' -- each warp owns "
+     "contiguous output rows, decodes this format's OWN qdata plane to BF16 and FMA's it into "
+     "FP32 accumulators, applying __bfloat162float(row_scales[row]) ONCE per output row; NO "
+     "tensor-core instruction) -> TUs ops/linear/fp8/fp8_gemv.cu and "
+     "ops/linear/fp8/fp8_small_t.cu, src/CMakeLists.txt:320 and :321, both unconditional. "
+     "NOTE the scale model: these read the per-output-row bf16 plane directly "
+     "(fp8_gemv.cuh:99 `const __nv_bfloat16* row_scales`, :149/:152/:168), which is exactly "
+     "what this format stores -- so unlike the QPN fp8 arm above there is nothing to convert. "
+     "Already reached by shape -- fp8_dispatch.cpp:81-85 calls launch_fp8_decode for t == 1 and "
+     "launch_fp8_small_t above it. MEASURED 2026-09-25 (dl/floorfix): one `-cubin` per TU with "
+     "this tree's own flags, then `nvdisasm -c` -- "
+     "dl/floorfix/out/tc_free_census/census.txt. At sm_75 the pair reports rc=0, ZERO HMMA, ZERO "
+     "IMMA, ZERO LDSM, ZERO emulation CALL, with 320 and 34112 FMA-pipe instructions; the same "
+     "instrument reports 192 HMMA on fp8_a16_gemm_mma.cu at sm_80, which is what makes the zero a "
+     "reading. sm_70 is NOT MEASURABLE on this box (all three toolkits reject -arch=sm_70 and "
+     "-arch=compute_70) and is NOT claimed; sm_75 is a PROXY, justified because these kernels "
+     "contain no mma/ldmatrix call at all."},
     // -----------------------------------------------------------------------
     // Appended 2026-09-18 (FMTCOVER): the two formats whose absence from this table was a TABLE
     // defect and not a support decision. Both are declared, both have their own encoded geometry
@@ -523,6 +1038,35 @@ inline constexpr FormatRequirement kFormatRequirements[] = {
      "(src/ops/ple/ple_table.cu, added to the ninfer_ops sources at src/CMakeLists.txt:173). No "
      "QType enumerator exists for U4 (src/core/tensor.h:30-45) and no src/ops/linear arm consumes "
      "it; never a tensor-core operand."},
+    // ---- appended 2026-09-29 (line flowopen, marker F1173) ------------------------------------
+    // The three low-bit carriers above, each with a Cap::None row and a note that NAMES the
+    // absent consumer.  This is not a formality: appending the enum members without these
+    // rows fails the static_assert at the bottom of this file, whose whole purpose is that a
+    // format cannot exist silently unconsumed.
+    {artifact::NumericFormat::Q1G64_F16S, Cap::None,
+     "1-bit grouped codes in row-split-k128-v1, geometry artifact/storage_layouts.cpp "
+     "quant_geometry() {64, 8, 0}.  The source side already decodes this: "
+     "tools/convert/gguf_kquant.py carries DEQUANTIZERS[41] = decode_q1_0 (ggml Q1_0, 18 B "
+     "per 128 values, d = sum|x|/128 plus a sign bitmap), recorded in dl/type41/REPORT.md. "
+     "What does NOT exist is a consumer: no QType enumerator (src/core/tensor.h) and no arm "
+     "of src/ops/linear executes 1-bit codes, so the only route to a GPU is a decode to "
+     "BF16 first -- which is what a pre_extract converter does, and which means this format "
+     "is a CARRIER, never a tensor-core operand."},
+    {artifact::NumericFormat::Q2G64_F16S, Cap::None,
+     "2-bit grouped codes, geometry quant_geometry() {64, 16, 0}.  The source side is where "
+     "the care is needed rather than here: Prism's private PQ2_0 (ggml id 142, 34 B/128) is "
+     "decodable in this tree, while UPSTREAM's Q2_0 is id 42 and is deliberately absent from "
+     "GGML_TYPES because it carries two different block layouts across releases -- "
+     "gguf_kquant's own comment refuses to guess one, since a table that guesses reads the "
+     "other silently, and type_name(42) degrades to \"type42\".  No QType enumerator and no "
+     "src/ops/linear arm exists for 2-bit codes; decode-to-BF16 only."},
+    {artifact::NumericFormat::Q3G64_F16S, Cap::None,
+     "3-bit grouped codes, geometry quant_geometry() {64, 16, 8} == 2 + 1 bit.  CARRIES "
+     "GROUPED 3-BIT CODES AND NOT GSQ: the GSQ spelling is pack-int32-le-v1 with pack_factor "
+     "10, bias 4 and codes in [-4, 3] (dl/gsq3/REPORT.md), which is ten codes per int32 -- a "
+     "different packing from a contiguous 3-bit group of 64, and it needs its own layout "
+     "name rather than this format.  Saying so here is cheaper than discovering it in a "
+     "converter.  No QType enumerator and no src/ops/linear arm; decode-to-BF16 only."},
 };
 
 inline constexpr std::size_t kFormatRequirementCount =
@@ -775,6 +1319,14 @@ const FormatRequirement* format_requirement(artifact::NumericFormat format) noex
 // about is a claim nothing exercises. If a future format makes the arm reachable on 120, the
 // missing row makes it refuse with the UNMEASURED reason below -- fail-closed, not guessed.
 //
+// THE SIX SUB-70 RUNGS ADDED 2026-09-24 (F702) ARE NOT IN IT EITHER, for the same reason one
+// step earlier: qpn_arm_reachable() REQUIRES Cap::Fp16Mma, and sm_50/52/53/60/61/62 carry
+// Cap::None (measured: `mma` needs .target sm_70 -- see the block above kArchLadder). The arm is
+// therefore not reached at all on those rungs, so they get no row here and NONE WAS ADDED. This
+// is the same fail-closed shape as sm_120/121 and NOT a gap: a lowering row for a rung the arm
+// never asks about would be a claim nothing exercises, and it would also read as "the QPN
+// channel was measured on this ISA", which it was not.
+//
 // AND THE KEY FOLDS THE '-a' SUFFIX. `arch_rung`'s own comment above says the
 // arch-accelerated suffix is NOT observable at runtime, so key 90 answers sm_90 AND sm_90a,
 // key 120 answers sm_120 and sm_120a. That is why each row carries `measured_target`: the
@@ -916,6 +1468,267 @@ inline constexpr std::size_t kQpnMmaRungCount = sizeof(kQpnMmaRungs) / sizeof(kQ
     return channel->lowering == QpnMmaLowering::HardwareMma884;
 }
 
+// ---------------------------------------------------------------------------
+// Is the TENSOR-CORE-FREE (FFMA/SIMT) floor EXECUTABLE on this rung?
+// ---------------------------------------------------------------------------
+//
+// The third floor, and it is a different KIND of fact from the two above it: `required` and
+// `fallback_required` are both Cap bits -- tensor-core instruction families -- so a rung whose
+// measured set is Cap::None satisfies neither, and every GEMM format used to refuse there. That
+// is right for the formats whose only kernel is a tensor-core one, and wrong for the four
+// groupwise-int formats this build also ships an FMA-pipe GEMM for.
+//
+// Three clauses, and the middle one is what keeps this from becoming a blanket "SIMT is free":
+//
+//   1. the TABLE names a tensor-core-free kernel for this format
+//      (kFormatRequirements.simt_kernel_evidence; empty means it does not), and
+//   2. the rung cannot serve THIS FORMAT'S DECLARED FLOOR -- `!covers(rung->caps,
+//      requirement->required)`. Read that as the exact thing it says, twice over:
+//        * `caps == Cap::None` (the six pre-75 rows) is the case this clause was FIRST written
+//          for and it is still covered, because a rung with no tensor core covers no Cap bit;
+//        * a rung that HAS a tensor core but not the one this format's floor names is a
+//          RESCUE and not a downgrade: the answer above this point is a refusal, so the
+//          tensor-core-free kernel is the only executable route there is, not a cheaper one
+//          chosen over a working one. sm_70 (Cap::Fp16Mma) and sm_75 (Cap::Fp16Mma|Int8Mma)
+//          against a Cap::Bf16Mma floor are exactly that case -- the 122 refusing cells of
+//          dl/ladderacpt's census.
+//      MEASURED, 2026-09-25 (dl/floorfix): that widening moves cells on TWO rungs and no
+//      others for a tensor-core floor -- {70, 75} for BF16 / Q4G64_F16S / Q5G64_F16S /
+//      Q6G64_F16S / W8G32_F16S / FP8_E4M3FN_ROW_BF16S, and {70, 75, 80, 86, 87, 88, 89, 90,
+//      100, 103} for NVFP4, whose floor Cap::Mxf4Nvfp4BlockScale exists only on 120/121. On
+//      every rung that DOES cover the floor the earlier branch returns first, so this arm can
+//      never take a format off its tensor-core route -- see test_arch_caps.cpp, which asserts
+//      that direction rather than the widening alone.
+//      WHAT THE CLAUSE IS AND IS NOT. It was `caps == Cap::None` EXACTLY, and the objection to
+//      widening it was that a rung with a tensor core would be handed a "silent downgrade". The
+//      silence is what was wrong with that, not the rescue: the arm below records
+//      FormatFallback{tensor_core_free = true}, render_fallback_notice() prints it, and
+//      select_route's ConservativeSimt reason names the kernel FILE. Nothing here is silent,
+//      and nothing here is reached while a tensor-core route for the same format is still
+//      standing. What the equality DID buy is gone with it, so it is stated rather than
+//      inherited: this predicate's coverage is now every (rung, format) pair whose table row
+//      names a tensor-core-free kernel and whose declared floor that rung does not cover --
+//      computed, not restated, by test_arch_caps.cpp.
+//   3. the number has a ladder row at all -- an unlisted number gets an answer from no table.
+//
+// NOT a clause: the arch list the binary was compiled for. A build that names only sm_120a can
+// still be ASKED about sm_61; that is the whole point of the parameterized selector, and the
+// answer is about the rung, not about the cubins in one binary.
+//
+// NOT CLAIMED: that any of these rungs has been RUN. This is an assembly-and-build fact -- the
+// kernel compiles for that ISA with zero tensor-core instructions and its source line is
+// unconditional in src/CMakeLists.txt. The rung rows in kArchLadder carry their own caliber and
+// say which of the six were configured, swept, or neither. The rows that carry a
+// simt_kernel_evidence entry and the flags its census used are named in each row's own text.
+// Whether the fp16-plane GEMM is compiled into THIS binary. Published by src/CMakeLists.txt on
+// the same lines that add ops/linear/bf16/bf16_mma_fp16.cu to a target, exactly like
+// NINFER_HAVE_QPN and for the same reason: a hand-written -D with the source line removed would
+// name a kernel the binary does not contain. The tie is the link-time reference to
+// bf16_mma1688_kernel in tests/test_bf16_fp16_plane.cpp.
+//
+// DECLARED HERE, ABOVE simt_floor_executable(), because that predicate's new clause 4 reads it
+// whereas the rest of this arm's own block is defined below it. The value is a compile-time
+// constant, so the position costs nothing and a forward declaration of the predicate is not
+// enough on its own.
+#ifdef NINFER_HAVE_BF16_FP16_MMA
+inline constexpr bool kFp16PlaneInBuild = true;
+#else
+inline constexpr bool kFp16PlaneInBuild = false;
+#endif
+
+// Forward declaration: the definition, with its four clauses and its measured channel table,
+// is below simt_floor_executable() -- which calls it. A non-template function's body resolves
+// names at its point of definition, so this declaration is required rather than cosmetic.
+[[nodiscard]] inline bool fp16_plane_executable(int sm, artifact::NumericFormat format,
+                                                bool fp16_plane_in_build) noexcept;
+
+[[nodiscard]] inline bool simt_floor_executable(int sm, artifact::NumericFormat format) noexcept {
+    const FormatRequirement* requirement = format_requirement(format);
+    if (requirement == nullptr || requirement->simt_kernel_evidence.empty()) { return false; }
+    // -----------------------------------------------------------------------
+    // CLAUSE 5 (added by dl/gapclose, F-769): the evidence's own measured FLOOR.
+    // -----------------------------------------------------------------------
+    // This arm is the ONLY one whose evidence is a per-rung MEASUREMENT rather than a build
+    // fact, and a measurement has a rung below which it was not taken. With the floor at its
+    // default 0 the clause is false and nothing moves; with a floor named, a rung below it keeps
+    // the refusal it had. See simt_evidence_floor_sm's own note for why the six sub-70 rungs
+    // must keep it: they cannot be censused by this toolchain at all.
+    if (requirement->simt_evidence_floor_sm != 0 && sm < requirement->simt_evidence_floor_sm) {
+        return false;
+    }
+    const ArchRung* rung = arch_rung(sm);
+    if (rung == nullptr) { return false; }
+    // -----------------------------------------------------------------------
+    // CLAUSE 4 (added by dl/fp16route, F-736): a rung that can serve this format
+    // from its OWN fp16 tensor cores is not a rung this arm rescues.
+    // -----------------------------------------------------------------------
+    // WHY THIS CLAUSE AND NOT A REORDER ANYWHERE ELSE. Clause 2 above was WIDENED by
+    // dl/floorfix (F-720) from `caps == Cap::None` to "this rung cannot serve this
+    // format's declared floor", and that file argues the widening correctly: "a rung
+    // that HAS a tensor core but not the one this format's floor names is a RESCUE and
+    // not a downgrade: the answer above this point is a refusal, so the tensor-core-free
+    // kernel is the only executable route there is, not a cheaper one chosen over a
+    // working one."
+    //
+    // THE PREMISE OF THAT ARGUMENT -- "the only executable route there is" -- WAS TRUE
+    // WHEN IT WAS WRITTEN and is not true any more for BF16 on sm_70/sm_75, because
+    // src/ops/linear/bf16/bf16_mma_fp16.cuh now exists. Where a tensor-core route for
+    // THIS format IS executable on THIS rung, the FFMA kernel stops being a rescue and
+    // becomes the cheaper route chosen over a working one -- which is the thing F-720's
+    // own text says this predicate must never be. So the arm is asked only where no
+    // tensor-core route for the format exists, and that is one clause rather than a
+    // reorder of the two arms: TWO DECIDERS READ THIS PREDICATE (this one and
+    // src/core/kernel_route.h's ConservativeSimt arm), so putting the rule HERE is what
+    // keeps them from drifting, which is the same reason clause 2's widening lives here.
+    //
+    // WHAT IT DOES NOT MOVE, computed rather than asserted:
+    //   * the six sub-70 rungs: no fp16 tensor core and no kFp16PlaneChannelRungs row, so
+    //     fp16_plane_executable() is false and BF16 keeps the FFMA route, which is its
+    //     native route. FFMA stays for 50/52/53/60/61/62 ON PURPOSE.
+    //   * every format but BF16: `fp16_plane_required` is Cap::None for all of them, so
+    //     the new clause is false and nothing moves.
+    //   * NVFP4: unchanged on EVERY rung, and by construction -- its fallback column is
+    //     the QPN one and its fp16_plane column is empty, so neither this clause nor the
+    //     new arm can see it. dl/floorfix measured why that matters (a simt column for
+    //     NVFP4 would widen to 86/89/90/100/103 and the op would fall through to a
+    //     kind::mxf4nvf4 kernel those ISAs lack).
+    //   * a build WITHOUT the fp16-plane kernel: kFp16PlaneInBuild is false, the clause is
+    //     false, and this predicate answers exactly what it answered before -- which is
+    //     what keeps the shared pin's own tables unambiguous.
+    if (fp16_plane_executable(sm, format, kFp16PlaneInBuild)) { return false; }
+    return !covers(rung->caps, requirement->required);
+}
+
+// ---------------------------------------------------------------------------
+// THE fp16-PLANE TENSOR-CORE CHANNEL, PER RUNG, AND ITS MEASURED LOWERING
+// ---------------------------------------------------------------------------
+// This is a SECOND channel table, not a second copy of the first one. kQpnMmaRungs above
+// measures ONE channel -- `mma.sync.aligned.m8n8k4` -- because that is the only channel the
+// QPN family emits; a table that answered for a different channel under the same name would
+// be the drift this file forbids. The fp16-plane arm emits TWO channels, and the rung picks
+// between them for a reason that is an instruction-set fact rather than a preference.
+//
+// `measured_target` and `evidence` carry the same two fields kQpnMmaRungs carries, and for
+// the same reason: a row is never read as a measurement of a target it did not measure.
+//
+//  * sm_70 -- mma.sync.aligned.m8n8k4, INHERITED rather than re-measured. Volta's fp16
+//    tensor core has exactly one mma form, and this tree has already read its SASS: the
+//    sm_70 row of kQpnMmaRungs (CUDA 12.8: 1024 HMMA.884, 0 CALLs into the emulation
+//    routine). Re-measuring is IMPOSSIBLE on this box, not merely unnecessary -- every
+//    toolkit installed here (13.0/13.1/13.3) rejects `-arch=sm_70` with "nvcc fatal :
+//    Unsupported gpu architecture", and 12.8 is gone. So the row says INHERITED.
+//  * sm_75 -- mma.sync.aligned.m16n8k8, MEASURED THIS LINE with CUDA 13.3. Turing has both
+//    forms and this is the faster one; it is also the one that stays HARDWARE above Turing,
+//    which is why it is preferred here rather than m8n8k4 (the same choice the m8n8k4
+//    emulation makes costly).
+//  * NO ROW FOR sm_80 AND UP, and that is fail-closed rather than a gap: those rungs have
+//    Cap::Bf16Mma, so the format's own floor is met and the arm is never asked. A row there
+//    would be a claim nothing exercises.
+enum class Fp16PlaneLowering : std::uint8_t {
+    HardwareFp16Mma = 0, // the channel is an HMMA instruction on this rung
+    EmulatedFp16Pipe,    // ptxas answers it with a CALL into a software FFMA routine
+};
+
+// THE ATOM'S ACTIVATION EXTENT, and it is quoted by TWO surfaces for the same reason: the route
+// arm names the channel and the engine-side plan
+// (src/ops/linear/bf16/bf16_fp16_route.h) decides whether to take it, and a threshold written
+// twice is a threshold that drifts. A warp-level fp16 mma atom consumes 8 activation rows, so
+// below 8 tokens the same mma work is issued for fewer useful tokens and the FFMA GEMV -- which
+// is weight-bandwidth bound and cannot be helped by a tensor core -- is the better route. The
+// kernel carries a static_assert against this value rather than restating the number.
+inline constexpr int kBf16Fp16MmaActivationExtent = 8;
+
+struct Fp16PlaneChannelRung {
+    int sm;
+    std::string_view measured_target;
+    std::string_view channel; // the literal the kernel emits, named for a reader
+    Fp16PlaneLowering lowering;
+    std::string_view evidence;
+};
+
+inline constexpr Fp16PlaneChannelRung kFp16PlaneChannelRungs[] = {
+    {70, "sm_70 (INHERITED, not re-measured: no toolkit on this box builds sm_70)",
+     "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32", Fp16PlaneLowering::HardwareFp16Mma,
+     "Volta's fp16 tensor core has exactly ONE mma form, so the channel this arm emits is the "
+     "channel kQpnMmaRungs already measured at sm_70 -- CUDA 12.8: 1024 HMMA.884.F32.F32 (224 "
+     "mma sites x 4 STEPs of the seven inline-asm QPN kernels, plus 128 from the two "
+     "nvcuda::wmma kernels), 0 CALL instructions targeting the emulation routine, 0 "
+     "HFMA2.MMA. THE SAME ROW IS THE MEASUREMENT THIS ARM BORROWS, and the borrowing is the "
+     "same one fp16_fallback_executable() already does for the QPN family. WHAT IS NOT CLAIMED: "
+     "a census of THIS kernel at sm_70 -- not taken, because no toolkit here builds it."},
+    {75, "sm_75", "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32",
+     Fp16PlaneLowering::HardwareFp16Mma,
+     "MEASURED THIS LINE (dl/fp16route, 2026-09-25), CUDA 13.3 V13.3.73, `-cubin -arch=sm_75` on "
+     "a TU that instantiates both kernels of ops/linear/bf16/bf16_mma_fp16.cuh, then `nvdisasm "
+     "-c` (dl/fp16route/logs/newkernel_75.sass): HMMA.884 = 64 in the m8n8k4 kernel (= 16 PTX "
+     "mma sites x 4 STEPs; the PTX site count is read from -ptx, dl/fp16route/logs/"
+     "newkernel_75.ptx.log) with 0 CALL instructions into ptxas's software FFMA routine, AND "
+     "HMMA.1688 present for the m16n8k8 kernel with 0 such CALLs. TWO COUNTING TRAPS AVOIDED, "
+     "both named in kQpnMmaRungs' own method note: the emulation routine lives INSIDE this cubin "
+     "as trailing-colon local labels, so it is counted as CALLs WITH THE ROUTINE AS OPERAND (16 "
+     "on the emulated rungs, 0 here) and never by symbol lines; and an mma FMA mnemonic is not a "
+     "fingerprint of emulation."},
+};
+
+inline constexpr std::size_t kFp16PlaneChannelRungCount =
+    sizeof(kFp16PlaneChannelRungs) / sizeof(kFp16PlaneChannelRungs[0]);
+
+[[nodiscard]] inline const Fp16PlaneChannelRung* fp16_plane_channel_rung(int sm) noexcept {
+    for (const Fp16PlaneChannelRung& r : kFp16PlaneChannelRungs) {
+        if (r.sm == sm) { return &r; }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] inline std::string_view fp16_plane_lowering_name(Fp16PlaneLowering l) noexcept {
+    switch (l) {
+    case Fp16PlaneLowering::HardwareFp16Mma: return "hardware fp16 mma on this rung";
+    case Fp16PlaneLowering::EmulatedFp16Pipe: return "emulated on the FP16x2 FMA pipe";
+    }
+    return "unknown-lowering";
+}
+
+// Whether the fp16-plane GEMM is compiled into THIS binary. THE DEFINITION IS ABOVE, beside
+// simt_floor_executable(), which reads it; the prose that belongs with the fact lives here so
+// the two halves of the arm stay in one place. See the note there for why the constant is
+// positioned above that predicate.
+
+// ---------------------------------------------------------------------------
+// Is the fp16-PLANE tensor-core arm EXECUTABLE on this rung, in this build?
+// ---------------------------------------------------------------------------
+// The sibling of fp16_fallback_executable() for the OTHER fp16 family, and it is deliberately
+// a separate function rather than another clause inside that one: that predicate's clause 1 is
+// "the QPN sources are in this build" and its clause 4 reads the m8n8k4 channel's lowering, so
+// folding a second family into it would make one predicate answer for two families with two
+// different build facts -- and NVFP4, which is the family that predicate exists for, would
+// change meaning. Four clauses here too, and every one is a BUILD fact or a MEASURED fact:
+//
+//   1. the kernel is in this build (the NINFER_HAVE_BF16_FP16_MMA fact);
+//   2. the format's row declares this arm (fp16_plane_required != Cap::None). Today BF16 only.
+//   3. the rung covers the arm's floor (Cap::Fp16Mma) -- Volta and Turing do, the six sub-70
+//      rungs do not (nothing assembles `mma` below .target sm_70), and every rung above them
+//      has Cap::Bf16Mma, so it never reaches here;
+//   4. the rung's MEASURED channel lowering is HardwareFp16Mma. Fail-closed on an unmeasured
+//      rung, so a rung with no row gets a refusal naming the missing measurement rather than a
+//      neighbour's tier.
+//
+// THE REACHABLE SET IS THEREFORE EXACTLY {70, 75} -- and that is not a coincidence, it is the
+// definition of the wall this arm exists for: "the rung has fp16 tensor cores and its route
+// still lands on SIMT/FFMA". What this predicate does NOT answer: whether the resulting
+// kernel is FASTER. That is a measurement (dl/fp16route benched it) and not a table fact.
+[[nodiscard]] inline bool fp16_plane_executable(int sm, artifact::NumericFormat format,
+                                                bool fp16_plane_in_build) noexcept {
+    if (!fp16_plane_in_build) { return false; }
+    const FormatRequirement* requirement = format_requirement(format);
+    if (requirement == nullptr || requirement->fp16_plane_required == Cap::None) { return false; }
+    const ArchRung* rung = arch_rung(sm);
+    if (rung == nullptr) { return false; }
+    if (!covers(rung->caps, requirement->fp16_plane_required)) { return false; }
+    const Fp16PlaneChannelRung* channel = fp16_plane_channel_rung(sm);
+    if (channel == nullptr) { return false; }
+    return channel->lowering == Fp16PlaneLowering::HardwareFp16Mma;
+}
+
 // Whether the QPN W4A16 family is compiled into THIS binary. Defined by src/CMakeLists.txt
 // on the same lines that add ops/linear/qpn/qpn_host.cu to a target; a hand-written -D on a
 // shipping build is caught by the link-time tie in tests/test_qpn_build_fact.cpp rather than
@@ -966,6 +1779,19 @@ struct FormatFallback {
     Cap primary_missing;                  // the floor this rung does not cover
     Cap fallback_used;                    // the floor it does cover instead
     std::string_view fallback_kernel;     // the kernel file that consumes the same bytes
+    // -----------------------------------------------------------------------
+    // WHICH OF THE TWO KINDS OF RESCUE THIS IS (v100fix candidate, NOT LANDED).
+    // -----------------------------------------------------------------------
+    // `fallback_used` is a Cap, and Cap's six bits are ALL tensor-core instruction families, so a
+    // rescue carried by an FFMA/SIMT kernel has no bit to write there. Formatting it as
+    // "the <Cap::None> fallback" would print `cap_name(Cap::None)` == "none" and read as a
+    // capability the card has, which is the opposite of the fact.
+    //
+    // TRAILING AND DEFAULTED, on purpose: every existing aggregate initialisation of this struct
+    // still compiles, so this member cannot change any path that does not set it. It is set in
+    // exactly ONE place -- the third-floor arm of evaluate_artifact_formats() -- and read in
+    // exactly one place, render_fallback_notice().
+    bool tensor_core_free = false;
 };
 
 struct CapabilityReport {
@@ -1376,11 +2202,83 @@ inline CapabilityReport evaluate_artifact_formats(
         if (requirement->required == Cap::None || covers(rung->caps, requirement->required)) {
             continue;
         }
-        // The floor is not met. BEFORE refusing, ask whether the table names a lower-floor
-        // kernel that this build contains and this rung executes in hardware. That question
-        // is fp16_fallback_executable(), and it is the same predicate the route selector
-        // uses -- the gate and the route read ONE fact, so "the artifact may load" and
-        // "there is a kernel to run" cannot come apart on the same card.
+        // ===================================================================
+        // THE FLOOR IS NOT MET. TWO LOWER FLOORS ARE ASKED, AND THE ORDER OF THE TWO WAS
+        // CHANGED BY dl/floorfix. THE ORDER IS THE FIX, SO IT IS ARGUED RATHER THAN ASSUMED.
+        // ===================================================================
+        // BOTH questions are the same question -- "is there a kernel this rung can execute that
+        // consumes THIS format's bytes?" -- and both are the SAME predicate the route selector
+        // calls, so the gate and the route read ONE fact and "the artifact may load" cannot come
+        // apart from "there is a kernel to run" on the same card.
+        //
+        // WHAT THE ORDER WAS: fp16_fallback_executable() first, the tensor-core-free arm second.
+        // On sm_70/sm_75 that answered NVFP4 with "the fp16 QPN channel" and the engine then
+        // REFUSED at op time, because that channel is selected by these tables and NOT
+        // DISPATCHABLE (qpn_arch_route.h:93-108: the native -> qpn_prepack weight converter and
+        // the bf16 -> fp16 activation step are both absent, so dispatch_qpn_fallback() throws on
+        // QpnWeightLayout::NativeBlockScale, which is the only layout an artifact delivers).
+        // MEASURED 2026-09-25 by dl/floorfix: the gate admitted NVFP4 at sm_70 and the op threw.
+        // An admission the engine cannot carry out is not a lower floor; it is the phantom this
+        // table exists to prevent, wearing the mask of a fallback.
+        //
+        // WHAT THE ORDER IS AND WHY. The tensor-core-free arm is asked FIRST, because it is the
+        // one whose declared evidence is the artifact's own bytes in the artifact's own layout --
+        // there is no converter and no dtype step between the selection and a launch -- and the
+        // fp16 arm is asked second, where it still ANSWERS for any format the first arm cannot
+        // serve. TWO PROPERTIES, both checkable and both checked below in this order's own test:
+        //   * nothing moves on a rung that COVERS the format's floor -- the branch above returns
+        //     before either arm is reached, so no tensor-core route is ever traded for a
+        //     narrower one;
+        //   * nothing moves for a format whose row has no tensor-core-free kernel -- the first
+        //     arm's clause 1 is empty-evidence fail-closed, so the fp16 arm keeps every cell it
+        //     had. That is why FP8_E4M3FN_ROW_F32S (a note row) and every Cap::None metadata row
+        //     are untouched.
+        // WHAT IT COSTS, NAMED: on sm_70/sm_75 an NVFP4 artifact now takes the FP32-FMA route
+        // instead of the QPN fp16 tensor-core one. That is SLOWER and it is the owner's own
+        // ordering -- 保精度优先, speed second -- and the faster route is not merely unpicked,
+        // it is UNRUNNABLE until two ports land. When they do, the reversal is this order.
+        // -------------------------------------------------------------------
+        // THE THIRD FLOOR, ASKED BY THE GATE AT LAST (landed by dl/v100fix, F-710; WIDENED and
+        // ASKED FIRST by dl/floorfix, F-720).
+        // -------------------------------------------------------------------
+        // The route selector has asked this question since F-705 (src/core/kernel_route.h:901:
+        // `if (simt_floor_executable(sm, format))`). THIS function did not ask it at all until
+        // F-710 landed that candidate, so the two deciders disagreed by construction: on sm_61 a
+        // groupwise-int-only artifact was REFUSED AT LOAD with `missing = Bf16Mma` while
+        // select_route() named the FFMA kernel that would run it. That disagreement is what the
+        // shared predicate exists to prevent.
+        // MEASURED, both sides, one host probe (dl/v100fix/out/floors_PRE_qpn1.txt):
+        //   gate  evaluate_artifact_formats(61, {FP32,I32,Q4,Q5,Q6,W8}) -> Unsupported, 4 gaps
+        //   route select_route(61, Q5G64_F16S, m=8)                    -> Selected conservative-simt
+        // The predicate is fail-closed, and dl/floorfix's widening of its second clause (from
+        // `caps == Cap::None` EXACTLY to "this rung cannot serve this format's declared floor")
+        // is the change that brings sm_70 and sm_75 into its coverage. It is stated once, in
+        // simt_floor_executable(), with the measured widening set; it is NOT restated here,
+        // because two statements of one rule drift.
+        // -------------------------------------------------------------------
+        // THE FOURTH FLOOR, ASKED FIRST (dl/fp16route, F-736).
+        // -------------------------------------------------------------------
+        // This arm and the tensor-core-free arm below it are MUTUALLY EXCLUSIVE by
+        // construction -- caps::simt_floor_executable() now carries the clause that returns
+        // false wherever this question is true -- so the order cannot move a cell either way.
+        // It is stated FIRST anyway so that neither predicate has to be read to know the
+        // precedence, and so that a future edit to either predicate cannot silently swap them.
+        // What it changes on the wall: rungs 70/75 against a Cap::Bf16Mma format used to be
+        // answered "TENSOR-CORE-FREE (FFMA/SIMT) kernel"; they are now answered with a real
+        // fp16 tensor-core GEMM over the artifact's OWN bytes. The verdict is Supported in
+        // both worlds, which is why this is a fallback and not a verdict change.
+        if (fp16_plane_executable(sm, format, kFp16PlaneInBuild)) {
+            report.fallbacks.push_back(FormatFallback{format, requirement->required & ~rung->caps,
+                                                      requirement->fp16_plane_required,
+                                                      requirement->fp16_plane_kernel_evidence});
+            continue;
+        }
+        if (simt_floor_executable(sm, format)) {
+            report.fallbacks.push_back(FormatFallback{format, requirement->required & ~rung->caps,
+                                                      Cap::None,
+                                                      requirement->simt_kernel_evidence, true});
+            continue;
+        }
         if (fp16_fallback_executable(sm, format, qpn_in_build)) {
             report.fallbacks.push_back(FormatFallback{
                 format, requirement->required & ~rung->caps, requirement->fallback_required,
@@ -1636,6 +2534,20 @@ inline std::string render_capability_report(const CapabilityReport& report,
     for (const FormatFallback& fallback : report.fallbacks) {
         out += "    - weight format ";
         out += std::string(artifact::format_name(fallback.format));
+        // v100fix candidate (NOT LANDED): a TENSOR-CORE-FREE rescue is a different KIND of fact
+        // from the fp16 fallback and must not borrow its words. This branch is placed BEFORE the
+        // existing sentence so the fp16 path below stays byte-identical.
+        if (fallback.tensor_core_free) {
+            out += " does NOT meet its own floor here: it needs ";
+            out += std::string(cap_name(fallback.primary_missing));
+            out += ", which this card does not have -- this rung has NO TENSOR CORE AT ALL. It is "
+                   "being served by a TENSOR-CORE-FREE (FFMA/SIMT) kernel instead, which consumes "
+                   "the SAME persisted bytes (no requantization, no fp16 weight copy):\n"
+                   "      kernel : ";
+            out.append(fallback.fallback_kernel);
+            out += "\n";
+            continue;
+        }
         out += " does NOT meet its own floor here: it needs ";
         out += std::string(cap_name(fallback.primary_missing));
         out += ", which this card does not have. It is being served by the ";
@@ -1707,20 +2619,41 @@ inline void require_artifact_formats_supported(
         return;
     }
     // UnknownArch is a warning, not a refusal: see unknown_arch_warning above. THE WARNING
-    // PRINTS BY DEFAULT, ONCE PER PROCESS, and this branch is where -- this function is the
-    // only production call site in the tree. The comment that used to sit here told callers to
-    // call unknown_arch_warning() and log it; measured, no caller in the engine ever did, so
-    // the message had no way out and an unplaceable card degraded in silence.
+    // PRINTS BY DEFAULT, and this branch is where -- this function is the only production call
+    // site in the tree. The comment that used to sit here told callers to call
+    // unknown_arch_warning() and log it; measured, no caller in the engine ever did, so the
+    // message had no way out and an unplaceable card degraded in silence.
     // NINFER_ARCH_WARN keeps every documented use -- any value still prints -- and gains the
     // off switch an operator expects: 0|off|false|no silences. The ONE refusal path (the throw
     // below) is untouched, so the evidence-backed refusal set is unchanged.
+    //
+    // ONCE PER DISTINCT CAPABILITY, NOT ONCE PER PROCESS. The first form of this branch
+    // announced the FIRST unlisted number and then went silent for the rest of the process, so a
+    // second, DIFFERENT unlisted number -- a second target in a serve process, a second rank, any
+    // later construct_target -- got no capability floor checked and NOTHING said. That is the
+    // same silent hole this branch was added to close, moved one occurrence along. The set below
+    // can only ADD announcements: it removes none, it does not change the silencing list above,
+    // and it does not touch the throw. The key is report.sm, the capability number the warning
+    // already names.
     if (report.verdict == Verdict::UnknownArch) {
         const char* arch_warn = std::getenv("NINFER_ARCH_WARN");
         const std::string_view arch_warn_value = arch_warn != nullptr ? arch_warn : "";
         const bool arch_warn_silenced = arch_warn_value == "0" || arch_warn_value == "off" ||
                                         arch_warn_value == "false" || arch_warn_value == "no";
-        static std::atomic<bool> arch_warn_announced{false};
-        if (!arch_warn_silenced && !arch_warn_announced.exchange(true)) {
+        static std::mutex arch_warn_mutex;
+        static std::vector<int> arch_warn_announced;
+        bool arch_warn_first_seen = true;
+        {
+            const std::lock_guard<std::mutex> arch_warn_lock(arch_warn_mutex);
+            for (const int arch_warn_sm : arch_warn_announced) {
+                if (arch_warn_sm == report.sm) {
+                    arch_warn_first_seen = false;
+                    break;
+                }
+            }
+            if (arch_warn_first_seen) { arch_warn_announced.push_back(report.sm); }
+        }
+        if (!arch_warn_silenced && arch_warn_first_seen) {
             const std::string warning = unknown_arch_warning(report, artifact_identity);
             std::fprintf(stderr, "%s\n", warning.c_str());
         }
@@ -1882,15 +2815,15 @@ inline constexpr PtxSite kPtxSites[] = {
      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16",
      "NINFER_MMA_HAS_LDMATRIX (mma.cuh:27-29); else arm traps at mma.cuh:105."},
     // cp.async -- Ampere's non-bulk async copy.
-    {PtxFamily::CpAsync, "src/ops/common/memory.cuh:119", "cp.async.cg.shared.global",
+    {PtxFamily::CpAsync, "src/ops/common/memory.cuh:131", "cp.async.cg.shared.global",
      "NINFER_MEMORY_HAS_CP_ASYNC (memory.cuh:18-20, `__CUDA_ARCH__ >= 800`); else arm traps at "
      "memory.cuh:129."},
-    {PtxFamily::CpAsync, "src/ops/common/memory.cuh:157", "cp.async.commit_group",
+    {PtxFamily::CpAsync, "src/ops/common/memory.cuh:169", "cp.async.commit_group",
      "NINFER_MEMORY_HAS_CP_ASYNC; else arm traps at memory.cuh:168. The comment there states "
      "the rule this whole section follows: an empty body would silently drop the group "
      "boundary, so a downstream cp_wait would look satisfied while nothing was in flight -- "
      "and 'the route selector is what keeps the kernel from being reached'."},
-    {PtxFamily::CpAsync, "src/ops/common/memory.cuh:176", "cp.async.wait_group",
+    {PtxFamily::CpAsync, "src/ops/common/memory.cuh:188", "cp.async.wait_group",
      "NINFER_MEMORY_HAS_CP_ASYNC; else arm traps at memory.cuh:185."},
     // TMA + mbarrier + setmaxnreg -- the Hopper/Blackwell warp-specialisation triple, all four
     // sites in one shipped header whose device body is compiled out below its floor.
@@ -2058,13 +2991,21 @@ struct AmdRung {
 
 inline constexpr AmdRung kAmdLadder[] = {
     {"gfx906", "Vega20 / GCN5.1", "MI50 / MI60 / Radeon VII",
-     "the ONLY one of these six names that already occurs in this tree -- in 21 files, and every "
-     "one of them a fork-survey borrow whose own provenance header reads \"ADDITIVE, NOT wired "
-     "into any build target\": include/ninfer/ops/allreduce.h:143 and "
+     "the ONLY one of these six names that already occurs in this tree -- in 84 files whole-tree "
+     "(45 of them under src/), MEASURED 2026-09-24 by a boundary-safe grep from the tree root, "
+     "`grep -rIlE '(^|[^A-Za-z0-9_])gfx906([^A-Za-z0-9_]|$)' .` -- the same class of file as "
+     "before, and the count this sentence used to carry (\"in 21 files\") was a reading from an "
+     "earlier revision of this tree and is no longer what the tree says. The plumbing it names is "
+     "unchanged and still inert: include/ninfer/ops/allreduce.h:143 and "
      "src/ops/common/allreduce.cu:263,:345 (NINFER_GFX906_TP2_FLAG_SYNC), plus "
-     "docs/gfx906/*.md. `allreduce` has 0 hits in src/CMakeLists.txt, whose source lists are "
-     "explicit (no GLOB), so this plumbing is inert. The upstream ENGINE has no gfx906 path "
-     "that is in the build.",
+     "docs/gfx906/*.md (10 files, each carrying a fork-survey PROVENANCE header). `allreduce` has "
+     "0 hits in src/CMakeLists.txt, whose source lists are explicit (no GLOB), so this plumbing is "
+     "inert. The upstream ENGINE has no gfx906 path that is in the build. "
+     "⚠ ONE PART OF THIS SENTENCE WAS ALSO TOO STRONG AND IS CORRECTED: it said every one of the "
+     "files is \"a fork-survey borrow whose own provenance header reads ADDITIVE, NOT wired into "
+     "any build target\". That is true of docs/gfx906/*.md (10 files) and of the tests/ carriers, "
+     "but NOT of src/compat/gfx906/include/** (11 files), which are this tree's own thin "
+     "forwarders to core/hip_compat.h and carry no fork-survey header at all.",
      "",
      "lowest rung of the ladder and the one the in-tree fork-survey docs report a bring-up on; "
      "that report is third-party, quoted and unverified, and is NOT evidence for this table. "
@@ -2075,34 +3016,59 @@ inline constexpr AmdRung kAmdLadder[] = {
      "direct __shfl_*_sync sites) is a SEMANTIC hazard a static table cannot settle. Neither is "
      "modelled as a Cap bit, because neither is a capability."},
     {"gfx908", "CDNA1", "MI100",
-     "appears NOWHERE in this tree (0 files). The target name is the ROCm offload-arch string; "
-     "no file in this tree names it.", "",
+     "MEASURED 2026-09-24, boundary-safe, from the tree root: 13 files. Under src/ the count is 4 "
+     "and EVERY ONE of them is this table, its tests, or a section of THIS SAME FILE -- but the "
+     "string \"(0 files)\" and the sentence \"no file in this tree names it\" that used to stand "
+     "here were FALSE, and src/ops/common/math.cuh:76 is the counter-example: "
+     "\"cvt.rn.bf16x2.f32 has no AMDGCN spelling on gfx906 (nor gfx908/90a/942/1030/1100/1200/"
+     "1201)\". A rung's evidence field is what render_amd_format_refusal() prints, so a false "
+     "negative here is printed at an operator, not filed. Corrected rather than softened: this "
+     "tree does name gfx908, in a comment about an instruction encoding, and it names no gfx908 "
+     "kernel, no gfx908 build target and no gfx908 probe.", "",
      "no gfx908 kernel, no gfx908 build target, no gfx908 probe. Every tensor-core format below "
      "is refused by name. This rung is on the ladder because it is a target an operator can "
      "legitimately ask `--offload-arch=` for, and the honest answer for it is a refusal that "
      "names the missing kernels rather than silence."},
     {"gfx90a", "CDNA2", "MI200 / MI210 / MI250 / MI250X",
-     "appears NOWHERE in this tree (0 files). The target name is the ROCm offload-arch string; "
-     "no file in this tree names it.", "",
+     "MEASURED 2026-09-24, boundary-safe, from the tree root: 12 files. Under src/ the count is 3 "
+     "and every one of them is this table or a section of this same file -- so for THIS rung the "
+     "sentence \"no file in this tree names it\" holds for src/ and is FALSE for the tree as a "
+     "whole (the 9 outside src/ are this table's tests and the shadowed copies a build dir "
+     "carries). Stated with both denominators rather than as \"0 files\", because \"0 files\" was "
+     "a reading of one directory presented as a reading of the tree.", "",
      "same as gfx908. It is called out separately because it is the first rung that WOULD "
      "exercise v_mfma_* -- i.e. it is the rung that would answer the mma.sync blocker -- and no "
      "kernel in this tree emits v_mfma_*, so the answer is still a refusal, now for a different "
      "reason: the missing piece is a re-authored kernel, not a hardware feature."},
     {"gfx942", "CDNA3", "MI300A / MI300X",
-     "appears NOWHERE in this tree (0 files). The target name is the ROCm offload-arch string; "
-     "no file in this tree names it.", "",
+     "MEASURED 2026-09-24, boundary-safe, from the tree root: 13 files. The sentence \"no file "
+     "in this tree names it\" is FALSE, and the counter-example is in THIS TREE'S OWN GATE: "
+     "src/core/amdsafe_gate.h:227, the sdot8 row, reads \"CDNA3 (gfx942) only\". It is ALSO named "
+     "at src/core/amdsafe_gate.h:405 (an artefact called nvfp4_gfx1201.hsaco and its load paths). "
+     "Corrected rather than softened, because a rung's evidence field is printed by "
+     "render_amd_format_refusal() and a false negative there reaches an operator.", "",
      "same as gfx90a. Current-generation and therefore the rung most tempting to assume, which "
      "is exactly why it says what it says: this tree contains no gfx942 kernel and no gfx942 "
      "probe, so nothing here establishes anything about it."},
     {"gfx1100", "RDNA3", "RX 7900 XTX / W7900",
-     "appears NOWHERE in this tree (0 files). The target name is the ROCm offload-arch string; "
-     "no file in this tree names it.", "",
+     "MEASURED 2026-09-24, boundary-safe, from the tree root: 12 files. Under src/ the count is 3 "
+     "and every one of them is this table or a section of this same file -- so for THIS rung the "
+     "sentence \"no file in this tree names it\" holds for src/ and is FALSE for the tree as a "
+     "whole. Both denominators are printed rather than the single \"0 files\" this row used to "
+     "carry, because \"0 files\" was a reading of one directory presented as a reading of the "
+     "tree.", "",
      "same refusal. RDNA's matrix path is v_wmma_*, NOT v_mfma_*, so even a kernel re-authored "
      "for gfx90a would not serve this rung -- and that difference is a fact about the AMD side, "
      "so it is labelled EXTERNAL-UNPROBED in kPtxFamilyAmdStatus rather than asserted here."},
     {"gfx1201", "RDNA4", "RX 9070 / RX 9070 XT",
-     "appears NOWHERE in this tree (0 files). The target name is the ROCm offload-arch string; "
-     "no file in this tree names it.", "",
+     "MEASURED 2026-09-24, boundary-safe, from the tree root: 13 files (14 by a raw fixed-string "
+     "grep, the difference being occurrences inside longer identifiers such as "
+     "nvfp4_gfx1201.hsaco). Under src/ the count is 4 and three of them are NOT this table: "
+     "src/ops/common/math.cuh:46 (a measured line: an instruction \"encodes on gfx900..gfx1201\"), "
+     "src/core/amdsafe_gate.h:405 (the artefact named nvfp4_gfx1201.hsaco), and "
+     "src/core/vendor_sim.h:915. So \"appears NOWHERE in this tree (0 files)\" and \"no file in "
+     "this tree names it\" were BOTH false, and they are corrected rather than softened: the two "
+     "denominators are printed, and the three named src/ sites are the reading.", "",
      "same refusal. Highest rung listed, and the one whose ROCm support is newest and least "
      "documented; if anything here is more likely to be wrong rather than merely unprobed, it "
      "is this row's ISA label, which is a NAME and not a capability."},
@@ -2144,17 +3110,39 @@ struct AmdLdsBlockerSite {
 inline constexpr AmdLdsBlockerSite kAmdLdsBlockerSites[] = {
     {"src/ops/linear/qpn/qpn_kernels.cuh:893", "98304 B = 96 KB", "96 * 1024",
      "cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024) on the "
-     "config-selectable WMMA entry (set_smem_opt). NOTE this file is the QPN family, which this "
-     "build does not contain (0 hits for `qpn` in src/CMakeLists.txt), so this site is a limit "
-     "on a route that is already refused for a different reason -- recorded rather than dropped, "
-     "because a reader who sees only the two MoE sites below would conclude the limit is "
-     "confined to the MoE path."},
+     "config-selectable WMMA entry (set_smem_opt). "
+     "⚠⚠ THIS NOTE WAS WRONG AND IS CORRECTED, MEASURED 2026-09-24. It said \"this file is the "
+     "QPN family, which this build does not contain (0 hits for `qpn` in src/CMakeLists.txt)\", and "
+     "every clause of that is now false: `grep -ci qpn src/CMakeLists.txt` = 35; "
+     "src/CMakeLists.txt:366 lists ops/linear/qpn/qpn_host.cu and :371 lists "
+     "ops/linear/qpn/qpn_arch_route.cpp in ninfer_ops' EXPLICIT source list (no GLOB); "
+     "qpn_host.cu:6 includes THIS FILE, and build/src/CMakeFiles/ninfer_ops.dir/ops/linear/qpn/"
+     "qpn_host.cu.o.d carries the dependency; and `nm -C build/apps/ninfer | grep -c qpn` = 54. "
+     "src/CMakeLists.txt:339-342 records the fix that made it false (\"The QPN family existed in "
+     "the tree and was compiled by NO target: `qpn` had 0 hits in this file\") -- so this note kept "
+     "a reading that the build file itself had already overtaken. The site is therefore a limit on "
+     "a route that IS in the build and IS linked into the binary, NOT on one \"already refused for "
+     "a different reason\"; qpn_host.cu:82 says so in the tree's own words (\"...IT IS IN THIS "
+     "BUILD\"). Recorded rather than dropped, and corrected rather than softened."},
     {"src/targets/qwen3_8_flash_next/impl/moe_kernels.cu:1989", "69312 B = 67.7 KB", "69312",
      "flash_next_moe_prefill_gate_up_mma_kernel<false>, also launched with 69312 bytes of "
-     "dynamic shared memory at moe_kernels.cu:2007. This target IS in the build."},
+     "dynamic shared memory at moe_kernels.cu:2007. "
+     "⚠ \"This target IS in the build\" WAS TOO BROAD AND IS CORRECTED, MEASURED 2026-09-24. What "
+     "is true: the file is listed at src/targets/qwen3_8_flash_next/CMakeLists.txt:16, and that "
+     "directory is added at src/CMakeLists.txt:714 as `add_subdirectory(targets/"
+     "qwen3_8_flash_next EXCLUDE_FROM_ALL)`. What is ALSO true and was missing: EXCLUDE_FROM_ALL "
+     "means it is not part of the default build, ninfer_engine's own link line "
+     "(src/CMakeLists.txt:716-722) names ninfer_artifact ninfer_core ninfer_ops ninfer_text "
+     "ninfer_media_decode and NOT this target, and the reading that settles it is "
+     "`nm -C build/apps/ninfer | grep -c flash_next_moe_prefill_gate_up_mma_kernel` = 0 while the "
+     "same command on `qpn` returns 54 -- so the symbol IS in the archive "
+     "(libninfer_qwen3_8_flash_next.a) and NOT in the engine binary. The correct sentence is "
+     "\"this target is DECLARED in the build system and COMPILED on demand, and it is linked into "
+     "no engine binary\", which is a weaker claim than the one that stood here."},
     {"src/targets/qwen3_8_flash_next/impl/moe_kernels.cu:1991", "92416 B = 90.25 KB", "92416",
      "flash_next_moe_prefill_gate_up_mma_kernel<true>, also launched with 92416 bytes at "
-     "moe_kernels.cu:2024. This target IS in the build."},
+     "moe_kernels.cu:2024. Same correction as the row above, for the same measurement: declared "
+     "and compilable, EXCLUDE_FROM_ALL, and NOT linked into ninfer."},
 };
 
 inline constexpr std::size_t kAmdLdsBlockerSiteCount =

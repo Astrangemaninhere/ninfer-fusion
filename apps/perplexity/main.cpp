@@ -65,8 +65,19 @@ struct Options {
     bool kv_layer_storage_explicit = false;
     // --kv-dtype is an explicit global tier: without this bit, layouts_impl.h
     // always takes either the pinned per-layer table or the target's registered
-    // default table, so --kv-dtype is a dead label here (measured: a bf16 run and
-    // an fp8 run came out bit-identical). Same field as include/ninfer/types.h.
+    // default table, so --kv-dtype WOULD be a dead label here. The bit exists for exactly
+    // that reason and this flag sets it (:190, the `--kv-dtype` branch), and the planner
+    // honours it (layouts_impl.h:2247 `else if (options.kv_cache_explicit)` fills the whole
+    // per-layer table with kv_profile.dtype). WARNING [F1229, line `landing`, 2026-09-29]:
+    // the historical clause this comment used to carry -- "measured: a bf16 run and an fp8
+    // run came out bit-identical" -- describes the PRE-BIT revision and must not be read as
+    // a live statement. Re-measured on binary 54588b93..., 13,318-token zh corpus, ctx 4096 /
+    // stride 2048: (none) mean_nll 0.02246 on the target's registered table, `--kv-dtype bf16`
+    // 0.52052 (repeat 0.52052, resolution 0.00000), `--kv-dtype int8` 0.49679 -- three
+    // DISTINCT readings -- and the positive control agrees to the last digit: `--kv-layer-storage
+    // all:bf16` == 0.52052 and `all:int8` == 0.49679 while the resolved `kv cache dtype` line
+    // reads `bf16` / `int8-g64` / the per-layer factory table respectively. Same field as
+    // include/ninfer/types.h.
     bool kv_cache_explicit = false;
     // --kv-residual-layers SPEC: the per-layer NVFP4 second-stage residual planes
     // (include/ninfer/types.h EngineOptions::kv_residual_layers). This is the ONLY handle
@@ -79,6 +90,40 @@ struct Options {
     std::array<bool, ninfer::kKvLayerStorageSlots> kv_residual_layers{};
     bool kv_residual_layers_explicit = false;
     bool quick                = false;
+    // W13 weight offload. The same four knobs apps/cli (apps/cli/options.h:146-149) and
+    // ninfer-serve already take, and the reason they belong here too: this is the one
+    // front end that runs a PREFILL-ONLY pass, which is the regime the offload is
+    // admitted for (registry.cpp's derived fetch_per_layer_entry). A front end that
+    // cannot arm the leg it is used to measure is not a driver.
+    std::uint64_t weight_host_offload_bytes = 0;
+    std::uint64_t weight_device_arena_bytes = 0;
+    std::uint32_t weight_prefetch_layers    = 2;
+    std::uint64_t weight_span_floor_bytes   = 0;
+    // The "the operator named it" gate for --weight-prefetch-layers, the ONLY one of the four W13
+    // knobs that needs a gate rather than a value test: its default is 2 -- a legal depth -- so
+    // `weight_prefetch_layers != 2` would let `--weight-prefetch-layers 2` alone through and would
+    // hard-code the default here. Same shape as kv_layer_storage_explicit above, and the same
+    // variable the other two front doors carry.
+    bool weight_prefetch_layers_explicit = false;
+    // --dump-logprobs <path>: the raw float32 this run scored, in scoring order. The
+    // report written below carries three doubles per window (total_nll / mean_nll / ppl),
+    // and a bit-identity claim between two arms should be checkable on the tokens
+    // themselves rather than on a sum of them. 4 bytes per scored token, little-endian.
+    std::optional<std::filesystem::path> dump_logprobs;
+    // --yarn: static YaRN factor 4. The artifact records a native context capacity of
+    // 262144 and layouts_impl.h:1165-1172 refuses anything above it unless the rope domain
+    // is extended, so without this flag --context 1048576 cannot even be asked for. Same
+    // spelling and same default as apps/cli/options.cpp:699-700 and
+    // src/serve/serve_options.cpp:615.
+    // [F1160] the cold/residency knobs, so the BLOCK arm (a per-block allocation
+    // under the fit's residual ceiling) can be SCORED by this instrument instead
+    // of only run by the CLI. Same spellings as apps/cli/options.cpp.
+    ninfer::ColdPolicy cold_policy = ninfer::ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    bool cold_keep_tokens_explicit = false;
+    std::uint32_t max_cold_pages = 0;
+    std::uint32_t unload_watermark_pages = 0;
+    bool yarn_enabled = false;
 };
 
 [[noreturn]] void usage_error(std::string_view message) {
@@ -88,7 +133,10 @@ struct Options {
                                 "[--context N] [--stride N] [--device N] [--prefill-chunk N] "
                                 "[--prefill-chunk-mode manual] "
                                 "[--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] "
-                                "[--kv-residual-layers SPEC] [--output <directory>]");
+                                "[--kv-residual-layers SPEC] [--output <directory>] "
+                                "[--weight-host-bytes N] [--weight-device-arena-bytes N] "
+                                "[--weight-prefetch-layers N] [--weight-span-floor-bytes N] "
+                                "[--dump-logprobs <path>] [--yarn]");
 }
 
 template <class Integer>
@@ -109,7 +157,10 @@ Options parse_options(int argc, char** argv) {
                      "       [--prefill-chunk-mode manual]\n"
                      "       [--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC]\n"
                      "       [--kv-residual-layers SPEC]\n"
-                     "       [--output <directory>]\n";
+                     "       [--output <directory>]\n"
+                     "       [--weight-host-bytes N] [--weight-device-arena-bytes N]\n"
+                     "       [--weight-prefetch-layers N] [--weight-span-floor-bytes N]\n"
+                     "       [--dump-logprobs <path>] [--yarn]\n";
         std::exit(0);
     }
     if (argc < 2 || std::string_view(argv[1]).starts_with("--")) {
@@ -177,11 +228,100 @@ Options parse_options(int argc, char** argv) {
                 value("--kv-residual-layers"));
             out.kv_residual_layers          = parsed.table;
             out.kv_residual_layers_explicit = true;
+        } else if (option == "--weight-host-bytes") {
+            out.weight_host_offload_bytes =
+                parse_integer<std::uint64_t>(value("--weight-host-bytes"), "weight-host-bytes");
+        } else if (option == "--weight-device-arena-bytes") {
+            out.weight_device_arena_bytes = parse_integer<std::uint64_t>(
+                value("--weight-device-arena-bytes"), "weight-device-arena-bytes");
+        } else if (option == "--weight-prefetch-layers") {
+            out.weight_prefetch_layers = parse_integer<std::uint32_t>(
+                value("--weight-prefetch-layers"), "weight-prefetch-layers");
+            // Same refusal, same words as apps/cli/options.cpp:680-683. The plan builder
+            // refuses a depth below 2 as well (weight_residency.h:446-449), and the
+            // front end says it first so the operator does not have to read a plan
+            // diagnostic to learn which flag was wrong.
+            if (out.weight_prefetch_layers < 2) {
+                throw std::invalid_argument(
+                    "--weight-prefetch-layers below 2 would let the arena slot of the layer "
+                    "being computed be overwritten by its own prefetch");
+            }
+            out.weight_prefetch_layers_explicit = true;
+        } else if (option == "--weight-span-floor-bytes") {
+            out.weight_span_floor_bytes = parse_integer<std::uint64_t>(
+                value("--weight-span-floor-bytes"), "weight-span-floor-bytes");
+        } else if (option == "--dump-logprobs") {
+            out.dump_logprobs = std::filesystem::path(value("--dump-logprobs"));
+        } else if (option == "--yarn") {
+            out.yarn_enabled = true;
+        } else if (option == "--kv-cold-policy") {
+            // [F1160] the two spellings the CLI takes, from the same vocabulary.
+            const std::string v(value("--kv-cold-policy"));
+            out.cold_policy = ninfer::ColdPolicy::None;
+            if (v == "none" || v == "off") { out.cold_policy = ninfer::ColdPolicy::None; }
+            else if (v == "window") { out.cold_policy = ninfer::ColdPolicy::Window; }
+            else if (v == "host") { out.cold_policy = ninfer::ColdPolicy::Host; }
+            else if (v == "disk") { out.cold_policy = ninfer::ColdPolicy::Disk; }
+            else if (v == "host-then-disk" || v == "host+disk") {
+                out.cold_policy = ninfer::ColdPolicy::HostThenDisk;
+            } else {
+                usage_error("--kv-cold-policy must be none, window, host, disk, or host-then-disk");
+            }
+            if (!out.cold_keep_tokens_explicit) { out.cold_keep_tokens = 128; }
+        } else if (option == "--kv-cold-keep-tokens") {
+            out.cold_keep_tokens = parse_integer<std::uint32_t>(value("--kv-cold-keep-tokens"),
+                                                               "cold-keep-tokens");
+            out.cold_keep_tokens_explicit = true;
+        } else if (option == "--kv-max-cold-pages") {
+            out.max_cold_pages = parse_integer<std::uint32_t>(value("--kv-max-cold-pages"),
+                                                             "max-cold-pages");
+        } else if (option == "--kv-unload-watermark-pages") {
+            // [F1160] the proactive free-pool watermark: at or below this many free
+            // text-KV pool pages the engine unloads the blocks its semantic directory
+            // judges unloadable -- which is the pass the block stage sits inside.
+            out.unload_watermark_pages = parse_integer<std::uint32_t>(
+                value("--kv-unload-watermark-pages"), "unload-watermark-pages");
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
         } else {
             usage_error("unknown option: " + std::string(option));
         }
+    }
+    // W13 weight offload: the contradiction apps/cli/options.cpp and src/serve/serve_options.cpp
+    // (971-981) refuse, IN THE SAME WORDS. This front end stored both numbers, printed both in its
+    // usage text and passed both into EngineOptions, while the plan builder returns an EMPTY plan at
+    // its first statement when the pinned host mirror is zero (src/product/weight_residency.h:447,
+    // twin src/artifact/binder.cpp:188) -- so the pair was accepted and read by nothing.
+    // --weight-prefetch-layers IS covered too, in the third refusal below, and it needs a BIT and
+    // not a value test for exactly the reason this comment used to give: its default is 2, a legal
+    // value, so `!= 2` could not tell "unset" from "explicitly 2". The bit is set in that flag's own
+    // branch above and the refusal is the SAME sentence in all three front doors.
+    if (out.weight_host_offload_bytes == 0 &&
+        (out.weight_device_arena_bytes != 0 || out.weight_span_floor_bytes != 0)) {
+        usage_error("--weight-device-arena-bytes / --weight-span-floor-bytes need a positive "
+                    "--weight-host-bytes");
+    }
+
+    // THE THIRD KNOB OF THE SAME FAMILY, and the reason it is not covered by the check above: the
+    // pair's two knobs signal by a NON-ZERO value, but this one's DEFAULT IS A LEGAL VALUE (2), so
+    // no value test can tell "unset" from "explicitly 2" and the gate has to be a BIT that flag's
+    // own parse branch sets. The plan builder returns an empty plan at its FIRST statement when the
+    // pinned host mirror is zero
+    //     if (limits.host_pinned_bytes == 0) { return plan; }
+    // (src/product/weight_residency.h:447, twin src/artifact/binder.cpp:188), and BOTH readers of
+    // the depth sit BELOW that return: the domain check at :448 and the only derive at :563, inside
+    // the `else` of :554. So without the partner the flag is ACCEPTED AND IGNORED -- and a flag that
+    // is accepted and ignored is this project's own worst outcome, so it is refused here with the
+    // reason named rather than left to be discovered.
+    if (out.weight_host_offload_bytes == 0 && out.weight_prefetch_layers_explicit) {
+        usage_error("--weight-prefetch-layers needs a positive --weight-host-bytes: without the "
+                    "host mirror the offload plan returns before the depth is read, so the flag "
+                    "would be accepted and ignored");
+    }
+    if (out.weight_host_offload_bytes != 0 &&
+        out.weight_device_arena_bytes >= out.weight_host_offload_bytes) {
+        usage_error("--weight-device-arena-bytes is not smaller than --weight-host-bytes, so "
+                    "the offload would free no device memory");
     }
     if (out.corpus.has_value() == out.text.has_value()) {
         usage_error("exactly one of --corpus and --text is required");
@@ -302,6 +442,19 @@ int run(const Options& options) {
     // Unset stays unset: the engine resolves the mode (and refuses `dynamic` on this path, which
     // has no governor). Copying a value here would only move the refusal to this file.
     engine_options.prefill_chunk_mode = options.prefill_chunk_mode;
+    engine_options.weight_host_offload_bytes = options.weight_host_offload_bytes;
+    engine_options.weight_device_arena_bytes = options.weight_device_arena_bytes;
+    engine_options.weight_prefetch_layers    = options.weight_prefetch_layers;
+    engine_options.weight_span_floor_bytes   = options.weight_span_floor_bytes;
+    engine_options.yarn_enabled              = options.yarn_enabled;
+    // [F1160] the cold/residency plan for this run: without these the scoring app
+    // can only score a RESIDENT plan, and the block axis is unscoreable by
+    // construction (its own mechanism, the cold pool, is unreachable from argv).
+    engine_options.cold_policy = options.cold_policy;
+    engine_options.cold_keep_tokens = options.cold_keep_tokens;
+    engine_options.max_cold_pages = options.max_cold_pages;
+    engine_options.unload_watermark_pages = options.unload_watermark_pages;
+
     engine_options.load_progress.callback = [&](std::string_view phase, std::uint64_t done,
                                                 std::uint64_t total) {
         const std::uint64_t bucket =
@@ -385,6 +538,17 @@ int run(const Options& options) {
               << " windows=" << total_windows << " in " << std::setprecision(2) << preflight_seconds
               << "s\n";
 
+    // --dump-logprobs is opened before the first window so a run that dies mid-corpus
+    // still leaves the tokens it did score on disk, in scoring order.
+    std::ofstream logprob_dump;
+    if (options.dump_logprobs.has_value()) {
+        logprob_dump.open(*options.dump_logprobs, std::ios::binary | std::ios::trunc);
+        if (!logprob_dump) {
+            throw std::runtime_error("cannot create --dump-logprobs file: " +
+                                     options.dump_logprobs->string());
+        }
+    }
+
     const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
     const Clock::time_point scoring_started      = Clock::now();
     Clock::time_point next_progress              = scoring_started + std::chrono::seconds(10);
@@ -413,6 +577,14 @@ int run(const Options& options) {
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
+            }
+            if (logprob_dump.is_open()) {
+                logprob_dump.write(reinterpret_cast<const char*>(logprobs.data()),
+                                   static_cast<std::streamsize>(logprobs.size() * sizeof(float)));
+                if (!logprob_dump) {
+                    throw std::runtime_error("cannot write --dump-logprobs file: " +
+                                             options.dump_logprobs->string());
+                }
             }
             const std::size_t expected = window.target_end - window.target_begin;
             if (logprobs.size() != expected) {

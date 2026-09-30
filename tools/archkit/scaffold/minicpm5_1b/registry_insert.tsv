@@ -1,0 +1,5 @@
+file	anchor_line	anchor	insert	kind
+src/CMakeLists.txt	654	add_subdirectory(targets/qwen3_6)	add_subdirectory(targets/minicpm5_1b)	NEW-ROW
+src/targets/registry.h	5	#include <ninfer/targets/qwen3_6_27b/package.h>	#include "ninfer/targets/minicpm5_1b/package.h"	NEW-ROW (include block)
+src/targets/registry.h	20	using Qwen3_6_27B    = qwen3_6_27b::Package;	using Minicpm5_1B = minicpm5_1b::Package;	NEW-ROW (using block)
+src/targets/registry.cpp	295	constexpr TargetRegistration kTargetRegistrations[] = {	{"minicpm5_1b", ...},   // plus the Loaded<>/<T>Instance pair in registry.h	NEW-ROW

@@ -199,33 +199,24 @@ void validate_registered_processor(const fi::ProcessorOptions& options) {
     }
 }
 
-void validate_tokenizer_config(const FrontendResources& resources) {
+// THE FOUR CONDITIONS ARE NOW EVALUATED IN ONE PLACE, against the policy the TARGET
+// declares rather than against four literals.  `tokenizer_config_reasons()` in
+// <ninfer/targets/qwen3_6/tokenizer_policy.h> is that one place; this function only
+// raises its first reason.  Under `TokenizerPolicy{}` -- Qwen3.6's own, which is the
+// default -- the sentences below are byte-identical to the ones this function threw
+// before the seam, and they are thrown in the same order on the same conditions.
+void validate_tokenizer_config(const FrontendResources& resources,
+                               const TokenizerPolicy& policy) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
-    if (tokenizer_config.value("add_bos_token", true) ||
-        tokenizer_config.value("add_prefix_space", true)) {
-        throw std::invalid_argument(
-            "tokenizer_config.json does not match Qwen3.6 tokenizer prefix semantics");
-    }
-    if (!tokenizer_config.contains("pad_token") || !tokenizer_config.at("pad_token").is_string() ||
-        tokenizer_config.at("pad_token").get<std::string>() != "<|endoftext|>") {
-        throw std::invalid_argument(
-            "tokenizer_config.json does not use the official <|endoftext|> pad token");
-    }
-    if (!tokenizer_config.contains("chat_template") ||
-        !tokenizer_config.at("chat_template").is_string()) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template must contain the loaded chat template");
-    }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
-    }
+    const std::vector<std::string> reasons =
+        tokenizer_config_reasons(tokenizer_config, resources.chat_template_jinja, policy);
+    if (!reasons.empty()) { throw std::invalid_argument(reasons.front()); }
 }
 
-fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
-    validate_tokenizer_config(resources);
+fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
+                                              const TokenizerPolicy& policy) {
+    validate_tokenizer_config(resources, policy);
     return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
 }
 
@@ -843,7 +834,7 @@ PreparedContextCache prepare_context_cache(
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
-        : chat_template(compile_chat_template(resources)),
+        : chat_template(compile_chat_template(resources, options.tokenizer_policy)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,

@@ -11,6 +11,10 @@
 #include <string_view>
 #include <vector>
 
+// The per-model TOKENIZER POLICY seam.  Data only, no engine dependency, so a target
+// package and a host-side harness can both fill it.
+#include "ninfer/targets/qwen3_6/tokenizer_policy.h"
+
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kTokenDomain = 248077;
@@ -22,6 +26,15 @@ struct FrontendOptions {
     // family members override with their own tokenizer geometry.
     std::size_t token_domain               = kTokenDomain;
     bool validate_official_special_ids     = true;
+    // The TOKENIZER POLICY this model declares about its own tokenizer_config.json.
+    // Default-initialised to Qwen3.6's own, so a target that does not set it is unchanged
+    // and the Qwen path keeps its exact behaviour.  This is the seam that closes the four
+    // hard-coded literals that used to sit in impl/frontend/frontend.cpp:202-225; the two
+    // fields above are the precedent, they are the same kind of per-model frontend fact.
+    // It is declared HERE and not at the end of the struct because a designated
+    // initialiser list must follow declaration order, and every existing caller writes
+    // `.validate_official_special_ids = false` before `.max_context`.
+    TokenizerPolicy tokenizer_policy{};
     std::uint32_t max_context              = 2'048;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;

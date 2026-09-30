@@ -83,7 +83,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         // i8win: the declared sliding window, in TOKENS, exactly as the nvfp4/iso3 siblings
         // take it. DEFAULTED so that every call site compiled before this patch keeps full
         // attention: 0 means "the field is not read", byte-identical to `window = last_pos + 1`.
-        std::int32_t sliding_window = 0) {
+        std::int32_t sliding_window = 0,
+        // [F1259 kvfill] THE NARROW CLASS, AS THIS LAYER'S TWO PLANE PAIRS. Defaulted, so every
+        // call site that existed before the axis keeps the pre-image kernel (null = dead branch).
+        const std::uint8_t* narrow_k_codes = nullptr,
+        const std::uint8_t* narrow_v_codes = nullptr,
+        const std::uint8_t* narrow_k_scales = nullptr,
+        const std::uint8_t* narrow_v_scales = nullptr,
+        std::int32_t narrow_pages = 0) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -451,6 +458,73 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float l0 = 0.0f, l1 = 0.0f;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        // [F1259 kvfill] THE NARROW CLASS, READ. A narrow page is one whose class descended off the
+        // resident set; its payload lives in THIS layer's narrow planes at index
+        // `paged_kv_narrow_index(entry)` (the class sentinel of core/paged_kv_cache.h -- the channel
+        // decoder_state.cpp:419-422 names for exactly this). The staging below is the cold staging
+        // with the two row bases taken from the two planes, so a narrow key row is decoded into the
+        // kernel's native int8 codes + fp16 g64 scales and the QK/PV math is untouched.
+        //
+        // TESTED BEFORE THE COLD ARM, AND THE COLD PREDICATE IS NARROWED BY IT: cold's own test is
+        // `physical_page <= -2` and the narrow sentinel is `<= -4096`, so without this ordering a
+        // narrow entry would read another layer's slot record.
+        if (physical_page <= kPagedKVNarrowSentinelBase && narrow_k_codes != nullptr &&
+            narrow_v_codes != nullptr && narrow_k_scales != nullptr &&
+            narrow_v_scales != nullptr && paged_kv_narrow_index(physical_page) < narrow_pages) {
+            const int np = paged_kv_narrow_index(physical_page);
+            const std::int64_t kc0 =
+                paged_kv_page_head_offset<Geometry::HeadDim / 2, Geometry::KVHeads>(np, kv_head);
+            const std::int64_t ks0 =
+                paged_kv_page_head_offset<Geometry::HeadDim / 16, Geometry::KVHeads>(np, kv_head);
+            // K and V share these origins: the narrow pair is the SAME geometry on both sides.
+            for (int key_l = tid; key_l < Bc; key_l += Threads) {
+                const int key = tile_k0 + key_l;
+                if (key >= split_start && key < split_end) {
+                    const int row = key & kPagedKVPageMask;
+                    std::int8_t row_codes[Geometry::HeadDim];
+                    __half row_scales[Geometry::HeadDim / kGqaKvQuantGroup];
+                    ninfer::ops::detail::kv_narrow_decode_row<Groups>(
+                        narrow_k_codes + kc0 + row * 128, narrow_k_scales + ks0 + row * 16,
+                        row_codes, row_scales);
+#pragma unroll 8
+                    for (int d = 0; d < Geometry::HeadDim; ++d) {
+                        ninfer::ops::gqa_small_t_i8_store_swz(k_i8, key_l, d,
+                                                              Geometry::HeadDim / 2, row_codes[d]);
+                    }
+#pragma unroll
+                    for (int g = 0; g < Groups; ++g) {
+                        k_scale_s[key_l * Groups + g] = row_scales[g];
+                    }
+                    ninfer::ops::detail::kv_narrow_decode_row<Groups>(
+                        narrow_v_codes + kc0 + row * 128, narrow_v_scales + ks0 + row * 16,
+                        row_codes, row_scales);
+#pragma unroll 8
+                    for (int d = 0; d < Geometry::HeadDim; ++d) {
+                        v_i8[key_l * Geometry::HeadDim + d] = row_codes[d];
+                    }
+#pragma unroll
+                    for (int g = 0; g < Groups; ++g) {
+                        v_scale_s[key_l * Groups + g] = row_scales[g];
+                    }
+                } else {
+#pragma unroll 1
+                    for (int dc = 0; dc < Geometry::HeadDim / 16; ++dc) {
+                        std::int8_t* dst = &k_i8[key_l * Geometry::HeadDim +
+                                                gqa_small_t_tc_swz(key_l, dc * 8) * 2];
+                        ninfer::ops::store_vec(dst, make_int4(0, 0, 0, 0));
+                        ninfer::ops::store_vec(&v_i8[key_l * Geometry::HeadDim + dc * 16],
+                                               make_int4(0, 0, 0, 0));
+                    }
+                    gqa_i8_scale_row_clear<Groups>(&k_scale_s[key_l * Groups]);
+                    gqa_i8_scale_row_clear<Groups>(&v_scale_s[key_l * Groups]);
+                }
+            }
+            // Same discipline as the cold arm below: this branch fills synchronously, so nothing is
+            // in flight; committing keeps the caller's cp_wait a no-op instead of a wait on the
+            // PREVIOUS tile's outstanding copies.
+            ninfer::ops::cp_commit();
+            return;
+        }
         // Revision 2b cold staging: raw nibble slots hold g64-requantized
         // E2M1 codes + E4M3 g16 scales; decode each key row straight into the
         // kernel's native int8 codes + fp16 group scales so the QK tensor-core

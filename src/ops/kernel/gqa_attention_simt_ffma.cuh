@@ -205,6 +205,10 @@
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/gqa_iso3_codec.cuh"
+// dl/nvfp4emu2: ONE keyed, add-only announce set. The same header ops/kernel/nvfp4_ldm_free.cuh
+// uses, for the same reason that file gives: a one-shot that can only ADD a key announces a
+// SECOND, DIFFERENT selected value instead of going silent after the first.
+#include "core/announce_once.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1181,6 +1185,230 @@ static_assert(gqa_simt_ffma_window_contract_holds(),
     return nullptr;
 }
 
+// ===========================================================================
+// THE PACKED NVFP4 PREFILL ARM'S OWN SELECTION (dl/nvfp4emu2).
+//
+// WHY A SECOND SELECTOR AND NOT A ROW IN THE ONE ABOVE. `SimtFfmaSelection` answers "which
+// attention family does this launch run?" -- one process-wide answer, and it is already the answer
+// the decode codec arm consumes (ops/launcher/gqa_attention_decode_partial.cuh:590). It does NOT
+// answer the question THIS arm asks, which is asked only AFTER the family is selected: "may a
+// PREFILL launch stage a PACKED NVFP4 tile, or must it be refused by name?". The two answers can
+// disagree, and they disagree in the direction that matters: a build can have the family selected
+// (forced on, or measured) and still have no prefill codec arm armed here.
+//
+// WHAT WAS MISSING, NAMED -- this is the gap this block exists to make answerable. The landed FFMA
+// prefill body, ops::gqa_attention_simt_ffma_prefill_bf16_kernel, was bf16-only in three places
+// that are ONE fact:
+//   (1) its template parameter list had no codec, so a packed tile had no encoder to be staged by;
+//   (2) BOTH of its plane parameters were `const __nv_bfloat16*`, so an NVFP4 code plane handed to
+//       it would have been decoded as bf16 halves -- a plausible wrong number, not a fault;
+//   (3) its only staging call was gqa_simt_ffma_stage_tile (one bf16 element per 8 dims) and its
+//       only row pass was gqa_simt_ffma_row_pass (`__bfloat162float(k_row[i])`).
+// So the route could not FEED the codec this same file already carries:
+// gqa_simt_ffma_row_pass_packed (:702) and gqa_simt_ffma_stage_tile_packed (:803) were landed and
+// used by the DECODE body only. The prefill body now reaches them through exactly the same
+// `if constexpr (Codec == GqaSimtKvCodec::Bf16)` seam the decode body uses (:1523, :1608).
+//
+// THE SHAPE, COPIED FROM SimtFfmaSelection ON PURPOSE, ONE PROPERTY PER LINE:
+//   * A NAMED REASON VALUE, not a bool. gqa_simt_ffma_prefill_codec_selection_text() has a case
+//     for every member, and the not-measured one says NOT MEASURED and names the build default.
+//   * THE ENV OVERRIDE IS ITS OWN FUNCTION AND IS REPORTED SEPARATELY. An operator who set
+//     NINFER_PREFILL_NVFP4_SIMT has overridden the probe, and a report that says "the probe
+//     answered X" while the env var is what decided is the same lie in a smaller font.
+//   * AN UNPROBED PROCESS IS NEVER PRESENTED AS A MEASURED ONE: NotProbed falls to the BUILD
+//     default, and this arm's build default is OFF (NINFER_PREFILL_NVFP4_SIMT_DEFAULT_ON is not
+//     defined anywhere), so every existing launch is unchanged.
+//   * THE ANNOUNCEMENT IS KEYED ON THE SELECTED VALUE (core/announce_once.h), because the header
+//     it replaces, `static bool`, announced the first value it saw and went silent -- a SECOND,
+//     different value reached nobody.
+//
+// ⚠ WHAT THIS SELECTOR CANNOT DO: it cannot move a launch PAST a refusal. The codec refusals run
+// FIRST (gqa_simt_ffma_prefill_codec_refusal below), and they include the same named refusals the
+// decode codec arm uses. This arm therefore ADDS a route and widens none.
+// ===========================================================================
+enum class GqaSimtFfmaPrefillCodecProbeAnswer : std::uint8_t {
+    // The probe has not run on the bound device. NOT a measurement, and it is not reported as one.
+    NotProbed = 0,
+    // The probe ran BOTH prefill bodies (the landed bf16 one and this packed NVFP4 one) on this
+    // device, on identical deterministic packed input, and they agreed to the tolerance the probe
+    // publishes. ⚠ Nothing calls the publisher below yet -- see its comment.
+    RanOk = 1,
+    // The probe ran and did not pass: a body did not launch, or it launched and disagreed.
+    Failed = 2,
+};
+
+[[nodiscard]] inline std::string_view gqa_simt_ffma_prefill_codec_probe_answer_name(
+    GqaSimtFfmaPrefillCodecProbeAnswer answer) {
+    switch (answer) {
+    case GqaSimtFfmaPrefillCodecProbeAnswer::NotProbed: return "not probed";
+    case GqaSimtFfmaPrefillCodecProbeAnswer::RanOk:
+        return "both prefill row passes (the landed bf16 D=128/D=256 body and the packed NVFP4 "
+               "codec this arm adds) ran on this device and agreed within the probe's tolerance";
+    case GqaSimtFfmaPrefillCodecProbeAnswer::Failed:
+        return "a prefill row pass did not run or did not agree with its reference";
+    }
+    return "?";
+}
+
+// WHERE THE ANSWER LIVES, AND WHY IT COSTS NO LINK EDGE. One object per process, shared by every
+// TU: a function-local static inside an `inline` function is the ODR's single instance, so a
+// writer in core/device_probe.cu and a reader in a launcher TU address the SAME object, and no
+// launcher object grows a link dependency just to ask a route question.
+[[nodiscard]] inline GqaSimtFfmaPrefillCodecProbeAnswer&
+gqa_simt_ffma_prefill_codec_probe_state() {
+    static GqaSimtFfmaPrefillCodecProbeAnswer answer =
+        GqaSimtFfmaPrefillCodecProbeAnswer::NotProbed;
+    return answer;
+}
+
+// The only writer. ⚠ NAMED, NOT HIDDEN: nothing in this tree calls it today (the decode codec
+// arm's probe is core/device_probe.cu's DeviceCapability::SimtFfmaAttention, which measures the
+// two ROW PASSES and not a full prefill launch). Until something does, the state is NotProbed and
+// this arm is OFF by the build default -- which is the honest reading and NOT a measurement.
+inline void gqa_attention_simt_ffma_prefill_codec_publish_probe_answer(
+    GqaSimtFfmaPrefillCodecProbeAnswer answer) {
+    gqa_simt_ffma_prefill_codec_probe_state() = answer;
+}
+
+// The env override, factored OUT of the decision so the two can be reported separately.
+// SINGLE-CHARACTER ONLY, the same discipline as gqa_attention_simt_ffma_env_override: `=1x`,
+// `=10` and `=01` are NOT overrides and return -1 (unset), rather than being read as a 1.
+// Returns -1 when unset, else 0/1.
+[[nodiscard]] inline int gqa_simt_ffma_prefill_codec_env_override() {
+    const char* env = std::getenv("NINFER_PREFILL_NVFP4_SIMT");
+    if (env != nullptr && env[0] != '\0' && env[1] == '\0') {
+        if (env[0] == '1') { return 1; }
+        if (env[0] == '0') { return 0; }
+    }
+    return -1;
+}
+
+// WHY the selector answered what it answered. Anything that PRINTS the route reads this instead of
+// guessing from the bool: "armed" alone cannot distinguish a measured answer from the unprobed
+// build default, and that difference is the whole point.
+enum class GqaSimtFfmaPrefillCodecSelection : std::uint8_t {
+    ForcedOn,             // NINFER_PREFILL_NVFP4_SIMT=1 (operator override)
+    ForcedOff,            // NINFER_PREFILL_NVFP4_SIMT=0 (operator override)
+    ProbeRanOk,           // measured: the probe ran both prefill bodies here and they agreed
+    ProbeFailed,          // measured: do not take this arm on this device
+    UnprobedBuildDefault, // NOT measured: the probe has not run (NINFER_PREFILL_NVFP4_SIMT_DEFAULT_ON)
+};
+
+[[nodiscard]] inline const char* gqa_simt_ffma_prefill_codec_selection_text(
+    GqaSimtFfmaPrefillCodecSelection how) {
+    switch (how) {
+    case GqaSimtFfmaPrefillCodecSelection::ForcedOn:
+        return "NINFER_PREFILL_NVFP4_SIMT=1 (operator override)";
+    case GqaSimtFfmaPrefillCodecSelection::ForcedOff:
+        return "NINFER_PREFILL_NVFP4_SIMT=0 (operator override)";
+    case GqaSimtFfmaPrefillCodecSelection::ProbeRanOk:
+        return "MEASURED by the prefill-codec probe: both prefill row passes ran on this device "
+               "and agreed within the probe's tolerance";
+    case GqaSimtFfmaPrefillCodecSelection::ProbeFailed:
+        return "MEASURED by the prefill-codec probe: a prefill row pass did not run or did not "
+               "agree on this device";
+    case GqaSimtFfmaPrefillCodecSelection::UnprobedBuildDefault:
+        return "NOT MEASURED: the prefill-codec probe has not run on this device, so this is the "
+               "BUILD default (NINFER_PREFILL_NVFP4_SIMT_DEFAULT_ON, undefined => OFF)";
+    }
+    return "?";
+}
+
+// The same decision, with its REASON. ORDER: operator override, then the PROBE, then the build
+// default -- the same order the family selector above uses, so the two cannot drift.
+//
+// ⚠ It does NOT consult gqa_attention_simt_ffma_selected(). That is the caller's job and it is
+// deliberate: this arm is a REFINEMENT of the family decision, so forcing it on must not bypass
+// the family. The launcher asks the family FIRST and this second.
+[[nodiscard]] inline GqaSimtFfmaPrefillCodecSelection gqa_simt_ffma_prefill_codec_selection() {
+    const int override_value = gqa_simt_ffma_prefill_codec_env_override();
+    if (override_value == 1) { return GqaSimtFfmaPrefillCodecSelection::ForcedOn; }
+    if (override_value == 0) { return GqaSimtFfmaPrefillCodecSelection::ForcedOff; }
+    switch (gqa_simt_ffma_prefill_codec_probe_state()) {
+    case GqaSimtFfmaPrefillCodecProbeAnswer::RanOk:
+        return GqaSimtFfmaPrefillCodecSelection::ProbeRanOk;
+    case GqaSimtFfmaPrefillCodecProbeAnswer::Failed:
+        return GqaSimtFfmaPrefillCodecSelection::ProbeFailed;
+    case GqaSimtFfmaPrefillCodecProbeAnswer::NotProbed:
+        return GqaSimtFfmaPrefillCodecSelection::UnprobedBuildDefault;
+    }
+    return GqaSimtFfmaPrefillCodecSelection::UnprobedBuildDefault;
+}
+
+// The host-side switch. TRUE only on a measured or an operator-forced answer; the unprobed build
+// default is OFF, from a macro that is defined nowhere in this tree.
+[[nodiscard]] inline bool gqa_simt_ffma_prefill_codec_selected() {
+    switch (gqa_simt_ffma_prefill_codec_selection()) {
+    case GqaSimtFfmaPrefillCodecSelection::ForcedOn:
+    case GqaSimtFfmaPrefillCodecSelection::ProbeRanOk: return true;
+    case GqaSimtFfmaPrefillCodecSelection::ForcedOff:
+    case GqaSimtFfmaPrefillCodecSelection::ProbeFailed: return false;
+    case GqaSimtFfmaPrefillCodecSelection::UnprobedBuildDefault:
+#if defined(NINFER_PREFILL_NVFP4_SIMT_DEFAULT_ON)
+        return true;
+#else
+        return false;
+#endif
+    }
+    return false;
+}
+
+// The announcement, KEYED ON THE SELECTED VALUE. Returns true when this value had not been
+// announced before; the caller prints on true and does nothing else (the contract
+// core/announce_once.h states in one line). ⚠ It is an OBSERVATION, not a knob: there is no
+// env var that silences it, and it cannot be cleared.
+[[nodiscard]] inline bool gqa_simt_ffma_prefill_codec_announce_once() {
+    return ninfer::detail::announce_once_keyed(gqa_simt_ffma_prefill_codec_selection());
+}
+
+// THE PREFILL CODEC ARM'S REFUSALS, IN ONE PLACE. It DELEGATES to the shared codec refusal for
+// everything that is a property of the CODEC (not-decodable / not-routable / cold pool / residual
+// pair / append ordering) and then adds THE ONE CLAUSE THAT IS A PREFILL QUESTION.
+//
+// ⚠ WHY THE WINDOW CLAUSE IS NOT THE DECODE ONE. gqa_simt_ffma_codec_refusal's window clause is a
+// BOUNDARY (gqa_simt_ffma_window_clips): it refuses only when `0 < W < logical_capacity`, because
+// on a DECODE launch `logical_capacity` is a HOST value and the replaced arm's origin is then
+// provably 0. A PREFILL launch has no such bound available here: the largest absolute key index it
+// services is `base_pos + tokens - 1`, and `base_pos` lives in the `positions` DEVICE tensor
+// (read at gqa_attention_simt_ffma.cuh's prefill body as `positions[0]`), so a host-side bound
+// would need a device-to-host read this launcher does not take. `PagedKVLayerView` and
+// `PagedKVBatchLayerView` carry NO capacity or context field (read at src/core/paged_kv_cache.h:35
+// -62 and :65-88, not assumed). So this arm refuses EVERY declared window by name rather than
+// attending outside it. That is a STRICTER gate than the decode arm's, i.e. it widens nothing.
+//
+// The tensor-core NVFP4 prefill kernel this arm replaces DOES read the window: it is passed
+// `static_cast<int>(cache.sliding_window_tokens)` at gqa_attention_prefill.cu:169 and :186.
+//
+// BOUNDED FOLLOW-UP, NAMED: thread the same bound in from the caller's capacity, or take the one
+// positions[0] device-to-host read, and then use gqa_simt_ffma_window_clips exactly as the decode
+// arm does. Neither is done here, and neither is assumed.
+[[nodiscard]] inline const char* gqa_simt_ffma_prefill_codec_refusal(bool cold_armed,
+                                                                   bool window_declared,
+                                                                   bool residual_armed) {
+    // (1) everything that is a property of the codec. `writes_cache` is false by CONSTRUCTION on
+    //     this route and not by assumption: the attention body is a SEPARATE launch from the append
+    //     fill (gqa_kv_append_launch_for at gqa_attention_prefill.cu:292, whose packed fill kernels
+    //     are launched at :356-382), and the two run on one stream in that order, so the packed row
+    //     this body stages is committed before it is read. That is the invariant the decode arm's
+    //     APPEND ORDERING block could not establish for a fused append-decode launch.
+    const char* const shared = gqa_simt_ffma_codec_refusal(GqaSimtKvCodec::Nvfp4, cold_armed,
+                                                           /*writes_cache=*/false,
+                                                           /*window_clips=*/false, residual_armed);
+    if (shared != nullptr) { return shared; }
+    if (window_declared) {
+        return "the SIMT FFMA PREFILL codec arm has NO sliding-window term, and this launcher "
+               "cannot decide whether the layer's declared window can clip: the largest absolute "
+               "key index a prefill launch services is base_pos + tokens - 1 and base_pos lives in "
+               "the `positions` DEVICE tensor, so a host-side bound would need a device-to-host "
+               "read this launcher does not take (PagedKVLayerView and PagedKVBatchLayerView carry "
+               "no capacity field, src/core/paged_kv_cache.h:35-62 and :65-88). The tensor-core "
+               "NVFP4 prefill kernel this arm replaces DOES read the window (gqa_attention_prefill"
+               ".cu:169), so the two arms would disagree on a window that clips. Refused by name "
+               "rather than attended outside the declared window";
+    }
+    return nullptr;
+}
+
 // M1 (MTP tree verify): the round-relative visibility rule, spelled exactly as
 // gqa_attention_prefill_bf16.cuh:115 spells it (bounded shift: a uint64_t shift of 64 or more is
 // undefined, and the exact answer for such a key is "no ancestor bit is set"). The decode body of
@@ -1655,13 +1883,37 @@ __launch_bounds__(kGqaSimtFfmaThreadsPerWarp * WarpsPerCta,
 // is therefore expected to differ at roughly bf16 weight precision (2^-9) rather than at fp32
 // rounding -- REPORT.md has the measured numbers from sm_120.
 // ---------------------------------------------------------------------------
-template <typename Geometry, typename Metadata>
+// ⚠ THE CODEC SEAM (dl/nvfp4emu2). The template list and the trailing by-value parameter below
+// are the SAME two seam pieces the DECODE body of this family already carries
+// (gqa_attention_small_t_simt_ffma_partial_bf16_kernel, `GqaSimtKvCodec Codec = GqaSimtKvCodec::Bf16`
+// and `GqaSimtKvScalePlanes scale_planes = {}`), and they are declared the same way for the same
+// reason: the defaults make the landed bf16 launch's source line IDENTICAL, and `if constexpr`
+// below makes the landed bf16 INSTANTIATION emit the same cells. ⚠ ONE NAMED DIFFERENCE FROM THE
+// DECODE SIDE, DELIBERATE: the decode kernel's __launch_bounds__ carries a second argument,
+// gqa_simt_ffma_min_blocks_per_sm(Codec). This one does NOT gain it. Adding it would change the
+// register budget the LANDED bf16 prefill instantiation is compiled against, i.e. it would change
+// the existing arm to pay for the new one -- and it is not needed, because the packed arena this
+// arm stages into is SMALLER than the bf16 tile it replaces (NVFP4 at D=256, Bc=32:
+// 2*32*128 + 2*32*16 = 9216 B, against the bf16 tile's 2*32*256*2 = 32768 B), so the packed arm
+// cannot be the one that limits occupancy.
+template <typename Geometry, typename Metadata, GqaSimtKvCodec Codec = GqaSimtKvCodec::Bf16>
 __launch_bounds__(kGqaSimtFfmaPrefillThreads) __global__ void
     gqa_attention_simt_ffma_prefill_bf16_kernel(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ cache_k,
         const __nv_bfloat16* __restrict__ cache_v, Metadata metadata,
         const std::int32_t* __restrict__ positions, float scale,
-        __nv_bfloat16* __restrict__ out, std::int32_t width) {
+        __nv_bfloat16* __restrict__ out, std::int32_t width,
+        // The packed codec's SECOND plane pair. Null (the default) for bf16, whose arena has no
+        // scale region at all; a packed instantiation must pass both, and the staging reads them
+        // through the codec's own index helper and not through a re-derived one.
+        //
+        // ⚠ WHY THE TWO PLANE PARAMETERS ABOVE STAY `const __nv_bfloat16*` EVEN FOR A PACKED CODEC.
+        // Same reason the decode kernel gives: the bf16 arm is the landed one, so a separate
+        // byte-typed parameter pair would have to be passed as null by every existing bf16 launch
+        // -- i.e. it would change the landed signature to pay for the new one. A packed
+        // instantiation reinterprets the SAME two parameters, at the one place that knows Codec is
+        // not bf16 (the staging's code_source below).
+        GqaSimtKvScalePlanes scale_planes = {}) {
     constexpr int D     = Geometry::HeadDim;
     constexpr int Br    = kGqaSimtFfmaRowsPerCta;
     constexpr int Bc    = kGqaSimtFfmaBc;
@@ -1672,11 +1924,36 @@ __launch_bounds__(kGqaSimtFfmaPrefillThreads) __global__ void
     static_assert(D == 128 || D == 256, "the SIMT FFMA attention family covers head_dim 128/256");
     static_assert(VecD * kGqaSimtFfmaWarpReduction == D);
     static_assert(Bc * VecD == D || Bc > 0);
-    static_assert(2 * Bc * D * static_cast<int>(sizeof(__nv_bfloat16)) <= 48 * 1024,
+    static_assert(gqa_simt_kv_codec_supported(Codec),
+                  "this codec is REFUSED BY NAME by gqa_simt_kv_codec_supported "
+                  "(see gqa_attention_simt_ffma_codec_refusal for why); E8Kv/rk4v4 is the named "
+                  "refusal there, because its reader emits a ROTATED K");
+    static_assert(gqa_simt_kv_arena_bytes(Codec, D, Bc) <= 48 * 1024,
                   "the SIMT FFMA prefill tile must fit a 48 KiB static shared-memory ceiling");
 
-    __shared__ __align__(16) __nv_bfloat16 k_s[Bc * D];
-    __shared__ __align__(16) __nv_bfloat16 v_s[Bc * D];
+    // ONE arena, typed views per codec -- the decode body's layout, copied rather than re-derived,
+    // so the sizing, the staging and the row pass cannot disagree about the byte layout. The region
+    // order is: K code, V code, K scale, V scale. For Bf16 the two "code" regions ARE k_s/v_s and
+    // BOTH scale regions are zero bytes (gqa_simt_kv_scale_row_bytes returns 0), so the byte count
+    // collapses to 2 * Bc * D * 2 = the two arrays this kernel declared before the seam existed.
+    // ⚠ That equality is the whole reason the landed bf16 instantiation is unchanged, and it is
+    // asserted rather than trusted:
+    constexpr int kCodeBytes  = gqa_simt_kv_code_plane_bytes(Codec, D, Bc);
+    constexpr int kScaleBytes = gqa_simt_kv_scale_plane_bytes(Codec, D, Bc);
+    constexpr int kCodeRow    = gqa_simt_kv_code_row_bytes(Codec, D);
+    constexpr int kScaleRow   = gqa_simt_kv_scale_row_bytes(Codec, D);
+    static_assert(gqa_simt_kv_arena_bytes(Codec, D, Bc) == 2 * kCodeBytes + 2 * kScaleBytes);
+    static_assert(Codec != GqaSimtKvCodec::Bf16 ||
+                      2 * kCodeBytes == 2 * Bc * D * static_cast<int>(sizeof(__nv_bfloat16)),
+                  "bf16: the byte arena must be exactly the two bf16 tiles it replaced");
+    static_assert(Codec != GqaSimtKvCodec::Bf16 || kScaleBytes == 0,
+                  "bf16: the scale plane must be zero bytes, as gqa_simt_kv_scale_row_bytes says");
+    __shared__ __align__(16) std::uint8_t tile_s[gqa_simt_kv_arena_bytes(Codec, D, Bc)];
+    __nv_bfloat16* const k_s = reinterpret_cast<__nv_bfloat16*>(tile_s);
+    __nv_bfloat16* const v_s = reinterpret_cast<__nv_bfloat16*>(tile_s + kCodeBytes);
+    const GqaSimtPackedPlane k_plane{tile_s, tile_s + 2 * kCodeBytes, kCodeRow, kScaleRow};
+    const GqaSimtPackedPlane v_plane{tile_s + kCodeBytes, tile_s + 2 * kCodeBytes + kScaleBytes,
+                                     kCodeRow, kScaleRow};
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -1718,16 +1995,46 @@ __launch_bounds__(kGqaSimtFfmaPrefillThreads) __global__ void
 
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0 = kb * Bc;
-        gqa_simt_ffma_stage_tile<Geometry, Bc>(
-            k_s, v_s, tid, kGqaSimtFfmaPrefillThreads, k0, 0, max_query_abs + 1,
-            [&](int key, int d, __nv_bfloat16* k_dst, __nv_bfloat16* v_dst) {
-                const int phys = block_table[key >> kPagedKVPageShift];
-                const std::int64_t off =
-                    paged_kv_element_offset<Geometry::HeadDim, Geometry::KVHeads>(
-                        phys, kv_head, key & kPagedKVPageMask, d);
-                store_vec(k_dst, load_vec<int4>(&cache_k[off]));
-                store_vec(v_dst, load_vec<int4>(&cache_v[off]));
-            });
+        // THE CODEC SEAM, PREFILL SIDE. The bf16 arm below is byte-for-byte the code that was
+        // here: same staging call, same split window, same lambda body. The packed arm is the
+        // decode body's codec arm (:1546-1585) with its one decode-specific piece removed -- the
+        // `physical_pages_s` page-id table, which this kernel does not have and does not need
+        // because it reads `block_table` per chunk exactly as the bf16 arm above it does.
+        if constexpr (Codec == GqaSimtKvCodec::Bf16) {
+            gqa_simt_ffma_stage_tile<Geometry, Bc>(
+                k_s, v_s, tid, kGqaSimtFfmaPrefillThreads, k0, 0, max_query_abs + 1,
+                [&](int key, int d, __nv_bfloat16* k_dst, __nv_bfloat16* v_dst) {
+                    const int phys = block_table[key >> kPagedKVPageShift];
+                    const std::int64_t off =
+                        paged_kv_element_offset<Geometry::HeadDim, Geometry::KVHeads>(
+                            phys, kv_head, key & kPagedKVPageMask, d);
+                    store_vec(k_dst, load_vec<int4>(&cache_k[off]));
+                    store_vec(v_dst, load_vec<int4>(&cache_v[off]));
+                });
+        } else {
+            // Same window (0, max_query_abs + 1) as the bf16 arm above, and it MUST be the same:
+            // gqa_simt_ffma_stage_tile_packed zero-fills both planes for a key outside it, so the
+            // two arms cover exactly the same key set with exactly the same padding.
+            gqa_simt_ffma_stage_tile_packed<Geometry, Bc, Codec>(
+                k_plane, v_plane, tid, kGqaSimtFfmaPrefillThreads, k0, 0, max_query_abs + 1,
+                [&](int key, int d, std::uint8_t* k_dst, std::uint8_t* v_dst) {
+                    const int phys     = block_table[key >> kPagedKVPageShift];
+                    const int page_off = key & kPagedKVPageMask;
+                    // The kernel's plane parameters are bf16-typed because the bf16 arm is the
+                    // landed one; for a packed codec the SAME two parameters are the CODE planes
+                    // and are reinterpreted here, at the one place that knows Codec is not bf16.
+                    gqa_simt_ffma_load_code<Geometry, Codec>(
+                        reinterpret_cast<const std::uint8_t*>(cache_k),
+                        reinterpret_cast<const std::uint8_t*>(cache_v), phys, kv_head, d, page_off,
+                        k_dst, v_dst);
+                },
+                [&](int key, int grp, std::uint8_t* k_dst, std::uint8_t* v_dst) {
+                    const int phys     = block_table[key >> kPagedKVPageShift];
+                    const int page_off = key & kPagedKVPageMask;
+                    gqa_simt_ffma_load_scale<Geometry, Codec>(scale_planes.k, scale_planes.v, phys,
+                                                             kv_head, grp, page_off, k_dst, v_dst);
+                });
+        }
         __syncthreads();
 
 #pragma unroll
@@ -1746,9 +2053,23 @@ __launch_bounds__(kGqaSimtFfmaPrefillThreads) __global__ void
             }
             // The prefill route's visible set is the causal prefix [0, max_query_abs] (the
             // staging zeroes everything above it), so the split bounds below are the whole tile.
-            gqa_simt_ffma_row_pass<Geometry, Bc>(qr, k_s, v_s, lane, k0, qabs, mask, round_masked,
-                                                 column_begin, first_pos, 0, 1 << 30, scale, m[r],
-                                                 l[r], acc[r]);
+            // The SAME split window (0, 1 << 30) on both arms, and the same visibility
+            // predicate inside them: gqa_simt_ffma_row_pass_packed's `key >= split_start &&
+            // key < split_end && key <= qabs` is gqa_simt_ffma_row_pass's, spelled the same way
+            // (:744 against :1233). That identity is what makes this substitution a DECODE
+            // substitution: the only thing that changes between the two arms is where the K and V
+            // values come from, not which keys are visible and not the fp32 association of the
+            // online softmax (the packed pass keeps P in fp32 too; only Bc would move the
+            // association, and Bc is a constant of the family).
+            if constexpr (Codec == GqaSimtKvCodec::Bf16) {
+                gqa_simt_ffma_row_pass<Geometry, Bc>(qr, k_s, v_s, lane, k0, qabs, mask,
+                                                     round_masked, column_begin, first_pos, 0,
+                                                     1 << 30, scale, m[r], l[r], acc[r]);
+            } else {
+                gqa_simt_ffma_row_pass_packed<Geometry, Bc, Codec>(
+                    qr, k_plane, v_plane, lane, k0, qabs, mask, round_masked, column_begin,
+                    first_pos, 0, 1 << 30, scale, m[r], l[r], acc[r]);
+            }
         }
         __syncthreads();
     }

@@ -25,6 +25,15 @@ struct Options {
 
     std::uint32_t max_new        = 128;
     std::uint32_t max_context    = 2048;
+    // --max-concurrency N: how many lanes the engine runs (the "N concurrent prefills"
+    // knob). The default 1 and the [1,16] bound are the engine's own
+    // (include/ninfer/types.h EngineOptions::max_concurrency; engine.cpp:95-96); the flag
+    // spelling, the bound and the refusal wording are ninfer-serve's
+    // (src/serve/serve_options.cpp:279-281, :831-832), so the two front ends cannot
+    // disagree about the same knob. This flag is the whole of this entry: the field
+    // existed in EngineOptions but no CLI path copied it across, so the knob was
+    // unreachable from the delivered `ninfer` binary.
+    std::uint32_t max_concurrency = 1;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t prefill_chunk  = 3072;
     // --prefill-chunk-mode dynamic|manual: which of the two modes owns the prefill unit
@@ -51,7 +60,7 @@ struct Options {
     // exact shape this project keeps paying for.
     std::string kv_residual_layers_spec;
     // KV bit budget: a single ceiling per element, or separable per-range ceilings
-    // ("0-7:8,8-63:4.5"); the DP never exceeds them and minimises the penalty inside them.
+    // ("0-7:8,8-15:4.5", tiling every FULL-ATTENTION layer); the DP never exceeds them and minimises the penalty inside them.
     double kv_bit_budget_bits = 0.0;
     std::string kv_bit_budget_ranges;
     bool kv_bit_budget_explicit = false;
@@ -141,12 +150,29 @@ struct Options {
     // ColdPolicy::Disk spill budget and directory (serve-only flags before).
     std::uint64_t cold_disk_bytes  = 32ULL << 30;
     std::string cold_disk_path;
+    // qwen4_exp (FlashNext) PLE n-gram sidecar root (--ple-sidecar). Empty =
+    // PLE off. Reaches the engine as EngineOptions::ple_sidecar_root and is
+    // validated at startup, so a typo is a refusal rather than a quietly
+    // missing PLE residual.
+    std::string ple_sidecar_root;
     // W13 weight offload. The CLI reaches the same engine knobs as ninfer-serve so a
     // 1M run can be sized from either front end (same reasoning as max_cold_pages).
     std::uint64_t weight_host_offload_bytes = 0;
     std::uint64_t weight_device_arena_bytes = 0;
     std::uint32_t weight_prefetch_layers    = 2;
     std::uint64_t weight_span_floor_bytes   = 0;
+
+    // --stage-layers SPEC: the PIPELINE STAGE PARTITION of the text-layer axis, kept RAW
+    // exactly like kv_layer_storage_spec above and parsed by core/stage_plan.h -- the one
+    // implementation the runtime calls too. Empty == the flag was absent == one stage ==
+    // axis `none` == the pre-existing single-device run.
+    std::string stage_layers_spec;
+    // --stage-handoff DIR / --stage-handoff-cut: where the boundary hidden state crosses, and
+    // the negative control that silences the producer so the ids MOVE. See core/stage_plan.h.
+    std::string stage_handoff_dir;
+    bool stage_handoff_cut      = false;
+    bool stage_layers_explicit  = false;
+    bool stage_handoff_explicit = false;
     bool yarn_enabled     = false;
     std::uint32_t graph_capture_ceiling = 16;
     // FreeToken step 1 observation switch (src/ops/common/ft_stats.h):
@@ -158,8 +184,29 @@ struct Options {
     // front end has no decision cycle, so it has no relayout flag.
     std::optional<bool> ft_stats;
 
+    // --inject-spec PATH: THE INGRESS SURFACE (src/spec/inject_channel.h,
+    // src/targets/qwen3_6/impl/runtime/inject_ingress.h). PATH is a declaration file, in
+    // that header's flat key=value grammar, of a CHOSEN TENSOR and the position range it
+    // will occupy -- direction, dtype, layout, rows, cols, position0, scale, path, digest.
+    // It is the one input channel that is not a token channel and not `media` (whose
+    // alphabet is the range of merger o layers o patch_embed, i.e. a decodable image is
+    // required). The declaration is validated with the header's own parser at parse time
+    // -- so a mis-shaped or mis-dtyped declaration refuses BY NAME before the artifact is
+    // loaded -- and admitted against the loaded model at bind time, where the row count and
+    // the context capacity are finally known. It is committed to NINFER_INJECT_SPEC (the
+    // --ft-stats precedent) because the consumption point is inside a device schedule
+    // that takes no per-request argument. Empty = the ingress is off and the engine's
+    // per-chunk cost is one branch.
+    std::string inject_spec;
+
     bool raw_output      = false;
     bool print_token_ids = false;
+    // F745 injectbind: the PROMPT side of --print-token-ids. `PreparedPrompt::prompt_token_ids()`
+    // exists (include/ninfer/engine.h:30, "so a measurement consumer can record the input side of a
+    // run") and had NO CLI surface -- so the ids a `sum_dir` row's content must be named by were not
+    // obtainable from a run, and a row could not be bound to the inject channel. This prints them on
+    // stderr, in the order the engine tokenized them, as one space-separated list.
+    bool print_prompt_ids = false;
     // M21 --append-context-text: the operator entry for appending a run of already-known tokens to
     // the running request and prefilling them mid-run (recall). The text is encoded by the artifact's
     // own tokenizer with NO chat template and NO implicit special token, i.e. exactly the bytes given

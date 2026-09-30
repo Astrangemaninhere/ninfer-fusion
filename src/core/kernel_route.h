@@ -68,10 +68,16 @@ namespace ninfer::caps {
 enum class KernelRoute : std::uint8_t {
     None = 0,          // no route: nothing in this tree can serve the request
     ConservativeSimt,  // lowest floor, no tensor-core requirement at all. It serves the
-                       // floor-free formats (scale words / index payloads); it is NOT the
-                       // unknown-card answer any more -- the only tensor-core-free GEMM in
-                       // this tree is the QPN SIMT one, which no target compiles, so
-                       // conservative_fallback() refuses instead of selecting this.
+                       // floor-free formats (scale words / index payloads) AND -- since
+                       // dl/oldkernel -- the four groupwise-int formats whose tensor-core-free
+                       // GEMM this build compiles (kFormatRequirements.simt_kernel_evidence),
+                       // on the rungs whose measured capability set is Cap::None. It is still
+                       // NOT the unknown-card answer: conservative_fallback() refuses there
+                       // because an unlisted number has no rung for the three clauses of
+                       // caps::simt_floor_executable() to read. MEASURED, and this comment used
+                       // to say the opposite: the QPN sources ARE compiled by a target in this
+                       // tree (src/CMakeLists.txt:366, NINFER_HAVE_QPN on the same lines), and
+                       // the tensor-core-free GEMMs are not one kernel but five.
     QpnW4a16,          // 4-bit codes expanded inline into fp16 mma; the Volta route.
                        // NO CARD IN THIS BUILD GETS IT, and this route now has TWO
                        // independent obstructions that used to be stated as one:
@@ -93,6 +99,16 @@ enum class KernelRoute : std::uint8_t {
     // with block scale' not supported". The earlier text here said "sm_100a / sm_120a",
     // which is what made the capability table hand this route to B200.
     Nvfp4W4a4Tma,
+    // The fp16 tensor core over a BF16 (or fp8) weight PLANE: the artifact's own bytes,
+    // converted inline to fp16, fed to mma_f16_m8n8k4 (sm_70) or mma_f16_m16n8k8 (sm_75).
+    // It is the answer for a rung that HAS fp16 tensor cores and does NOT have the
+    // format's declared floor -- rungs 70 and 75 against Cap::Bf16Mma, which is the wall
+    // this route exists to remove. Distinct from QpnW4a16 on purpose: that family consumes
+    // PACKED e2m1/e4m3 codes and this one consumes a bf16 plane, so one enumerator for both
+    // would make `kernel` the only place the difference lived.
+    // Kernel: ops/linear/bf16/bf16_mma_fp16.cuh. Reachable set is computed, not asserted:
+    // caps::fp16_plane_executable() is true exactly at {70, 75} -- see its own note.
+    MmaFp16Plane,
     Count,
 };
 
@@ -188,8 +204,23 @@ struct RouteChoice {
 // the with-QPN and without-QPN worlds in ONE binary, so the fail-closed half gets a real red
 // control instead of an assertion about a binary nobody can build. Production callers use
 // the default and cannot forget it.
+//
+// `fp16_plane_in_build` (dl/fp16route, F-736) is the SECOND build fact -- whether
+// src/ops/linear/bf16/bf16_mma_fp16.cu is compiled in -- and its default is caps::kFp16PlaneInBuild.
+// THE DEFAULTS ARE ON THE SHORTER OVERLOADS BELOW, not here: two overloads that both carried
+// defaults for the same trailing argument would make `select_route(sm, fmt, shape)` ambiguous,
+// and the compiler said so the moment the second fact landed.
 [[nodiscard]] RouteChoice select_route(int sm, artifact::NumericFormat format, ProblemShape shape,
-                                       bool qpn_in_build = kQpnInBuild) noexcept;
+                                       bool qpn_in_build, bool fp16_plane_in_build) noexcept;
+
+// The two shorter forms, and the ONLY places the build defaults live. Four-and-three arguments
+// in, one answer out: each delegates to the full form so the four clauses and the arms cannot
+// differ between callers.
+[[nodiscard]] RouteChoice select_route(int sm, artifact::NumericFormat format, ProblemShape shape,
+                                       bool qpn_in_build) noexcept;
+
+[[nodiscard]] RouteChoice select_route(int sm, artifact::NumericFormat format,
+                                       ProblemShape shape) noexcept;
 
 // The same question asked about a card the ladder does not contain, kept as its own
 // entry point so a test can pin the fallback WITHOUT also pinning the ladder.
@@ -227,7 +258,8 @@ struct RouteChoice {
 // decoration (the SIMULATED marker in `why`, `simulated = true`, the Refused passthrough)
 // because that decoration is the part that must not be written twice.
 [[nodiscard]] RouteChoice select_route(const ArchView& view, artifact::NumericFormat format,
-                                       ProblemShape shape, bool qpn_in_build) noexcept;
+                                       ProblemShape shape, bool qpn_in_build,
+                                       bool fp16_plane_in_build) noexcept;
 [[nodiscard]] RouteChoice conservative_fallback(const ArchView& view,
                                                 ProblemShape shape) noexcept;
 
@@ -266,6 +298,7 @@ inline std::string_view route_name(KernelRoute route) noexcept {
     case KernelRoute::Fp8A16Bf16: return "fp8-a16-bf16";
     case KernelRoute::Fp8A8KindF8f6f4: return "fp8-a8-kind-f8f6f4";
     case KernelRoute::Nvfp4W4a4Tma: return "nvfp4-w4a4-tma";
+    case KernelRoute::MmaFp16Plane: return "mma-fp16-plane";
     case KernelRoute::Count: break;
     }
     return "unknown-route";
@@ -311,16 +344,16 @@ namespace detail {
 // has NO host entry point today" -- both were stale: that entry was added on 2026-09-10,
 // and this function emitted skinny_nvfp4_qpn2 for M 4..8 three arms away from the claim.)
 //
-// AND IT REFUSES ALL OF THEM ANYWAY, because they are not in THIS BUILD. The kernels live
+// AND THE ARMS BELOW REFUSE WHEN `qpn_in_build` IS FALSE -- i.e. for a translation unit
+// that did not receive -DNINFER_HAVE_QPN. The kernels live
 // in src/ops/linear/qpn/qpn_kernels.cuh (skinny_nvfp4_qpn_simt<M> :985,
 // skinny_nvfp4_qpn2<SPLITK, NACC> :1077, skinny_nvfp4_qpn<MT> :903) with the host entry
-// gemm_qpn in src/ops/linear/qpn/qpn_host.cu, and NOTHING under src/ops/linear/qpn/ is in
-// any CMake target: `qpn` has 0 hits in src/CMakeLists.txt, whose ninfer_ops source list is
-// deliberately explicit -- src/CMakeLists.txt:75-76 says "adding a source is a
-// build-boundary decision, not an accidental recursive-glob side effect" -- and no GLOB or
-// file(GLOB) appears anywhere in it. MEASURED: 0 qpn object members across all 11 archives
-// under build/src/ (247 members in libninfer_ops.a alone), and 0 qpn entries among
-// build/compile_commands.json's 503 TUs, with gqa_attention at 52 as the positive control.
+// gemm_qpn in src/ops/linear/qpn/qpn_host.cu. THE SENTENCE THAT STOOD HERE WAS FALSE OF THIS
+// TREE AND WAS CORRECTED ON 2026-09-23 18:56Z. It read "NOTHING under src/ops/linear/qpn/ is
+// in any CMake target: `qpn` has 0 hits in src/CMakeLists.txt ... MEASURED: 0 qpn object
+// members across all 11 archives". Re-read on the spot: `grep -ci qpn src/CMakeLists.txt` =
+// 35 lines, 5 CODE and 2 of those SOURCE ENTRIES -- :366 ops/linear/qpn/qpn_host.cu and
+// :371 ops/linear/qpn/qpn_arch_route.cpp, both in ninfer_ops' list -- and 2 qpn object members.
 // A route SELECTED here would name a kernel the caller cannot launch, and
 // RouteOutcome::NoKernelInTree exists for exactly that ("`why` names the MISSING KERNEL",
 // this file's header). So every arm below refuses, and `why` names the kernel.
@@ -348,13 +381,13 @@ inline constexpr std::string_view kQpnFamily =
 // whose kernel is absent must name the kernel, and it must say WHAT TO DO (add the source)
 // rather than only WHICH card asked.
 inline constexpr std::string_view kQpnMissingKernelReason =
-    "Missing kernel, and it is a build fact rather than a GPU fact: the QPN W4A16 family -- "
+    "Missing kernel FOR THE CALLING TRANSLATION UNIT: the QPN W4A16 family -- "
     "skinny_nvfp4_qpn_simt<M> (M 1..3), skinny_nvfp4_qpn2<1, 1> (M 4..8), "
     "skinny_nvfp4_qpn<2> (M 9..16) in src/ops/linear/qpn/qpn_kernels.cuh, host entry "
-    "gemm_qpn in src/ops/linear/qpn/qpn_host.cu -- exists in this tree and is compiled by NO "
-    "target in it: src/ops/linear/qpn/ is absent from every CMakeLists, and this build's "
-    "archives and compile_commands.json carry no QPN object at all. Add "
-    "ops/linear/qpn/qpn_host.cu to a target to make this route selectable. Port plan: "
+    "gemm_qpn in src/ops/linear/qpn/qpn_host.cu -- is compiled by NO target that this caller "
+    "was built against, because this TU did not receive -DNINFER_HAVE_QPN. That is a fact "
+    "about the caller, NOT about the tree: the sources ARE in ninfer_ops in the shipping "
+    "build, and a caller that receives the macro gets kQpnNotTheBuildReason instead. Port plan: "
     "docs/maintainer/1cat-remaining-workpackages.md section 4.3.";
 
 // THE REASON WHEN THE KERNEL IS NOT THE PROBLEM. Reachable only once the source is in a
@@ -529,13 +562,18 @@ inline constexpr std::string_view kQpnNotTheBuildReason =
 
 inline RouteChoice conservative_fallback(int sm, ProblemShape shape, bool qpn_in_build) noexcept {
     RouteChoice out;
-    // The lowest-floor kernel this tree EMITS is still the tensor-core-free SIMT path -- and
-    // that path is the QPN one (skinny_nvfp4_qpn_simt<M>). Nothing under
-    // src/ops/linear/qpn/ is in a CMake target, so UnknownArchFallback would be a WARNING
-    // whose contract is "the run may proceed on the fallback" for a fallback that does not
-    // exist in this build. A route is a plan, not a permission, and a plan that cannot be
-    // carried out is a refusal with a reason -- so this refuses, and the reason names the
-    // missing kernel rather than the card. Do not "fix" this by selecting
+    // The lowest-floor kernels this tree EMITS are the tensor-core-free SIMT ones, and
+    // dl/oldkernel added an arm that SELECTS them (select_route_on_rung's
+    // simt_floor_executable() block). THIS function is the DIFFERENT question -- an unlisted
+    // compute capability -- and it still refuses, for a reason that is no longer the build:
+    // src/ops/linear/qpn/qpn_host.cu IS in ninfer_ops (src/CMakeLists.txt:366) and the rowsplit
+    // SIMT GEMMs are in it too (:374/379/418/419, all unconditional), so an UnknownArchFallback
+    // would no longer be a phantom on that ground. What is still missing on an unlisted number
+    // is the RUNG: caps::simt_floor_executable() needs an ArchRung to read `caps == Cap::None`
+    // from, and there is none, so "the run may proceed" would be a promise about a card whose
+    // instruction set nobody has measured. A route is a plan, not a permission, and a plan that
+    // cannot be carried out is a refusal with a reason -- so this refuses, and the reason names
+    // the missing MEASUREMENT rather than the card. Do not "fix" this by selecting
     // KernelRoute::ConservativeSimt with an empty kernel: `ok()` would then say the run is
     // fine and the caller would have nothing to launch.
     out.route   = KernelRoute::None;
@@ -564,7 +602,8 @@ namespace detail {
 // takes a measurement. The 230 lines inside are otherwise unchanged.
 inline RouteChoice select_route_on_rung(const ArchRung* rung, int sm,
                                         artifact::NumericFormat format, ProblemShape shape,
-                                        bool qpn_in_build) noexcept {
+                                        bool qpn_in_build,
+                                        bool fp16_plane_in_build) noexcept {
 
     const FormatRequirement* requirement = format_requirement(format);
     if (requirement == nullptr) {
@@ -639,6 +678,136 @@ inline RouteChoice select_route_on_rung(const ArchRung* rung, int sm,
                   ") covers the floor " + std::string(cap_name(requirement->required)) +
                   " that " + std::string(artifact::format_name(format)) + " needs; kernel " +
                   std::string(requirement->kernel_evidence);
+        return out;
+    }
+
+    // -------------------------------------------------------------------------------------
+    // THE fp16-PLANE TENSOR-CORE ARM, ASKED BEFORE THE TENSOR-CORE-FREE ONE.
+    // (added by dl/fp16route, F-736)
+    // -------------------------------------------------------------------------------------
+    // WHY IT IS HERE AND NOT FURTHER DOWN. This is the one arm in this selector whose
+    // premise is that the rung HAS a tensor core and is not using it. Every arm below is
+    // about a rung that has LESS: the fp16 fallback arm needs the rung's m8n8k4 channel to
+    // be hardware and reads only the formats whose fallback column is the QPN one, and the
+    // tensor-core-free arm is the FMA-pipe rescue. So the order is: floor met -> fp16 plane
+    // -> FMA pipe. Asking the FMA-pipe rescue first is what produced the wall this arm
+    // removes; asking it last is what makes "the rung has tensor cores" a fact that can win.
+    //
+    // IT CANNOT TAKE A CELL OFF A WORKING TENSOR-CORE ROUTE, and that is clause 3, not this
+    // position: fp16_plane_executable() requires the rung NOT to cover the format's declared
+    // floor... read the other way, wherever the floor IS covered the `floor_met` branch above
+    // has already returned. So this arm only ever answers where today's answer is a rescue.
+    //
+    // WHAT IT ANSWERS WITH, and the citation is the point: `kernel` names the FILE and the
+    // two kernels in it, and `why` names the CHANNEL this rung's row measured -- m8n8k4 on
+    // sm_70 (Volta's only fp16 mma form) and m16n8k8 on sm_75 (Turing's native form). Both
+    // rungs' rows are HardwareFp16Mma, which is the same per-rung SASS fact
+    // fp16_fallback_executable() gates on, read from kFp16PlaneChannelRungs instead of
+    // kQpnMmaRungs because it is a different channel.
+    if (fp16_plane_executable(sm, format, fp16_plane_in_build)) {
+        const Fp16PlaneChannelRung* channel = fp16_plane_channel_rung(sm);
+        RouteChoice out;
+        out.outcome = RouteOutcome::Selected;
+        out.route   = KernelRoute::MmaFp16Plane;
+        out.kernel  = requirement->fp16_plane_kernel_evidence;
+        out.why = std::string("sm_") + std::to_string(sm) + " (" + std::string(rung->label) +
+                  ", caps=" + std::string(cap_list_text(rung->caps)) +
+                  ") does not cover the floor " + std::string(cap_name(requirement->required)) +
+                  " that " + std::string(artifact::format_name(format)) +
+                  " declares, and it is one of the rungs that DOES have an fp16 tensor core, so "
+                  "this route uses it: " +
+                  std::string(requirement->fp16_plane_kernel_evidence) +
+                  ". CHANNEL on this rung: " +
+                  std::string(channel != nullptr ? channel->channel : std::string_view("<none>")) +
+                  " -- " +
+                  std::string(fp16_plane_lowering_name(channel != nullptr
+                                                           ? channel->lowering
+                                                           : Fp16PlaneLowering::EmulatedFp16Pipe)) +
+                  ", measured: " + std::string(channel != nullptr ? channel->evidence : "") +
+                  ". NO requantization and NO fp16 weight copy: the artifact's own persisted bf16 "
+                  "bytes are converted inline. EVIDENCE AND CALIBER: the channel is an "
+                  "INSTRUCTION-SET and SASS fact about this rung (per-rung cubin census, "
+                  "dl/fp16route/logs/newkernel_*.sass), and the kernel's own throughput is a "
+                  "SEPARATE measurement (dl/fp16route bench) -- this route answer claims the "
+                  "first and not the second. PRECISION, stated because the owner's first rule is "
+                  "precision first: bf16 -> fp16 is exact in the mantissa and narrower in range "
+                  "(|x| > 65504 saturates), where the FP32-FMA route it replaces is exact; the "
+                  "engine-side plan (src/ops/linear/bf16/bf16_fp16_route.h) is where a caller may "
+                  "decline that trade. THE KERNELS THAT EXECUTE ARE THIS BINARY'S, not sm_" +
+                  std::to_string(sm) +
+                  " binaries: only the route decision is simulated for a simulated rung.";
+        return out;
+    }
+
+    // -------------------------------------------------------------------------------------
+    // THE TENSOR-CORE-FREE ARM, ASKED BEFORE THE GRADED REFUSALS.
+    // (added below by dl/oldkernel; MOVED to here by dl/floorfix, F-720)
+    // -------------------------------------------------------------------------------------
+    // WHY IT MOVED, AND WHY THE POSITION IS THE FIX. This arm used to sit BELOW the whole
+    // `if (has_cap(rung->caps, Cap::Fp16Mma))` block, where the groupwise-int formats' own
+    // `default:` case returned a graded refusal BEFORE the arm was read. So it was reachable only
+    // on a rung with no tensor core at all, and on sm_70/sm_75 -- which HAVE fp16 mma -- the
+    // selector answered `no-kernel-in-tree` for BF16 / Q4 / Q5 / Q6 / W8 while the load-time
+    // gate, with the widened caps::simt_floor_executable(), answered `Supported` and the ENGINE
+    // then ran exactly the kernel this arm names (the host shape tables select it WITHOUT
+    // consulting the arch). Two surfaces answering one question differently is the drift this
+    // file's header forbids, and it is the same drift F-710 fixed in the other direction.
+    // MEASURED on both sides, one instrument (dl/floorfix/out/grid_POST.txt):
+    //   gate  evaluate_artifact_formats(70, {BF16})   -> Supported, 1 tensor-core-free fallback
+    //   route select_route(70, BF16, m=1)             -> no-kernel-in-tree   <-- the defect
+    // AFTER the move those two calls read `Supported` and `selected conservative-simt`.
+    //
+    // WHY NVFP4 IS EXCLUDED, AND IT IS A DELIBERATE, NAMED EXCEPTION. NVFP4 is the one format
+    // whose fp16 QPN arm is SELECTED here rather than refused, so asking this arm first would
+    // REPLACE an answer this file's own tests pin band-by-band (M 1..3 -> qpn_simt, 4..8 ->
+    // qpn<1>, 9..16 -> qpn<2>, 17..64 -> skinny_nvfp4_wmma, M>64 -> refused at the ceiling).
+    // Those pins are the record's evidence for the QPN band table and dl/floorfix does not
+    // overturn them; the QPN arm is also the FASTER route and the one the owner's 1cat parity
+    // argument is about. What was wrong with NVFP4 on sm_70/sm_75 was not the tables -- it was
+    // that the ENGINE could not dispatch the route they selected, and that is fixed at the op
+    // (src/ops/linear/nvfp4/nvfp4_dispatch.cpp), which now takes the tensor-core-free A16 arm
+    // instead of throwing. The residual, stated rather than hidden: for NVFP4 on sm_70/sm_75
+    // the gate and this selector both name the QPN fp16 fallback while the op runs the FP32
+    // FMA-pipe one, so the ADMISSION is right and the ROUTE LABEL is one layer optimistic.
+    // Making the tables say `conservative-simt` for NVFP4 here is the clean repair and it costs
+    // the band pins above; that trade is reported, not taken.
+    //
+    // NOT A BLANKET "SIMT IS FREE". caps::simt_floor_executable() is fail-closed on three
+    // clauses, and the second is the guard that matters: it fires ONLY where the rung does NOT
+    // cover this format's declared floor. A rung that covers it returned above, so no
+    // tensor-core route is ever traded for a narrower one -- asserted in tests/test_kernel_route.cpp
+    // rather than asserted here in prose.
+    //
+    // WHAT IT PROVES AND WHAT IT DOES NOT. The kernels are tensor-core-free by measurement
+    // (per-TU `-cubin` + nvdisasm census, dl/floorfix/out/tc_free_census.txt) and their host
+    // shape tables already select them without consulting the arch. NOT CLAIMED: that any of
+    // these rungs has been RUN. The selection is the FORMAT-FLOOR answer; the caller's own shape
+    // table still owns exact geometry.
+    if (format != artifact::NumericFormat::NVFP4 && simt_floor_executable(sm, format)) {
+        RouteChoice out;
+        out.outcome = RouteOutcome::Selected;
+        out.route   = KernelRoute::ConservativeSimt;
+        out.kernel  = requirement->simt_kernel_evidence;
+        out.why = std::string("sm_") + std::to_string(sm) + " (" + std::string(rung->label) +
+                  ", caps=" + std::string(cap_list_text(rung->caps)) +
+                  ") does not cover the floor " + std::string(cap_name(requirement->required)) +
+                  " that " + std::string(artifact::format_name(format)) +
+                  " declares, and this build ships a TENSOR-CORE-FREE kernel for that format "
+                  "whose source line is unconditional, so this rung's tensor cores are not "
+                  "needed and not used: " +
+                  std::string(requirement->simt_kernel_evidence) +
+                  ". Selected: " +
+                  std::string(requirement->simt_kernel_evidence) +
+                  ". EVIDENCE AND CALIBER: an ASSEMBLY and BUILD fact, NOT a run on this card. "
+                  "MEASURED per TU with this tree's own flags (see "
+                  "dl/floorfix/out/tc_free_census/census.txt, which also carries the rung the "
+                  "measurement could NOT be taken at and why): zero HMMA/IMMA, zero LDSM, zero "
+                  "emulation CALL, with the FMA-pipe instruction counts recorded. NOT CLAIMED: "
+                  "that this rung has been RUN, and no throughput or latency figure from a "
+                  "simulated run may be quoted as this card's -- the kernels that execute are the "
+                  "ones THIS binary was compiled for. The selection is the FORMAT-FLOOR answer; "
+                  "the caller's own shape table (select_bf16_launch / select_q4_a16_launch and "
+                  "their siblings) still owns exact geometry.";
         return out;
     }
 
@@ -847,13 +1016,75 @@ inline RouteChoice select_route_on_rung(const ArchRung* rung, int sm,
         return out;
     }
 
+    // -------------------------------------------------------------------------------------
+    // THE NO-TENSOR-CORE BRANCH, REACHED AT LAST -- AND WHY ITS TEXT CHANGED WITH IT.
+    // -------------------------------------------------------------------------------------
+    // Until 2026-09-24 this branch was UNREACHABLE and tests/test_kernel_route.cpp pinned it as
+    // unreachable: every rung of kArchLadder carried Cap::Fp16Mma. The six sub-70 rungs added
+    // that day (F702; sm_50/52/53 Maxwell, sm_60/61/62 Pascal) carry Cap::None, which is the
+    // measured truth for those ISAs -- ptxas rejects `mma.sync` below .target sm_70 ("Feature
+    // 'mma' requires .target sm_70 or higher", tools/archkit/_GPU_MATRIX.md section 3.3, whose
+    // citation ops/common/mma.cuh:191 still resolves). So this is now a LIVE branch and it has
+    // to answer the question the operator actually has.
+    //
+    // WHAT IT SAID, AND WHY THAT WAS NOT ENOUGH: "Missing capability, not a missing table row."
+    // True, and it is the REASON CATEGORY -- but it named no FLOOR and no KERNEL, while the
+    // load-time gate's refusal for the same rung (render_capability_report) names both. Two
+    // surfaces answering one question with different amounts of evidence is the drift this
+    // file's header forbids, so the floor's own kernel citation is added here (the same
+    // `requirement->kernel_evidence` field the gate prints), together with the one fact that
+    // makes the refusal actionable rather than merely correct: the rung's OWN measured
+    // instruction floor, which is the reason no lower-floor arm can rescue it either.
+    // -------------------------------------------------------------------------------------
+    // THE TENSOR-CORE-FREE ARM NOW LIVES ABOVE, ASKED BEFORE THE TENSOR-CORE FLOORS.
+    // -------------------------------------------------------------------------------------
+    // It was here (dl/oldkernel added it at this position) and dl/floorfix (F-720) MOVED it to
+    // just after the floor-met branch, for the reason stated in full at its new home: from here
+    // it was UNREACHABLE on any rung that has Cap::Fp16Mma, because the groupwise-int formats'
+    // `default:` case below returned a graded refusal before the arm was ever read. So the
+    // selector answered `no-kernel-in-tree` on sm_70/sm_75 while the load-time gate, with the
+    // widened caps::simt_floor_executable(), answered `Supported` -- two deciders of one question
+    // disagreeing, which is the drift this file's header forbids.
+    //
+    // NOTHING IS LOST BY THE MOVE. The refusal below still ends by NAMING that predicate, and
+    // its text is still true: for a format whose simt_kernel_evidence column is EMPTY there is
+    // no tensor-core-free kernel in this tree, so the refusal stands. The dl/oldkernel census
+    // that used to be quoted here (nvcc 12.8, `-cubin -arch=sm_52`/`-arch=sm_61` per TU, then
+    // `nvdisasm -c`: rc=0, ZERO HMMA/IMMA, ZERO ldmatrix, ZERO LDGSTS, 896..10676 FMA-pipe
+    // instructions) is cited where a citation belongs -- in each row's own simt_kernel_evidence
+    // column and in that census file -- and dl/floorfix extended it to sm_70/sm_75, which are
+    // the rungs whose floor is unmet for these formats. A second copy of a census is a second
+    // answer to one question.
+
     RouteChoice out;
     out.outcome = RouteOutcome::NoKernelInTree;
     out.why = std::string("sm_") + std::to_string(sm) + " (" + std::string(rung->label) +
-              ") has no tensor core at all in kArchLadder, and " +
+              ") has no tensor core at all in kArchLadder (caps=" +
+              std::string(cap_list_text(rung->caps)) + "), and " +
               std::string(artifact::format_name(format)) + " needs " +
               std::string(cap_name(requirement->required)) +
-              ". Missing capability, not a missing table row.";
+              ". REASON CATEGORY: UNMET FORMAT FLOOR -- and this is a CAPABILITY fact about the "
+              "ISA, not a missing table row: the rung's row exists (it is the one being read) "
+              "and its route text records the measurement that gives it no tensor core, namely "
+              "that ptxas rejects `mma.sync` below .target sm_70 (recorded per rung in "
+              "tools/archkit/_GPU_MATRIX.md section 3.3; the m8n8k4 helper it cites, "
+              "ops/common/mma.cuh:191, still resolves there). THE FLOOR, NAMED: kernel floor : " +
+              std::string(requirement->kernel_evidence) +
+              ". NO TENSOR-CORE LOWER FLOOR RESCUES THIS EITHER, and the reason is the same "
+              "fact one level down: the fp16 fallback is honoured only when "
+              "fp16_fallback_executable() is true, and that requires Cap::Fp16Mma on this rung "
+              "(clause 3) plus a measured HMMA.884 lowering (clause 4) -- this rung has neither. "
+              "A TENSOR-CORE-FREE lower floor is a DIFFERENT question and is answered above this "
+              "point by caps::simt_floor_executable(), which selects KernelRoute::ConservativeSimt "
+              "for the formats whose FMA-pipe GEMM this build compiles "
+              "(kFormatRequirements.simt_kernel_evidence). FOR THIS FORMAT THERE IS NO SUCH KERNEL "
+              "IN THIS TREE -- the column is empty for it -- so the refusal stands, and the "
+              "missing piece is a tensor-core-free kernel that consumes THIS format's bytes: not "
+              "a capability bit, and not a table row. Not attempted instead: writing Cap::None in "
+              "this format's required column, which would DELETE a real tensor-core floor in "
+              "order to add a second one -- this table keeps two floors in two columns for "
+              "exactly that reason. What to do instead: recreate the weight in a format whose "
+              "floor this card meets, or run the artifact on a rung that covers the floor above.";
     return out;
 }
 
@@ -864,10 +1095,29 @@ inline RouteChoice select_route_on_rung(const ArchRung* rung, int sm,
 // deleted and NOT deprecated: it is the honest answer to "what does the TABLE say about a
 // number", which is a question a table can answer and a measurement cannot.
 inline RouteChoice select_route(int sm, artifact::NumericFormat format, ProblemShape shape,
-                                bool qpn_in_build) noexcept {
+                                bool qpn_in_build, bool fp16_plane_in_build) noexcept {
     const ArchRung* rung = arch_rung(sm);
     if (rung == nullptr) { return conservative_fallback(sm, shape, qpn_in_build); }
-    return detail::select_route_on_rung(rung, sm, format, shape, qpn_in_build);
+    return detail::select_route_on_rung(rung, sm, format, shape, qpn_in_build, fp16_plane_in_build);
+}
+
+// ---------------------------------------------------------------------------
+// THE FOUR-ARGUMENT FORMS, KEPT AND DELEGATING (dl/fp16route, F-736).
+// ---------------------------------------------------------------------------
+// `fp16_plane_in_build` is a SECOND build fact and it is defaulted to caps::kFp16PlaneInBuild
+// here for the same reason `qpn_in_build` is a parameter one line up: a caller that has the
+// macro answers from it, and a test that wants the other world passes false without a rebuild.
+// The property that matters is that the DEFAULT is the compile-time fact, so a production
+// caller cannot forget it -- which is exactly the contract the ArchView overload below states
+// for the QPN flag, reused rather than restated.
+inline RouteChoice select_route(int sm, artifact::NumericFormat format, ProblemShape shape,
+                                bool qpn_in_build) noexcept {
+    return select_route(sm, format, shape, qpn_in_build, kFp16PlaneInBuild);
+}
+
+inline RouteChoice select_route(int sm, artifact::NumericFormat format,
+                                ProblemShape shape) noexcept {
+    return select_route(sm, format, shape, kQpnInBuild, kFp16PlaneInBuild);
 }
 
 // THE MEASURED ENTRY POINT -- the one the ENGINE uses. Same body, fed the row the box's own
@@ -876,12 +1126,14 @@ inline RouteChoice select_route(int sm, artifact::NumericFormat format, ProblemS
 // fallback and says so (resolve_measured_row's rule), which is why the engine can call this
 // unconditionally.
 inline RouteChoice select_route(int sm, artifact::NumericFormat format, ProblemShape shape,
-                                const MeasuredCaps& measured, bool qpn_in_build) noexcept {
+                                const MeasuredCaps& measured, bool qpn_in_build,
+                                bool fp16_plane_in_build) noexcept {
     const MeasuredRow resolved = resolve_measured_row(sm, measured, "select_route");
     const ArchRung* rung       = resolved.effective();
     RouteChoice out = (rung == nullptr) ? conservative_fallback(sm, shape, qpn_in_build)
                                        : detail::select_route_on_rung(rung, sm, format, shape,
-                                                                      qpn_in_build);
+                                                                      qpn_in_build,
+                                                                      fp16_plane_in_build);
     // The provenance goes on EVERY answer, refusals included: a refusal whose reason does not
     // say whether the capability set was measured or named is the same defect one layer down.
     out.why += " " + resolved.why;
@@ -930,11 +1182,17 @@ inline std::string route_selection_line(int sm, artifact::NumericFormat format,
 // fleet an hour on 2026-09-17; that one was deleted, this one is owed a body.)
 inline RouteChoice select_route(const ArchView& view, artifact::NumericFormat format,
                                ProblemShape shape) noexcept {
-    return select_route(view, format, shape, kQpnInBuild);
+    return select_route(view, format, shape, kQpnInBuild, kFp16PlaneInBuild);
 }
 
 inline RouteChoice select_route(const ArchView& view, artifact::NumericFormat format,
                                ProblemShape shape, bool qpn_in_build) noexcept {
+    return select_route(view, format, shape, qpn_in_build, kFp16PlaneInBuild);
+}
+
+inline RouteChoice select_route(const ArchView& view, artifact::NumericFormat format,
+                               ProblemShape shape, bool qpn_in_build,
+                               bool fp16_plane_in_build) noexcept {
     // FAIL CLOSED. A simulation was asked for and could not be honoured: the caller's
     // question was "what happens on sm_70", and answering with the real card's route would
     // be an answer to a question nobody asked -- and the one answer most likely to be
@@ -946,7 +1204,8 @@ inline RouteChoice select_route(const ArchView& view, artifact::NumericFormat fo
         out.why     = sim_refusal_reason(view);
         return out;
     }
-    RouteChoice out = select_route(view.effective_sm, format, shape, qpn_in_build);
+    RouteChoice out = select_route(view.effective_sm, format, shape, qpn_in_build,
+                                   fp16_plane_in_build);
     if (!view.simulated()) { return out; }
     // Says WHICH number answered, WHICH card it is not, and that nothing about the real
     // device is being claimed. prepend rather than append, so a reader who stops after one

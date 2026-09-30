@@ -41,6 +41,7 @@
 // g++ (tests/test_ple_carrier.cpp), matching tests/test_kv_cold_tier_budget.cpp.
 
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -91,6 +92,31 @@ enum class PleCarrierClass : std::uint8_t {
 
 // The CLASS-level admission: can this tree actually serve the carrier class at all? Kept
 // separate from the policy request so "should" never answers "can".
+// STARTUP VALIDATION of an operator-supplied sidecar root (--ple-sidecar and its
+// ninfer-serve twin). This is what keeps that flag from being a decoration: the
+// carrier header owns the option surface (requirement 4 above), and a root that
+// holds no ple-manifest.json must stop the run rather than resolve to "PLE off",
+// which no output could be distinguished from a typo.
+//
+// EXACTLY the three states tests/ops/ple_table_e2e_test.cu defines for its own
+// root, so the flag and that test cannot drift into two vocabularies:
+//   * empty                   -> how PLE is switched off; never a contradiction
+//   * set, holds a manifest   -> fine
+//   * set, holds no manifest  -> REFUSE, never a skip
+inline void validate_ple_sidecar_root(const std::filesystem::path& root) {
+    if (root.empty()) { return; }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(root / "ple-manifest.json", ec)) {
+        throw std::invalid_argument(
+            "PLE sidecar root '" + root.string() +
+            "' holds no ple-manifest.json, so the PLE n-gram stage would be silently "
+            "absent (it is ADDITIVE, so nothing downstream would notice). PLE needs "
+            "<root>/ple-manifest.json plus <root>/ple/ple-bf16-*.bin; the real table "
+            "is the flashnext_ple workspace directory. Pass an empty value (or omit "
+            "--ple-sidecar) to switch PLE off on purpose.");
+    }
+}
+
 [[nodiscard]] inline bool ple_carrier_class_servable(PleCarrierClass cls) noexcept {
     switch (cls) {
     case PleCarrierClass::MemoryResident: return true;

@@ -1,11 +1,13 @@
 #pragma once
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "targets/qwen3_6/impl/runtime/attn_output_gate_route.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/stage_plan.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
@@ -105,6 +107,199 @@ struct ModelConfig {
             return 0.0f;
         }
     }
+    // ------------------------------------------------------------------ //
+    // The three hooks the Spark-X2.5-4B artifact needs and nothing read.
+    // Named, target-visible, and opt-in: every one is a compile-time NO-OP for an
+    // arch that does not declare it, so the four other targets that share this
+    // runtime (muse_glimmer_30b / qwen3_6_27b / qwen3_6_35b_a3b / qwen3_5_9b) keep
+    // the exact call sequence and the exact constants.  The readings that prove it
+    // are dl/sparkhooks/logs/c01_compile.log; the reason each hook exists is
+    // dl/sparktarget/REPORT.md section 5 (A), (B), (C).
+    // ------------------------------------------------------------------ //
+    //
+    // (A) q/k rmsnorm at the attention entry is UNCONDITIONAL today
+    //     (text_context_impl.h:1204-1205).  Where a checkpoint has no q_norm/k_norm
+    //     object AT ALL, an all-ones stand-in is not the fix: rmsnorm still divides
+    //     by the RMS whatever the weight is.  `FullAttentionWeights::query_norm` is
+    //     a Tensor BY VALUE and `FullLayerW` takes its ADDRESS unconditionally
+    //     (text_context_impl.h:593-594), so there is no "leave it unset" that means
+    //     "skip".  Muse declares qk_norm_enabled() == true
+    //     (muse_glimmer_30b/impl/config.h:74) and the qwen3 family declares nothing,
+    //     so THE DEFAULT IS true and only an arch that says `false` skips.
+    //     spark_x2_5_4b says false (impl/config.h:268), and its checkpoint backs it:
+    //     no q_norm/k_norm key in config.json, no such object among the artifact's
+    //     363 tensors.
+    template <class TC>
+    static constexpr bool qk_norm_impl() {
+        if constexpr (requires { TC::qk_norm_enabled(); }) {
+            return TC::qk_norm_enabled();
+        } else {
+            return true;
+        }
+    }
+    [[nodiscard]] static constexpr bool qk_norm() { return qk_norm_impl<TextConfig>(); }
+    //
+    // (B) rope width and base are single-valued today: one `rotary_dim` constexpr
+    //     slot (this file, :44) and one `rope_theta` (this file, :54), read at one
+    //     call site (text_context_impl.h:1212-1214).  `rope_theta_at` above is
+    //     defined and called from NOWHERE.  Spark rotates 27 layers at 256 @ 10000
+    //     and 9 at 64 @ 5000000 -- and those are NOT copied from a sibling, they are
+    //     the checkpoint's own declaration: config.json `rope_parameters`
+    //     {sliding_attention: partial_rotary_factor 1.0, rope_theta 10000} and
+    //     {full_attention: partial_rotary_factor 0.25, rope_theta 5000000}, against
+    //     `head_dim: 256` -- i.e. 1.0 x 256 = 256 and 0.25 x 256 = 64.
+    //
+    //     THE TRIGGER IS `rotary_dim_at`, NOT `requires { TC::rope_theta_at(0); }`.
+    //     muse_glimmer_30b -- which HAS a runtime -- declares rope_theta_at
+    //     (muse_glimmer_30b/impl/config.h:97) and returns 0.0F on 13 of its 52
+    //     layers (NoPE; counted and asserted at muse_glimmer_30b/impl/config.h:118-124).
+    //     Consuming that accessor on sight would hand those 13 layers theta == 0.0F,
+    //     and ops::rope refuses a non-positive theta by name
+    //     (src/ops/wrapper/rope.cpp:66-68): a hard regression on Muse.  `rotary_dim_at`
+    //     has no such holder -- the only two archs that declare it are gemma4_31b
+    //     (identity-only, no runtime; dl/heritage/REPORT.md 3.4 row 1) and
+    //     spark_x2_5_4b.
+    // ---- (B) THE PER-LAYER TRIGGER TESTS THE DECLARATION, NOT A PROXY FOR IT ----
+    // PRE  was `requires { TC::rotary_dim_at(0); }` ALONE, and muse_glimmer_30b -- which HAS a
+    // runtime -- declares `rope_theta_at` and NOT `rotary_dim_at`, so the trigger read FALSE and
+    // `rope_theta_for()` handed EVERY layer the global `TextConfig::rope_theta`. On muse's 13
+    // NoPE layers (its own config.h asserts `rope_theta_at(l) == 0.0F` for exactly 13 of 52)
+    // that rotated a layer the model declares MUST NOT be rotated, by a theta the arch never
+    // declared for it: rc=0 and a wrong number, silently. The trigger now reads BOTH accessors,
+    // because either one is the arch declaring that this is a per-layer model, and
+    // `rope_is_nope()` below carries the 0.0F case to its own leaf instead of to ops::rope --
+    // which refuses a non-positive theta by name (src/ops/wrapper/rope.cpp:66-68), so the NoPE
+    // path had never been drivable at all.
+    template <class TC>
+    static constexpr bool per_layer_rope_impl() {
+        return requires { TC::rotary_dim_at(0); } || requires { TC::rope_theta_at(0); };
+    }
+    [[nodiscard]] static constexpr bool per_layer_rope() {
+        return per_layer_rope_impl<TextConfig>();
+    }
+    // Whether THIS arch declares a per-layer theta at all. Only such an arch can have a NoPE
+    // layer, and the skip below is compiled only for it, so every other arch keeps the exact
+    // call sequence it had.
+    template <class TC>
+    static constexpr bool rope_declares_theta_impl() { return requires { TC::rope_theta_at(0); }; }
+    [[nodiscard]] static constexpr bool rope_declares_theta() {
+        return rope_declares_theta_impl<TextConfig>();
+    }
+    // THE NoPE GATE. A layer whose DECLARED theta is 0.0F is a layer the reference derivation
+    // passes NO position embeddings for (`position_embeddings if layer_rope_theta[i] else None`):
+    // it must receive no rotation at all, which is a different thing from being rotated by the
+    // global default. The population is asserted by the arch's own static_assert (muse: 13).
+    template <class TC>
+    static constexpr bool rope_is_nope_impl(int fidx) {
+        if constexpr (requires { TC::rope_theta_at(0); }) {
+            return per_layer_rope_impl<TC>() &&
+                   TC::rope_theta_at(layer_of_full_impl<TC>(fidx)) == 0.0F;
+        }
+        return false;
+    }
+    [[nodiscard]] static constexpr bool rope_is_nope(int fidx) {
+        return rope_is_nope_impl<TextConfig>(fidx);
+    }
+    // Same detection idiom as rope_theta_at_impl above: an arch that declares the
+    // accessor gets it; every other arch keeps the single TextConfig::rotary_dim
+    // slot it has always used.
+    template <class TC>
+    static constexpr int rotary_dim_at_impl(int layer) {
+        if constexpr (requires { TC::rotary_dim_at(0); }) {
+            return TC::rotary_dim_at(layer);
+        } else {
+            return TC::rotary_dim;
+        }
+    }
+    [[nodiscard]] static constexpr int rotary_dim_at(int layer) {
+        return rotary_dim_at_impl<TextConfig>(layer);
+    }
+    // `fidx` is a FULL-layer index -- the coordinate `layer_of_full` and the call
+    // site use -- while the per-kind tables are indexed by MODEL layer, so the
+    // composition goes through layer_of_full and never through fidx directly.
+    // When the arch does not opt in these are the two constants the call site used
+    // before, and `if constexpr` means the per-layer branch is not instantiated.
+    [[nodiscard]] static constexpr int rope_dim_for(int fidx) {
+        if constexpr (per_layer_rope()) {
+            return rotary_dim_at(layer_of_full(fidx));
+        } else {
+            return TextConfig::rotary_dim;
+        }
+    }
+    [[nodiscard]] static constexpr float rope_theta_for(int fidx) {
+        if constexpr (per_layer_rope()) {
+            return rope_theta_at(layer_of_full(fidx));
+        } else {
+            return TextConfig::rope_theta;
+        }
+    }
+    //
+    // (C) the attention-output gate.  The family hands it to the leaf as a
+    //     {head_dim, n_q, T} view flattened to {q_size, T}, and then to
+    //     ops::sigmoid_mul (text_context_impl.h:1284).  sigmoid_mul picks its
+    //     headwise route BY SHAPE -- `headwise_gate_shape`, src/ops/wrapper/
+    //     sigmoid_mul.cpp:34-37, dispatched at :48 -- and the contract it serves is
+    //     stated in src/ops/launcher/sigmoid_gate_mul.h:16-19: x is [head_dim, H, T]
+    //     and gate is [H, T], one sigmoid per (head, token) broadcast over the
+    //     head_dim axis.  Spark's gate is 16 rows, not 4096 (`headwise_attn_output_
+    //     gate: true`, `gate_attn_act_mode: "sigmoid"`, `num_attention_heads: 16`),
+    //     and 256 == 16 is FALSE, so a {256,16,T} gate falls through to the
+    //     PER-ELEMENT route -- which ACCEPTS the pair and multiplies `a` by gate rows
+    //     16..4095, numbers this target never wrote.  Silent wrong number.  The
+    //     routing decision IS the shape, so the family must hand a headwise gate over
+    //     2-D, and the two declarations are cross-checked at namespace scope just
+    //     below the class (see the static_assert after kCfg).
+    template <class TC>
+    static constexpr int gate_rows_impl() {
+        if constexpr (requires { TC::attention_gate_rows; }) {
+            return TC::attention_gate_rows;
+        } else {
+            return TC::query_size;
+        }
+    }
+    [[nodiscard]] static constexpr int gate_rows() { return gate_rows_impl<TextConfig>(); }
+    // ---- (C') THE GATE IS DECIDED BY THE ARCH'S OWN DECLARATIONS, NOT BY A SHAPE ----
+    // `headwise_gate_declared_impl` / `gate_rows_declared_impl` exist so that "the arch declares
+    // false" and "the arch declares NOTHING" are DISTINGUISHABLE FACTS: that difference is the
+    // whole defect this reader closes (impl/runtime/attn_output_gate_route.h (A)). The route is
+    // read from the table in that header by the arch's DECLARED GATE TRIPLE; a triple with no row
+    // is REFUSED BY NAME by the namespace-scope static_assert below and, at runtime, by
+    // `gate_route_refusal()`.
+    template <class TC>
+    static constexpr bool headwise_gate_declared_impl() {
+        return requires { TC::headwise_attn_output_gate_enabled(); };
+    }
+    template <class TC>
+    static constexpr bool gate_rows_declared_impl() { return requires { TC::attention_gate_rows; }; }
+    template <class TC>
+    static constexpr bool headwise_gate_impl() {
+        if constexpr (headwise_gate_declared_impl<TC>()) {
+            return TC::headwise_attn_output_gate_enabled();
+        } else {
+            return false;
+        }
+    }
+    [[nodiscard]] static constexpr bool headwise_gate_declared() {
+        return headwise_gate_declared_impl<TextConfig>();
+    }
+    [[nodiscard]] static constexpr bool gate_rows_declared() {
+        return gate_rows_declared_impl<TextConfig>();
+    }
+    [[nodiscard]] static constexpr attn_output_gate_route::GateRoute gate_route() {
+        return attn_output_gate_route::gate_route_for(
+            headwise_gate_declared_impl<TextConfig>(), headwise_gate_impl<TextConfig>(),
+            gate_rows_declared_impl<TextConfig>(), gate_rows_impl<TextConfig>(),
+            TextConfig::query_size);
+    }
+    [[nodiscard]] static constexpr bool headwise_gate() {
+        return gate_route() == attn_output_gate_route::GateRoute::Headwise;
+    }
+    [[nodiscard]] static std::string gate_route_refusal() {
+        return attn_output_gate_route::attn_output_gate_refusal(
+            headwise_gate_declared_impl<TextConfig>(), headwise_gate_impl<TextConfig>(),
+            gate_rows_declared_impl<TextConfig>(), gate_rows_impl<TextConfig>(),
+            TextConfig::query_size);
+    }
     [[nodiscard]] static constexpr float rope_theta_at(int layer) {
         return rope_theta_at_impl<TextConfig>(layer);
     }
@@ -165,6 +360,46 @@ struct ModelConfig {
 };
 
 inline constexpr ModelConfig kCfg{};
+// THE BRIDGE TO ops::sigmoid_mul IS A SHAPE, AND THE ROUTE IS NOT: sigmoid_mul chooses by shape
+// (src/ops/wrapper/sigmoid_mul.cpp's `headwise_gate_shape`, then the per-element loop), so an arch
+// that says "headwise" while leaving its gate query_size wide would silently take the PER-ELEMENT
+// route and read gate rows it never wrote. Refused at compile time, at namespace scope because the
+// class is not complete inside its own definition (see the two rejected placements recorded in
+// dl/sparkhooks/sh/b01_patch.py).
+//
+// * THIS FIRST ASSERT IS THE PRE GUARD, INVERTED, AND THE INVERSION IS THE FIX (accfix F910). *
+// PRE  was  `!headwise_gate() || gate_rows() != query_size`, whose arming condition IS the
+// accessor that may be missing: an arch that OMITS `headwise_attn_output_gate_enabled()` reads
+// `false`, the guard is satisfied VACUOUSLY, and the omission DISARMS THE GUARD IT EXISTS FOR.
+// POST arms it on the DECLARATION OF THE GATE instead: an arch that declares a row count the
+// per-element route cannot accept must be able to say why, and if it cannot, the build stops here
+// with the arch's own declaration in the message.
+static_assert(!ModelConfig::gate_rows_declared() ||
+                  ModelConfig::gate_rows() == TextConfig::query_size ||
+                  ModelConfig::headwise_gate(),
+              "this arch DECLARES attention_gate_rows with a value the per-element route cannot "
+              "accept, which IS a headwise gate, but it does not declare "
+              "headwise_attn_output_gate_enabled(). Add that declaration, or declare the gate row "
+              "count as query_size. THE GUARD IS ARMED BY THE GATE'S OWN DECLARATION, NOT BY THE "
+              "DECLARATION OF HEADWISE-NESS: the PRE guard's arming condition was the very "
+              "accessor whose omission it existed to catch.");
+// And the PRE clause is KEPT -- a headwise gate must still have a row count the per-element route
+// cannot accept, or the two legal shapes would both reach it.
+static_assert(!ModelConfig::headwise_gate() ||
+                  ModelConfig::gate_rows() != TextConfig::query_size,
+              "a headwise output gate must have a row count the per-element route "
+              "cannot accept, or src/ops/wrapper/sigmoid_mul.cpp:34-37 routes it "
+              "elementwise and reads gate rows the target never wrote");
+// THE REGISTRATION. The identity is the DECLARED GATE TRIPLE and not the geometry -- (16 q / 4 kv /
+// 256) is both spark_x2_5_4b (headwise) and qwen3_5_9b (per-channel). A triple with no row is
+// REFUSED HERE, by name, with the arch's own declaration and every registered row in the message.
+static_assert(ModelConfig::gate_route() != attn_output_gate_route::GateRoute::Unregistered,
+              "attn output gate: this arch's DECLARED GATE TRIPLE has no registered row (see "
+              "impl/runtime/attn_output_gate_route.h). Before this seam an absent headwise "
+              "accessor took a SILENT DEFAULT of false and the launch returned rc=0 with a "
+              "different answer; the resting state is now a refusal that names the fingerprint, "
+              "so add the arch's row to kRegisteredAttnOutputGates (with the arch's own "
+              "impl/config.h as its evidence) or fix the declarations it disagrees with.");
 inline constexpr float kAttnScale                     = kAttentionScale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
@@ -256,6 +491,20 @@ class VisionPrefillSession;
 
 class TextContext {
 public:
+    // --stage-layers SPEC / --stage-handoff DIR / --stage-handoff-cut. THE entry point of the
+    // layer-range surface: parses the raw spec with core/stage_plan.h (the one parser), then
+    // refuses BY NAME -- before a single layer is walked -- a spec that is mis-shaped
+    // (refused-stage-layers), that is not a cover of this model's text layers
+    // (refused-stage-layers-partition), or that is not a shard of the world the RANK AXIS
+    // derives for THIS model's geometry (refused-stage-layers-axis, decided by plan_shards()
+    // itself rather than by a second derivation of the balanced split). `spec` empty is the
+    // flag-absent state and is a no-op.
+    //
+    // It does NOT call validate_virtual_request() and it does not move that guard's answer:
+    // for axis=pp that guard returns active = 0 and STAYS 0. This makes pp REACHABLE, not
+    // universally SUPPORTED -- the run shapes a partial range cannot carry are refused below
+    // in core/stage_plan.h's stage_layers_run_shape_refusal().
+    void set_stage_layers_spec(std::string_view spec, std::string handoff_dir, bool handoff_cut);
     void set_graph_segment(std::int32_t segment, std::int32_t segments) noexcept {
         active_graph_segment_  = segment;
         active_graph_segments_ = segments;
@@ -443,6 +692,18 @@ private:
     // Optional layer window for segmented graph capture. last < first disables.
     std::int32_t active_layer_first_                                               = 0;
     std::int32_t active_layer_last_                                                = -1;
+    // --stage-layers: the parsed stage partition. `requested == false` (the default, the
+    // flag-absent state) makes the layer walk in run_layers() exactly `0 .. kCfg.n_layers - 1`,
+    // i.e. byte-for-byte the single walk it was before this surface existed.
+    multi::StagePlan stage_plan_;
+    std::string stage_handoff_dir_;
+    bool stage_handoff_cut_ = false;
+    // The seam's payload, written by the producing stage and read by the consuming one: raw
+    // bytes of the hidden tensor plus a header carrying a magic, the producing layer, the
+    // element count and an FNV-1a, so a payload left over from another prompt is DETECTABLE
+    // rather than silently consumed.
+    void stage_handoff_read(Tensor& x);
+    void stage_handoff_write(Tensor& x, int layer_last);
     // Segmented decode state: when active_graph_segments_ > 1 each
     // ordinary_decode_batch call executes only its slice of the forward pass.
     std::int32_t active_graph_segment_                                             = 0;
@@ -475,3 +736,4 @@ private:
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+

@@ -1,5 +1,9 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ops/launcher/speculative_round.h"
+#include "ops/launcher/speculative_accept_tree.h"   // F904
+#include "ops/launcher/speculative_accept_tree.h"   // F904
+#include "ops/launcher/speculative_accept_tree.h"   // F904
+#include "ops/stream_capture.h"   // F881: the one capture-predicate reader
 
 #include <algorithm>
 #include <cstdint>
@@ -168,29 +172,49 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                      static_cast<long long>(column_masks.nb[2]),
                      static_cast<long long>(column_masks.nb[3]));
         if (accmask_bound != 0) {
-            const std::int32_t accmask_cols = k + 1;
-            std::vector<std::uint64_t> accmask_host(
-                static_cast<std::size_t>(accmask_cols) * static_cast<std::size_t>(batch),
-                std::uint64_t{0});
-            const int accmask_sync_rc = static_cast<int>(cudaStreamSynchronize(stream));
-            const int accmask_copy_rc = static_cast<int>(cudaMemcpyAsync(
-                accmask_host.data(), column_masks.data,
-                accmask_host.size() * sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
-            const int accmask_drain_rc = static_cast<int>(cudaStreamSynchronize(stream));
-            std::fprintf(stderr,
-                         "[accmask] round=%d sync_rc=%d copy_rc=%d drain_rc=%d\n", accmask_round,
-                         accmask_sync_rc, accmask_copy_rc, accmask_drain_rc);
-            for (std::int32_t accmask_r = 0; accmask_r < batch; ++accmask_r) {
-                std::fprintf(stderr, "[accmask] round=%d row=%d masks:", accmask_round,
-                             static_cast<int>(accmask_r));
-                for (std::int32_t accmask_c = 0; accmask_c < accmask_cols; ++accmask_c) {
-                    std::fprintf(stderr, " %llu",
-                                 static_cast<unsigned long long>(
-                                     accmask_host[static_cast<std::size_t>(accmask_r) *
-                                                      accmask_cols +
-                                                  static_cast<std::size_t>(accmask_c)]));
+            // F881 -- GUARD, and the observation it suppresses is NAMED below.
+            // The two `cudaStreamSynchronize` calls and the ordered D2H in this branch are the
+            // capture-incompatible pair the NOTE above has always warned about. Ask the stream the
+            // round is actually launched on (ops/stream_capture.h, the same predicate
+            // `acceptlog_capturing` delegates to), and when a capture is in flight SKIP the
+            // readback rather than killing the process at the next CUDA_CHECK.
+            // WHAT IS LOST: the mask VALUES and the sync/copy/drain return codes, on captured
+            // rounds only. WHAT IS KEPT: the pointer / bound / ne / nb line printed above, which
+            // issues NO CUDA call and is therefore capture-legal -- so the world-(A)/(B)
+            // discriminator (`column_masks.data != nullptr`) remains answerable on a captured
+            // round. The VALUES are obtainable eagerly with `--no-cuda-graph`, and a REPLAYED
+            // round has no readback to make anyway (a capture body runs once).
+            if (ops::stream_is_capturing(stream)) {
+                std::fprintf(stderr,
+                             "[accmask] round=%d readback=SKIPPED stream-capture-in-flight "
+                             "(no sync and no cudaMemcpy may be issued while capturing; re-run "
+                             "with --no-cuda-graph for the mask values)\n",
+                             accmask_round);
+            } else {
+                const std::int32_t accmask_cols = k + 1;
+                std::vector<std::uint64_t> accmask_host(
+                    static_cast<std::size_t>(accmask_cols) * static_cast<std::size_t>(batch),
+                    std::uint64_t{0});
+                const int accmask_sync_rc = static_cast<int>(cudaStreamSynchronize(stream));
+                const int accmask_copy_rc = static_cast<int>(cudaMemcpyAsync(
+                    accmask_host.data(), column_masks.data,
+                    accmask_host.size() * sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
+                const int accmask_drain_rc = static_cast<int>(cudaStreamSynchronize(stream));
+                std::fprintf(stderr,
+                             "[accmask] round=%d sync_rc=%d copy_rc=%d drain_rc=%d\n",
+                             accmask_round, accmask_sync_rc, accmask_copy_rc, accmask_drain_rc);
+                for (std::int32_t accmask_r = 0; accmask_r < batch; ++accmask_r) {
+                    std::fprintf(stderr, "[accmask] round=%d row=%d masks:", accmask_round,
+                                 static_cast<int>(accmask_r));
+                    for (std::int32_t accmask_c = 0; accmask_c < accmask_cols; ++accmask_c) {
+                        std::fprintf(stderr, " %llu",
+                                     static_cast<unsigned long long>(
+                                         accmask_host[static_cast<std::size_t>(accmask_r) *
+                                                          accmask_cols +
+                                                      static_cast<std::size_t>(accmask_c)]));
+                    }
+                    std::fprintf(stderr, "\n");
                 }
-                std::fprintf(stderr, "\n");
             }
         }
         ++accmask_round;
@@ -229,6 +253,43 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
         target_tokens, logits, drafts, current_extents, column_masks, lengths, anchors,
         licensed_tokens, licensed_counts, accepted, accepted_columns, token_domain, configs,
         draft_ids, draft_probs, scratch, stream);
+
+    // =========================================================================================
+    // F904 -- ONE RULE, ONE OP, TWO ROUTES, AND ONLY ONE OF THEM IMPLEMENTED IT.
+    //
+    // THE DEFECT, MEASURED ON THIS ARTIFACT. `column_masks` is bound exactly on a tree round
+    // (--draft-tree L>1). The Op has two accept routes and only the single-block one reads the
+    // mask: `kernel/speculative_round.cuh`'s `speculative_accept_greedy_drafts_kernel` (`:142`)
+    // branches on it and applies the parent-column rule, while the multiblock route's
+    // `speculative_sampling_group_finalize_kernel` (`:483-486`) takes neither the mask nor the
+    // published column and runs the CHAIN prefix test
+    //     while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
+    // over a DEPTH-MAJOR tree frame. On the sibling lattice
+    // (targets/qwen3_6/impl/runtime/mtp_tree_produce.h:209-223) column 1 + s*L + i carries node
+    // (s,i) whose parent is column 1 + (s-1)*L, so that test compares a column against a SIBLING's
+    // token and stops at the first non-spine column; and it never writes `accepted_columns`, which
+    // kernel/speculative_round.cuh:207-210, ops/launcher/speculative_round.cu:84-85 and
+    // targets/qwen3_6/impl/runtime/speculative_target_impl.h:236 all rely on being written.
+    // WHICH ROUTE RUNS IS NOT EXOTIC: sampler_multiblock_ok (ops/common/sampling_workspace.h:38-43)
+    // holds for token_domain 248077 with 8 columns AND with 15, so EVERY speculative accept on this
+    // artifact takes the multiblock route, tree or chain.
+    //
+    // THE MEASUREMENT THAT SAYS THIS IS WHERE THE COST IS, not an argument: on ONE tree round's OWN
+    // `extent`/`drafts[]`/`targets[]`/`column_masks` row, the observed rule reproduces the
+    // published `accepted` on 24 of 24 rounds, while the contract's rule on the SAME row asks for
+    // 4.625 tokens/round against the published 1.958 (bin/accpred.py over the engine's own
+    // NINFER_ACCEPTLOG + `[accmask]` output; the ratio is 2.362x).
+    //
+    // SO THE ROUND'S PUBLISHED ACCEPT IS RECOMPUTED HERE, with the contract's rule, on the same
+    // stream, in the window between the accept launch and the first reader of its values. The
+    // multiblock finalize kernel keeps its chain rule in source: this SUPERSEDES its result, and
+    // that is stated rather than smoothed.
+    // =========================================================================================
+    if (column_masks.data != nullptr && k + 1 <= detail::kTreeAcceptMaximumWidth) {
+        detail::speculative_accept_tree_greedy_overwrite(
+            target_tokens, drafts, current_extents, column_masks, lengths, anchors, licensed_tokens,
+            licensed_counts, accepted, accepted_columns, token_domain, configs, stream);
+    }
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

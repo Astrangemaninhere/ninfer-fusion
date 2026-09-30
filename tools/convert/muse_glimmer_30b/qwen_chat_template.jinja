@@ -1,170 +1,351 @@
-{%- set image_count = namespace(value=0) %}
-{%- set video_count = namespace(value=0) %}
-{%- macro render_content(content, do_vision_count, is_system_content=false) %}
-    {%- if content is string %}
-        {{- content }}
-    {%- elif content is iterable and content is not mapping %}
-        {%- for item in content %}
-            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
-                {%- if is_system_content %}
-                    {{- raise_exception('System message cannot contain images.') }}
-                {%- endif %}
-                {%- if do_vision_count %}
-                    {%- set image_count.value = image_count.value + 1 %}
-                {%- endif %}
-                {%- if add_vision_id %}
-                    {{- 'Picture ' ~ image_count.value ~ ': ' }}
-                {%- endif %}
-                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
-            {%- elif 'video' in item or item.type == 'video' %}
-                {%- if is_system_content %}
-                    {{- raise_exception('System message cannot contain videos.') }}
-                {%- endif %}
-                {%- if do_vision_count %}
-                    {%- set video_count.value = video_count.value + 1 %}
-                {%- endif %}
-                {%- if add_vision_id %}
-                    {{- 'Video ' ~ video_count.value ~ ': ' }}
-                {%- endif %}
-                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
-            {%- elif 'text' in item %}
-                {{- item.text }}
-            {%- else %}
-                {{- raise_exception('Unexpected item type in content.') }}
-            {%- endif %}
-        {%- endfor %}
-    {%- elif content is none or content is undefined %}
-        {{- '' }}
-    {%- else %}
-        {{- raise_exception('Unexpected content type.') }}
-    {%- endif %}
-{%- endmacro %}
-{%- if not messages %}
-    {{- raise_exception('No messages provided.') }}
-{%- endif %}
-{%- set reasoning_instructions = '' %}
-{%- if enable_thinking is undefined or enable_thinking is true %}
-    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
-    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
-        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}
-    {%- endif %}
-    {%- if resolved_reasoning_effort == 'xhigh' %}
-        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
-    {%- elif resolved_reasoning_effort == 'low' %}
-        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
-    {%- endif %}
-{%- endif %}
-{%- if tools and tools is iterable and tools is not mapping %}
-    {{- '<|im_start|>system\n' }}
-    {%- if reasoning_instructions %}
-        {{- reasoning_instructions + '\n\n' }}
-    {%- endif %}
-    {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
-    {%- for tool in tools %}
-        {{- "\n" }}
-        {{- tool | tojson }}
-    {%- endfor %}
-    {{- "\n</tools>" }}
-    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
-    {%- if messages[0].role == 'system' %}
-        {%- set content = render_content(messages[0].content, false, true)|trim %}
-        {%- if content %}
-            {{- '\n\n' + content }}
-        {%- endif %}
-    {%- endif %}
-    {{- '<|im_end|>\n' }}
-{%- else %}
-    {%- if messages[0].role == 'system' %}
-        {%- set content = render_content(messages[0].content, false, true)|trim %}
-        {%- if content %}
-            {{- '<|im_start|>system\n' + (reasoning_instructions + '\n\n' if reasoning_instructions else '')  + content + '<|im_end|>\n' }}
-        {%- elif reasoning_instructions %}
-            {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
-        {%- endif %}
-    {%- elif reasoning_instructions %}
-        {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
-    {%- endif %}
-{%- endif %}
-{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
-{%- for message in messages[::-1] %}
-    {%- set index = (messages|length - 1) - loop.index0 %}
-    {%- if ns.multi_step_tool and message.role == "user" %}
-        {%- set content = render_content(message.content, false)|trim %}
-        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
-            {%- set ns.multi_step_tool = false %}
-            {%- set ns.last_query_index = index %}
-        {%- endif %}
-    {%- endif %}
-{%- endfor %}
-{%- if ns.multi_step_tool %}
-    {{- raise_exception('No user query found in messages.') }}
-{%- endif %}
-{%- for message in messages %}
-    {%- set content = render_content(message.content, true)|trim %}
-    {%- if message.role == "system" %}
-        {%- if not loop.first %}
-            {{- raise_exception('System message must be at the beginning.') }}
-        {%- endif %}
-    {%- elif message.role == "user" %}
-        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
-    {%- elif message.role == "assistant" %}
-        {%- set reasoning_content = '' %}
-        {%- if message.reasoning_content is string %}
-            {%- set reasoning_content = message.reasoning_content %}
-        {%- endif %}
-        {%- set reasoning_content = reasoning_content|trim %}
-        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
-            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
-        {%- else %}
-            {{- '<|im_start|>' + message.role + '\n' + content }}
-        {%- endif %}
-        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
-            {%- for tool_call in message.tool_calls %}
-                {%- if tool_call.function is defined %}
-                    {%- set tool_call = tool_call.function %}
-                {%- endif %}
-                {%- if loop.first %}
-                    {%- if content|trim %}
-                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
-                    {%- else %}
-                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
-                    {%- endif %}
-                {%- else %}
-                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
-                {%- endif %}
-                {%- if tool_call.arguments is defined and tool_call.arguments != '' %}
-                    {%- for args_name, args_value in tool_call.arguments|items %}
-                        {{- '<parameter=' + args_name + '>\n' }}
-                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
-                        {{- args_value }}
-                        {{- '\n</parameter>\n' }}
-                    {%- endfor %}
-                {%- endif %}
-                {{- '</function>\n</tool_call>' }}
-            {%- endfor %}
-        {%- endif %}
-        {{- '<|im_end|>\n' }}
-    {%- elif message.role == "tool" %}
-        {%- if loop.previtem and loop.previtem.role != "tool" %}
-            {{- '<|im_start|>user' }}
-        {%- endif %}
-        {{- '\n<tool_response>\n' }}
-        {{- content }}
-        {{- '\n</tool_response>' }}
-        {%- if not loop.last and loop.nextitem.role != "tool" %}
-            {{- '<|im_end|>\n' }}
-        {%- elif loop.last %}
-            {{- '<|im_end|>\n' }}
-        {%- endif %}
-    {%- else %}
-        {{- raise_exception('Unexpected message role.') }}
-    {%- endif %}
-{%- endfor %}
-{%- if add_generation_prompt %}
-    {{- '<|im_start|>assistant\n' }}
-    {%- if enable_thinking is defined and enable_thinking is false %}
-        {{- '<think>\n\n</think>\n\n' }}
-    {%- else %}
-        {{- '<think>\n' }}
-    {%- endif %}
-{%- endif %}
+      "ÑĥÐº ÑĢÐ°",
+      "ĠÐĽ ÐµÑĤ",
+      "ĠìĥģëĮĢ ë°©",
+      "Ġìļ°ë¦¬ ë¥¼",
+      "ãĥĩãĤ£ ãĤ¹ãĤ¯",
+      "ens if",
+      "ic ier",
+      "ÐºÐ°ÑĢ Ð±Ð¾",
+      "Ð¿Ð¾Ð´ Ð¾Ð±",
+      "à¸¡à¸²à¸£ à¸±à¸ļ",
+      "Ġdef i",
+      "Ġdr an",
+      "Ġod st",
+      "ĠÐļ Ð°ÑĢÐµ",
+      "ĠÐļ ÑĢÑĥÐ¿",
+      "ĠÐ¸ Ð½ÑĭÐ¼",
+      "ĠÑı ÑĩÐµÐ¹",
+      "ĠìĿ´ìķ¼ ê¸°ê°Ģ",
+      "par ole",
+      "ĠPier o",
+      "ĠgeÃ§ er",
+      "Ġk upon",
+      "Ġreg ro",
+      "Ġves el",
+      "ĠÎ¿ ÏģÎ³Î±Î½",
+      "ĠØ¢Ø®Ø± ÛĮÙĨ",
+      "ĠÙģØ¶ ÙĦØ§Ùĭ",
+      "ĠÙħØ¹ Ø±ÙĥØ©",
+      "ti erten",
+      "ĠProp or",
+      "ĠRud olf",
+      "ĠSCU OLA",
+      "Ġdis ana",
+      "ĠdÃ© bito",
+      "Ġmodel u",
+      "ĠrÃ© cent",
+      "Ġsog lia",
+      "Ġver mek",
+      "ĠÐ¸ Ð¼ÐµÐ½",
+      "ĠÐ¸Ð¼ÐµÐ½ ÐµÐ¼",
+      "ĠÑĢÐ°Ð· Ð±Ð¾ÑĢ",
+      "ĠØ§ÙĦÙĥ ÙĦÙħ",
+      "ĠØ§ÙĦÙĥÙĦÙħ Ø©",
+      "aft arkan",
+      "ĠCast elo",
+      "Ġinte ira",
+      "Ġprz eds",
+      "Ġprzeds z",
+      "ĠÐ²Ð¾Ð¿ÑĢÐ¾Ñģ Ðµ",
+      "ĠØ§ÙĦØ¬ÙĨ ÙĪØ¨ÙĬ",
+      "ĠHin blick",
+      "Ġauxqu els",
+      "Ġexecut ar",
+      "Ġkal ender",
+      "ĠÑĢÐ°ÑģÑĩÐµÑĤ Ð¾Ð²",
+      "ĠÐŁÐ¾Ð»Ð¾ Ð¶ÐµÐ½Ð¸Ðµ",
+      "ĠRein igungs",
+      "ĠÐ¸Ð½ÑĤÐµÑĢÐµÑģ Ð½Ð¾Ðµ",
+      "ĠÐ¾Ð´ Ð½Ð¾Ð²ÑĢÐµÐ¼ÐµÐ½",
+      "ĠÐ¿ÑĢÐ¾Ð¸Ð·Ð²Ð¾Ð´ Ð¸ÑĤ",
+      "Ġtestimon ianza",
+      "Ø¦ Ø±",
+      "ë°© ì§Ģ",
+      "ìłĦ íĺķ",
+      "Ð¶ ÑĥÑİ",
+      "Ø§ÙĦ Ø±",
+      "ÙĪØ³ ÛĮ",
+      "ÙĪÛĮ ÙĦ",
+      "æĢĿ ãĤıãģļ",
+      "r ira",
+      "t ova",
+      "Ø¬Ùħ Ø§ÙĦ",
+      "ĠB ES",
+      "ĠDe j",
+      "V ille",
+      "de les",
+      "eb ben",
+      "eva ar",
+      "ka art",
+      "à®³à¯įà®³ à®¤à¯ģ",
+      "ĠD ANS",
+      "ved ere",
+      "Ð³Ð»Ðµ Ð¶Ð´Ð°",
+      "Ġber in",
+      "Ġnow ej",
+      "Ġpod io",
+      "Ġsc urt",
+      "Ġzdro j",
+      "ĠÐ·Ð²Ñĥ ÐºÐ°",
+      "ĠØ±ÙĬØ§ Ø¶Ø©",
+      "ĠAd esso",
+      "ĠK ampus",
+      "ĠSat uan",
+      "Ġbas ura",
+      "ĠlanÃ§ ar",
+      "ĠÃ©c rite",
+      "ĠÃ©p ouse",
+      "ĠÐļÑĭ ÑĢÐ³ÑĭÐ·",
+      "ĠTurqu ie",
+      "Ġapro bar",
+      "Ġattend u",
+      "ĠtÅĤ uszcz",
+      "Ġvyro ben",
+      "Ġavanz ado",
+      "Ġobten ido",
+      "Ġont staan",
+      "Ġpart ijen",
+      "ĠsaÄŁ layan",
+      "Ġcondu cciÃ³n",
+      "ĠÑĤÐµÑĢÑĢÐ¸ÑĤ Ð¾ÑĢÐ¸Ñı",
+      "Ġplate formes",
+      "Ġrisparmi are",
+      "ĠÃĸff nungszeiten",
+      "ÙĬ ÙĬ",
+      "à¤Ł à¤ķ",
+      "à´° àµĨ",
+      "à¸Ħ à¸ļ",
+      "ãĥĻ ãĤ¤",
+      "N go",
+      "Ùħ Ø¯Ø©",
+      "ĠS á»ķ",
+      "ĠÐ¼ Ò¯",
+      "Ġà®ķ à¯ĩ",
+      "ĠáĥĲ áĥ¡",
+      "ĠìĹ° ê´Ģ",
+      "Ġíķ© ë³ĳ",
+      "IT AR",
+      "ut io",
+      "ÐĹ Ð¾Ð»Ð¾",
+      "ĠÐ´Ð° Ð¼",
+      "ĠÙĤ ÙĪÙħ",
+      "Ġë³µìŀ¡ íķľ",
+      "æĿ¥ ãģ¾ãģĹãģŁ",
+      "V amos",
+      "y bers",
+      "y kker",
+      "ĠPH ÃģT",
+      "ĠTH ÃĬM",
+      "Ġdo by",
+      "Ġd Ã¶nt",
+      "ĠÏĥÎ¿ Î²Î±",
+      "ĠÐĶ ÐµÐ¼Ð¾",
+      "ĠÐ¸Ñİ Ð½Ðµ",
+      "ĠÐ¿ Ð¸Ð²Ð¾",
+      "ĠØ£ÙĤ ÙĪÙī",
+      "ĠØ§ÙĦØ± Ø´",
+      "ĠØ¨Ø® Ø´ÛĮ",
+      "ĠÙħÛĮØ± Ø³",
+      "Ġà¸Ħ à¸Ńà¸£à¹Į",
+      "Î¬Î» Î¹ÏĥÏĦÎ±",
+      "ĠGall i",
+      "Ġsed ih",
+      "Ġsu olo",
+      "ĠsvÄĽ ta",
+      "ĠØ§ÙĦÙħ ØµØ±",
+      "ĠÙĨÙĪØ¹ ÙĬØ©",
+      "an iques",
+      "enf ance",
+      "ĠRab att",
+      "Ġatmos f",
+      "Ġes empi",
+      "Ġà¹Ĥà¸Ķà¸¢ à¹ĥà¸Ĭà¹ī",
+      "ĠF uentes",
+      "ĠPesc ara",
+      "Ġà¸Ńà¸¢à¸¹à¹Ī à¸Ĺà¸µà¹Ī",
+      "Ġexist ent",
+      "Ġpot Ãªncia",
+      "ĠCual quier",
+      "Ġarg omento",
+      "Ġbert empat",
+      "Ġstab ilitÃ©",
+      "Ġexter iores",
+      "Ġpreced enza",
+      "ĠÐ°Ð½Ð³Ð»Ð¸Ð¹ ÑģÐºÐ¾Ð¼",
+      "ĠErweiter ung",
+      "Ġconsequ Ãªncias",
+      "Ġrepresent aÃ§Ã£o",
+      "íķ´ ìĻ¸",
+      "L av",
+      "h re",
+      "Ùģ ÙĬØª",
+      "à¸Ļ à¸²à¸§",
+      "ĠÐĽ Ðĺ",
+      "ĠÐ¤ Ðķ",
+      "Ġà¤ª à¥ĩ",
+      "Ġìŀħ ì£¼",
+      "ãĤĴ æºĢãģŁ",
+      "ãĥĴ ãĥ³ãĥĪ",
+      "ë¸Į ëŀľëĵľ",
+      "F ach",
+      "m Ã¡ny",
+      "Å¾en Ã½",
+      "Ð»Ñĸ Ð·Ñĥ",
+      "Ø§Ø¨ ÙĬØ±",
+      "à¹īà¸² à¸£à¸°",
+      "ĠB PK",
+      "ĠC Ã´n",
+      "Ġre h",
+      "Ġìļ´ ëıĻìĿĦ",
+      "ãģĹãģŁ ãĤĤãģ®",
+      "m ooth",
+      "ĠB Ã¼nd",
+      "Ġres i",
+      "Ġwy zw",
+      "Ġy olu",
+      "ĠÐ¸Ð¼Ðµ Ñı",
+      "ĠÙħ Ø¨ÙĨÙī",
+      "Ġà¤¸à¤ķ à¤¤à¥Ģ",
+      "Ġ ãģĵãģĨãģĦãģĨ",
+      "Ġìĺ¤ëŀ« ëıĻìķĪ",
+      "att ung",
+      "ĠHor as",
+      "ĠPH ÃĴNG",
+      "Ġdent i",
+      "ĠÐµ ÑħÐ°ÑĤÑĮ",
+      "ĠÐ·Ð² ÑĥÑĩ",
+      "ĠÐ·Ð²ÑĥÑĩ Ð°",
+      "ĠÙĦÙħ Ø¬ÙĦØ³",
+      "ĠÚ©ÙĪØª Ø§Ùĩ",
+      "bah nhof",
+      "p Ã¤d",
+      "pÃ¤d agog",
+      "ĠBel ieb",
+      "ĠMon ika",
+      "Ġag rega",
+      "Ġdot ata",
+      "Ġober en",
+      "Ġpert ar",
+      "ĠÐ²Ñĭ ÑħÐ¾Ð´Ðµ",
+      "gef unden",
+      "Ġcomp one",
+      "Ġprz eczy",
+      "Ġren trer",
+      "Ġriv olta",
+      "ĠÐ¸Ð½ ÑĨÐ¸Ð´ÐµÐ½",
+      "Ġmod ellen",
+      "Ġpre stit",
+      "Ġprestit o",
+      "Ġreg isztr",
+      "Ġriun ione",
+      "Ġteknolo j",
+      "ĠÐ²Ð¸Ð½Ð¾ Ð³ÑĢÐ°Ð´",
+      "ĠÐ´Ð¾ ÐºÐ°Ð·Ð°ÑĤÑĮ",
+      "ĠÑģÑĤÑĢÐ° Ð´Ð°ÐµÑĤ",
+      "Ġdel icios",
+      "Ġdelicios o",
+      "Ġvert ellen",
+      "Ġsentiment i",
+      "Ġson rasÄ±nda",
+      "ĠÑģÑĤÐ°Ð½Ð´Ð°ÑĢ ÑĤÐ°Ð¼",
+      "Ġpublic idade",
+      "Ġà¸¥à¹īà¸²à¸Ļ à¸Ķà¸Ńà¸¥à¸¥à¸²à¸£à¹Į",
+      "Ġà¸«à¸¥à¸±à¸ĩà¸Īà¸²à¸ģ à¸Ļà¸±à¹īà¸Ļ",
+      "Ġproces amiento",
+      "Ġprovved imenti",
+      "Ġspecial izzata",
+      "Ûķ Ú©",
+      "à¸ŀ à¸±à¸ļ",
+      "à¹ģà¸ģ à¸°",
+      "ĠB á»ĺ",
+      "ĠK F",
+      "Ġà¸ŀ à¸µ",
+      "Ġëĭ¨ ìľĦ",
+      "Ġìļ´ íĸī",
+      "ãģ® ç¢ºèªį",
+      "f ogo",
+      "le ch",
+      "zi em",
+      "Ã³z is",
+      "ĠC ty",
+      "ĠÙĪÙģ Ùī",
+      "Ġà¤¤ à¤°à¥Ģ",
+      "ĠëĿ¼ìĿ´ ìĦ¼",
+      "ĠìĿ´ê³³ ìĿĢ",
+      "ãĥĩãĤ¶ ãĥ¼ãĥĪ",
+      "ist el",
+      "te ils",
+      "Ġraz o",
+      "Ġraz u",
+      "iew icz",
+      "s phase",
+      "ĠDes af",
+      "ĠGard a",
+      "ĠN essa",
+      "ĠSem en",
+      "ĠVan af",
+      "Ġdire k",
+      "Ġmi Ã©rt",
+      "Ġp olec",
+      "Ġrum it",
+      "ĠÐ½Ð¾ ÑģÑıÑĤ",
+      "gest eld",
+      "ĠFak ten",
+      "Ġman cano",
+      "Ġpenc ari",
+      "Ġriti ene",
+      "ĠÐĳÐ¾Ð»ÑĮÑĪ Ð¾Ðµ",
+      "ĠÐ± Ð°ÑĤÐ°ÑĢ",
+      "ĠÐ±Ð°ÑĤÐ°ÑĢ ÐµÐ¹",
+      "ĠÙĦÙħ ÙĥØ§ÙģØŃØ©",
+      "an leitung",
+      "Ã¤nd igkeit",
+      "à¸£à¸¹à¹īà¸ªà¸¶à¸ģ à¸§à¹Īà¸²",
+      "Ġfab brica",
+      "ĠÐ³Ð¾ÑĢÐ¼ Ð¾Ð½Ð¾Ð²",
+      "ĠÐºÐ°Ð¼ Ð¿Ð°Ð½Ð¸Ð¸",
+      "ĠÑģÑĤÑĢÐ¾ ÐµÐ½Ð¸Ñı",
+      "ĠÐ²ÑĭÑģÑĤÑĥÐ¿ Ð°ÑĤÑĮ",
+      "à¸ĺà¸£à¸£à¸¡à¸Ĭà¸²à¸ķà¸´ à¹ģà¸¥à¸°",
+      "Ġreligios os",
+      "ĠÐºÐ¾Ð½ÑĤÑĢÐ¾Ð»Ð¸ ÑĢÑĥ",
+      "ĠEnt span",
+      "ĠEntspan nung",
+      "Ġditer bitkan",
+      "Ġmen jan",
+      "Ġmenjan j",
+      "Ġmenjanj ikan",
+      "à¸Ńà¸±à¸Ļà¸Ķà¸±à¸ļ à¸ªà¸¹à¸ĩà¸ªà¸¸à¸Ķà¹ĥà¸Ļ",
+      "ĠëĤ ¼",
+      "Ġìŀ İ",
+      "é £¼",
+      "é£¼ ãģĦ",
+      "à¸Ķ à¸²à¸£",
+      "O ber",
+      "Xu áº¥t",
+      "g ili",
+      "o zen",
+      "à¸ĭ à¸±à¹Īà¸Ļ",
+      "ĠAV V",
+      "ĠC az",
+      "ĠR UR",
+      "ĠrÃ¡ d",
+      "ĠÐł Ð¸Ñģ",
+      "ĠÑı ÐºÐµ",
+      "ĠØ§Øµ Ø·",
+      "ĠÙģØ± Ø²",
+      "OLOG I",
+      "ens uu",
+      "yaw ar",
+      "Ð´ÐµÑĢ Ð¾Ð²",
+      "áĢĶáĢ¾ áĢĦáĢ·áĢº",
+      "ĠEnt e",
+      "ĠF EST",
+      "ĠÐ·Ð°ÑĢ Ð¾",
+      "ĠÑĢÑıÐ´ Ðµ",
+      "ĠÙĤ ÙĪØ§ÙĨ",
+      "ĠÙħØª Ø§Ø¨",
+      "ĠÙĨÚ¯ ÙĩØ¯",
+      "Ġà¤¹ à¤¾à¤²",
+      "Ġà¤¹à¤¾à¤² à¤¾",
+      "ãĤ« ãĥ¬ãĥ³ãĥĢ

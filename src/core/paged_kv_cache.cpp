@@ -68,15 +68,23 @@ DeviceKVPagePoolLayout plan_device_kv_page_pool(LayoutBuilder& builder,
         DeviceKVPlaneLayout planned;
         planned.geometry        = plane;
         const std::string label = "Paged KV plane " + std::to_string(index);
+        // [F1255 kvaxisA] THE THIRD AXIS IS THIS ONE RESOLUTION. A plane that declares its own
+        // `page_group_count` is sized for ITS class' pages instead of the pool's whole page space;
+        // 0 keeps the pre-image `physical_pages`, so a geometry that declares nothing produces the
+        // byte-identical region every existing run was measured on.
+        const std::int32_t plane_pages =
+            plane.page_group_count == 0
+                ? physical_pages
+                : checked_i32(plane.page_group_count, "Paged KV plane page count");
         if (spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
             planned.storage = builder.add_tensor(
                 plane.dtype,
-                {plane.leading_extent, kPagedKVPageSize, plane.head_extent, physical_pages},
+                {plane.leading_extent, kPagedKVPageSize, plane.head_extent, plane_pages},
                 plane.alignment, label);
         } else {
             planned.storage = builder.add_tensor(
                 plane.dtype,
-                {plane.leading_extent, kPagedKVPageSize, physical_pages, plane.head_extent},
+                {plane.leading_extent, kPagedKVPageSize, plane_pages, plane.head_extent},
                 plane.alignment, label);
         }
         layout.planes.push_back(planned);
@@ -206,14 +214,27 @@ DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLay
             plane.ne[1] != kPagedKVPageSize) {
             throw std::logic_error("Paged KV device plane tensor is inconsistent");
         }
+        // [F1255 kvaxisA] The plane's OWN page extent, not the pool's: the third axis is exactly
+        // that a plane may be sized for its class' pages. 0 resolves to the pool's count, which is
+        // the pre-image value for every geometry that declares nothing.
+        const std::int32_t plane_pages =
+            expected.page_group_count == 0
+                ? physical_pages
+                : checked_i32(expected.page_group_count, "Paged KV plane page count");
         if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
-            if (plane.ne[2] != expected.head_extent || plane.ne[3] != physical_pages) {
+            if (plane.ne[2] != expected.head_extent || plane.ne[3] != plane_pages) {
                 throw std::logic_error("Paged KV PageMajor plane shape is inconsistent");
             }
-        } else if (plane.ne[2] != physical_pages || plane.ne[3] != expected.head_extent) {
+        } else if (plane.ne[2] != plane_pages || plane.ne[3] != expected.head_extent) {
             throw std::logic_error("Paged KV HeadMajor plane shape is inconsistent");
         }
         planes_.push_back(plane);
+        // [F1255 kvaxisA] The plane's own page extent, kept so the class-blind helpers below
+        // (zero/copy/H2D/D2H) can SKIP a plane a page index does not belong to. The narrow planes
+        // of the third axis are addressed through the block table's class sentinel, never through a
+        // DeviceKVPageHandle, so a handle's index is only ever meaningful on the planes whose extent
+        // contains it.
+        plane_page_counts_.push_back(static_cast<std::uint32_t>(plane_pages));
     }
 
     free_page_runs_.reserve(spec_.page_group_count);
@@ -236,6 +257,10 @@ std::uint32_t DeviceKVPagePool::available_pages() const noexcept {
 std::size_t DeviceKVPagePool::plane_count() const noexcept { return planes_.size(); }
 
 const Tensor& DeviceKVPagePool::plane(std::size_t index) const { return planes_.at(index); }
+
+std::uint32_t DeviceKVPagePool::plane_page_count(std::size_t index) const noexcept {
+    return index < plane_page_counts_.size() ? plane_page_counts_[index] : 0U;
+}
 
 std::uint32_t
 DeviceKVPagePool::contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const {
@@ -529,7 +554,14 @@ void DeviceKVPagePool::zero_pages(std::span<const DeviceKVPageHandle> pages,
         while (end < pages.size() && pages[end].index_ == pages[end - 1].index_ + 1) { ++end; }
         const std::int32_t first = pages[begin].index_;
         const std::int32_t count = static_cast<std::int32_t>(end - begin);
-        for (const Tensor& plane : planes_) {
+        for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+            // [F1255 kvaxisA] A page handle only names a page of the planes whose extent contains
+            // it. The narrow planes of the third axis are addressed by the block table's class
+            // sentinel, so this class-blind path must not run off their (smaller) region.
+            if (first + count > static_cast<std::int32_t>(plane_page_counts_[plane_index])) {
+                continue;
+            }
+            const Tensor& plane = planes_[plane_index];
             auto* base = static_cast<unsigned char*>(plane.data);
             if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
                 CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(first) * plane.nb[3], 0,
@@ -550,7 +582,14 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
     const std::int32_t source_index      = physical_index(source);
     const std::int32_t destination_index = physical_index(destination);
     if (source_index == destination_index) { return; }
-    for (const Tensor& plane : planes_) {
+    for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+        // [F1255 kvaxisA] same guard as zero_pages: a handle index is not a page of a plane that
+        // does not carry it.
+        if (source_index >= static_cast<std::int32_t>(plane_page_counts_[plane_index]) ||
+            destination_index >= static_cast<std::int32_t>(plane_page_counts_[plane_index])) {
+            continue;
+        }
+        const Tensor& plane = planes_[plane_index];
         auto* base = static_cast<unsigned char*>(plane.data);
         if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
             CUDA_CHECK(
@@ -583,6 +622,11 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
         const std::size_t count  = end - begin;
         const std::int32_t first = source[begin].index_;
         for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+            // [F1255 kvaxisA] same guard as zero_pages.
+            if (first + static_cast<std::int32_t>(count) >
+                static_cast<std::int32_t>(plane_page_counts_[plane_index])) {
+                continue;
+            }
             const Tensor& plane                 = planes_[plane_index];
             const HostKVPlaneLayout& host_plane = host.planes[plane_index];
             auto* host_base = destination.data() + begin * host.page_stride + host_plane.offset;
@@ -628,6 +672,11 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
         const std::size_t count  = end - begin;
         const std::int32_t first = destination[begin].index_;
         for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+            // [F1255 kvaxisA] same guard as zero_pages.
+            if (first + static_cast<std::int32_t>(count) >
+                static_cast<std::int32_t>(plane_page_counts_[plane_index])) {
+                continue;
+            }
             const Tensor& plane                 = planes_[plane_index];
             const HostKVPlaneLayout& host_plane = host.planes[plane_index];
             const auto* host_base = source.data() + begin * host.page_stride + host_plane.offset;

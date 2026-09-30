@@ -377,6 +377,25 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         cold_k_i8 != nullptr && cache.cold_slots.nb[2] != 0
             ? cold_k_i8 + cache.cold_slots.nb[2]
             : nullptr;
+    // [F1259 kvfill] The narrow class' four planes. Empty tensors (the knob unset, a dropped
+    // layer, a non-i8 tier) disable the kernel's narrow branch exactly the way the null cold
+    // pointers disable the cold one -- so this is a no-op on every pre-image launch.
+    const std::uint8_t* narrow_k_codes =
+        cache.k_narrow_pages.data != nullptr
+            ? static_cast<const std::uint8_t*>(cache.k_narrow_pages.data)
+            : nullptr;
+    const std::uint8_t* narrow_v_codes =
+        cache.v_narrow_pages.data != nullptr
+            ? static_cast<const std::uint8_t*>(cache.v_narrow_pages.data)
+            : nullptr;
+    const std::uint8_t* narrow_k_scales =
+        cache.k_narrow_scale_pages.data != nullptr
+            ? static_cast<const std::uint8_t*>(cache.k_narrow_scale_pages.data)
+            : nullptr;
+    const std::uint8_t* narrow_v_scales =
+        cache.v_narrow_scale_pages.data != nullptr
+            ? static_cast<const std::uint8_t*>(cache.v_narrow_scale_pages.data)
+            : nullptr;
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         gqa_splitdbg_tile<Geometry>("i8", invocation, cache.dtype, TokenTile, WarpsPerCta,
@@ -413,7 +432,9 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                 // i8win: the live INT8 call site (gqa_attention_decode_i8.cu instantiates
                 // launch_tc_partial_i8 for this family).
-                static_cast<std::int32_t>(cache.sliding_window_tokens));
+                static_cast<std::int32_t>(cache.sliding_window_tokens),
+                narrow_k_codes, narrow_v_codes, narrow_k_scales, narrow_v_scales,
+                static_cast<std::int32_t>(cache.narrow_page_capacity));
     };
     // Revision 2b: INT8-tier cold slots (raw nibble codec). The kernel takes
     // region-relative K/V slot bases; empty tensors disable the cold branch.
@@ -727,7 +748,8 @@ void launch_tc_partial_nvfp4(const Tensor& q, const __nv_bfloat16* input_k,
                 logical_capacity, split_units, cache.layer_index, scale,
                 static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-                invocation.batch_size, masked, writes_cache);
+                invocation.batch_size, masked, writes_cache,
+                nvfp4_frag_ld_launch_flag());
     };
     // Minimal production schedule set for the first NVFP4 revision.
     if constexpr (Geometry::GroupSize == 16) {

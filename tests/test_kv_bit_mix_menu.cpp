@@ -260,23 +260,39 @@ void test_equal_bit_set_at_450() {
 void test_default_answer_at_450_is_the_cheapest_exact_450_mix() {
     const KvBitBudgetSolution solved =
         ninfer::product::kv_bit_budget_solve(kLayers, 4.50, kRk4v4Limit, 0);
-    // ⚠ THE DEFAULT ANSWER MOVED, AND THE LADDER'S OWN PRICES MOVED IT (line `redkv`,
-    // dl/redkv/TRIAGE.md #55). It was `0-15:nvfp4` while rows 6/7 were unselectable. They are
-    // selectable now and the ladder prices rk3v4 at 12 and rk2v4 at 16 against nvfp4's 30, so the
-    // saturating DP -- "maximum bits at or below the ceiling, then minimum penalty" -- finds an
-    // exact-4.50 mix costing 292 hundredths where all-nvfp4 costs 16 x 30 = 480. The rule did not
-    // change; the candidate set and its prices did, in the same item that opened the gate.
-    check(solved.spec == "0-2:rk2v4,3-4:rk4v4,5:rk3v4,6-7:rk2v4,8-9:int8,10-15:nvfp4",
-          "the default answer at 4.50 is the cheapest exact-4.50 mix the ladder has, got " +
+    // ⚠ THE DEFAULT ANSWER MOVED, AND THEN MOVED BACK, FOR TWO DIFFERENT REASONS (line `redkv`,
+    // dl/redkv/TRIAGE.md #55 for the first, landq/kvreach for the second).
+    //   * It was `0-15:nvfp4` while rows 6/7 were unselectable.
+    //   * The gate opened them, the ladder prices rk3v4 at 12 and rk2v4 at 16 against nvfp4's 30,
+    //     and the saturating DP -- "maximum bits at or below the ceiling, then minimum penalty" --
+    //     found the exact-4.50 mix `0-2:rk2v4,3-4:rk4v4,5:rk3v4,6-7:rk2v4,8-9:int8,10-15:nvfp4`
+    //     costing 292 hundredths where all-nvfp4 costs 16 x 30 = 480.
+    //   * Those two rows are now WITHHELD, because product::kv_dtype_for_storage refuses that very
+    //     plan (product/kv_storage_dtype.h:107-123 and layouts_impl.h:681-684; the set is
+    //     product/kv_bit_budget.h kv_bit_budget_deployable_rows(), derived from that decision
+    //     point rather than written down). detail::kv_gear_solve_gated answers with the SHIPPED
+    //     candidate set only while its answer is runnable and falls back to the deployable rows
+    //     otherwise, so the answer at 4.50 is the cheapest exact-4.50 mix THE DEPLOY LAYER CAN
+    //     BUILD -- all-nvfp4, at 480 hundredths.
+    // THE RULE CHANGED IN NEITHER STEP, so the pin below is still an exact spec, an exact penalty
+    // and an exact achieved bits; it also gained the assertion that no withheld row is in it.
+    check(solved.spec == "0-15:nvfp4",
+          "the default answer at 4.50 is the cheapest exact-4.50 mix the DEPLOY LAYER can build, "
+          "got " +
               solved.spec);
     check(std::fabs(solved.achieved_bits - 4.50) < 1e-12,
           "the default answer is still exactly 4.5000, got " +
               std::to_string(solved.achieved_bits));
-    check(std::fabs(solved.penalty - 2.92) < 1e-12,
-          "and it costs 292 hundredths, against all-nvfp4's 480, got " +
+    check(std::fabs(solved.penalty - 4.80) < 1e-12,
+          "and it costs 480 hundredths (all-nvfp4, 16 x 30) against the withheld mix's 292, got " +
               std::to_string(solved.penalty));
     check(solved.spec.find("iso4e") == std::string::npos,
           "the default does not use iso4e");
+    check(solved.spec.find("rk3v4") == std::string::npos &&
+              solved.spec.find("rk2v4") == std::string::npos,
+          "and it uses NO row the deploy layer refuses (rk3v4/rk2v4 are withheld), got " +
+              solved.spec);
+// kvland-p12-menu-default
     // The pin that DID NOT MOVE: all-nvfp4 is still an exact-4.50 plan, so the answer above is a
     // tie-break on an equal-bit set and not a bit change.
     check(kKvBitBudgetTiers[3].bits_x100 * kLayers == 450 * kLayers &&
@@ -354,14 +370,48 @@ void test_two_codec_different_mixes_same_bits() {
     check(comparisons == 5, "the pair was compared at every weight");
 }
 
+// The UNPREFERRED answer of the SAME entry the preference knob belongs to: the request
+// kv_gear_solve_preferring builds, with `candidate_order` -- the only field it sets -- left empty.
+// See the note inside test_preference_never_overrides_a_strictly_worse_score for why the
+// comparison partner may NOT be kv_bit_budget_solve.
+KvGearSolution shipped_ladder_unpreferred(double budget) {
+    ninfer::product::KvGearSolveRequest request;
+    request.layers = kLayers;
+    request.budget_bits = budget;
+    request.ladder = kKvBitBudgetTiers;
+    request.per_layer = ninfer::product::kv_gear_sets_from_rk4v4_set(
+        kLayers, ninfer::product::kv_bit_budget_rk4v4_prefix_set(kRk4v4Limit));
+    return ninfer::product::kv_gear_solve(request);
+}
+
 // (5) NEGATIVE CONTROL: the preference is NOT a penalty override.
 void test_preference_never_overrides_a_strictly_worse_score() {
+// kvland-p13-menu-helper
     const auto rk4v4 = ninfer::product::kv_bit_budget_rk4v4_prefix_set(kRk4v4Limit);
     // The incumbent is whatever the SHIPPED ladder's own prices return with no preference at all.
     // (There is no "empty preference" call: `kv_gear_solve_preferring` REFUSES a name that is not
     // a candidate gear, which is the control in (6). The unpreferred answer is the plain solver's.)
-    const KvBitBudgetSolution incumbent =
-        ninfer::product::kv_bit_budget_solve(kLayers, 4.50, kRk4v4Limit, 0);
+    //
+    // ⚠ IT MUST BE THE SAME ENTRY, AND THAT IS NOT A DETAIL (landq/kvreach,
+    // dl/_orch/landq/kvreach/PINS.md section 2, coordinate B). `kv_bit_budget_solve` and
+    // `kv_gear_solve_preferring` are no longer one call: the first reaches the DP through
+    // detail::kv_gear_solve_gated, which solves the SHIPPED candidate set first and falls back to
+    // the rows the deploy layer accepts ONLY when the first answer is a plan it refuses, while the
+    // preferring entry calls kv_gear_solve directly. At 4.50 on the shipped ladder that makes
+    // `kv_bit_budget_solve` answer `0-15:nvfp4` (the deploy layer refuses the cheaper
+    // `0-2:rk2v4,3-4:rk4v4,5:rk3v4,6-7:rk2v4,8-9:int8,10-15:nvfp4` mix) while
+    // `kv_gear_solve_preferring` still returns that refused mix. Comparing THOSE two would compare
+    // two different candidate sets and would redden for a reason that has nothing to do with the
+    // preference, which is the only thing this control is about. So the partner is the same
+    // request with no gear tried first -- which is what "no preference at all" means, and what the
+    // one-line `kv_bit_budget_solve` call above meant before the gate existed.
+    //
+    // What it does NOT do: it does not lift the gate off `kv_gear_solve_preferring`. That entry is
+    // deliberately left ungated (its only consumer is this test file; gating it would also change
+    // the equal-bit pair control in (4), whose whole point is that TWO codec-different mixes are
+    // reachable at one budget).
+    const KvGearSolution incumbent = shipped_ladder_unpreferred(4.50);
+// kvland-p14-menu-incumbent
     // ⚠ The needle moved with the answer (line `redkv`, dl/redkv/TRIAGE.md #55): the incumbent
     // used to be `0-15:nvfp4` because nvfp4 was the only exact-4.50 plan the grammar had. The
     // CONTROL is unchanged and is what is asserted: a preference for a codec whose shipped
@@ -402,10 +452,12 @@ void test_preference_refuses_non_candidate_gears() {
     // ⭐ AND THE POSITIVE HALF, so "refused" and "accepted" are both pinned: the two rows the gate
     // opened are nameable now, they do not throw, and they do not move the achieved bits -- the
     // knob selects among equal-bit mixes and never among bit counts.
-    const KvBitBudgetSolution no_pref =
-        ninfer::product::kv_bit_budget_solve(kLayers, 4.50, kRk4v4Limit, 0);
+    // The unpreferred partner is the SAME entry, for the reason spelled out in (5): a gated
+    // comparison partner would compare two candidate sets rather than the preference.
+    const KvGearSolution no_pref = shipped_ladder_unpreferred(4.50);
     const KvGearSolution pref_nvfp4 = ninfer::product::kv_gear_solve_preferring(
         kLayers, 4.50, kKvBitBudgetTiers, rk4v4, "nvfp4");
+// kvland-p15-menu-nopref
     check(pref_nvfp4.spec == no_pref.spec,
           "the declared ladder's unpreferred answer is the solver's own, got " + pref_nvfp4.spec +
               " vs " + no_pref.spec);

@@ -352,7 +352,15 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
         return {};
     }
 
-    switch (options.reasoning_effort.value_or(ReasoningEffort::XHigh)) {
+    // The absent-flag default is Medium, which injects NOTHING -- the behaviour every caller had
+    // before this lever existed -- and NOT XHigh, which injects the long "think carefully through
+    // the task" instruction.  Measured on this box against the registered qwen3.8-27b/nvfp4
+    // artifact with the pelican fixture (dl/effthink F1062, four arms, identical argv but the
+    // effort token): low 5,197 B and medium 6,254 B both reach the document channel, while xhigh
+    // AND an absent flag both burn the whole 12,000-token budget in the thinking stream and emit
+    // 1 byte.  A default that silently selects the arm producing no output is the defect; naming
+    // low|xhigh still lets a caller opt IN to an instruction.
+    switch (options.reasoning_effort.value_or(ReasoningEffort::Medium)) {
     case ReasoningEffort::Low:
         return kLowReasoningInstructions;
     case ReasoningEffort::Medium:
@@ -430,7 +438,10 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
         result.reasoning_effort.low            = true;
         result.reasoning_effort.medium         = true;
         result.reasoning_effort.xhigh          = true;
-        result.reasoning_effort.default_effort = ReasoningEffort::XHigh;
+        // Kept equal to the injection default above: src/serve/translate.cpp:128 reads this
+        // field, so the two must name the same arm or the serve path and the CLI path would
+        // disagree about what an unset reasoning effort means.
+        result.reasoning_effort.default_effort = ReasoningEffort::Medium;
     }
     return result;
 }

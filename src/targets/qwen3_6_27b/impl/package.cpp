@@ -230,6 +230,50 @@ EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
     // confusing weights mismatch. A non-DFlash2 artifact defaults to MTP; the
     // single-source ModelOpt profile lands here, which is what its object plan
     // declares (twelve mtp/* objects and no dflash/dflash2 object at all).
+    // landq/unlock -- THE VISION CONJUNCT BELOW, NAMED.
+    //
+    // FIRST, A HARD CORRECTION TO THE COMMENT ABOVE, because this landing must not endorse it. The
+    // sentence above states an ARTIFACT fact -- "a DFlash2 artifact has no MTP draft head (the two
+    // are mutually exclusive)" -- and THIS BOX'S ARTIFACT CONTRADICTS IT. Read off the container's
+    // own objects[] (byte caliber): qwen3_8_27b_nvfp4_dflash2.ninfer declares all TWELVE objects
+    // the mtp group requires (bindings.cpp:591-611), 451,267,584 B, formats W8G32_F16S/BF16 --
+    // byte-for-byte the same MTP block the plain nvfp4 artifact declares, alongside its 76
+    // dflash2/* objects and its text/draft_head. Readings: dl/unlock/logs/22_mtp_sizes.txt and
+    // 21_mtp_probe.txt. So "a DFlash2 artifact has no MTP draft head" is true of the ONE-SLOT
+    // BACKEND ENUM (startup_features.h:19 makes mtp() and dflash2() exclusive by construction) and
+    // FALSE of the container. The sentence above is left exactly as it stands -- correcting it is a
+    // separate finding that this line reports and does NOT land -- and this note is here so the two
+    // facts are never read as one.
+    //
+    // NOW THE CONJUNCT BELOW. Nothing in the tree says why `--vision` vetoes that choice: the
+    // conjunct was added with the rest of this chain (commit 582d979e, 2026-09-12) whose message
+    // never mentions vision, and the veto is SILENT -- the run simply becomes MTP.
+    //
+    // What the readings support is that the pair is refused because it was NEVER CO-VALIDATED,
+    // which is a policy and not an artifact fact:
+    //   * NOT an artifact limit: 9 of the 91 readable .ninfer artifacts on this box declare a
+    //     complete DFlash2 head and a complete vision tower at once, and all 9 also declare a
+    //     complete MTP block (byte caliber, the containers' own objects[];
+    //     dl/unlock/logs/20_artifact_census.txt).
+    //   * NOT a designed pairing: the upstream family ships its Vision companion as a separate
+    //     `vision-mtp-bf16` head, and its acceptance-rate plan never spells vision beside DFlash2.
+    // So the fall-through keeps its behaviour exactly, and gains a NAMED line: a silent veto states
+    // no reason at all, and "not validated" is the reason there is.
+    if (options.enable_vision &&
+        (weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2 ||
+         weights_profile == detail::WeightsProfile::Qwen38Nvfp4Dspark)) {
+        std::fprintf(stderr,
+                     "ninfer: qwen3_6_27b --spec auto with --vision: profile %u carries a %s "
+                     "draft head, and the draft-head + Vision pair is not co-validated, so auto "
+                     "resolves to MTP. POLICY refusal, not an artifact limit -- this artifact "
+                     "holds the draft head, the Vision tower and the MTP block (dl/unlock). "
+                     "Spell --spec %s --vision explicitly to run the unvalidated pair.\n",
+                     static_cast<unsigned>(weights_profile),
+                     weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2 ? "DFlash2"
+                                                                                   : "DFlash",
+                     weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2 ? "dflash2"
+                                                                                   : "dflash");
+    }
     if (weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2 &&
         !options.enable_vision) {
         resolved.speculative.backend = SpeculativeBackend::DFlash2;

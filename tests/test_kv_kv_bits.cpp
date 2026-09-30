@@ -28,6 +28,10 @@
 //     slider's effect in the other cases is real.
 
 #include "product/kv_kv_bits.h"
+// [dl/e8vaxis F1166] the plane axis this test now pins lives in the e8 geometry header, and a
+// test includes what it measures rather than relying on a transitive include to keep the numbers
+// reachable (kv_kv_bits.h names product/kv_e8_width.h in prose, and prose does not compile).
+#include "product/kv_e8_width.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -136,11 +140,68 @@ void test_joint_entry() {
         check(row.k_bits == row.v_bits, "joint: every layer has k_bits == v_bits");
     }
     // The joint entry's displayed pair must be the ENGINE's pair, including the two
-    // asymmetric tiers -- an rk4v4 layer is (e8-lattice, i4), not (e8-lattice, e8-lattice).
+    // asymmetric tiers -- an rk4v4 layer is (e8-lattice, i4).
     for (const auto& row : plan.rows) {
         if (row.k_format == "e8-lattice") {
-            check(row.v_format == "i4", "an rk4v4 layer's V plane is i4, not a second lattice");
+            check(row.v_format == "i4", "an rk4v4 layer's V plane is still i4 (unchanged)");
         }
+    }
+    // ============================================================================================
+    // ⭐ [dl/e8vaxis F1166] THE ASSERTION THIS LOOP USED TO CARRY, REVERSED
+    // ============================================================================================
+    // THE PRE-IMAGE, verbatim, was:
+    //
+    //     check(row.v_format == "i4", "an rk4v4 layer's V plane is i4, not a second lattice");
+    //
+    // and the negative control near the top of this file still says the pair
+    // (e8-lattice, e8-lattice) is NOT realizable. Both were true, and both were true for ONE
+    // reason that had nothing to do with E8's mathematics: the family's only input was a **K**
+    // width, so `e8-lattice` was a single token for three K widths and there was no way to SPELL
+    // a lattice on V AT ALL. The refusal was about the VOCABULARY, and the owner's order is that
+    // "the minimum on BOTH K and V must be e8 2bit".
+    //
+    // WHAT REPLACES IT -- TWO claims, both required, so neither half can be satisfied alone:
+    //   (a) the rk4v4 row above is UNCHANGED: (e8-lattice, i4) is still the only e8 pair the
+    //       LADDER carries, because the ladder's steps are K widths and no row prices a
+    //       V-carrying pair yet; and
+    //   (b) V IS A DECISION VARIABLE on the plane axis, and the floor is representable.
+    // (b) is why this is a REVERSAL and not a relaxation: it asserts a capability that did not
+    // exist, and it asserts the FLOOR -- B2 on BOTH planes -- rather than some intermediate
+    // width, so an edit that offered only, say, B3 on V would red here.
+    {
+        // (b1) THE FLOOR: e8 at 2 bits on K AND on V.
+        check(ninfer::product::kv_e8_plane_pair_realizable("e8-lattice-2", "e8-lattice-2"),
+              "PLANE AXIS: (e8 at 2 bits, e8 at 2 bits) IS realizable -- the owner's floor");
+        // (b2) the same statement one width up, so the axis is a RULE and not one lucky cell.
+        check(ninfer::product::kv_e8_plane_pair_realizable("e8-lattice-3", "e8-lattice-3"),
+              "PLANE AXIS: (e8 at 3 bits, e8 at 3 bits) is realizable");
+        // (b3) INDEPENDENT, which is the whole word: the two MIXED pairs hold as well.
+        check(ninfer::product::kv_e8_plane_pair_realizable("e8-lattice-3", "e8-lattice-2") &&
+                  ninfer::product::kv_e8_plane_pair_realizable("e8-lattice-2", "e8-lattice-3"),
+              "PLANE AXIS: K and V are chosen INDEPENDENTLY (both mixed lattice pairs hold)");
+        // (b4) THE FLOOR IS ARITHMETIC rather than a promise: 4608 + 4608 == 9216 B/head-page,
+        // and the ladder's own cost formula reads 2.25 b/element per plane off it.
+        using ninfer::product::E8KvPlaneFormat;
+        check(ninfer::product::e8_kv_plane_format_bytes(E8KvPlaneFormat::B2) == 4608,
+              "PLANE AXIS: the e8 B2 plane is 4608 B/head-page");
+        check(ninfer::product::e8_kv_pair_bytes(E8KvPlaneFormat::B2, E8KvPlaneFormat::B2) == 9216,
+              "PLANE AXIS: e8 B2 on BOTH planes is 4608 + 4608 = 9216 B/head-page");
+        check(ninfer::product::e8_kv_pair_bits_x100(E8KvPlaneFormat::B2, E8KvPlaneFormat::B2) ==
+                  225,
+              "PLANE AXIS: e8 B2/B2 is 2.25 b/element per plane -- THE OWNER'S FLOOR");
+        // (b5) THE AXIS REPRODUCES THE SHIPPED ROW rather than replacing it. If this ever stops
+        // holding, the axis is a SECOND geometry and not the same one re-spelled.
+        check(ninfer::product::e8_kv_pair_bytes(E8KvPlaneFormat::B4, E8KvPlaneFormat::B4) ==
+                  ninfer::product::e8_kv_layer_bytes(ninfer::product::E8KvWidth::W4),
+              "PLANE AXIS: the B4/B4 pair IS the shipped W4 layer, byte for byte");
+        // (b6) NEGATIVE CONTROL, KEPT -- and it is what proves (b1) is not vacuous. The OLD token
+        // is still not a lattice pair, because the 4-bit lattice plane does not exist.
+        check(!ninfer::product::kv_e8_plane_pair_realizable("e8-lattice", "e8-lattice"),
+              "NEGATIVE CONTROL (kept): (e8-lattice, e8-lattice) is STILL not realizable -- "
+              "there is no 4-bit lattice plane, and the old token still means the 4-bit K one");
+        check(!ninfer::product::kv_e8_plane_pair_realizable("e8-lattice-2", "e8-lattice") &&
+                  !ninfer::product::kv_e8_plane_pair_realizable("e8-lattice", "e8-lattice-2"),
+              "NEGATIVE CONTROL: a lattice K plane does not pair with the 4-bit plane either");
     }
 }
 
@@ -381,13 +442,25 @@ void test_slider_on_off_and_negative_control() {
 // ---------------------------------------------------------------- the ladder floor
 void test_below_floor_is_named() {
     const KvTierScoreTable scores = ninfer::product::kv_bit_budget_default_scores();
-    // ⚠ THE FLOOR MOVED WITH THE GATE (line `redkv`, dl/redkv/TRIAGE.md #52). 4.25 WAS the
-    // floor while rows 6/7 were unselectable: the cheapest admissible 16-layer allocation was
-    // `rk4v4 x 8 + nvfp4 x 8` = (8*425 + 8*450)/16 = 4.375, and the rk4v4 exposure limit
-    // (kKvBitBudgetE8LayerLimit = 8) is what stopped it going lower. With rk3v4 (375) and rk2v4
-    // (325) selectable the same cap buys `rk2v4 x 8 + nvfp4 x 8` = (8*325 + 8*450)/16 = 3.875,
-    // so 4.25 is a FEASIBLE ceiling now and the refusal moved down with it. Both directions are
-    // asserted, so the move is pinned rather than merely observed.
+    // ⚠ THE FLOOR MOVED TWICE, AND THE SECOND MOVE IS A DIFFERENT KIND OF MOVE (landq/kvreach,
+    // dl/_orch/landq/kvreach/PINS.md section 1). It first moved DOWN with the gate (line `redkv`,
+    // dl/redkv/TRIAGE.md #52): 4.25 was the floor while rows 6/7 were unselectable, because the
+    // cheapest admissible 16-layer allocation was `rk4v4 x 8 + nvfp4 x 8` = 4.375; with rk3v4
+    // (375) and rk2v4 (325) selectable the same rk4v4 exposure limit bought
+    // `rk2v4 x 8 + nvfp4 x 8` = 3.875, so 4.25 became feasible.
+    //
+    // It is back UP now, and NOT because a row changed its price: those two rows are WITHHELD from
+    // the solver's candidate set because the DEPLOY LAYER refuses the plan they produce
+    // (product/kv_storage_dtype.h:107-123 refuses KvCacheStorage::E8K3Group64 / E8K2Group64 by
+    // name, and src/targets/qwen3_6/impl/runtime/layouts_impl.h refuses the same two rows one step
+    // later). `selectable` is unchanged -- the rows are still ladder rows, still priced, still
+    // spellable -- but detail::kv_bit_budget_solve_impl_gated / detail::kv_gear_solve_gated drop
+    // them on the pass that ANSWERS, so the deployable floor is `rk4v4 x 8 + nvfp4 x 8` = 4.375
+    // again and 4.25 -- the value this function used to call feasible -- is 0.125 under it.
+    //
+    // BOTH SIDES ARE PINNED, so the move is asserted rather than observed: 4.25 is refused by
+    // name, 4.38 deploys the plan that reaches the floor, and the refusal TEXT itself is read.
+// kvland-p16-kvbits-floor
     check_throws(
         [&] {
             (void)ninfer::product::kv_kv_bits_entry_joint(
@@ -402,20 +475,75 @@ void test_below_floor_is_named() {
                 ninfer::product::kKvBitBudgetE8LayerLimit, 0, ninfer::KvVCodec::Iso3);
         },
         "rk4v4 exposure limit", "below-floor split ceiling names the rk4v4 cap");
-    // ... and the ceiling that used to be below the floor is now ABOVE it: the two rows the gate
-    // opened moved the floor by exactly (8*(425-325))/16 = 0.50 bits/element, and this is the
-    // pair that pins WHICH rows did it (a floor that moved for an unrelated reason would take
-    // 4.25 with it and this check would still pass -- the split/equal check in
-    // test_split_entry_equal_ceilings_deploys is what says the answer is deployable).
+    // THE REFUSAL TEXT IS THE EVIDENCE, so it is READ rather than merely matched: it must name the
+    // DEPLOYABLE floor, and its "tiers reachable" list must NOT offer a row the deploy layer
+    // refuses -- a refusal naming a floor no plan can reach sends the operator to raise a ceiling
+    // that was already high enough.
+    //
+    // [F1246, re-derived 2026-09-30] THESE FOUR PINS ARE THE THIRD MOVE OF THE SAME FLOOR, and the
+    // number that moved them is the owner's own relaxation. `kKvBitBudgetE8LayerLimit` went
+    // 8 -> 16 (product/kv_bit_budget.h:179; every saved pre-image of that header carries 8, and
+    // dl/pull carries 10, so the pre-relaxation value is on disk five times over). With the
+    // exposure limit at 8 the cheapest admissible 16-layer allocation was
+    // `rk4v4 x 8 + nvfp4 x 8` = 4.375; with it at 16 the same exposure buys `rk4v4 x 16` = 4.25,
+    // and the refusal text below says exactly that in its own words ("the effective floor at this
+    // layer count is 4.25 b/element ... rk4v4, capped at 16 layer(s) by the rk4v4 exposure limit").
+    // So the floor FELL to 4.25 and 4.25 is now ANSWERED rather than refused.
+    //
+    // PINNED IN BOTH DIRECTIONS, so the move is asserted rather than observed, and the achievable
+    // side is checked to stay WITHIN its ceiling -- a solver that answered 4.25 with a plan above
+    // 4.25 would be a defect, and this block is what would say so.
+    // The readings that re-derived these numbers: dl/_orch/probe_kvbits_floor.cpp (built against
+    // this tree's headers) prints, for ceilings 3.50 / 3.875 / 4.25 / 4.375 / 4.38 / 4.50,
+    // REFUSED / REFUSED / 0-15:rk4v4@4.2500 / 0-1:rk4v4,2:nvfp4,3-8:rk4v4,9-15:nvfp4@4.3750 /
+    // (same) / 0-14:rk4v4,15:int8@4.5000, every answer within_ceiling=yes.
+    {
+        std::string refusal;
+        try {
+            (void)ninfer::product::kv_kv_bits_entry_joint(
+                kLayers, 3.875, scores, -1.0, ninfer::product::kKvBitBudgetE8LayerLimit, 0,
+                ninfer::KvVCodec::Iso3);
+            check(false, "3.875 is under the deployable floor and must be refused, not answered");
+        } catch (const std::exception& exception) {
+            refusal = exception.what();
+        }
+        check(refusal.find("no feasible allocation") != std::string::npos,
+              "3.875 is below the DEPLOYABLE floor and is refused by name, got " + refusal);
+        check(refusal.find("4.25 b/element") != std::string::npos,
+              "and the refusal names the deployable floor 4.25, got " + refusal);
+        check(refusal.find("rk3v4") == std::string::npos &&
+                  refusal.find("rk2v4") == std::string::npos,
+              "and it does NOT offer a withheld row in its reachable set, got " + refusal);
+    }
+    // ... and the floor's OWN side, which is what stops "3.875 is refused" from also holding for a
+    // solver that refused everything: 4.25 is the deployable floor and deploys the plan that
+    // reaches it -- rk4v4 on all 16 layers, 4.2500 b/element, which is the cap's own width.
     {
         const KvBitsPlan plan = ninfer::product::kv_kv_bits_entry_joint(
             kLayers, 4.25, scores, -1.0, ninfer::product::kKvBitBudgetE8LayerLimit, 0,
             ninfer::KvVCodec::Iso3);
-        check(plan.deployed && !plan.refused, "4.25 is a feasible ceiling now");
-        check(plan.spec.find("rk2v4") != std::string::npos ||
-                  plan.spec.find("rk3v4") != std::string::npos,
-              "and the rows that moved the floor are IN the answer, got " + plan.spec);
+        check(plan.deployed && !plan.refused, "4.25 is ON the deployable floor and deploys");
+        check(plan.spec == "0-15:rk4v4",
+              "and the floor plan is the cap's own -- rk4v4 on every layer -- got " + plan.spec);
+        check(std::fabs(plan.achieved_bits - 4.25) < 1e-9,
+              "which fills to 4.2500 b/element, got " + std::to_string(plan.achieved_bits));
+        check(plan.achieved_bits <= 4.25 + 1e-9,
+              "and it stays WITHIN the ceiling it was asked for");
     }
+    // ... and the rung above the floor is pinned too, because the LAYOUT there is now the
+    // SCORE-driven one (the same 8+8 split, placed by the layers' own scores rather than by a
+    // contiguous 0-7/8-15 cut), so a change of PLACEMENT reds here instead of passing silently.
+    {
+        const KvBitsPlan plan = ninfer::product::kv_kv_bits_entry_joint(
+            kLayers, 4.375, scores, -1.0, ninfer::product::kKvBitBudgetE8LayerLimit, 0,
+            ninfer::KvVCodec::Iso3);
+        check(plan.deployed && !plan.refused, "4.375 deploys");
+        check(plan.spec == "0-1:rk4v4,2:nvfp4,3-8:rk4v4,9-15:nvfp4",
+              "and its layout is the score-driven 8+8 split, got " + plan.spec);
+        check(std::fabs(plan.achieved_bits - 4.375) < 1e-9,
+              "which fills to 4.3750 b/element, got " + std::to_string(plan.achieved_bits));
+    }
+// kvland-p17-kvbits-425
 }
 
 // ------------------------------------------- named tables must never be dropped

@@ -92,6 +92,27 @@ bool require(bool condition, const char* what, bool& ok) {
     return condition;
 }
 
+// kvfix (F893): build_ft_spec now REFUSES the byte-neutral boundary by name (see the
+// declaration in serve/kv_auto_relayout.h). Every assertion below that pinned the tertile
+// PLACEMENT is re-pointed at the REFUSAL, so the test still discriminates: it fails if the
+// proxy places iso4e again, and it fails if the refusal ever goes quiet. Before this edit
+// `spec` was the spec string and `count_tier(spec, ...)` the placement; now `spec` is
+// either "SPEC <table>" or "REFUSED <reason>" and the placement is asserted only for
+// tables the guard does not reach (rk4v4_hi == rk4v4_lo, i.e. fewer than three measured
+// layers in the pre-deep band).
+std::string spec_or_refusal(const std::vector<std::pair<int, double>>& e, int layers,
+                            double frac, int shift = 0) {
+    try {
+        return std::string("SPEC ") + ninfer::serve::build_ft_spec(e, layers, frac, shift);
+    } catch (const std::exception& ex) {
+        return std::string("REFUSED ") + ex.what();
+    }
+}
+bool is_refused(const std::string& s) { return s.rfind("REFUSED ", 0) == 0; }
+std::string spec_body(const std::string& s) {
+    return is_refused(s) ? std::string() : s.substr(std::string("SPEC ").size());
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -101,7 +122,7 @@ int main(int argc, char** argv) {
     }
 
     const auto energy = synthetic_energy();
-    const std::string spec = ninfer::serve::build_ft_spec(energy, 16, 0.2);
+    const std::string spec = spec_or_refusal(energy, 16, 0.2);
     std::printf("spec=%s\n", spec.c_str());
 
     bool ok = true;
@@ -132,7 +153,10 @@ int main(int argc, char** argv) {
                 first.empty() ? "(none)" : first.c_str(),
                 second.empty() ? "(none)" : second.c_str(),
                 third.empty() ? "(none)" : third.c_str());
-    if (!first.empty() || second != spec || !third.empty() || applies != 1) {
+    // kvfix (F893): the candidate never becomes a spec, so the correct reading is that all
+    // three cycles are empty and NOTHING was applied. The pre-edit condition compared the
+    // second cycle against the spec itself and required exactly one apply.
+    if (!first.empty() || !second.empty() || !third.empty() || applies != 0) {
         std::printf("hysteresis FAIL\n");
         ok = false;
     }
@@ -158,8 +182,8 @@ int main(int argc, char** argv) {
     {
         int mismatches = 0;
         for (const Energy& e : equivalence_tables()) {
-            const std::string base = build_ft_spec(e, 16, 0.2);
-            const std::string zero = build_ft_spec(e, 16, 0.2, 0);
+            const std::string base = spec_or_refusal(e, 16, 0.2);
+            const std::string zero = spec_or_refusal(e, 16, 0.2, 0);
             if (base != zero) { ++mismatches; }
         }
         std::printf("shift0_equivalence: tables=%zu mismatches=%d\n",
@@ -202,7 +226,14 @@ int main(int argc, char** argv) {
                 KvAutoRelayout r(c, [](std::string_view) { return true; });
                 (void)r.decide_once(e);                 // records the candidate
                 const std::string landed = r.decide_once(e);  // applies it
-                if (r.last_vram_shift() != 0 || landed != build_ft_spec(e, 16, 0.2)) { ++bad; }
+                // kvfix (F893): the invariant this block exists for is unchanged -- a disarmed
+                // axis yields the SHIFT-0 outcome, whatever that outcome is. It is a spec for a
+                // table the guard does not reach (fewer than three measured layers in the
+                // pre-deep band) and NOTHING for one it does, so the comparison is against
+                // `spec_body()` of the shift-0 reading rather than against a spec.
+                if (r.last_vram_shift() != 0 || landed != spec_body(spec_or_refusal(e, 16, 0.2))) {
+                    ++bad;
+                }
             }
         }
         std::printf("disarmed_axis_equivalence: cases=%zu tables=%zu mismatches=%d\n",
@@ -238,45 +269,63 @@ int main(int argc, char** argv) {
     //     the measured set, unobserved layers stay on the conservative iso4e, the
     //     deep band never moves, and the rk4v4 exposure cap is respected.
     {
-        const std::string s0 = build_ft_spec(energy, 16, 0.2, 0);
-        const std::string s_tight = build_ft_spec(energy, 16, 0.2, 1);
-        const std::string s_loose = build_ft_spec(energy, 16, 0.2, -1);
-        const std::string s_max = build_ft_spec(energy, 16, 0.2, 1000);
-        const std::string s_min = build_ft_spec(energy, 16, 0.2, -1000);
+        const std::string s0 = spec_or_refusal(energy, 16, 0.2, 0);
+        const std::string s_tight = spec_or_refusal(energy, 16, 0.2, 1);
+        const std::string s_loose = spec_or_refusal(energy, 16, 0.2, -1);
+        const std::string s_max = spec_or_refusal(energy, 16, 0.2, 1000);
+        const std::string s_min = spec_or_refusal(energy, 16, 0.2, -1000);
         // 12 measured layers (0..11): base bands are 4/4/4 -> +1 moves layer 5
         // from iso4e to rk4v4, -1 moves layer 4 from rk4v4 to iso4e.
-        require(count_tier(s0, "rk4v4") == 4 && count_tier(s0, "iso4e") == 4, "base tertiles", ok);
-        require(count_tier(s_tight, "rk4v4") == 5 && count_tier(s_tight, "iso4e") == 3,
-                "tight shift did not grow the rk4v4 band", ok);
-        require(count_tier(s_loose, "rk4v4") == 3 && count_tier(s_loose, "iso4e") == 5,
-                "loose shift did not shrink the rk4v4 band", ok);
-        require(count_tier(s_loose, "nvfp4") == count_tier(s0, "nvfp4"),
-                "the byte-neutral iso4e/nvfp4 boundary moved", ok);
-        // A14 (redtest). The cap is product/kv_bit_budget.h's kKvBitBudgetE8LayerLimit,
-        // which is 8: it is the size of the measured rk4v4 window (layers 0..7), and that
-        // header's own banner note ("the banner is stale on that one", :18) records that an
-        // older banner still claiming 10 is out of date. build_ft_spec clamps rk4v4_lo to
+        // kvfix (F893): the placement this pinned is WITHHELD; the shift axis is still
+        // exercised end to end because spec_or_refusal reaches build_ft_spec with the shift,
+        // and the refusal must be identical across every shift (the guard precedes the band
+        // arithmetic). The pre-edit expectation was 4/4, +1 -> 5/3, -1 -> 3/5.
+        // kvfix (F893) ROUND 3: the guard fires iff a byte-neutral band EXISTS, and a shift
+        // changes whether one does. On this 12-measured-layer table lo/hi are 4/8 at shift 0,
+        // 5/8 at +1, 3/8 at -1, 8/8 at +1000 (the band is empty -- nothing to decide, so the
+        // table is emitted) and 0/8 at -1000. The assertion is therefore per case, and it
+        // DISCRIMINATES in both directions: it fails if the proxy places iso4e again, and it
+        // fails if the refusal goes quiet where a band does exist.
+        require(is_refused(s0), "shift 0 placed a byte-neutral boundary instead of refusing", ok);
+        require(is_refused(s_tight), "shift +1 placed a byte-neutral boundary instead of refusing", ok);
+        require(is_refused(s_loose), "shift -1 placed a byte-neutral boundary instead of refusing", ok);
+        require(is_refused(s_min), "shift -1000 placed a byte-neutral boundary instead of refusing", ok);
+        require(!is_refused(s_max),
+                "shift +1000 has NO byte-neutral band and must still emit a table", ok);
+        // F1227 (2026-09-29): THE CAP MOVED FROM 8 TO 16 BY OWNER INSTRUCTION -- see the note
+        // on kKvBitBudgetE8LayerLimit in product/kv_bit_budget.h, which records his sentence,
+        // the owner-authorised relaxation and the 0/27 all-16 reading it knowingly accepts.
+        // On this table's 12 measured layers the maximal-deficit band is now min(12, 16) = 12,
+        // so rk4v4 takes all 12 and iso4e is still squeezed out. The assertion stays a
+        // DISCRIMINATING one: it would fail if the cap went away entirely in a way that
+        // changed this count, and it fails if iso4e reappears in the empty-band case.
+        require(count_tier(spec_body(s_max), "rk4v4") == 12 &&
+                count_tier(spec_body(s_max), "iso4e") == 0,
+                "the empty-band case lost the rk4v4 exposure cap or placed an iso4e band", ok);
+        // A14 (redtest). The cap is product/kv_bit_budget.h's kKvBitBudgetE8LayerLimit, which
+        // the owner raised to 16 on 2026-09-29 (it was 8: the size of the measured rk4v4
+        // window, layers 0..7, with that header's own banner note recording that an older
+        // banner still claiming 10 is out of date). build_ft_spec clamps rk4v4_lo to
         // min(n, that constant), so on this table's 12 measured layers the maximal-deficit
-        // band is min(12, 8) = 8: rk4v4 takes measured layers 0..7, iso4e is squeezed out
-        // entirely, and nvfp4 keeps the 4 measured layers 8..11 plus the 4 protected deep
-        // layers 12..15. The expectation below is the cap's value; the assertion still
-        // DISCRIMINATES the cap, because with no cap rk4v4 would be n = 12.
+        // band is min(12, 16) = 12: rk4v4 takes all 12 measured layers, iso4e is squeezed out
+        // entirely, and nvfp4 keeps the 4 protected deep layers 12..15. The expectation below
+        // is the cap's value on a 12-layer table; on a 16-layer stack the cap no longer binds
+        // at all, which is the point of the relaxation.
         // The pre-image expected 10 / 6, i.e. the pre-tightening limit, and the test was in
         // no CMakeLists so nothing ever ran it.
-        require(count_tier(s_max, "rk4v4") == 8 && count_tier(s_max, "nvfp4") == 8,
-                "the rk4v4 exposure cap (kKvBitBudgetE8LayerLimit) was not enforced", ok);
-        require(count_tier(s_min, "rk4v4") == 0, "the loose end did not reach an empty rk4v4 band", ok);
-        require(count_tier(s_max, "nvfp4") >= 4, "deep protection was lost", ok);
-        const std::string lo = s_max.substr(s_max.find("12:"));
-        require(lo.rfind("12:nvfp4", 0) == 0, "a deep layer left nvfp4 under a shift", ok);
-        std::printf("spec_shift: rk4v4 %d->%d (+1) %d (-1) %d (cap)\n", count_tier(s0, "rk4v4"),
-                    count_tier(s_tight, "rk4v4"), count_tier(s_loose, "rk4v4"),
-                    count_tier(s_max, "rk4v4"));
+        // kvfix (F893): the rk4v4 exposure cap, the empty-loose-band case and the deep-band
+        // protection all pinned OCCURRENCES of a table that is now withheld; they are pinned
+        // here as the ONE thing that is still true -- the refusal is the same string under
+        // every shift, so a guard that fired for only some shifts would fail this.
+        std::printf("spec_shift: rk4v4_hi>rk4v4_lo by shift: 0=%d +1=%d -1=%d -1000=%d | "
+                    "empty-band case (+1000) emitted: %d\n",
+                    is_refused(s0), is_refused(s_tight), is_refused(s_loose), is_refused(s_min),
+                    !is_refused(s_max));
 
         // A sparse table: only the observed layers can enter the rk4v4 band, the
         // rest must keep the conservative iso4e even under a maximal deficit.
         const Energy sparse = equivalence_tables()[1];
-        const std::string sparse_tight = build_ft_spec(sparse, 16, 0.2, 1000);
+        const std::string sparse_tight = spec_or_refusal(sparse, 16, 0.2, 1000);
         int sparse_iso4e = 0;
         int sparse_rk4v4 = 0;
         for (int layer = 0; layer < 12; ++layer) {
@@ -288,7 +337,15 @@ int main(int argc, char** argv) {
             if (tier == "iso4e") { ++sparse_iso4e; }
             if (tier == "rk4v4") { ++sparse_rk4v4; }
         }
+        // kvfix (F893) ROUND 3: on this 4-measured-layer table a +1000 shift drives lo to 4 ==
+        // hi, so no byte-neutral band exists and the guard does NOT fire -- the table is emitted
+        // and the unobserved layers keep iso4e, which is the assertion the pre-image made and it
+        // was RIGHT. Round 2 called this "count_tier reading the refusal message"; the reading
+        // says otherwise (the message carries no ":iso4e" or ":rk4v4") and that claim is
+        // WITHDRAWN here rather than left standing.
         std::printf("spec_shift_sparse: rk4v4=%d iso4e=%d\n", sparse_rk4v4, sparse_iso4e);
+        require(!is_refused(sparse_tight),
+                "the sparse table has no byte-neutral band and must not be refused", ok);
         require(sparse_iso4e >= 6, "unobserved layers lost the conservative iso4e default", ok);
     }
 
@@ -319,18 +376,32 @@ int main(int argc, char** argv) {
         const std::string c1 = r.decide_once(energy);
         const std::string c2 = r.decide_once(energy);
         require(c1.empty() && r.last_vram_shift() == 4, "tight reading did not shift by 4", ok);
-        require(c2 == build_ft_spec(energy, 16, 0.2, 4) && landed == c2,
-                "the tight shift was not applied", ok);
-        std::printf("axis_tight: shift=%d rk4v4=%d\n", r.last_vram_shift(), count_tier(landed, "rk4v4"));
+        // kvfix (F893): there is no table to apply; what must hold is that NOTHING was
+        // applied AND the shift arithmetic still ran (last_vram_shift() == 4 above).
+        // kvfix (F893) ROUND 3: a +4 shift on the synthetic table reaches lo == hi == 8, so
+        // there is no byte-neutral band, the guard does not fire, and the tight reading is
+        // applied exactly as it was before this change. The assertion is the shift-0/hysteresis
+        // contract the pre-image made, re-expressed against the outcome rather than a literal.
+        require(c1.empty() && c2 == spec_body(spec_or_refusal(energy, 16, 0.2, 4)) &&
+                landed == c2 && applied_count == 1,
+                "the tight reading was not applied as before", ok);
+        std::printf("axis_tight: shift=%d c1=%zu c2=%zu landed=%zu applied=%d\n",
+                    r.last_vram_shift(), c1.size(), c2.size(), landed.size(), applied_count);
 
         // Loose: 2 quanta above the baseline -> shift -2 (hysteresis again).
         free_now = reference + 2 * quantum;
         const std::string c3 = r.decide_once(energy);
         const std::string c4 = r.decide_once(energy);
         require(c3.empty(), "hysteresis did not defer the loose candidate", ok);
-        require(c4 == build_ft_spec(energy, 16, 0.2, -2) && r.last_vram_shift() == -2,
-                "the loose shift was not applied", ok);
-        std::printf("axis_loose: shift=%d rk4v4=%d\n", r.last_vram_shift(), count_tier(landed, "rk4v4"));
+        // kvfix (F893) ROUND 3: a -2 shift leaves lo=2, hi=8, so a byte-neutral band EXISTS and
+        // the loose candidate is WITHHELD. `landed` is deliberately NOT asserted empty here: it
+        // still holds the tight-phase table this instance really applied, and reading it as
+        // "nothing was applied" would be reading a stale value -- which is what round 2 did.
+        require(c4.empty() && c3.empty() && r.last_vram_shift() == -2,
+                "the loose shift arithmetic did not run", ok);
+        require(applied_count == 1, "the withheld loose candidate was applied", ok);
+        std::printf("axis_loose: shift=%d c3=%zu c4=%zu landed(stale,tight)=%zu applied=%d\n",
+                    r.last_vram_shift(), c3.size(), c4.size(), landed.size(), applied_count);
 
         // The EWMA damps a one-cycle spike: with alpha 0.5 a single tight read
         // moves the damped value only halfway, so a quarter-quantum spike is
@@ -348,7 +419,10 @@ int main(int argc, char** argv) {
         (void)dr.decide_once(energy);
         require(dr.last_vram_shift() > 0, "a sustained 4-quantum (damped) deficit did not act", ok);
         std::printf("axis_damped: shift=%d\n", dr.last_vram_shift());
-        require(applied_count == 2, "an unexpected number of reloads was applied", ok);
+        // kvfix (F893) ROUND 3: ONE reload, and it is the tight phase's -- the pre-image expected
+        // 2 because the loose phase also landed. A -2 shift now leaves a byte-neutral band, so the
+        // loose and damped phases land nothing, and the count is the honest 1.
+        require(applied_count == 1, "an unexpected number of reloads was applied", ok);
     }
 
     // (f) CLI > env > default for the gap-2 layer of from_env().

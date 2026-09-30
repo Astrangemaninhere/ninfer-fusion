@@ -82,8 +82,19 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    // The stochastic route is unreachable with a non-empty mask (the runtime rejects a tree round
-    // on a non-greedy request), so the masks and the accepted column are not forwarded here.
+    // F904 -- THE PREMISE HERE WAS HALF TRUE AND THE CONCLUSION DID NOT FOLLOW, AND THIS SENTENCE
+    // IS WHAT HID THE DEFECT. It read: "The stochastic route is unreachable with a non-empty mask
+    // (the runtime rejects a tree round on a non-greedy request), so the masks and the accepted
+    // column are not forwarded here." The first clause is TRUE. The conclusion is FALSE, because
+    // the GREEDY branch of speculative_sampling_group_finalize_kernel is what runs for the greedy
+    // request a tree round is required to be, and this route is selected by sampler_multiblock_ok
+    // (ops/common/sampling_workspace.h:38-43), which HOLDS on this artifact for the chain (8
+    // columns) AND for the tree (15 columns). Every speculative accept on this artifact therefore
+    // took this route, and a tree round's accept ran the chain rule and published no column.
+    // THE FIX IS NOT HERE: wrapping the accept in src/ops/wrapper/speculative_round.cpp with
+    // detail::speculative_accept_tree_greedy_overwrite (F904) re-decides every tree round with the
+    // rule include/ninfer/ops/speculative_round.h:74-88 states. This file is a DEVICE TU this line
+    // did not recompile, so THIS COMMENT IS SOURCE-ONLY and the object on disk is the pin's.
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const std::int32_t groups         = sampler_group_count(partial_blocks);
     const SamplingWorkspace scratch   = layout.bind(workspace);

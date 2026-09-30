@@ -18,6 +18,7 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ops/stream_capture.h"   // F881: the one capture-predicate reader
 #include "ninfer/ops/swa.h"
 
 #include <cuda_runtime.h>
@@ -154,6 +155,8 @@ void append_context_impl(DFlash2AppendContext& state, const Tensor& features,
             const char* const dump_dir = df2_dump_dir("NINFER_DF2FEAT_DIR");
             auto dump_one = [&](const char* tag, const Tensor& view) {
                 if (dump_dir == nullptr || view.data == nullptr || view.numel() == 0) { return; }
+                // F881 -- GUARD (NINFER_DF2FEAT dump): the round's own stream is asked first.
+                if (ninfer::ops::stream_is_capturing(s)) { return; }
                 std::vector<std::byte> host(view.bytes());
                 CUDA_CHECK(cudaMemcpyAsync(host.data(), view.data, host.size(),
                                            cudaMemcpyDeviceToHost, s));
@@ -426,6 +429,9 @@ void propose_batch_impl(DFlash2BatchContext& state, qwen3_6::DFlashDecodeState& 
             const char* const dump_dir     = df2_dump_dir("NINFER_DF2SCORES_DIR");
             auto dump_one = [&](const char* tag, const Tensor& view) {
                 if (dump_dir == nullptr || view.data == nullptr || view.numel() == 0) { return; }
+                // F881 -- GUARD. This block's OWN comment already says the sync is forbidden
+                // during capture ("needs --no-cuda-graph"); it now checks instead of instructing.
+                if (ninfer::ops::stream_is_capturing(dump_stream)) { return; }
                 std::vector<std::byte> host(view.bytes());
                 CUDA_CHECK(cudaMemcpyAsync(host.data(), view.data, host.size(),
                                            cudaMemcpyDeviceToHost, dump_stream));

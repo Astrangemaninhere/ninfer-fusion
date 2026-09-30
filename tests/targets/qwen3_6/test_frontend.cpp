@@ -1021,7 +1021,7 @@ int test_reasoning_effort_chat_template() {
         effort_capabilities.enable_thinking && effort_capabilities.reasoning_effort.low &&
             effort_capabilities.reasoning_effort.medium &&
             effort_capabilities.reasoning_effort.xhigh &&
-            effort_capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
+            effort_capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::Medium,
         "reasoning-effort template did not advertise its complete capability set");
 
     const auto render_effort = [](ninfer::ReasoningEffort effort) {
@@ -1243,7 +1243,7 @@ int test_official_resource_guards() {
     failures +=
         check(capabilities.reasoning_effort.low && capabilities.reasoning_effort.medium &&
                   capabilities.reasoning_effort.xhigh &&
-                  capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
+                  capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::Medium,
               "Frontend did not expose capabilities from its loaded chat template");
 
     // Standing guard for the near-miss criterion itself, so that it cannot be quietly

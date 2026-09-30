@@ -35,11 +35,11 @@
 //
 //   The other two refused sources are refused for their own named reasons, not by association:
 //     * an EMBEDDING vector -- a similarity score may narrow (the candidate-set UNION) and may
-//       never determine; the tree says so at program_impl.h:14418-14422 ("exact-or-silent, never
+//       never determine; the tree says so at program_impl.h [text: exact-or-silent, never approximately right; = :15948 on 2026-09-25] ("exact-or-silent, never
 //       approximately right ... belongs in the candidate-set UNION, never in place of this
 //       arbiter"), and `sum_dir_vector.h`'s own default offer needs an embedder that does not exist
 //       in the tree, so it cannot produce a KEY at all;
-//     * a CALLER-SUPPLIED identity -- sum_dir.h:1372-1383 refuses it for `append` in the same words
+//     * a CALLER-SUPPLIED identity -- sum_dir.h [text: an API taking a caller-supplied identity; = :1599 on 2026-09-25] refuses it for `append` in the same words
 //       this file inherits: "an API taking a caller-supplied identity would be an API through which
 //       position could sneak back in".
 //
@@ -77,9 +77,9 @@ enum class SumDirQueryKeySource : std::uint8_t {
     EngineRollingDigest = 1,
     // REFUSED: same objection as above, plus it is not card-free.
     ModelHiddenState = 2,
-    // REFUSED: a score may narrow, never determine (program_impl.h:14418-14422).
+    // REFUSED: a score may narrow, never determine (program_impl.h [text: exact-or-silent, never approximately right; = :15948 on 2026-09-25]).
     EmbeddingVector = 3,
-    // REFUSED: the caller does not get to name the block it is looking for (sum_dir.h:1372-1383).
+    // REFUSED: the caller does not get to name the block it is looking for (sum_dir.h [text: an API taking a caller-supplied identity; = :1599 on 2026-09-25]).
     CallerSuppliedIdentity = 4,
 };
 
@@ -119,10 +119,10 @@ sum_dir_query_key_source_admitted(SumDirQueryKeySource source) noexcept {
                "has already rejected it as an identity (recall_identity.h:588-603)";
     case SumDirQueryKeySource::EmbeddingVector:
         return "refused: a similarity score may enter the candidate-set UNION and nothing else "
-               "(program_impl.h:14418-14422); it can never produce DETERMINED";
+               "(program_impl.h [text: exact-or-silent, never approximately right; = :15948 on 2026-09-25]); it can never produce DETERMINED";
     case SumDirQueryKeySource::CallerSuppliedIdentity:
         return "refused: an identity a caller names is an API through which position sneaks back "
-               "in (sum_dir.h:1372-1383)";
+               "in (sum_dir.h [text: an API taking a caller-supplied identity; = :1599 on 2026-09-25])";
     }
     return "unknown";
 }
@@ -306,7 +306,7 @@ sum_dir_query_key_lookup(const SumDir& directory, const SumDirQueryKey& key) noe
     } else {
         // COUNTED, named, and deliberately not resolved: choosing among these by anything but an
         // exact content check would be the "plausible-looking wrong anchor" the tree forbids
-        // (sum_dir_reach.h:104-108, program_impl.h:14502-14507).
+        // (sum_dir_reach.h [text: substitute the positional first-fit silently; = :110 on 2026-09-25], program_impl.h [text: chooses a page by POSITION; = :16212 on 2026-09-25]).
         out.verdict = SumDirQueryKeyVerdict::RefusedAmbiguous;
     }
     return out;

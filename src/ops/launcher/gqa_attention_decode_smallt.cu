@@ -6,6 +6,7 @@
 #include "ops/launcher/gqa_attention.h"
 #include "ops/launcher/gqa_attention_decode_split.h"
 #include "ops/launcher/gqa_attention_decode_tiers.h"
+#include "ops/launcher/gqa_attention_geometry_route.h"
 
 #include "core/device.h" // CUDA_CHECK
 
@@ -120,6 +121,33 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                                       GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                       Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                       cudaStream_t stream) {
+    // ============================ F910: WHY THIS INSTANTIATION IS NOT WRITTEN ================    // `gqa_attention_small_t_launch_for<Gqa16x4Geometry>` is the NAMED ABSENCE dl/musefix F-897
+    // recorded. It is not a missing line here, and writing it here alone would be WORSE than the
+    // refusal: the six per-codec launchers this function forwards to
+    // (gqa_attention_decode_{bf16,i8,nvfp4,fp8,iso3,e8}_launch) are NON-TEMPLATE functions whose
+    // dispatch is INSIDE their own TU and keys on (q.ne[1], q.ne[0]) -- the Q-head count and the
+    // head dim, with no kv-head signature -- so a 16/4 request that reached them would select the
+    // Gqa35Geometry (16/2) kernels while THIS template computed Gqa16x4Geometry's split schedule.
+    // The tree's own geometry header says the two disagree: gqa_attention_geometry.cuh:42,
+    // "Gqa16x4Geometry <16,4,1,256> DecodeSplits=85 -> 170/4 = 42 CHANGES (Spark-X2.5, NOT
+    // measured)". Mismatched split counts under a matched result = a SILENT WRONG NUMBER.
+    // The real work is in those five tier TUs (each needs its own 16/4 branch and its own kernel
+    // instantiations; the E8 tier is the only one that even names the geometry, and its
+    // `require_group4_schedule` REFUSES), and recompiling them is forbidden to this line because
+    // they are the five heavy TUs whose compilation kills the box. So the instantiation stays
+    // UNWRITTEN and this assert makes the reason a NAME: instantiate it and the build stops HERE.
+    static_assert(!(Geometry::QHeads == Gqa35Geometry::QHeads &&
+                    Geometry::HeadDim == Gqa35Geometry::HeadDim &&
+                    Geometry::KVHeads != Gqa35Geometry::KVHeads),
+                  "this Geometry shares (QHeads, HeadDim) with Gqa35Geometry but not its KVHeads, "
+                  "and the per-codec tier launchers this function forwards to select their "
+                  "geometry from (q_heads, head_dim) ALONE -- they have no kv-head signature. "
+                  "Instantiating gqa_attention_small_t_launch_for<Gqa16x4Geometry> would run the "
+                  "16 q / 2 kv kernels under the 16 q / 4 kv split schedule computed HERE "
+                  "(Gqa16x4Geometry's DecodeSplits is 85 -> 42 splits, Gqa35Geometry's is not): a "
+                  "silent wrong number, not a launch. Add the Gqa16x4Geometry branch AND its "
+                  "kernel instantiations to each of the five tier TUs first. Until then a 16/4 "
+                  "small-T decode is refused BY NAME by gqa_small_t_geometry_refusal below.");
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
     // FIX-A pin test (NINFER_SPLIT_PARITY): the window the batch-1 decode of THIS launch's last
     // column would carry. The round's column 0 sits (full_width - 1) below
@@ -332,30 +360,29 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         .width         = width,
         .batch_size    = q.ne[3],
     };
-    if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim) {
+    if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim &&
+        cache.num_kv_heads == Gqa27Geometry::KVHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
                                                         envelope, partial_acc, partial_m, partial_l,
                                                         out, stream);
         return;
     }
-    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
+    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim &&
+        cache.num_kv_heads == GqaMuseGeometry::KVHeads) {
         gqa_attention_small_t_launch_for<GqaMuseGeometry>(q, input, pos, scale, cache, invocation,
                                                           envelope, partial_acc, partial_m,
                                                           partial_l, out, stream);
         return;
     }
-    if (q.ne[1] == Gqa35Geometry::QHeads && q.ne[0] == Gqa35Geometry::HeadDim) {
+    if (q.ne[1] == Gqa35Geometry::QHeads && q.ne[0] == Gqa35Geometry::HeadDim &&
+        cache.num_kv_heads == Gqa35Geometry::KVHeads) {
         gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
                                                         envelope, partial_acc, partial_m,
                                                         partial_l, out, stream);
         return;
     }
-    throw std::invalid_argument(
-        "gqa_attention_small_t_launch: unsupported query-head geometry (" +
-        std::to_string(q.ne[1]) + " q-heads); registered: " +
-        std::to_string(Gqa27Geometry::QHeads) + "/" +
-        std::to_string(GqaMuseGeometry::QHeads) + "/" +
-        std::to_string(Gqa35Geometry::QHeads));
+    throw std::invalid_argument(gqa_small_t_geometry_refusal(
+        "gqa_attention_small_t_launch", q.ne[1], cache.num_kv_heads, q.ne[0]));
 }
 
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
@@ -373,21 +400,29 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
         .batch_size    = 1,
     };
     const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
-    if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim) {
+    if (q.ne[1] == Gqa27Geometry::QHeads && q.ne[0] == Gqa27Geometry::HeadDim &&
+        cache.num_kv_heads == Gqa27Geometry::KVHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
                                                         invocation, envelope, partial_acc,
                                                         partial_m, partial_l, out, stream);
         return;
     }
-    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim) {
+    if (q.ne[1] == GqaMuseGeometry::QHeads && q.ne[0] == GqaMuseGeometry::HeadDim &&
+        cache.num_kv_heads == GqaMuseGeometry::KVHeads) {
         gqa_attention_small_t_launch_for<GqaMuseGeometry>(q, input, pos, scale, batch_cache,
                                                           invocation, envelope, partial_acc,
                                                           partial_m, partial_l, out, stream);
         return;
     }
-    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, batch_cache, invocation,
+    if (q.ne[1] == Gqa35Geometry::QHeads && q.ne[0] == Gqa35Geometry::HeadDim &&
+        cache.num_kv_heads == Gqa35Geometry::KVHeads) {
+        gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, batch_cache, invocation,
                                                     envelope, partial_acc, partial_m, partial_l,
                                                     out, stream);
+        return;
+    }
+    throw std::invalid_argument(gqa_small_t_geometry_refusal(
+        "gqa_attention_cached_small_t_launch", q.ne[1], cache.num_kv_heads, q.ne[0]));
 }
 
 } // namespace ninfer::ops::detail

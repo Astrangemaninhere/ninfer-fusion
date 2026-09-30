@@ -89,6 +89,18 @@ __global__ void ple_gather_rows_kernel(const unsigned long long* row_ptrs,
 PleTable::PleTable(PleTableOptions options)
     : layout_(PleLayout::from_manifest((options.sidecar_root / "ple-manifest.json").string())),
       options_(std::move(options)) {
+    // The prefetch pool this option names was never written (ple_table.h used to claim it in
+    // this file's own header comment). A non-zero value is therefore a request that nothing in
+    // this translation unit reads, so it is refused BY NAME rather than accepted and ignored.
+    if (options_.prefetch_workers != 0) {
+        throw std::invalid_argument(
+            "PLE PleTableOptions::prefetch_workers=" +
+            std::to_string(options_.prefetch_workers) +
+            " was requested, but no prefetch worker pool exists in this build: the option is "
+            "accepted only as 0, which is its default. See src/ops/ple/ple_table.h -- the "
+            "header claimed an async prefetcher and the claim was removed rather than left "
+            "standing. Reads happen synchronously inside gather().");
+    }
     open_files();
 }
 

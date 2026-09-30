@@ -43,7 +43,24 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class PackedU4Format:
+    """Unsigned four-bit codes with one binary16 multiplier per K-axis group.
+
+    Mirrors the engine's `artifact::NumericFormat::U4Z8G16_F16S`
+    (src/artifact/reader.h), the PLE n-gram shard encoding `packed-u4-g16-v1`:
+    packed nibbles plus one FP16 scale word per 16 K-axis columns.  It is NOT an
+    `Nvfp4Format` -- NVFP4 pairs E2M1 codes with E4M3FN scale words, this pairs U4
+    codes with FP16 scale words.
+    """
+
+    name: str
+    group_size: int
+
+
+NumericFormat: TypeAlias = (
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | PackedU4Format
+)
 
 
 BF16 = DirectFormat("BF16", 2)
@@ -54,8 +71,25 @@ Q4G64_F16S = QuantFormat("Q4G64_F16S", 4, 64, -8, 7)
 Q5G64_F16S = QuantFormat("Q5G64_F16S", 5, 64, -16, 15)
 Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
+
+
+#: 1-bit grouped codes, group 64 -- the bonsai-family rung.  Mirrors
+#: ``artifact::NumericFormat::Q1G64_F16S`` (src/artifact/reader.h) and the
+#: ``quant_geometry()`` case ``{64, 8, 0}`` (src/artifact/storage_layouts.cpp), i.e.
+#: 8 bytes of base plane per 64 values == 1.00 bit, high plane empty.
+Q1G64_F16S = QuantFormat("Q1G64_F16S", 1, 64, -1, 1)
+
+#: 2-bit grouped codes, group 64 -- Prism PQ2_0 / upstream Q2_0.  ``{64, 16, 0}`` == 2.00 bit.
+Q2G64_F16S = QuantFormat("Q2G64_F16S", 2, 64, -2, 1)
+
+#: 3-bit grouped codes, group 64 -- ``{64, 16, 8}`` == 2 + 1 bit.  NOT GSQ: see the
+#: ``arch_caps.h`` note; GSQ's pack-int32-le-v1 (pack_factor 10) is a different packing.
+Q3G64_F16S = QuantFormat("Q3G64_F16S", 3, 64, -4, 3)
+
 NVFP4 = Nvfp4Format("NVFP4", 16)
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
+FP8_E4M3FN_ROW_F32S = Fp8RowFormat("FP8_E4M3FN_ROW_F32S")
+U4Z8G16_F16S = PackedU4Format("U4Z8G16_F16S", 16)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -64,15 +98,21 @@ DIRECT_FORMATS = MappingProxyType(
 QUANT_FORMATS = MappingProxyType(
     {
         item.name: item
-        for item in (Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, W8G32_F16S)
+        for item in (Q1G64_F16S, Q2G64_F16S, Q3G64_F16S,
+                 Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, W8G32_F16S)
     }
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType(
-    {FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S}
+    {
+        FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S,
+        FP8_E4M3FN_ROW_F32S.name: FP8_E4M3FN_ROW_F32S,
+    }
 )
+PACKED_U4_FORMATS = MappingProxyType({U4Z8G16_F16S.name: U4Z8G16_F16S})
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS,
+     **PACKED_U4_FORMATS}
 )
 
 
@@ -131,6 +171,15 @@ def valid_fp8_row_scale_word(word: int) -> bool:
     return math.isfinite(value)
 
 
+def valid_fp32_row_scale_word(word: int) -> bool:
+    """Return whether *word* is a nonnegative finite FP32 multiplier."""
+
+    if type(word) is not int or not 0 <= word <= 0xFFFFFFFF or word & 0x80000000:
+        return False
+    value = struct.unpack("<f", struct.pack("<I", word))[0]
+    return math.isfinite(value)
+
+
 def valid_positive_fp32_word(word: int) -> bool:
     """Return whether an IEEE binary32 word represents a finite positive value."""
 
@@ -154,6 +203,7 @@ __all__ = [
     "DIRECT_FORMATS",
     "DirectFormat",
     "FP8_E4M3FN_ROW_BF16S",
+    "FP8_E4M3FN_ROW_F32S",
     "FP8_ROW_FORMATS",
     "FP32",
     "Fp8RowFormat",
@@ -163,15 +213,22 @@ __all__ = [
     "NVFP4_FORMATS",
     "Nvfp4Format",
     "NumericFormat",
+    "PACKED_U4_FORMATS",
+    "PackedU4Format",
+    "Q1G64_F16S",
+    "Q2G64_F16S",
+    "Q3G64_F16S",
     "Q4G64_F16S",
     "Q5G64_F16S",
     "Q6G64_F16S",
     "QUANT_FORMATS",
     "QuantFormat",
+    "U4Z8G16_F16S",
     "W8G32_F16S",
     "decode_e2m1_word",
     "decode_e4m3fn_word",
     "get_format",
+    "valid_fp32_row_scale_word",
     "valid_fp8_row_scale_word",
     "valid_fp8_weight_word",
     "valid_nvfp4_scale_word",

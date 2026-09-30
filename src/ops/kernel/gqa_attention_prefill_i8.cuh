@@ -375,7 +375,14 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     std::int32_t width,
     const std::uint8_t* __restrict__ cold_k_slots = nullptr,
     const std::uint8_t* __restrict__ cold_v_slots = nullptr,
-    int slot_bytes = 0) {
+    int slot_bytes = 0,
+    // [F1259 kvfill] THE NARROW CLASS, AS THIS LAYER'S TWO PLANE PAIRS. Defaulted, so every call
+    // site that existed before the axis keeps the pre-image kernel (null = the branch is dead).
+    const std::uint8_t* __restrict__ narrow_k_codes = nullptr,
+    const std::uint8_t* __restrict__ narrow_v_codes = nullptr,
+    const std::uint8_t* __restrict__ narrow_k_scales = nullptr,
+    const std::uint8_t* __restrict__ narrow_v_scales = nullptr,
+    int narrow_pages = 0) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillI8Br;
     constexpr int Bc            = kGqaPrefillI8Bc;
@@ -463,18 +470,90 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         // and skip the cp.async pipeline: the double-buffer prefetch would
         // otherwise overwrite the tile being consumed. Cold tiles are rare
         // (one per window crossing), so the lost overlap is negligible.
-        const bool tile_cold =
+        const bool tile_cold_raw =
             gqa_prefill_i8_tile_is_cold(table_entry, cold_k_slots, cold_v_slots,
                                         slot_bytes);
+        // [F1259 kvfill] THE NARROW CLASS, READ. A narrow page is one whose class descended off the
+        // resident set; its payload lives in THIS layer's narrow planes at index
+        // `paged_kv_narrow_index(entry)` (core/paged_kv_cache.h: the class sentinel, which is what
+        // decoder_state.cpp:419-422 named as the addressing channel). The branch below stages a
+        // narrow tile exactly the way the cold branch stages a cold one, so the QK/PV math and the
+        // smem layouts are untouched and the kernel cannot tell the two classes apart.
+        //
+        // IT IS TESTED FIRST, AND `tile_cold` IS NARROWED BY IT, because the cold predicate is
+        // `entry <= -2` and the narrow sentinel is `entry <= -4096`: without this line a narrow
+        // entry would enter the cold branch and read another layer's slot record.
+        const bool tile_narrow =
+            narrow_k_codes != nullptr && narrow_v_codes != nullptr &&
+            narrow_k_scales != nullptr && narrow_v_scales != nullptr &&
+            table_entry <= kPagedKVNarrowSentinelBase &&
+            paged_kv_narrow_index(table_entry) < narrow_pages;
+        const bool tile_cold = tile_cold_raw && !tile_narrow;
         // A negative entry without the cold planes is NOT a page index.
         // Zero-fill the tile instead of silently aliasing another layer's plane.
-        const bool tile_absent = table_entry < 0 && !tile_cold;
+        const bool tile_absent = table_entry < 0 && !tile_cold && !tile_narrow;
         const std::int64_t slot_flat =
             static_cast<std::int64_t>(-table_entry - 2) * (2 * Geometry::KVHeads) + kv_head;
         const std::uint8_t* k_slot = tile_cold ? cold_k_slots + slot_flat * slot_bytes
                                                 : nullptr;
         const std::uint8_t* v_slot = tile_cold ? cold_v_slots + slot_flat * slot_bytes
                                                 : nullptr;
+        if (tile_narrow) {
+            // [F1259 kvfill] THE NARROW TILE, STAGED. The row bases come from the two planes:
+            // `paged_kv_page_head_offset<D/2, KVHeads>(np, head)` is the plane's own page-head
+            // origin (the same function the resident planes are addressed with), and the 128 B /
+            // 16 B row strides are the record this file's cold branch already uses.
+            const int np = paged_kv_narrow_index(table_entry);
+            const std::int64_t kc0 =
+                paged_kv_page_head_offset<D / 2, Geometry::KVHeads>(np, kv_head);
+            const std::int64_t ks0 =
+                paged_kv_page_head_offset<D / 16, Geometry::KVHeads>(np, kv_head);
+            // K and V share these origins: the narrow pair is the SAME geometry on both sides.
+            for (int key_l = tid; key_l < Bc; key_l += kGqaPrefillI8Threads) {
+                const int key = tile_k0 + key_l;
+                __half* kd    = &k_scale_s[key_l * Groups];
+                __half* vd    = &v_scale_s[key_l * Groups];
+                if (key > max_query_abs) {
+                    store_vec(kd, make_int2(0, 0));
+                    store_vec(vd, make_int2(0, 0));
+#pragma unroll 1
+                    for (int dc = 0; dc < D / 16; ++dc) {
+                        std::int8_t* kdst =
+                            &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, dc * 8)) * 2];
+                        store_vec(kdst, make_int4(0, 0, 0, 0));
+                        store_vec(&v_i8[key_l * D + dc * 16], make_int4(0, 0, 0, 0));
+                    }
+                    continue;
+                }
+                const int row = key & kPagedKVPageMask;
+                std::int8_t row_codes[kGqaKvQuantHeadDim];
+                __half row_scales[kGqaKvQuantGroups];
+                ninfer::ops::detail::kv_narrow_decode_row<Groups>(
+                    narrow_k_codes + kc0 + row * 128, narrow_k_scales + ks0 + row * 16, row_codes,
+                    row_scales);
+#pragma unroll 4
+                for (int d = 0; d < kGqaKvQuantHeadDim; ++d) {
+                    gqa_prefill_i8_store_swz(k_i8, key_l, d, row_codes[d]);
+                }
+#pragma unroll
+                for (int g = 0; g < Groups; ++g) { kd[g] = row_scales[g]; }
+                ninfer::ops::detail::kv_narrow_decode_row<Groups>(
+                    narrow_v_codes + kc0 + row * 128, narrow_v_scales + ks0 + row * 16, row_codes,
+                    row_scales);
+#pragma unroll 4
+                for (int d = 0; d < kGqaKvQuantHeadDim; ++d) {
+                    v_i8[key_l * D + d] = row_codes[d];
+                }
+#pragma unroll
+                for (int g = 0; g < Groups; ++g) { vd[g] = row_scales[g]; }
+            }
+            // Same discipline as the cold arm: this branch fills synchronously, so nothing is in
+            // flight; committing and waiting keeps the caller's cp_wait<0> a no-op instead of a
+            // wait on the PREVIOUS tile's outstanding copies.
+            ninfer::ops::cp_commit();
+            ninfer::ops::cp_wait<0>();
+            return;
+        }
         if (tile_cold && v_slot != nullptr) {
             for (int key_l = tid; key_l < Bc; key_l += kGqaPrefillI8Threads) {
                 const int key = tile_k0 + key_l;
@@ -889,6 +968,33 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             ninfer::ops::cp_wait<0>();
             if constexpr (E8) { unpack_tile((kb + 1) * Bc); }
         }
+        // int8sync (dl/_orch/landq/int8sync): THE CROSS-ITERATION BARRIER.
+        //
+        // THE DEFECT IT CLOSES. This loop body has one __syncthreads() -- the one above, which
+        // orders tile kb's WRITERS (p_s :816-819, v_f16 :845) against tile kb's READERS (the PV
+        // pass :874/:882). It has NONE after the PV pass, so tile kb+1's writers -- the same
+        // buffers, the same threads that raced ahead -- can overwrite p_s and v_f16 while the
+        // slower warps are still reading tile kb's. From outside the process that is not a
+        // wrong-answer-once bug, it is a NON-REPRODUCIBLE answer: two runs of one command on one
+        // binary gave 118 / 256 / 108 / 256 generated tokens.
+        //
+        // WHY THIS LINE AND NOT SOMEWHERE ELSE. The first K element that differs between two runs
+        // is token 64 (kvsrc_1_L1_kn.bin, byte 131072 in ne=[256,4,3072,1]/nb=[2,512,2048,...]) --
+        // the first token of the first q_block with key_blocks >= 2, i.e. the first q_block whose
+        // body runs twice. Tokens 0..63 (key_blocks == 1) are byte-identical everywhere. A race
+        // that needs two iterations is exactly what that boundary says.
+        //
+        // WHY THE E8 ARM LOOKED FINE. :890 is `if constexpr (E8) { unpack_tile(...); }` and
+        // unpack_tile ends with __syncthreads() at :644, so the E8 arm has had this barrier all
+        // along by accident. Adding it here unconditionally makes the E8 arm carry two; that is
+        // redundant and cheap, and it is DELIBERATE: if a later change ever removes the one inside
+        // unpack_tile, the E8 arm stays correct instead of silently inheriting this defect.
+        //
+        // WHAT THIS DOES NOT CHANGE. No arithmetic, no buffer, no launch geometry, no index. It
+        // adds one barrier and the barrier is reachable by every thread that reaches the end of the
+        // loop body (`key_blocks` is uniform per CTA: it is derived from q0/base_pos/tokens, and the
+        // only early return is above the loop). Cost: one barrier per key tile per q_block.
+        __syncthreads();
     }
 
     if (warp < ProducerWarps && lid == 0) {

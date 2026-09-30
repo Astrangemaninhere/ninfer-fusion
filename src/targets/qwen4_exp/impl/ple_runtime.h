@@ -76,7 +76,9 @@ class PleRuntime {
 public:
     struct Options {
         std::size_t cache_bytes = 512ULL << 20; // pinned LRU budget (ple_table.h:30)
-        unsigned prefetch_workers = 16;         // ple_table.h:31
+        // 0 only: PleTable refuses a non-zero value by name because no prefetch pool exists
+        // (ple_table.h:31 records the same conclusion from the op's side).
+        unsigned prefetch_workers = 0;
     };
 
     // Returns nullptr when PLE is off (empty resolved root). Throws loudly

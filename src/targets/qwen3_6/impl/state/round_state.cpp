@@ -43,7 +43,7 @@ void validate_spec(const RoundStateSpec& spec) {
             "RoundState DFlash draft window exceeds the decode frame domain");
     }
     if (spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
-        throw std::invalid_argument("RoundState batch capacity must be in [1,8]");
+        throw std::invalid_argument("RoundState batch capacity must be in [1,16]");
     }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                       "RoundState draft window exceeds int32");
@@ -83,7 +83,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                                          const OrdinaryDecodeStateLayout& layout,
                                          std::uint32_t batch_capacity) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency) {
-        throw std::invalid_argument("ordinary decode batch capacity must be in [1,8]");
+        throw std::invalid_argument("ordinary decode batch capacity must be in [1,16]");
     }
     static_assert(std::is_standard_layout_v<OrdinaryDecodeIngress>);
     static_assert(std::is_standard_layout_v<OrdinaryDecodeEgress>);

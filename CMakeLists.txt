@@ -401,6 +401,37 @@ endif()
 # This is the BELT. The braces are TMPDIR=/var/tmp/nvcc-tmp in ~/.profile.
 # Neither removes bytes written -- only where they land.
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--objdir-as-tempdir>)
+# --- K40 (CUDA 11.8 / compute_35) forced includes -- PART 2 of landq/k40cmake ---------
+#
+# WHY: the K40 path compiles this tree with nvcc 11.8.  That front end cannot read the
+# tree's C++20 shape, so CMAKE_CUDA_STANDARD drops to 17 (PART 1 of this entry), and
+# under C++17 two things this tree relies on are missing: (a) a handful of library
+# spellings that move or disappear between the two dialects, and (b) the sm_3x..sm_8x
+# attribute/name backfill the K40 target needs.  Both live in exactly two headers.
+#
+# MEASURED, not asserted: with `-std=c++20` on a modern toolkit the two headers expand
+# to nothing that reaches code generation -- see dl/k40cmake/REPORT.md section 3, and
+# the neutrality arm that compares PTX/SASS byte for byte with and without them.
+#
+# SPELLING FIXED 2026-09-22 by landq/k40spell -- dl/k40spell/REPORT.md.  The marker line
+# above is kept byte-identical to the sibling entry's ON PURPOSE, so that either entry's
+# editor REFUSES (rc=2) instead of half-editing a block the other one wrote.
+#
+# One option string per header, `SHELL:`-prefixed.  Both halves were measured on a 3-line
+# CMake project before landing (dl/k40spell/logs/s01_forms.txt):
+#   (a) CMake de-duplicates COMPILE_OPTIONS: written as FOUR items the two `-include`s fold
+#       into ONE carrying TWO paths, and nvcc reads the second .h as a second positional
+#       input -- `A single input file is required for a non-link phase when an outputfile
+#       is specified` on 184/184 CUDA command lines, objects 0 B.  `SHELL:` splits each
+#       string into its own argv pair at GENERATE time, i.e. after that de-duplication, so
+#       two `-include` tokens do appear (measured: 2).
+#   (b) the prefix must stay INSIDE the generator expression, else the two headers also
+#       land on every CXX command line (measured: CXX -include=2).
+# Same mechanism as the line above, and for the same reason: a bare set() of
+# CMAKE_CUDA_FLAGS would shadow each build directory's CACHED value for one configure.
+# nvcc has no `-include=<file>` form (`--include=<file>` answers `Unknown option`).
+add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-include ${CMAKE_SOURCE_DIR}/k40_shim/cxx17_compat.h>")
+add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-include ${CMAKE_SOURCE_DIR}/k40_shim/cxx17_arch_backfill.h>")
 
 # The toolkit floor is a property of the TARGET LIST, not of the project.
 # CUDA 13.x is needed for the arch-specific ('a') and family ('f') suffixes and

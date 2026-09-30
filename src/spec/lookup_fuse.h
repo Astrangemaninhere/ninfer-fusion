@@ -50,13 +50,33 @@ inline SuffixHit suffix_best(const std::vector<std::int32_t>& ids, std::int32_t 
     return best;
 }
 
-// 链式决策: 返回应填入草稿块的 token 数 (0 = 回退 drafter); out 前 n 项为草案。
-// Q = 查询窗长 (通常等于草稿块窗), K = 想提的 token 数。
-// 语义: 匹配段后历史首 token = ids[o+Q] (窗口起点 o 的续写位, 全/部分匹配同式)。
-inline std::int32_t fuse_chain(const std::vector<std::int32_t>& ids,
-                               std::int32_t query_start, std::int32_t query_len,
-                               std::int32_t min_len, std::int32_t k,
-                               std::int32_t* out) {
+// ---------------------------------------------------------------------------
+// THE COPIED-FROM SOURCE, EXPOSED -- leg 3's input. Nothing else changes.
+//
+// WHY. `fuse_chain` returns only a COUNT. The offset it copied from is computed inside
+// `suffix_best` (`SuffixHit::offset`, the history window start o), consumed inside `fill()` as
+// `pos = hit.offset + query_len + j`, and THROWN AWAY when the function returns. So the one
+// datum that would let a retention policy be keyed on WHICH PAGES OF HISTORY the drafts come
+// from -- the sequence position each filled slot was copied from -- exists for the duration of
+// this function and nowhere afterwards. A per-PAGE access histogram is therefore not merely
+// unprinted: it is never formed.
+//
+// THIS IS ADDITIVE AND BEHAVIOUR-PRESERVING. `fuse_chain` keeps its exact signature and its
+// exact behaviour by DELEGATING to the new function with a null source pointer, so every
+// existing call site (program_impl.h:15760 and both CPU tests) compiles and behaves
+// identically, and there is ONE implementation of the chain rather than two.
+//
+// `source_pos_out` may be null. When it is not, `source_pos_out[j]` receives the HISTORY
+// position the j-th filled slot was copied from, for j < the returned count. With
+// kPagedKVPageSize == 64 (core/paged_kv_cache.h:17, == kColdHostPageTokens,
+// cold_host_tier.h:68-69) the page is `source_pos_out[j] / 64`, which is the cross-layer unit
+// sum_dir.h:20 describes ("one logical page ACROSS ALL TEXT LAYERS ... a page moves whole").
+// ---------------------------------------------------------------------------
+inline std::int32_t fuse_chain_with_source(const std::vector<std::int32_t>& ids,
+                                           std::int32_t query_start, std::int32_t query_len,
+                                           std::int32_t min_len, std::int32_t k,
+                                           std::int32_t* out,
+                                           std::int32_t* source_pos_out) {
     const SuffixHit hit = suffix_best(ids, query_start, query_len, min_len, k);
     if (hit.length < min_len) { return 0; }
     const auto fill = [&](std::int32_t n) {
@@ -65,6 +85,7 @@ inline std::int32_t fuse_chain(const std::vector<std::int32_t>& ids,
             const std::int32_t pos = hit.offset + query_len + j;
             if (pos >= static_cast<std::int32_t>(ids.size())) { break; }
             out[j] = ids[pos];
+            if (source_pos_out != nullptr) { source_pos_out[j] = pos; }
             ++filled;
         }
         return filled;
@@ -76,5 +97,16 @@ inline std::int32_t fuse_chain(const std::vector<std::int32_t>& ids,
     // 部分匹配: 试探 1 个 (历史在匹配窗后的首 token), 下轮并入查询再查
     return fill(1);
 }
+
+// 链式决策: 返回应填入草稿块的 token 数 (0 = 回退 drafter); out 前 n 项为草案。
+// The v1 chain, UNCHANGED, now delegating: one implementation, and this signature is
+// what the live call site and both CPU tests already use.
+inline std::int32_t fuse_chain(const std::vector<std::int32_t>& ids,
+                               std::int32_t query_start, std::int32_t query_len,
+                               std::int32_t min_len, std::int32_t k,
+                               std::int32_t* out) {
+    return fuse_chain_with_source(ids, query_start, query_len, min_len, k, out, nullptr);
+}
+
 
 } // namespace ninfer::spec

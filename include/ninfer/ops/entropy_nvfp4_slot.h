@@ -123,10 +123,12 @@ void entropy_nvfp4_slot_restore_plane_raw(const std::uint8_t* slots, int slot_by
 // Scatters the uncompressed 1024-byte scale tail of every (page, kv_head)
 // slot into the matching paged scale plane. slots uses the host-cold layout:
 // page stride slot_page_stride, head stride slot_bytes; scale page stride is
-// scale_page_stride and page_ids supplies physical pages.
+// scale_page_stride. `physical_page` is the destination page and arrives BY VALUE -- it used to be
+// a device-dereferenced `const std::int32_t* page_ids` that every caller filled from a HOST stack
+// array (dl/coldcrash/REPORT.md). page_count is the grid.y extent and must be 1.
 void entropy_nvfp4_slot_scales_scatter_raw(const std::uint8_t* slots, int slot_bytes,
                                            int slot_page_stride, int kv_heads,
-                                           int page_count, const std::int32_t* page_ids,
+                                           int page_count, std::int32_t physical_page,
                                            int scale_page_stride, std::uint8_t* scales,
                                            cudaStream_t stream);
 

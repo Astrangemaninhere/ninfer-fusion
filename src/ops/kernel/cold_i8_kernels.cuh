@@ -123,4 +123,54 @@ __device__ __forceinline__ void cold_i8_decode_row(const std::uint8_t* slot, int
     }
 }
 
+// [F1259 kvfill] THE NARROW CLASS' ROW DECODER. Same arithmetic as the raw slot above, with the two
+// row bases taken from TWO PLANES instead of one slot record: the narrow set is the geometry's own
+// NVFP4 plane pair (U8 codes [head_dim/2, 64, kv_heads, N] + E4M3FN scales [head_dim/16, 64,
+// kv_heads, N], `decoder_state.cpp:480-491`), so the row strides are the same 128 B / 16 B and the
+// caller only has to add them.
+//
+// WHY THE RECORD BRIDGE IS EXACT, NOT APPROXIMATE. `cold_i8_slot_pack_kernel`'s own note above says
+// its source is "the nvfp4 page-major geometry entropy_cold_requant emits" -- and that is exactly
+// what the narrow planes hold (`entropy_cold_requant_kernels.cuh`, the Int8G64 arm, writes
+// `dst_codes + 128*head_off` and `dst_scales + 16*head_off`). So a narrow key row is decoded by the
+// same instructions as a cold one and the engine's QK/PV math cannot tell which class it read;
+// `program_impl.h`'s fill points the requant at the narrow plane instead of the scratch, so the two
+// destinations are the same bytes by construction as well as by arithmetic.
+//
+// The scale plane's leading extent (16) is the NVFP4 tier's own group
+// (`kv_layer_quant_group(DType::NVFP4)`, decoder_state.cpp:472) and it is what the slot layout
+// already hard-codes as 16 B/row, so the two cannot drift without this file moving too.
+template <int Groups = 4>
+__device__ __forceinline__ void kv_narrow_decode_row(const std::uint8_t* row_codes,
+                                                     const std::uint8_t* row_scales,
+                                                     std::int8_t* codes_out,   // 256, d-major
+                                                     __half* scales_out) {     // 4 groups
+#pragma unroll
+    for (int g = 0; g < Groups; ++g) {
+        float mx = 0.0f;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            mx = fmaxf(mx, gqa_kv_nvfp4_e4m3_to_f32(row_scales[g * 4 + s]));
+        }
+        const float scale = mx * 6.0f / 127.0f;
+        scales_out[g]     = __float2half(scale);
+        const float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 64; i += 2) {
+            const int d          = g * 64 + i;
+            const std::uint8_t b = row_codes[d >> 1];
+            const float v0 = gqa_kv_nvfp4_e2m1_to_f32(b & 0x0F) *
+                             gqa_kv_nvfp4_e4m3_to_f32(row_scales[d >> 4]);
+            const float v1 = gqa_kv_nvfp4_e2m1_to_f32(b >> 4) *
+                             gqa_kv_nvfp4_e4m3_to_f32(row_scales[(d + 1) >> 4]);
+            int c0         = __float2int_rn(v0 * inv);
+            int c1         = __float2int_rn(v1 * inv);
+            c0             = max(-127, min(127, c0));
+            c1             = max(-127, min(127, c1));
+            codes_out[d]     = static_cast<std::int8_t>(c0);
+            codes_out[d + 1] = static_cast<std::int8_t>(c1);
+        }
+    }
+}
+
 } // namespace ninfer::ops::detail

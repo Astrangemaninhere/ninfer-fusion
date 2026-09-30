@@ -231,6 +231,30 @@ def encode_direct(spec: inv.TensorSpec, reader: GgufReader) -> bytes:
     # artifact must hold `gamma - 1`.  The GGUF holds the plain `gamma`.
     # Set + why: tools/convert/unit_offset_norms.py
     flat = unit_offset_norms.stored_values(flat, spec.name)
+    # `gdn/a_log` is what the engine binds as its `A_log`, and the engine's gate is
+    # `-expf(A_log[row]) * softplus(...)`
+    # (src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu:378, and the 35-geometry
+    # scalar path at :141/:280/:314), while the GGUF's `blk.N.ssm_a` is ALREADY
+    # `-exp(A_log)` -- upstream's own source says so, verbatim:
+    #   ggml-org/llama.cpp src/models/qwen35.cpp:376
+    #     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);
+    #     // -A_log.exp() * softplus
+    # and `ssm_a` is the multiplier upstream uses.  So the value the engine needs is the LOG
+    # of the negated source, because `-exp(log(-ssm_a)) == ssm_a`.
+    # Measured on the RED 9B artifact: all 768 values of `gdn/a_log` are negative
+    # (-74.63 .. -0.00921, 24/24 layers all-negative), while the GREEN artifacts' `gdn/a_log`
+    # is mixed sign (-5.56 .. +4.94) and the engine's `-exp()` is right for them.
+    # Without this the engine computes `-exp(-exp(A_log))`: the per-channel decay spread
+    # collapses to [-0.9908, -3.9e-33] instead of [-74.63, -0.00921], in 24 of 32 layers.
+    # Refusal, not silence: a non-negative source means the reading does not hold for this
+    # file and `log` would hand the engine a NaN.
+    if spec.name.endswith("/gdn/a_log"):
+        if bool((flat >= 0).any()):
+            raise ConversionRefused(
+                "object %s sources a non-negative value: the GGUF's -exp(A_log) reading does "
+                "not hold, and log(-x) would be NaN.  Refusing rather than writing NaN."
+                % spec.name)
+        flat = torch.log(-flat.float())
     if spec.format == inv.BF16:
         return A_layouts.encode_direct(flat.to(torch.bfloat16), "BF16")
     if spec.format == inv.FP32:

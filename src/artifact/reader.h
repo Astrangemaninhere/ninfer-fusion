@@ -34,6 +34,25 @@ enum class NumericFormat {
     I64,
     FP8_E4M3FN_ROW_F32S,
     U4Z8G16_F16S,
+    // ---- appended 2026-09-29 (line flowopen, marker F1173) ------------------------------------
+    // THE LOW-BIT RUNGS THE OWNER ASKED FOR, and the reason they are here rather than in a
+    // converter: the container could not NAME them, so every 1-bit / 2-bit / 3-bit source
+    // died on the format gate with a refusal that read as "this model is not supported".
+    // MEASURED on the four rungs that exist: quant_geometry() is a two-plane bit-split
+    //   bits per group == 8 * (base_bytes_per_group + high_bytes_per_group) / group_size
+    //   Q4G64_F16S {64,32, 0} = 4.00   Q5G64_F16S {64,32, 8} = 5.00
+    //   Q6G64_F16S {64,32,16} = 6.00   W8G32_F16S {32,32, 0} = 8.00
+    // so the struct can already express the lower rungs; only the switch's case list was
+    // short.  These three carry the CODES.  They do NOT claim a kernel: src/core/arch_caps.h
+    // must give each one a Cap::None row naming the absent consumer, and that row is part of
+    // this same change -- a carrier with no named consumer is the "admits a file it then
+    // cannot read" failure this tree refuses to make.
+    Q1G64_F16S,   // 1 bit  -> quant_geometry {64, 8, 0}   bonsai-family sources (ggml Q1_0)
+    Q2G64_F16S,   // 2 bits -> quant_geometry {64,16, 0}   Prism PQ2_0 / upstream Q2_0
+    Q3G64_F16S,   // 3 bits -> quant_geometry {64,16, 8}   3-bit packed sources (see the note
+                  //                                     below: GSQ's pack-int32-le-v1 with
+                  //                                     pack_factor 10 is a DIFFERENT packing
+                  //                                     and is NOT carried by this member)
     // THE ENUM'S OWN COUNT, and it exists so that "walk every NumericFormat" is a compiler-checked
     // fact instead of a list someone has to remember to extend. It is the LAST member and NOT a
     // format: no artifact object may carry it, no parse arm names it, and format_name() returns {}

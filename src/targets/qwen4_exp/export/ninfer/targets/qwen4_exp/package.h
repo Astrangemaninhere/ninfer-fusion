@@ -47,6 +47,59 @@ inline constexpr std::string_view kModelId      = "qwen4-exp";
 inline constexpr std::string_view kTargetKey    = "qwen4-exp";
 inline constexpr std::string_view kRuntimeStage = "a-identity-only";
 
+// ---------------------------------------------------------------------------------------
+// STAGE (b) COMPLETENESS -- the predicate src/targets/registry.cpp's load gate reads.
+// ---------------------------------------------------------------------------------------
+// PUBLISHED BY THE BUILD. This directory's stage_b.cmake derives it from an existence test
+// over the three sources CMakeLists.txt names as stage (b) (impl/package.cpp,
+// impl/variant.cpp, impl/load/bindings.cpp) and CMakeLists.txt turns that verdict into the
+// two definitions below.
+//
+// WHERE THE FAIL-SAFE DIRECTION IS: a TU that sees NEITHER definition -- a test, a tool, or
+// any future translation unit that compiles this header without the engine's definitions --
+// reads false, and the registry refuses BY NAME. "The gate is open" is never a default; it is
+// stated by the build that owns the implementation.
+//
+// WHY IT IS A PREDICATE AND NOT THE UNCONDITIONAL throw THAT WAS HERE: that throw was taken
+// whether or not a runtime existed, so landing stage (b) would have needed a second edit in
+// another file before anything could load. Inverted, the open arm is the arm that has to
+// exist, and it carries a static_assert that demands the family's registration row.
+#if defined(NINFER_QWEN4_EXP_STAGE_B_COMPLETE)
+inline constexpr bool kStageBImplemented = NINFER_QWEN4_EXP_STAGE_B_COMPLETE != 0;
+#else
+inline constexpr bool kStageBImplemented = false;
+#endif
+
+// PER-SOURCE INTEGER FLAGS, NOT ONE STRING LIST, and the reason is measured rather than
+// stylistic: a definition carrying a LIST cannot be written as `-DNAME=a.cpp b.cpp` -- the
+// preprocessor body is then a token sequence, not a string literal, and the refusal that is
+// supposed to NAME the missing files fails to compile ("error: 'MISS_A' was not declared in
+// this scope", measured). Three integers need no quoting, and the list is composed below.
+//
+// The fail-safe direction is the same as the predicate's: a TU that sees NONE of the three
+// definitions reads all three as 0, i.e. "every stage (b) source is absent", and refuses.
+#ifndef NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_PACKAGE
+#define NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_PACKAGE 0
+#endif
+#ifndef NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_VARIANT
+#define NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_VARIANT 0
+#endif
+#ifndef NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_BINDINGS
+#define NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_BINDINGS 0
+#endif
+
+// The stage (b) sources this build did NOT find, named one by one. Empty exactly when
+// kStageBImplemented is true, so the verdict and the message cannot disagree about WHICH files
+// are gone; built at runtime from three compile-time flags, which is why no quoting is involved.
+[[nodiscard]] inline std::string stage_b_missing_sources() {
+    std::string missing;
+    if (!NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_PACKAGE) { missing += "impl/package.cpp "; }
+    if (!NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_VARIANT) { missing += "impl/variant.cpp "; }
+    if (!NINFER_QWEN4_EXP_STAGE_B_HAS_IMPL_BINDINGS) { missing += "impl/load/bindings.cpp "; }
+    if (missing.empty()) { missing = "(none: the declared stage (b) sources are all present)"; }
+    return missing;
+}
+
 namespace detail {
 
 // 取一个具名张量的形状。缺失或不是张量 -> 抛错指名（这就是 S28 writer 的契约面）。

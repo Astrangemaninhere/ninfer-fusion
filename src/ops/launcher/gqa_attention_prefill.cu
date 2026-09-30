@@ -13,6 +13,7 @@
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
+#include <cstdio> // dl/nvfp4emu2: stderr for the prefill codec arm's keyed announcement
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -120,6 +121,25 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
             }
             return;
         } else {
+            // [F1259 kvfill] The narrow class' four planes, passed the way the cold slots are:
+            // empty tensors (knob unset, dropped layer, non-i8 tier) leave the kernel's narrow
+            // branch null-guarded and therefore dead -- identical to the pre-image launch.
+            const std::uint8_t* narrow_k_codes =
+                cache.k_narrow_pages.data != nullptr
+                    ? static_cast<const std::uint8_t*>(cache.k_narrow_pages.data)
+                    : nullptr;
+            const std::uint8_t* narrow_v_codes =
+                cache.v_narrow_pages.data != nullptr
+                    ? static_cast<const std::uint8_t*>(cache.v_narrow_pages.data)
+                    : nullptr;
+            const std::uint8_t* narrow_k_scales =
+                cache.k_narrow_scale_pages.data != nullptr
+                    ? static_cast<const std::uint8_t*>(cache.k_narrow_scale_pages.data)
+                    : nullptr;
+            const std::uint8_t* narrow_v_scales =
+                cache.v_narrow_scale_pages.data != nullptr
+                    ? static_cast<const std::uint8_t*>(cache.v_narrow_scale_pages.data)
+                    : nullptr;
             gqa_attention_prefill_i8_kernel<Geometry, Metadata>
                 <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI8SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
@@ -128,7 +148,15 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                     static_cast<const __half*>(cache_k_scale.data),
                     static_cast<const __half*>(cache_v_scale.data), metadata,
                     static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+                    static_cast<__nv_bfloat16*>(out.data), tokens,
+                    static_cast<const std::uint8_t*>(cache.cold_slots.data),
+                    cache.cold_slots.data == nullptr
+                        ? nullptr
+                        : static_cast<const std::uint8_t*>(cache.cold_slots.data) +
+                              cache.cold_slots.nb[2],
+                    cache.slot_bytes, narrow_k_codes, narrow_v_codes, narrow_k_scales,
+                    narrow_v_scales,
+                    static_cast<std::int32_t>(cache.narrow_page_capacity));
         }
     } else if (cache.dtype == DType::NVFP4) {
         // S45d: this tier's prefill kernel is 256-only by construction
@@ -152,6 +180,78 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 : reinterpret_cast<const std::int32_t*>(
                       reinterpret_cast<const std::uint8_t*>(cold_k_valid) +
                       cache.cold_slot_valid.nb[1]);
+        // -------------------------------------------------------------------------------------
+        // dl/nvfp4emu2: THE PACKED NVFP4 NON-TENSOR-CORE PREFILL ARM.
+        //
+        // THIS IS THE GAP THE LINE WAS OPENED FOR. The landed prefill body of the FFMA family,
+        // gqa_attention_simt_ffma_prefill_bf16_kernel, had no codec (see the seam note in
+        // ops/kernel/gqa_attention_simt_ffma.cuh), so an NVFP4 prefill launch reached the
+        // tensor-core arm here UNCONDITIONALLY (:156/:173) even when the family was selected.
+        // The decode side already has this gate, in the same shape, at
+        // ops/launcher/gqa_attention_decode_partial.cuh:590.
+        //
+        // WHY IT SITS INSIDE THE `if constexpr (Geometry::HeadDim == kGqaKvQuantHeadDim)` BLOCK
+        // AND DOES NOT WIDEN IT. The D=128 else-branch below throws `nvfp4 prefill requires
+        // head_dim=256` and that throw is NOT relaxed: the simt body itself would run at D=128
+        // (gqa_simt_kv_codec_routable admits the codec and VecD=4 divides the 16-dim group), but
+        // whether the TIER produces a D=128 NVFP4 code/scale plane is a different question this
+        // line did not settle, and a route that answers it by assumption is the silent wrong this
+        // tree refuses. So a D=128 NVFP4 prefill is refused exactly as it was.
+        //
+        // ORDER, AND WHAT IT COSTS: the REFUSALS run before the selection. A launch that declares
+        // an armed cold pool, an armed residual pair, or a sliding window is refused BY NAME even
+        // when the arm is armed, so this change adds a route and widens nothing.
+        // -------------------------------------------------------------------------------------
+        if (gqa_attention_simt_ffma_selected()) {
+            const bool residual_armed = cache.k_residual_pages.data != nullptr ||
+                                        cache.k_residual_scale_pages.data != nullptr ||
+                                        cache.v_residual_pages.data != nullptr ||
+                                        cache.v_residual_scale_pages.data != nullptr;
+            const GqaSimtFfmaPrefillCodecSelection codec_how =
+                gqa_simt_ffma_prefill_codec_selection();
+            const char* const codec_refusal = gqa_simt_ffma_prefill_codec_refusal(
+                /*cold_armed=*/cold_k != nullptr,
+                /*window_declared=*/cache.sliding_window_tokens != 0, residual_armed);
+            // THE ANNOUNCEMENT IS KEYED ON THE SELECTED VALUE, so a second, different selection is
+            // announced instead of being swallowed by a one-shot. It is printed BEFORE the refusal
+            // throw: an operator who armed the arm on a launch it cannot serve must be told why.
+            if (gqa_simt_ffma_prefill_codec_announce_once()) {
+                std::fprintf(stderr,
+                             "[nvfp4emu2] SIMT FFMA NVFP4 prefill arm: %s; refusal: %s\n",
+                             gqa_simt_ffma_prefill_codec_selection_text(codec_how),
+                             codec_refusal != nullptr ? codec_refusal : "(none)");
+            }
+            if (codec_refusal != nullptr) { throw std::invalid_argument(codec_refusal); }
+            if (!gqa_simt_ffma_prefill_codec_selected()) {
+                throw std::invalid_argument(
+                    std::string("the SIMT FFMA attention family was selected for this launch, but "
+                                "its PACKED NVFP4 PREFILL arm is not armed on this process: ") +
+                    gqa_simt_ffma_prefill_codec_selection_text(codec_how) +
+                    ". The bf16 prefill body this family landed cannot read an NVFP4 code plane "
+                    "-- it would decode E2M1 nibbles as bf16 halves, a plausible wrong number "
+                    "rather than a fault -- so the launch is REFUSED BY NAME instead of being "
+                    "routed back to the tensor-core arm it replaces (see "
+                    "gqa_attention_simt_ffma_refusal for why that fallback is refused). Arm it "
+                    "with NINFER_PREFILL_NVFP4_SIMT=1, which additionally requires "
+                    "NINFER_ATTENTION_SIMT_FFMA=1.");
+            }
+            // The FFMA body carries kGqaSimtFfmaRowsPerCta rows per CTA (a different row tiling
+            // from the tensor-core body's kNvfp4PrefillBr), so it derives its own grid, exactly as
+            // the bf16 FFMA arm below does. The key tiling and the causal alignment are internal.
+            const dim3 simt_grid(static_cast<unsigned>(div_up(tokens, kGqaSimtFfmaRowsPerCta)),
+                                 static_cast<unsigned>(Geometry::QHeads), 1u);
+            gqa_attention_simt_ffma_prefill_bf16_kernel<Geometry, Metadata, GqaSimtKvCodec::Nvfp4>
+                <<<simt_grid, kGqaSimtFfmaPrefillThreads, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(cache_k.data),
+                    static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens,
+                    GqaSimtKvScalePlanes{static_cast<const std::uint8_t*>(cache_k_scale.data),
+                                         static_cast<const std::uint8_t*>(cache_v_scale.data)});
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         if (cache.v_dtype == DType::ISO3) {
             gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, DType::NVFP4, DType::ISO3>
                 <<<attention_grid, kNvfp4PrefillThreads, kNvfp4PrefillSmemBytes, stream>>>(

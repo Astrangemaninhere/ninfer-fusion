@@ -217,16 +217,58 @@ load_added_tokens(const Json& root, std::string_view label, std::vector<std::str
         AddedToken token = parse_added_token(item, label);
         validate_supported_added_token(token, label);
         const auto index = static_cast<std::size_t>(token.id);
-        if (occupied_vocab_ids.contains(token.id)) {
-            throw std::invalid_argument("field added_tokens overlaps existing id in " +
-                                        std::string(label));
+        // ------------------------------------------------------------------ F1227 ----
+        // THE TWO PATHS, ONE DECISION. `merge_added_tokens_decoder` below (called on
+        // tokenizer_config.json, one statement after this function) TOLERATES an added-token
+        // definition that repeats an existing one exactly: it compares with
+        // `same_added_token` (:190-194) and `continue`s (`:265-272`). This path threw on the
+        // same fact, so the engine answered one question two ways and the stricter answer
+        // ran first. Both are now the same rule:
+        //
+        //     an added_tokens entry that repeats a `model.vocab` entry EXACTLY -- same id,
+        //     same content -- is not a conflict. It is the same token declared twice, and
+        //     the ADDED declaration is the one that carries `special` and the one that makes
+        //     the loader SKIP the byte-level decode for that id (:783-785 decodes only ids
+        //     with `valid && !added`). So tolerating it is what keeps a non-byte-level vocab
+        //     entry (spark_x2.5-4b: `<｜start▁of▁sentence｜>` at id 0, `｜` = U+FF5C outside
+        //     the GPT-2 alphabet) loadable at all.
+        //
+        // ANY OTHER overlap is still a refusal, both directions: an id occupied by a
+        // different token, or a content that belongs to a different id, is a real conflict
+        // and names itself. Measured shape of the tolerated case (dl/musesparkfix, F1227):
+        // spark ships 131,072 vocab entries and 113 added_tokens that are all identical
+        // re-declarations at the same id (113/113 identical, 0 differing) and NONE of the
+        // 113 is referenced by model.merges as left, right or result -- so tolerating them
+        // cannot move a single BPE output either.
+        // AND IT IS NOT A TOLERANCE FOR MAVERICK FILES: on the shipped spark_x2.5-4b
+        // artifact this is what lets the front end be built at all. The opposite edit --
+        // deleting the redundant `added_tokens` entries, which is what dl/sparkgap tried
+        // first -- is WORSE, not better: the 8 non-byte-level vocab entries are then no
+        // longer `added`, the byte-level decode at :783-785 reaches them, and the refusal
+        // simply moves to `decode_byte_level_token`. The converter side runs a mirror of
+        // this gate before it writes (tools/convert/spark_x2_5_4b/convert.py, F1227) and
+        // deliberately does NOT rewrite `model.vocab`, because HF `tokenizers` RENUMBERS a
+        // token it can no longer resolve inside the vocab, and a chat prompt is made of
+        // exactly the strings involved (measured: `<think>` 3 -> 130962).
+        const auto vocab_content = occupied_vocab_tokens.find(token.content);
+        const bool repeats_vocab_exactly =
+            vocab_content != occupied_vocab_tokens.end() && vocab_content->second == token.id;
+        if (occupied_vocab_ids.contains(token.id) && !repeats_vocab_exactly) {
+            throw std::invalid_argument(
+                "field added_tokens overlaps existing id in " + std::string(label) +
+                " (id " + std::to_string(token.id) +
+                " is a model.vocab id whose token is not this one verbatim; only an exact "
+                "re-declaration of the same id and content is tolerated)");
         }
         if (!seen_added_ids.insert(token.id).second) {
             throw std::invalid_argument("field added_tokens has duplicate id in " +
                                         std::string(label));
         }
-        if (occupied_vocab_tokens.contains(token.content) ||
-            !seen_added_contents.emplace(token.content, token.id).second) {
+        if (!repeats_vocab_exactly && occupied_vocab_tokens.contains(token.content)) {
+            throw std::invalid_argument("field added_tokens has duplicate content mapping in " +
+                                        std::string(label));
+        }
+        if (!seen_added_contents.emplace(token.content, token.id).second) {
             throw std::invalid_argument("field added_tokens has duplicate content mapping in " +
                                         std::string(label));
         }
@@ -271,19 +313,32 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
             }
             continue;
         }
-        if (occupied_vocab_ids.contains(id)) {
+        // F1227: THE SAME RULE AS load_added_tokens ABOVE, so the two paths cannot answer
+        // one question two ways. An `added_tokens_decoder` entry whose id is a
+        // `model.vocab` id carrying EXACTLY this content is a re-declaration of that token
+        // with its `special` flag attached -- not a conflict -- and it is accepted exactly
+        // as `added_tokens` accepts the same fact. Anything else overlapping is named:
+        // an id occupied by a different token, or a content that belongs to another id.
+        const bool repeats_vocab_exactly =
+            occupied_vocab_ids.contains(id) &&
+            static_cast<std::size_t>(id) < id_to_token.size() &&
+            id_to_token[static_cast<std::size_t>(id)] == token.content;
+        if (occupied_vocab_ids.contains(id) && !repeats_vocab_exactly) {
             throw std::invalid_argument("added_tokens_decoder overlaps vocabulary id " +
-                                        std::to_string(id));
+                                        std::to_string(id) +
+                                        " (and does not repeat that vocab entry verbatim; "
+                                        "only an exact re-declaration of the same id and "
+                                        "content is tolerated)");
         }
-        if (token_by_content.contains(token.content) ||
-            occupied_vocab_tokens.contains(token.content)) {
+        if (!repeats_vocab_exactly && (token_by_content.contains(token.content) ||
+                                       occupied_vocab_tokens.contains(token.content))) {
             throw std::invalid_argument("conflicting added-token content mapping for " +
                                         token.content);
         }
 
         const auto index = static_cast<std::size_t>(id);
         if (index >= id_to_token.size()) { id_to_token.resize(index + 1); }
-        if (!id_to_token[index].empty()) {
+        if (!id_to_token[index].empty() && !repeats_vocab_exactly) {
             throw std::invalid_argument("duplicate tokenizer mapping for id " + std::to_string(id));
         }
         id_to_token[index] = token.content;

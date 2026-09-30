@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -306,12 +307,94 @@ struct CapabilityNeeds {
         // discarded layer (NINFER_KV_DROP_LAYERS) owns no KV planes, so it adds no
         // codec capability to the preflight.  That is a DECISION, not a fallthrough
         // that happens to work.  Naming it is what keeps -Wswitch pointed at this
-        // switch when the enumeration grows; the trailing return stays for a storage
-        // code that no enumerator names (KvCacheStorage is a uint8_t, so a cast or an
-        // untrusted input can produce one).
+        // switch when the enumeration grows. The sentence that used to end here ("the trailing
+        // return stays for a storage code that no enumerator names") is now FALSE and is
+        // rewritten rather than left standing: the trailing return became a refusal, and the five
+        // tiers INTEGRATE4 appended are named further down this same switch, so EVERY code this
+        // enum names has an arm of its own and the refusal is reachable only for a code no
+        // enumerator names (KvCacheStorage is a uint8_t, so a cast or an untrusted input can
+        // produce one). That is what makes this arm's answer unique to this layer: it is the only
+        // storage that owns no KV planes at all.
         return CapabilityNeeds{kKernelImageBaseline};
+    // ---------------------------------------------------------------------------------------
+    // INTEGRATE4's five, NAMED here as well. They are named in kv_storage_name() below with
+    // tokens pinned by static_assert (product/kv_storage_dtype.h:276-302) and they are refused
+    // BY NAME at product/kv_storage_dtype.h (SITE 3) and at target_kv_cache_profile() (SITE 4),
+    // so naming them here does not admit them anywhere -- it removes a POSITIVE CLAIM. Falling
+    // past this switch is not "no answer": the trailing `return` makes the claim "the
+    // kernel-image baseline covers this tier" about a tier the enum names and whose planes are
+    // declared in core/paged_kv_storage.h:92-123. That silent under-report is named in
+    // dl/warnsurface/E8_SWITCH_SITES.md:31 ("a silent under-report: no codec capability is
+    // demanded for the tier") and in dl/e8mixwire/REPORT.md S1, which left it OPEN.
+    //
+    // The demand per tier is DERIVED from the tree, not chosen; the two derivations are stated
+    // in the arms. None of these five is reachable from --kv-dtype or --kv-layer-storage
+    // (product/kv_options.h:45 parse_kv_storage returns nullopt for all five), so no operator
+    // spelling becomes newly admitted by this landing.
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        // A K/V CODEC PAIR: its resolved planes (core/paged_kv_storage.h:92-99) are
+        // {FP8_E4M3FN, 256, FP16, 1} for K -- byte-for-byte Fp8E4M3Row256's arm above -- and
+        // {U8, 128, U8, 16} for V -- byte-for-byte Nvfp4Group16's. include/ninfer/types.h:55-60
+        // says the same in the enumerator's own words. A layer carrying the pair must decode BOTH
+        // planes, so the demand is the CONJUNCTION of the two rows above, not either one alone:
+        // the fp8 row alone would miss the fp4 MMA the V plane needs, and the nvfp4 row alone
+        // would miss the fp8 MMA the K plane needs. The conjunction is strictly MORE demanding
+        // than either neighbour, so this arm can only narrow.
+        //
+        // The V-side codec choice (KvVCodec Iso3|E2M1, include/ninfer/types.h:106-124) is
+        // deliberately not a capability: its own note says the choice is "a pure decoder switch:
+        // no extra plane, no extra allocation, and no new kernel instantiation".
+        return CapabilityNeeds{kKernelImageBaseline | capability_bit(DeviceCapability::Fp8MmaKindF8f6f4) |
+                               capability_bit(DeviceCapability::Int8Mma) |
+                               capability_bit(DeviceCapability::Nvfp4MmaBlockScale) |
+                               capability_bit(DeviceCapability::Iso4eKvCodec)};
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+        // THE FOUR INT8-FAMILY STORAGES. The rule that decides their demand is the tree's own
+        // classifier, not this line's judgement: core/paged_kv_storage.h:139-150
+        // kv_storage_is_int8_family() returns true for exactly {Int8Group64,
+        // RotatedInt8KeyInt4ValueGroup64, RotatedInt4KeyInt4ValueGroup64, RK4V4E8, RK2V4E8} and
+        // false for every other enumerator, and their declared planes
+        // (core/paged_kv_storage.h:104-123) are I8/U8 data with per-64 FP16 group scales -- the
+        // int8 family's shape. So the demand is exactly Int8Group64's row above: this is the same
+        // rule src/ops/kv/e8_width_contract_test.cpp:219-220 already pins one family over
+        // ("rk3v4/rk2v4 demand exactly the rk4v4 codec's capabilities").
+        //
+        // WHAT IS DELIBERATELY *NOT* DEMANDED, and this is the load-bearing sentence:
+        // `E8KvLattice` is NOT demanded for RK4V4E8/RK2V4E8, even though
+        // core/paged_kv_storage.h:158-165 sets `.e8_lattice = true` on RK4V4E8. dl/e8dev measured
+        // that these two names are "two characters from this tree's rk4v4/rk3v4/rk2v4 TIERS and
+        // describe a different codec on the same geometry (the 240-root root-cylinder specimen)",
+        // and that mapping them onto the lattice is "a WRONG CODEC UNDER A RIGHT NAME"
+        // (dl/e8dev/patch/06-SWITCH-ARMS.md section 3, cited by product/kv_storage_dtype.h:153-156,
+        // which refuses that aliasing one table over). Demanding the lattice bit here would BE that
+        // aliasing, one table up. And the rotation codec has no capability bit in this tree --
+        // DeviceCapability::E8KvLattice is core/e8_lattice.cuh's E8 Hadamard rotation, a different
+        // codec from the fork's -- so nothing above the family floor can be truthfully demanded.
+        // The open question this leaves is named in this landing's REPORT.md; it is not silently
+        // settled here.
+        return CapabilityNeeds{kKernelImageBaseline | capability_bit(DeviceCapability::Int8Mma)};
     }
-    return CapabilityNeeds{kKernelImageBaseline};
+    // A STORAGE CODE NO ENUMERATOR NAMES, and it is reachable -- the comment above records it,
+    // and KvCacheStorage is a uint8_t (include/ninfer/types.h:29) so a cast or an untrusted input
+    // can produce one. This used to `return CapabilityNeeds{kKernelImageBaseline};`, which makes
+    // a silent POSITIVE claim ("the kernel-image baseline covers this tier") about a tier nobody
+    // recognises. That is the defect shape the owner rates worse than a refusal, so it refuses
+    // instead. The code is printed so the caller can find where it came from.
+    //
+    // THE CALLERS CAN PROPAGATE IT, MEASURED (a caller census, which DELTA.md section 4 row 4
+    // recorded as not determined): src/targets/qwen3_6/impl/runtime/layouts_impl.h:1109 (inside
+    // required_capabilities(), which has no noexcept -- that file contains 0 occurrences of the
+    // word), src/core/device_capabilities.h:553, and four test TUs. Nothing in the chain is
+    // noexcept, so this is an std::invalid_argument and not a terminate.
+    throw std::invalid_argument(
+        "kv storage code " + std::to_string(static_cast<unsigned>(storage)) +
+        " is not a KvCacheStorage this build knows, so this table cannot say which capabilities it "
+        "needs; refusing to assume the kernel-image baseline covers it. The tiers this build knows "
+        "are enumerated in include/ninfer/types.h and their canonical tokens are in "
+        "product/kv_storage_dtype.h.");
 }
 
 // DType 口径 (layouts_impl.h 的 layer_overrides 表用的就是 DType)。
@@ -386,9 +469,16 @@ struct CapabilityNeeds {
     case DType::FP8_E4M3FN: return "fp8-e4m3";
     case DType::NVFP4: return "nvfp4";
     case DType::ISO3: return "iso4e";
-    case DType::E8Kv: return "rk4v4";
+    case DType::E8Kv: return "rk4v4";   // LEGACY (dl/e8names F1194): pair(B4,B4); its
+                                         // plane-level spelling is `e8-b4/e8-b4`
     // The e8 family's narrower K planes. Unreachable today (product::kv_dtype_for_storage
     // refuses both storages), named so this switch stays complete over DType.
+    // LEGACY (dl/e8names F1194). `rk3v4` / `rk2v4` are the DEPLOYED tokens and are KEPT,
+    // byte for byte: this function's spellings are asserted equal by TEXT to the ones the
+    // stage's own refusal quotes, and a refusal that re-spelled its tier would name a tier
+    // the operator did not ask for. The plane-level primary spellings of these same two
+    // pairs are `E8KvB3B4` / `E8KvB2B4` (core/dtype.h) and `e8-b3/e8-b4` / `e8-b2/e8-b4`
+    // (product/kv_e8_width.h).
     case DType::E8K3Kv: return "rk3v4";
     case DType::E8K2Kv: return "rk2v4";
     }

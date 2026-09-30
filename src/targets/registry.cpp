@@ -6,11 +6,18 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "core/amdsafe_gate.h"
 #include "core/arch_caps.h"
 #include "core/arch_sim.h"
 #include "core/device.h"
+#include "core/vendor_sim.h"
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/context_cost.h"
+
+// The engine-side reader of EngineOptions::ple_sidecar_root. Declared CUDA-free by
+// impl/ple_attach.h and defined by impl/ple_session.cpp; before this include no translation
+// unit in ninfer_engine read that option at all. See the pre-flight in construct_target().
+#include "targets/qwen4_exp/impl/ple_attach.h"
 
 #include <algorithm>
 #include <chrono>
@@ -60,7 +67,7 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument("Engine kv_capacity mode is invalid");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1,16]");
     }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
@@ -136,6 +143,41 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         .device_arena_bytes = resolved_options.weight_device_arena_bytes,
         .prefetch_layers    = resolved_options.weight_prefetch_layers,
         .min_span_bytes     = resolved_options.weight_span_floor_bytes,
+        // W13: DERIVED per run, not the field flipped to `true`. The field asserts the
+        // residency contract stated in weight_residency.h:374-383 -- every pass over the
+        // layer order enters every offloaded layer through note_layer() -- and the engine
+        // proves that assertion for THIS purpose alone:
+        // normalize_engine_options' CausalScoring case (src/runtime/engine/engine.cpp:79-82)
+        // forces speculative={} / enable_vision=false / use_cuda_graph=false /
+        // context_cache={enabled=false}, and ProgramImplCore::causal_score re-asserts all
+        // four before it scores (program_impl.h:2015-2018). A causal score is teacher
+        // forced, not autoregressive, so the only run_layers call site it can reach is the
+        // Phase::Prefill one that carries the hook (text_context_impl.h:1506-1511); the two
+        // Phase::Verify sites (text_context_impl.h:1015, :1078) have no hook and are
+        // unreachable by construction. For Generation the predicate is FALSE and the
+        // refusal stands -- that is the arm which measured 64 ids that were all 0
+        // (weight_residency.h:583-588), so a generation run cannot reach this plan.
+        // (notehook) DERIVED FROM THE GRAPH DECISION, not from the purpose. The residency hook
+        // now runs in every phase that is not CUDA-graph captured (text_context_impl.h
+        // run_layers) and the H2D is joined to the consuming stream by an event, so the
+        // contract holds exactly when the layer walk is never captured -- and `use_cuda_graph`
+        // is the ONE flag every capture site reads (decode_impl.h:85, mtp_impl.h:420,
+        // dflash_impl.h:615). The old predicate (`purpose == CausalScoring`) was true only
+        // because a causal score forces use_cuda_graph=false (src/runtime/engine/engine.cpp:81),
+        // so it said nothing about the verify sites, and under it a Generation run could not
+        // reach this plan at all. BOTH halves are now stated, so the rotation the arena
+        // performs and the capture the run performs cannot disagree in silence.
+        // F1059: TRUE UNCONDITIONALLY, INCLUDING UNDER CAPTURE. This field is the caller's
+        // assertion that the run enters every offloaded layer through note_layer(); run_layers
+        // now does so in every phase, capture included, because the fetch is enrolled into the
+        // capture instead of being a host call outside it. The old
+        // `!resolved_options.use_cuda_graph` spelled the same thing only because a capture used
+        // to make the hook impossible -- and under it a graph-on run was refused for the wrong
+        // reason. What still guards the unsafe case is WeightOffloadLimits::decode_graph_captured,
+        // which refuses a rotating arena under capture unless the capturable fetch was asked for
+        // by name (NINFER_W13_CAPTURABLE_FETCH=1).
+        .fetch_per_layer_entry = true,
+        .decode_graph_captured = resolved_options.use_cuda_graph,
     });
     auto load_plan = Target::plan_load(binder, resolved_options, weights_profile);
     const std::size_t preflight_runtime_bytes =
@@ -291,6 +333,16 @@ constexpr TargetRegistration kTargetRegistrations[] = {
     {"qwen3_5_9b", Qwen3_5_9B::model_id, Qwen3_5_9B::target_key,
      &Qwen3_5_9B::declares_model,
      &construct_registered<Qwen3_5_9B, LoadedQwen3_5_9B, Qwen3_5_9BInstance>},
+    // Spark-X2.5-4B.  The row the WORK_ITEMS text named twice: once under "C++ target"
+    // ("plus registry.h / registry.cpp (:135-141)") and once by the artifact's own
+    // absence ("an artifact written now could not be loaded by any engine build").
+    // The family label is the artifact directory's name, the model_id is the HF-side
+    // spelling the artifact's ArtifactIdentity carries, and target_key is the C++/on-disk
+    // spelling -- the three-string separation package.h:10-26 records as S54 section 7
+    // clause 1.
+    {"spark_x2_5_4b", SparkX2_5_4B::model_id, SparkX2_5_4B::target_key,
+     &SparkX2_5_4B::declares_model,
+     &construct_registered<SparkX2_5_4B, LoadedSparkX2_5_4B, SparkX2_5_4BInstance>},
 };
 
 constexpr std::size_t kTargetRegistrationCount =
@@ -340,6 +392,19 @@ constexpr bool registrations_are_well_formed() {
 static_assert(registrations_are_well_formed(),
               "target registry row is empty or its detection model_id is duplicated; a duplicate "
               "would make first-match-wins routing depend on row order");
+
+// Is there a row that would dispatch the qwen4-exp identity? Asked at COMPILE TIME, and over
+// the table's model_id column rather than through declares_model(), so the answer stays a
+// constant expression. It is the second half of the conditional gate further down: the
+// preprocessor arm of that gate asserts this, because kStageBImplemented == true is a claim
+// that this table carries the row and an open gate with nothing behind it is the one way the
+// fail-safe inversion could go wrong.
+constexpr bool qwen4_exp_row_is_registered() {
+    for (std::size_t i = 0; i < kTargetRegistrationCount; ++i) {
+        if (kTargetRegistrations[i].model_id == qwen4_exp::kModelId) { return true; }
+    }
+    return false;
+}
 
 // Self-check surface for the table above. Env-gated the same way the existing
 // NINFER_EXPORT_HEAD_DIR hook is, so no CLI flag is added and --help is
@@ -485,6 +550,33 @@ Qwen3_5_9BInstance::Qwen3_5_9BInstance(std::unique_ptr<LoadedQwen3_5_9B> stable_
 
 Qwen3_5_9BInstance::~Qwen3_5_9BInstance() = default;
 
+// Spark-X2.5-4B (model_type spark2_5, model_id "spark-x2.5-4b").  Same shape as the
+// qwen3_5_9b pair above: one weights profile, no MTP, no draft backend.  What is
+// NOT here is the interesting part -- there is no geometry gate in this file for
+// Spark because the family needs none: the artifact this target consumes is BF16
+// in contiguous-le-v1 and src/core/arch_caps.h admits that on every route.  The
+// three family hooks Spark DOES need (qk-norm, per-kind rope, the headwise gate)
+// are refused inside the target, by name, at the runtime-view fill
+// (src/targets/spark_x2_5_4b/impl/load/bindings.cpp:271-291) -- i.e. AFTER plan_load
+// succeeds, so the load PLAN stays structurally testable against a real artifact.
+LoadedSparkX2_5_4B::LoadedSparkX2_5_4B(std::unique_ptr<SparkX2_5_4B::LoadedModel> stable_model,
+                                       const EngineOptions& options)
+    : model(std::move(stable_model)),
+      frontend(SparkX2_5_4B::make_frontend(*model, options)) {}
+
+LoadedSparkX2_5_4B::~LoadedSparkX2_5_4B() = default;
+
+SparkX2_5_4BInstance::SparkX2_5_4BInstance(
+    std::unique_ptr<LoadedSparkX2_5_4B> stable_loaded,
+    runtime::KvCapacityResolution resolution, SparkX2_5_4B::SequencePlan sequence_plan,
+    SparkX2_5_4B::WeightsProfile weights_profile_in, DeviceContext& device)
+    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+      capacity(sequence_plan.capacity()),
+      program(SparkX2_5_4B::create_program(*loaded->model, std::move(sequence_plan), device)),
+      weights_profile(weights_profile_in) {}
+
+SparkX2_5_4BInstance::~SparkX2_5_4BInstance() = default;
+
 ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device) {
     if (std::getenv("NINFER_REGISTRY_DUMP") != nullptr) { dump_registrations(); }
     validate_options(options);
@@ -514,14 +606,129 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     const caps::ArchView arch_view = caps::arch_view_for_device(device.sm());
     caps::require_artifact_formats_supported(arch_view, caps::artifact_formats(reader.objects()),
                                             identity.model_id + "/" + identity.weights_id);
+
+    // -----------------------------------------------------------------------------------------
+    // THE LOAD-TIME BY-NAME GATE -- src/core/amdsafe_gate.h (landq/amdsafe/0002, amdcpu/0001).
+    // -----------------------------------------------------------------------------------------
+    // WHY HERE, AND NOWHERE ELSE. This function is the engine's ONLY load door: the artifact is
+    // read at :508, the identity is resolved at :509, the arch/format verdict is taken at :529 and
+    // the target registration is chosen at :536. It is also the engine's ONLY ARCH/VENDOR
+    // DETERMINATION POINT, because the arch_view_for_device() call above is -- in its own words at
+    // :518 -- "the ONLY place the test-only override can reach a decision the engine ACTS ON". And
+    // it is the whole of ninfer_engine's own source list (src/CMakeLists.txt:633), so the target a
+    // compile of ninfer_engine covers is the target THIS GATE COMPILES INTO.
+    //
+    // MEASURED BEFORE THIS EDIT: `grep -rl 'amdsafe_gate.h' build --include='*.o.d' | wc -l` = 0
+    // of 599 dependency files. The header existed, said of itself that "a refusal which is not
+    // loud is not a refusal", and NO TU IN THE BUILD INCLUDED IT -- so an AMD-class load path
+    // reached the operator with no by-name gate in front of it at all.
+    //
+    // WHICH AXIS SWITCHES IT ON, AND WHY THE VENDOR AXIS RATHER THAN THE DEVICE. The gate
+    // adjudicates an AMD primitive MAPPING, so it must run when AMD semantics are being reproduced
+    // and must NOT run when they are not: on the physical device the primitives ARE this binary's
+    // own, and the two names the gate calls unmappable (ldmatrix, mma_sync_family) are exactly
+    // where those spellings COME FROM on CUDA -- so consulting it unconditionally would refuse a
+    // load that is correct. The engine's AMD axis is caps::vendor_view_for_device(), the vendor
+    // class's only reachable surface in this tree and the surface root CMakeLists.txt:263-269
+    // records as having no engine consumer yet. `physical` is answered VendorClass::Nvidia, and
+    // that is a DECISION rather than a device query, which src/core/vendor_sim.h:79-80 requires the
+    // wiring line to state: this statement is reached only after device.sm() has SUCCEEDED, i.e.
+    // only after a CUDA device answered for this process, and this tree deliberately carries no AMD
+    // detector (vendor_sim.h:52-57 measures why one read here would report inverted).
+    const caps::VendorView amdsafe_vendor_view =
+        caps::vendor_view_for_device(caps::VendorClass::Nvidia);
+    if (!amdsafe_vendor_view.usable()) {
+        // G3-V, ONE AXIS OVER FROM THE ARCH GATE FOUR LINES UP. A request that was REFUSED is not a
+        // licence to answer off the real card, and require_artifact_formats_supported(ArchView, ...)
+        // at :530 already throws for exactly that reason. The vendor entry point has printed its own
+        // reason; this makes the rule executable instead of advisory.
+        throw std::runtime_error(
+            std::string("artifact '") + identity.model_id + "/" + identity.weights_id +
+            "' was gated against a SIMULATED VENDOR whose request was REFUSED, so no vendor "
+            "answer exists for it: " +
+            amdsafe_vendor_view.reason);
+    }
+    if (amdsafe_vendor_view.simulated()) {
+        // THE ONE LINE A LOADER CALLS (src/core/amdsafe_gate.h:479). The NAME is the one this
+        // function ALREADY hands to require_artifact_formats_supported() one statement above -- the
+        // artifact's own identity, computed from the artifact's bytes at :509 -- so the by-name gate
+        // and the format gate name the SAME subject and neither can drift from the artifact they
+        // describe. A name the manifest does not carry is refused on that ground ALONE, which is the
+        // gate's whole difference from a table.
+        // ORDERING, AND IT IS LOAD-BEARING: this block must stay ABOVE any wiring of
+        // caps::require_vendor_formats_supported() (src/core/vendor_sim.h:811, 0 engine callers
+        // today), because that gate throws for EVERY format on an active non-NVIDIA view (G4-V
+        // NEVER WIDENS) and wiring it first would make every line below unreachable.
+        const std::string amdsafe_path = identity.model_id + "/" + identity.weights_id;
+        if (!caps::amdsafe_gate_allows_load(amdsafe_path)) {
+            const std::string amdsafe_refusal =
+                caps::render_amdsafe_gate_refusal(caps::amdsafe_gate(amdsafe_path));
+            std::fputs(amdsafe_refusal.c_str(), stderr);
+            throw std::runtime_error(amdsafe_refusal);
+        }
+    }
     // Table lookup replaces the previous four-branch if chain. Row order is kept
     // identical to the chain, but the routes are disjoint by construction (the
     // static_assert above rejects a duplicated model_id), so first-match-wins is
     // order-independent.
+    // ---------------------------------------------------------------------------------------
+    // EngineOptions::ple_sidecar_root, READ. It used to be parsed by both front ends
+    // (apps/cli/options.cpp:686, src/serve/serve_options.cpp:538), stored
+    // (include/ninfer/types.h:571) and STAT'd at startup
+    // (product::validate_ple_sidecar_root, from apps/cli/main.cpp:503 and
+    // src/serve/generation_service.cpp:313) -- and then read by NOTHING on the engine side.
+    // A by-name census over src/targets, src/ops, src/serve and src/product found exactly one
+    // consumer of the value anywhere in the engine surface: resolve_ple_sidecar_root()
+    // (targets/qwen4_exp/impl/ple_runtime.h:64), which had no caller either. So
+    // `--ple-sidecar <valid root>` and no flag produced the same load, which is the silently
+    // inert switch F391 names. The cure is not a comment; it is this caller.
+    //
+    // WHY BEFORE THE TABLE, AND NOT INSIDE A TARGET: this is the engine's only load door and
+    // the identity is already known here, so the flag is read on EVERY load attempt, including
+    // the ones that a target row answers and the ones no row claims. Putting it after the
+    // dispatch would make it reachable only for families that consume it, i.e. exactly the
+    // arrangement that made it invisible.
+    //
+    // THE THREE STATES OF THE FLAG, executed rather than described:
+    //   * empty            -> PLE off. No attachment, no filesystem access. This is the default
+    //                         and the arm every existing run takes, and it is byte-for-byte the
+    //                         old behaviour (the fields it stamps below are empty).
+    //   * set, this family -> PleRuntime::attach(): the sidecar (4 fds + a bounded pinned
+    //                         cache, ple_table.h:35-38) is opened and its handle rides out on
+    //                         the ConstructedTarget, so it is alive for the engine's lifetime.
+    //   * set, other family-> REFUSED BY NAME. The PLE residual is ADDITIVE, so a load that
+    //                         succeeded with a sidecar attached-and-ignored is indistinguishable
+    //                         from PLE off in every downstream number -- the one outcome a gate
+    //                         must not produce.
+    // The adjacent ple-root/ fallback deliberately stays inside the qwen4_exp branch below: it
+    // is that target's documented discovery rule, and applying it to every family would refuse
+    // a load over a directory that merely happens to be called ple-root.
+    qwen4_exp::PleSidecarHandle ple_sidecar;
+    if (!options.ple_sidecar_root.empty()) {
+        ple_sidecar = qwen4_exp::attach_ple_sidecar(options);
+        if (!qwen4_exp::declares_ple_stage(identity.model_id)) {
+            throw std::runtime_error(
+                "artifact identity '" + identity.model_id + "/" + identity.weights_id +
+                "' was given a PLE n-gram sidecar at '" + ple_sidecar.root +
+                "' (--ple-sidecar) but this target declares no PLE stage, so the sidecar "
+                "would be attached and then ignored: the PLE residual is ADDITIVE, so nothing "
+                "downstream could tell that apart from PLE switched off. Pass an empty value "
+                "(--ple-sidecar=) or drop the flag to switch PLE off on purpose.");
+        }
+    }
+
     for (const TargetRegistration& registration : kTargetRegistrations) {
         if (registration.declares_model(identity.model_id)) {
-            return registration.entry(options, device, reader, load_start,
-                                      registration.target_key);
+            ConstructedTarget constructed = registration.entry(
+                options, device, reader, load_start, registration.target_key);
+            // The attached sidecar rides out on the constructed target. Without this the
+            // handle above would be a local that opens the sidecar and closes it again before
+            // this function returns -- the same "the flag changed nothing" shape, only with
+            // more file descriptors. It travels the way EngineOptions::prefill_chunk's
+            // resolved value already does: a fact about THIS load the caller cannot recompute.
+            constructed.ple_sidecar      = std::move(ple_sidecar.owner);
+            constructed.ple_sidecar_root = std::move(ple_sidecar.root);
+            return constructed;
         }
     }
     // S37 stage (a): the identity is recognized but its runtime does not exist yet.
@@ -532,10 +739,47 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     // instead of failing inside a kernel later.
     if (identity.model_id == qwen4_exp::kModelId) {
         const std::string geometry_verdict = qwen4_exp::validate_stage_a_geometry(reader);
+        // THE REFUSAL IS CONDITIONAL NOW. kStageBImplemented is published by the build from an
+        // existence test over this target's own stage (b) sources
+        // (src/targets/qwen4_exp/stage_b.cmake -> NINFER_QWEN4_EXP_STAGE_B_COMPLETE=0/1), so:
+        //   * stage (b) absent (TODAY, definition reads 0) -> refuse BY NAME, and name the
+        //     missing sources from the SAME list that produced the verdict;
+        //   * stage (b) present -> the refusal is withdrawn without a second edit here.
+        // The alternative -- what was here -- took the refusal UNCONDITIONALLY, i.e. whether
+        // or not a runtime existed, which made "land stage (b)" a two-file change whose second
+        // file nobody would remember.
+#if NINFER_QWEN4_EXP_STAGE_B_COMPLETE
+        // Stage (b) exists. This arm deliberately contains no dispatch of its own: the row in
+        // kTargetRegistrations IS the dispatch, exactly as it is for the four registered
+        // families, and the assert below is what makes "both halves or neither" mechanical.
+        // Reaching here with no row would otherwise fall through to the unknown-model refusal,
+        // which names neither side of the problem.
+        static_assert(qwen4_exp_row_is_registered(),
+                      "NINFER_QWEN4_EXP_STAGE_B_COMPLETE is 1 but kTargetRegistrations has no "
+                      "row whose model_id is the qwen4-exp identity: the stage (b) sources "
+                      "landed without the registry row, so this open arm has nothing to "
+                      "dispatch to. Add the row in the same patch as the sources (this file's "
+                      "own table comment: 'Adding a model whose family is already in this "
+                      "table = add one row here').");
+        (void)geometry_verdict;
+#else
+        if (qwen4_exp::kStageBImplemented) {
+            // The predicate and the preprocessor are the same fact spelled twice, one runtime
+            // and one compile-time. They are computed from one definition, so a disagreement
+            // means a build that published it to the header and not to this TU; assert rather
+            // than trust, because in this direction trusting would OPEN the gate.
+            throw std::logic_error(
+                "qwen4-exp stage (b): the runtime predicate reads implemented while this "
+                "translation unit's preprocessor reads absent; refusing to guess which is true");
+        }
         throw std::runtime_error(
             "artifact identity '" + identity.model_id + "' recognized (" + geometry_verdict +
             "), but its runtime is not implemented yet (W7/P1 staged plan, "
-            "_collab/B_s37_flashnext_p1.md); refusing to load a stub target");
+            "_collab/B_s37_flashnext_p1.md): src/targets/qwen4_exp/ is missing " +
+            qwen4_exp::stage_b_missing_sources() +
+            " [stage_b_predicate=" + std::to_string(qwen4_exp::kStageBImplemented) +
+            "]; refusing to load a stub target");
+#endif
     }
 
     // Gemma-4-31B (model_type gemma4). Same shape as the qwen4_exp branch above, and for the

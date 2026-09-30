@@ -164,8 +164,29 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
     specs.extend(_hyper_connection("mtp/layer/mlp/hyper_connection/"))
     specs.extend(
         (
-            tensor_spec("mtp/layer/mlp/experts/gate_up", (512, 1_280, 2_560), NVFP4),
-            tensor_spec("mtp/layer/mlp/experts/down", (512, 2_560, 640), NVFP4),
+            # MTP routed experts are BF16 stacked tensors, not NVFP4 banks.
+            # MEASURED 2026-09-22 (FN-FIX): registered as NVFP4 here, these two objects were
+            # the ONLY difference between this inventory and its own pin, and they tilted four
+            # counters at once: {BF16 1235, NVFP4 98} and {contiguous-le-v1 1238,
+            # expert-blockscale-k16-m128x4-v1 98} against the pinned {1237, 96} and {1240, 96}.
+            # BF16 closes all four. Five independent readings carry the pin, none carries NVFP4:
+            #   docs/maintainer/qwen3.8-flash-next-artifact.md:36-42  the shipped artifact's own
+            #     closed inventory (BF16 1237 / NVFP4 96 / 1560 tensors / 1566 objects), and
+            #     :97 `MTP has 29 BF16 objects, including dense [512,...] expert banks`;
+            #   tests/targets/qwen3_8_flash_next/test_inventory.py  asserts that same pin, so
+            #     this file was making the tree's own test uncollectable, not merely red;
+            #   recipe.py:321-332  declares the same two objects `_direct` (transform copy,
+            #     dtype BF16), i.e. a byte bijection of the source tensor;
+            #   the checkpoint on this box carries them BF16 [512,2560,640] / [512,1280,2560]
+            #     while its NVFP4 quads number exactly 48*512*3 = 73,728 and are text-only;
+            #   splice_mtp.py:1-8 + tools/reference/qwen3_8_flash_next/quantize_mtp.cpp  exist
+            #     to REPLACE these two objects with NVFP4 banks read as BF16 bytes -- an
+            #     optional post-step that presumes the base artifact is not already NVFP4.
+            # The engine reads either form (src/targets/qwen3_8_flash_next/impl/load/
+            # bindings.cpp:225-239 picks BF16 off the descriptor and quantizes at load), so
+            # this is a plan/provenance correction, not a runtime change.
+            tensor_spec("mtp/layer/mlp/experts/gate_up", (512, 1_280, 2_560), BF16),
+            tensor_spec("mtp/layer/mlp/experts/down", (512, 2_560, 640), BF16),
             tensor_spec("mtp/layer/attention/indexer/query_key", (640, 2_560), BF16),
             tensor_spec("mtp/layer/attention/indexer/key_norm", (128,), BF16),
             tensor_spec("mtp/layer/attention/indexer/query_norm", (128,), BF16),

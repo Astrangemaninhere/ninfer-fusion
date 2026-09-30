@@ -31,6 +31,35 @@ inline constexpr std::int32_t kPagedKVColdSentinelBase = -2;
     return kPagedKVColdSentinelBase - slot_base;
 }
 
+// [F1259 kvfill] THE NARROW CLASS' SENTINEL, AND WHY IT IS A SIBLING AND NOT A REUSE.
+// `decoder_state.cpp:419-422` states the design: a narrow page is addressed THROUGH THE BLOCK
+// TABLE'S CLASS SENTINEL and never through a DeviceKVPageHandle, so the pool's own page space is
+// `P - N` and a resident handle can never name a narrow page. That leaves the block-table entry as
+// the only place a page's class can live, and it must be DISJOINT from the cold class' own range:
+// cold slot s is spelled `-2 - s`, so reusing it would make one entry claimable by two branches.
+//
+// A FIXED FLOOR RATHER THAN A COUNTER. `-4096` is below every cold slot index this engine mints
+// (the cold pool is bounded by the resident window, and `plan_cache` refuses a narrow class that
+// leaves no resident page at all), so `entry <= -4096` is decidable by a kernel that knows nothing
+// about the other class, and `(kPagedKVNarrowSentinelBase, -2]` stays cold's own range.
+inline constexpr std::int32_t kPagedKVNarrowSentinelBase = -4096;
+
+// HOST **AND** DEVICE on purpose: the sentinel's ONE reader that is not host code is the attention
+// kernel's per-page class branch (gqa_attention_decode_i8.cuh / gqa_attention_prefill_i8.cuh), and
+// a host-only helper there is a compile error, not a slow call. The cold helpers above stayed
+// host-only because their kernel readers spell `entry <= -2` inline; this pair is spelled once.
+[[nodiscard]] __host__ __device__ inline bool paged_kv_is_narrow(std::int32_t entry) noexcept {
+    return entry <= kPagedKVNarrowSentinelBase;
+}
+[[nodiscard]] __host__ __device__ inline std::int32_t
+paged_kv_narrow_index(std::int32_t entry) noexcept {
+    return kPagedKVNarrowSentinelBase - entry;
+}
+[[nodiscard]] __host__ __device__ inline std::int32_t
+paged_kv_narrow_entry(std::int32_t narrow_index) noexcept {
+    return kPagedKVNarrowSentinelBase - narrow_index;
+}
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -59,6 +88,17 @@ struct PagedKVLayerView {
     std::int32_t v_quant_group = 0;
     std::uint32_t sliding_window_tokens = 0;
     std::array<DType, 64> layer_dtypes{};
+    // [F1259 kvfill] THE NARROW CLASS' OWN PLANES, AS THIS LAYER SEES THEM. Four tensors and not
+    // two because the narrow set is the NVFP4 pair: a U8 code plane and an E4M3FN scale plane for
+    // K and for V alike, each carrying `narrow_page_capacity` pages at the rung `kv_cell_modes.h`
+    // prices (9216 B/head-page against int8's 16896). EMPTY when the layer has no narrow class
+    // (knob unset, dropped layer, or a non-quantized tier) -- which is the pre-image shape, so a
+    // reader that tests `data == nullptr` disables itself exactly where the axis is absent.
+    Tensor k_narrow_pages;
+    Tensor v_narrow_pages;
+    Tensor k_narrow_scale_pages;
+    Tensor v_narrow_scale_pages;
+    std::int32_t narrow_page_capacity = 0;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -85,14 +125,36 @@ struct PagedKVBatchLayerView {
     DType v_dtype             = DType::BF16;
     std::int32_t v_quant_group = 0;
     std::uint32_t sliding_window_tokens = 0;
+    // [F1259 kvfill] see PagedKVLayerView: the narrow class' own planes. Empty = no narrow class.
+    Tensor k_narrow_pages;
+    Tensor v_narrow_pages;
+    Tensor k_narrow_scale_pages;
+    Tensor v_narrow_scale_pages;
+    std::int32_t narrow_page_capacity = 0;
 };
 
 // A plane is storage-only. Target code assigns K/V/layer meaning to plane indices.
+//
+// [F1255 kvaxisA] THE THIRD AXIS, AND IT IS A PAGE COUNT RATHER THAN A STRIDE.
+// The pre-image pool gave every plane the SAME page count (`DeviceKVPagePoolSpec
+// ::page_group_count`), so a page's stride was a constant of its plane and a rung could only be
+// taken by a WHOLE LAYER (product/kv_block_descent.h:1046-1088 priced exactly that and printed
+// `realizable_saved_bytes=0 of_saved_bytes=1022623744` at 64k). `page_group_count` below is the
+// per-PLANE override that removes the block: a layer may now carry a SECOND set of planes -- the
+// narrow class -- sized for the pages that class holds, while the first set is sized for the rest.
+// Which class a given (block, layer) cell is on is carried by that LAYER's block-table entry (the
+// table is per-layer: KVExecutionTables, paged_kv_cache.h), i.e. the unit of the decision is the
+// CELL and the storage can express it.
+//
+// 0 (the default) is the pre-image shape: this plane uses the pool's `page_group_count`, one
+// region, one stride, byte-for-byte the plane every existing run measured.
 struct KVPlaneGeometry {
     DType dtype                 = DType::BF16;
     std::int32_t leading_extent = 0;
     std::int32_t head_extent    = 0;
     std::size_t alignment       = 256;
+    // Pages THIS plane carries. 0 = the pool's own `page_group_count` (pre-image).
+    std::uint32_t page_group_count = 0;
 
     friend bool operator==(const KVPlaneGeometry&, const KVPlaneGeometry&) = default;
 };
@@ -250,6 +312,10 @@ public:
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
+    // [F1255 kvaxisA] How many pages THIS plane carries (the third axis). Equals
+    // `capacity_pages()` for every pre-image plane; smaller for a plane that holds only one class'
+    // pages.
+    [[nodiscard]] std::uint32_t plane_page_count(std::size_t index) const noexcept;
     [[nodiscard]] std::uint32_t
     contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const;
 
@@ -305,6 +371,7 @@ private:
 
     DeviceKVPagePoolSpec spec_;
     std::vector<Tensor> planes_;
+    std::vector<std::uint32_t> plane_page_counts_;  // [F1255 kvaxisA] per-plane page extent
     std::vector<FreePageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
     std::vector<bool> page_allocated_;

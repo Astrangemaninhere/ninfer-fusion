@@ -38,17 +38,26 @@
 // refusal is a separate decision that needs the extent-aware shape check and the owner's
 // call, not this file.
 //
-// THE V PLANE IS NOT NARROWED, AND THAT IS THE FAMILY'S OWN RULE
-// --------------------------------------------------------------
-// `kv_e8_width.h`: "the V plane is NOT a function of the width: this family narrows K only
-// ... and the shipped V is i4 at 4 bits + the same g64 FP16 scale plane, i.e. the W4
-// geometry" (`e8_kv_v_plane_bytes() == 8704`). So V here is byte-for-byte the shipped W4
-// V plane, written through the ONE spelling of that format that the tree already has --
-// `gqa_kv_quant_i4_code()` / `gqa_kv_pack_i4()` / `kv_scale_half()` -- rather than a second
-// copy of it. The CLAMSHARE note in `gqa_attention_kv_quant.cuh:244-267` is why that
-// matters: the K side of that format used to be spelled twelve times and the four things
-// the spellings could disagree about (rounding, zero guard, clamp range, divisor) are
-// exactly the things a fresh copy would get wrong.
+// THE V PLANE IS A DECISION, AND THE SHIPPED ARM OF IT DID NOT MOVE
+// -----------------------------------------------------------------
+// THE PRE-IMAGE of this block read "THE V PLANE IS NOT NARROWED, AND THAT IS THE FAMILY'S OWN
+// RULE" and cited `kv_e8_width.h`: "the V plane is NOT a function of the width: this family
+// narrows K only". THAT SENTENCE IS STILL TRUE OF THE FAMILY'S WIDTH AXIS and is no longer true
+// of the family (line dl/e8vaxis, marker F1166): the V plane is now a FORMAT, chosen
+// independently of K's, and `e8_kv_v_plane_bytes(E8KvPlaneFormat)` is where the choice is
+// priced. What remains exactly as the pre-image left it is the DEFAULT and the shipped tier:
+//
+//   * `kE8AppendVBitsShippedI4` is the V every existing launcher passes, its row extent is
+//     static_asserted at the pre-image's own 128 B, and it is byte-for-byte the shipped W4 V
+//     plane, written through the ONE spelling of that format the tree already has --
+//     `gqa_kv_quant_i4_code()` / `gqa_kv_pack_i4()` / `kv_scale_half()` -- rather than a second
+//     copy of it. The CLAMSHARE note in `gqa_attention_kv_quant.cuh:244-267` is why that
+//     matters: the K side of that format used to be spelled twelve times and the four things
+//     the spellings could disagree about (rounding, zero guard, clamp range, divisor) are
+//     exactly the things a fresh copy would get wrong. THIS LINE DID NOT ADD A COPY.
+//   * what IS added is the lattice arm below, and it reuses the K plane's OWN primitive
+//     (`e8_kv_lattice_encode_group<VBits>`) instead of re-deriving anything. Two arms, one
+//     codec each, and the choice between them is a compile-time constant.
 //
 // ⚠ THE SCALE CONVENTION IS THE SHIPPED ONE, INCLUDING ITS ASYMMETRY
 // -----------------------------------------------------------------
@@ -103,8 +112,47 @@ inline constexpr int kE8AppendKCodeBytesPerRow =
 // The one FP16 scale word per 64-group, so a row carries 4 of them -- on BOTH planes.
 inline constexpr int kE8AppendScaleWordsPerRow = kE8AppendKGroups;
 
-// V: packed i4, two codes per byte, at the W4 geometry this family never narrows.
-inline constexpr int kE8AppendVCodeBytesPerRow = kKVCacheAppendFullHeadDim / 2;
+// ===========================================================================
+// [dl/e8vaxis F1166] THE V PLANE, AND THE WIDTH IT IS NO LONGER A CONSTANT OF
+// ===========================================================================
+// THE PRE-IMAGE OF THIS LINE read "V: packed i4, two codes per byte, at the W4 geometry this
+// family never narrows" and the extent below was `kKVCacheAppendFullHeadDim / 2` -- 128, a
+// constant -- because a single template parameter `WBits` drove BOTH planes and only K was
+// allowed to move. THIS is where the KV-bound design was actually ENFORCED: the geometry header
+// could only describe V as a constant, but this file is where V's bytes were written.
+//
+// WHAT REPLACES IT. The V plane's code bytes become a function of the V format, spelled with the
+// SAME widths the K plane already uses, plus a sentinel for the shipped i4 V. There is no fourth
+// codec and no new mathematics: a lattice V plane is filled by `e8_kv_lattice_encode_group<VBits>`
+// -- the K plane's OWN device primitive -- on the V plane's own slot, and the codec rotates
+// internally exactly as it does for K.
+//
+// WHY A WIDTH AND NOT THE FORMAT ENUM. `e8_kv_plane_codec_of_record(E8KvPlane, E8KvPlaneFormat)`
+// is declared in `src/product/kv_e8_width.h`, and no `.cuh` under `src/ops/` includes a
+// `product/` header -- a boundary this file has already had to respect once (see the
+// static_assert block below, which pins its extents against literals for exactly that reason).
+// The format therefore arrives here as the WIDTH it selects, which is what the codec consumes
+// anyway (`e8_kv_lattice_width_of()`), and `kE8AppendVBitsShippedI4` is the sentinel meaning
+// "the shipped i4 arm". It is 0, a value no lattice width can take, and THAT is what makes the
+// sentinel safe rather than merely conventional.
+inline constexpr int kE8AppendVBitsShippedI4 = 0;   // the shipped packed i4 V; NOT a lattice
+
+// constexpr TEMPLATE VARIABLES rather than functions: the K plane's own extents above are
+// templates for the same reason, and a variable is a CONSTANT to every consumer -- including a
+// device function that needs it as a template argument. A host-only `constexpr` FUNCTION called
+// at run time from device code would need `--expt-relaxed-constexpr`, which this build does not
+// pass (read off build/compile_commands.json's own entry for ops/kv_cache/append/launch.cu).
+template <int VBits>
+inline constexpr bool kVbitsIsLattice = (VBits == 3 || VBits == 2);
+
+template <int VBits>
+inline constexpr int kE8AppendVCodeBytesPerRowT =
+    kVbitsIsLattice<VBits> ? (kKVCacheAppendFullHeadDim * VBits) / 8
+                           : kKVCacheAppendFullHeadDim / 2;
+
+// THE PRE-IMAGE NAME, KEPT AS AN ALIAS so that every reader of this file keeps a name meaning
+// exactly what it used to: the SHIPPED i4 V row extent.
+inline constexpr int kE8AppendVCodeBytesPerRow = kE8AppendVCodeBytesPerRowT<kE8AppendVBitsShippedI4>;
 
 static_assert(kE8AppendKGroups == 4, "a 256-wide row is four 64-groups");
 static_assert(kE8AppendKCodeBytesPerRow<3> == 96, "W3 K code extent is 96 B/row");
@@ -122,6 +170,21 @@ static_assert(kE8AppendKCodeBytesPerRow<2> * 64 +
 static_assert(kE8AppendVCodeBytesPerRow * 64 +
                       4 * 64 * 2 == 8704,
               "V stays at the shipped W4 plane: 128*64 + 512 = 8704 B/head-page");
+// [dl/e8vaxis F1166] THE SHIPPED V ROW EXTENT IS UNMOVED, and the two lattice V planes are the
+// SAME extents the K plane's own lattice widths use -- because it is the same codeword.
+static_assert(kE8AppendVCodeBytesPerRow == 128,
+              "THE SHIPPED V ROW EXTENT IS UNMOVED at 128 B/row (marker F1166): the sentinel "
+              "kE8AppendVBitsShippedI4 must reproduce the geometry the pre-image wrote");
+static_assert(kE8AppendVCodeBytesPerRowT<3> == 96 && kE8AppendVCodeBytesPerRowT<2> == 64,
+              "e8 on V at 3/2 bits is 96/64 B/row -- the SAME extents as the K plane, because "
+              "it is the same lattice codeword on a different plane");
+static_assert(kE8AppendVCodeBytesPerRowT<2> * 64 + 4 * 64 * 2 == 4608,
+              "e8 on V at 2 bits: 64*64 + 512 = 4608 B/head-page -- the owner's floor");
+static_assert(kE8AppendVCodeBytesPerRowT<3> * 64 + 4 * 64 * 2 == 6656,
+              "e8 on V at 3 bits: 96*64 + 512 = 6656 B/head-page");
+static_assert(kE8AppendVBitsShippedI4 != 2 && kE8AppendVBitsShippedI4 != 3,
+              "the shipped-V sentinel must not collide with a lattice width, or the branch "
+              "that chooses between the i4 arm and the lattice arm would be ambiguous");
 static_assert(kE8AppendScaleWordsPerRow * 64 * 2 == 512,
               "the g64 fp16 scale block is 512 B/head-page on both planes");
 
@@ -136,10 +199,12 @@ __device__ __forceinline__ std::int64_t e8_append_k_code_index(int physical_page
         physical_page, kv_head, page_off, byte_in_row);
 }
 
-template <typename Geometry>
+// [dl/e8vaxis F1166] keyed on the V WIDTH, not on a constant: the V row extent is the V
+// plane's business now, and this is the one place the address arithmetic learns it.
+template <typename Geometry, int VBits>
 __device__ __forceinline__ std::int64_t e8_append_v_code_index(int physical_page, int kv_head,
                                                                int packed_d, int page_off) {
-    return paged_kv_element_offset<kE8AppendVCodeBytesPerRow, Geometry::KVHeads>(
+    return paged_kv_element_offset<kE8AppendVCodeBytesPerRowT<VBits>, Geometry::KVHeads>(
         physical_page, kv_head, page_off, packed_d);
 }
 
@@ -159,7 +224,10 @@ __device__ __forceinline__ std::int64_t e8_append_scale_index(int physical_page,
 // costs registers -- the group plus the codec's own working copy -- and that cost is
 // accepted rather than paid for by re-spelling the codec.
 // ===========================================================================
-template <typename Geometry, int WBits>
+// [dl/e8vaxis F1166] TWO plane parameters, not one. `WBits` is the K width (unchanged, 3 or
+// 2) and `VBits` is the V FORMAT: `kE8AppendVBitsShippedI4` for the shipped packed i4, or 3/2
+// for the family's own lattice on V. The K side of this function is byte-for-byte the pre-image.
+template <typename Geometry, int WBits, int VBits>
 __device__ __forceinline__ void kv_cache_append_full_e8_lattice_group(
         const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
         const E8KvLatticeTables& tables, std::uint8_t* __restrict__ cache_k,
@@ -169,6 +237,9 @@ __device__ __forceinline__ void kv_cache_append_full_e8_lattice_group(
     static_assert(e8_kv_lattice_width_supported<WBits>,
                   "the narrow e8 K plane exists at 3 and 2 bits only: W4 is the shipped "
                   "packed tier and must not fall into this arm");
+    static_assert(VBits == kE8AppendVBitsShippedI4 || kVbitsIsLattice<VBits>,
+                  "a V format is either the shipped i4 arm or one of the two lattice widths; "
+                  "there is no third state and this assert is what keeps it that way");
     constexpr int blocks = kE8LatticeGroup / kE8LatticeDim;   // 8 codewords per group
 
     const int d0 = group * kE8LatticeGroup;
@@ -190,8 +261,38 @@ __device__ __forceinline__ void kv_cache_append_full_e8_lattice_group(
     scale_k[e8_append_scale_index<Geometry>(physical_page, kv_head, group, page_off)] =
         __ushort_as_half(k_scale_bits);
 
-    // ---- V: the shipped W4 plane, i4, narrowed by nothing.
-    float v_absmax = 0.0f;
+    // ---- V. TWO ARMS, CHOSEN AT COMPILE TIME BY `VBits`.
+    if constexpr (kVbitsIsLattice<VBits>) {
+        // [dl/e8vaxis F1166] THE PLANE AXIS ON V. This is the K plane's OWN device primitive
+        // (`e8_kv_lattice_encode_group<VBits>`, the same call the K half above makes) filling
+        // the V plane's own slot: same lattice, same 256-entry stage-2 table, same
+        // `e8_lattice_hadamard64()`. There is no second encoder to drift from the first, and
+        // that is the whole reason E8 on V costs no new mathematics.
+        //
+        // RAW V IN, ROTATED V OUT -- the codec's own domain, exactly as documented for K at the
+        // top of this file: the codec rotates each 64-group INTERNALLY, so rotating here would
+        // rotate twice (H64 is its own inverse) and silently quantise the natural coordinates
+        // instead of the rotated ones.
+        float vraw[kE8LatticeGroup];
+#pragma unroll
+        for (int i = 0; i < kE8LatticeGroup; ++i) {
+            vraw[i] = __bfloat162float(v[kv_cache_fp8_src_index<Geometry>(kv_head, d0 + i, token)]);
+        }
+        std::uint16_t v_scale_bits = 0;
+        std::uint8_t* v_slot =
+            cache_v + e8_append_v_code_index<Geometry, VBits>(
+                          physical_page, kv_head,
+                          group * blocks * kE8KvLatticeCodeBytesPer8<VBits>, page_off);
+        (void)e8_kv_lattice_encode_group<VBits>(tables, vraw, v_slot, &v_scale_bits);
+        // The stored word is the codec's own, unrounded by anything here -- the same rule the K
+        // half above carries, and for the same reason: a re-conversion would be a second
+        // spelling of the product layer's round-half-up conversion.
+        scale_v[e8_append_scale_index<Geometry>(physical_page, kv_head, group, page_off)] =
+            __ushort_as_half(v_scale_bits);
+    } else {
+        // ---- V: THE SHIPPED W4 PLANE, i4, narrowed by nothing. UNCHANGED FROM THE PRE-IMAGE,
+        // byte for byte, including its scale convention and the asymmetry that comment records.
+        float v_absmax = 0.0f;
 #pragma unroll
     for (int i = 0; i < kE8LatticeGroup; ++i) {
         const float a =
@@ -215,8 +316,9 @@ __device__ __forceinline__ void kv_cache_append_full_e8_lattice_group(
             __bfloat162float(v[kv_cache_fp8_src_index<Geometry>(kv_head, d, token)]);
         const float hi =
             __bfloat162float(v[kv_cache_fp8_src_index<Geometry>(kv_head, d + 1, token)]);
-        cache_v[e8_append_v_code_index<Geometry>(physical_page, kv_head, d >> 1, page_off)] =
+        cache_v[e8_append_v_code_index<Geometry, VBits>(physical_page, kv_head, d >> 1, page_off)] =
             gqa_kv_pack_i4(gqa_kv_quant_i4_code(lo, v_inv), gqa_kv_quant_i4_code(hi, v_inv));
+        }
     }
 }
 
@@ -225,7 +327,10 @@ __device__ __forceinline__ void kv_cache_append_full_e8_lattice_group(
 // caller can size it freely, and `metadata.valid_tokens(width)` is honoured the same way
 // every other arm in this directory honours it.
 // ===========================================================================
-template <typename Geometry, typename Metadata, int WBits>
+// [dl/e8vaxis F1166] `VBits` is the V FORMAT (kE8AppendVBitsShippedI4, or 3 / 2). It is
+// carried through to the group writer and it changes nothing about the grid, the K plate or the
+// scale plane: the V plane's code extent is the only thing it decides.
+template <typename Geometry, typename Metadata, int WBits, int VBits>
 __launch_bounds__(256) __global__ void kv_cache_append_full_e8_lattice_kernel(
         const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
         const std::int32_t* __restrict__ positions, Metadata metadata,
@@ -243,7 +348,7 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_e8_lattice_kernel(
         const int token = unit / units_per_token;
         const int position     = positions[0] + token;
         const int physical_page = paged_kv_physical_page(metadata.block_table(), position);
-        kv_cache_append_full_e8_lattice_group<Geometry, WBits>(
+        kv_cache_append_full_e8_lattice_group<Geometry, WBits, VBits>(
             k, v, tables, cache_k, cache_v, scale_k, scale_v, token, head, group, physical_page,
             position & kPagedKVPageMask);
     }

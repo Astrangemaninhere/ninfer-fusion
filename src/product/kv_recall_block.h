@@ -58,6 +58,7 @@
 // across layer directories (product/kv_rowscale_bake.h includes ops/kernel/...).
 #include "spec/fnv_convention.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -91,13 +92,83 @@ enum class RecallBlockCodec : std::uint8_t {
     None,      // no cold codec: the block is not in the cold tier at all
     Int8Raw,   // raw E2M1-nibble slot (cold_slot_stride_for -> 9232 B)
     Nvfp4Rans, // rANS streams plus an uncompressed scale tail (-> 9632 B)
+    // -----------------------------------------------------------------------------------------
+    // [F1172] THE FAMILY, APPENDED.  The block's payload is a VECTOR of codecs, one per layer
+    // (see `layer_codec` below), and until this append the enum could name only TWO of the
+    // names the engine itself uses. Two facts, both READ IN SOURCE in the same session:
+    //
+    //   1. `decoder_state.cpp` proves the three raw-slot codecs write ONE record with three
+    //      static_asserts -- `cold_slot_stride_for(DType::I8)`, `(DType::BF16)` and
+    //      `(DType::E8Kv)` all `== ops::kColdI8SlotBytes` -- and `kv_tier_formats.h` proves it
+    //      from the product side by giving `KvLayerClass::Classic16` and `::Rk4v4Fusion` the
+    //      same `ColdCodec::Int8Raw`.  THIS is the conflation that made the single field wrong
+    //      for a mixed block: ONE stride, and the engine names three codecs for it.
+    //   2. The stage's own codec switch has FOUR codec names ("the int8 raw slot", "the nvfp4
+    //      rANS slot", "the bf16 raw slot (E2M1 g64)", "the rk4v4 raw slot (verbatim 4-bit
+    //      codes + requantized g64)") while `ColdCodec` has TWO values.  FOUR NAMES, TWO VALUES.
+    //
+    // The two appended raw-slot values are therefore NOT new codecs: they are names that already
+    // exist upstream and had nowhere to live here.
+    Bf16Raw,   // [F1172] raw E2M1-nibble slot, SAME RECORD as Int8Raw (9232 B)
+    Rk4v4Raw,  // [F1172] raw slot, verbatim 4-bit codes + requantized g64, SAME RECORD (9232 B)
+    // [F1172] THE ORDER'S FLOOR, WITH A NAME AND NO PACK ARM.  `DType::E8K2Kv` is real
+    // (`core/dtype.h`, "e8k3 / e8k2 ... the K code plane packed at 3 or 2 bits per element") and
+    // the engine names it "rk2v4" in its ten-arm dtype switch, but NO COLD RECORD EXISTS for it:
+    // the seven-arm codec switch in impl/runtime/program_impl.h has no arm for `E8K3Kv` or
+    // `E8K2Kv`, so they fall to `default: return "a 16-bit plane (no cold codec)"`. This value
+    // exists so the per-layer vector can NAME the floor a cell is supposed to reach; it is NOT
+    // a claim that a packer exists, and `recall_block_codec_has_pack_arm()` below says so.
+    E8Lattice2Bit,
 };
+
+// [F1172] THE VECTOR'S AXIS SIZE.  `full_attention_layers(total_layers)` =
+// `total_layers / kHybridAttentionInterval` with `kHybridAttentionInterval = 4`
+// (targets/qwen3_6/export/ninfer/targets/qwen3_6/hybrid_topology.h:7,13-15), so the shipped
+// 64-layer stack has 16. The append costs EXACTLY 16 bytes.
+//
+// The pin that this constant IS `full_attention_layers(64)` belongs in a test TU where both
+// headers can be included -- the SAME caveat this header already writes about
+// `kRecallBlockTokens`: "this header cannot include that ... so the pin lives in
+// tests/test_kv_recall_block.cpp where both can be included." This header is in `product/` and
+// will not reach into `targets/`, so it carries the constant and not the include.
+inline constexpr std::uint32_t kRecallBlockLayerAxis = 16;
+
+// [F1172] WHETHER THIS CODEC HAS A PACK ARM.  The CODEC question, and it is deliberately NOT
+// the same as "does a record exist" -- the stage's own message exists to keep those two apart,
+// verbatim: "the two facts this message exists to keep apart are CODEC and RECORD."
+[[nodiscard]] inline constexpr bool recall_block_codec_has_pack_arm(RecallBlockCodec codec) noexcept {
+    return codec != RecallBlockCodec::None && codec != RecallBlockCodec::E8Lattice2Bit;
+}
+
+// [F1172] IS THE BLOCK'S PAYLOAD ONE CODEC?  This is the ONE property that has to hold for the
+// scalar `codec` field to be a FAITHFUL description of the payload, and it is the invariant the
+// vector below is written against. A block with two different codecs cannot be described by one
+// byte -- which is what `NoCodec`'s own comment already said, in the PLURAL: "the block's layers
+// have no cold codec, so nothing was packed".
+[[nodiscard]] inline bool recall_block_codecs_are_uniform(
+    std::span<const RecallBlockCodec> codecs) noexcept {
+    for (std::size_t index = 1; index < codecs.size(); ++index) {
+        if (codecs[index] != codecs[0]) { return false; }
+    }
+    return !codecs.empty();
+}
+
+// [F1172] The one codec a uniform span is described by, or `None` when it is not uniform.
+[[nodiscard]] inline RecallBlockCodec recall_block_uniform_codec(
+    std::span<const RecallBlockCodec> codecs) noexcept {
+    if (!recall_block_codecs_are_uniform(codecs)) { return RecallBlockCodec::None; }
+    return codecs[0];
+}
 
 [[nodiscard]] inline std::string_view recall_block_codec_name(RecallBlockCodec codec) noexcept {
     switch (codec) {
     case RecallBlockCodec::None: return "none";
     case RecallBlockCodec::Int8Raw: return "int8-raw-slot";
     case RecallBlockCodec::Nvfp4Rans: return "nvfp4-rans-slot";
+    case RecallBlockCodec::Bf16Raw: return "bf16-raw-slot";
+    case RecallBlockCodec::Rk4v4Raw: return "rk4v4-raw-slot";
+    // THE NAME CARRIES THE GAP, so a printed line cannot be read as "this tier exists".
+    case RecallBlockCodec::E8Lattice2Bit: return "e8-2bit(no-pack-arm)";
     }
     return "?";
 }
@@ -142,6 +213,26 @@ struct RecallBlockRecord {
     // or member offset moves.
     std::uint32_t shard_rank  = 0;
     std::uint32_t shard_world = 1;
+    // -----------------------------------------------------------------------------------------
+    // [F1172] V(b): THE PER-LAYER CODEC VECTOR.  THE CARRIER IS THE SIDECAR AND ONLY THE
+    // SIDECAR.  The block's payload is a vector -- one codec per full-attention layer -- and the
+    // single `codec` above cannot describe a block whose layers differ, which is EXACTLY the
+    // state the order's mechanism produces ("SOME layers inside it are int8; inside a cell there
+    // should be ALL KINDS of quantisation modes").
+    //
+    // THE COLD SLOT PAYLOAD IS NOT TOUCHED, and this header says why in its own words, verbatim:
+    // "The cold slot record has NO spare space. Its stride is a function of the page ... every
+    // byte of both codecs is spoken for". This array is APPENDED to the SIDECAR, and the same
+    // header's own precedent is quoted here rather than paraphrased: "The fields sit at the END
+    // of the struct and default to the identity world ... Appended rather than inserted so no
+    // existing aggregate initialisation or member offset moves."
+    //
+    // WHY 16 BYTES WITH NO LENGTH FIELD: the cost has to be exactly `full_attention_layers()`.
+    // A record written before this axis existed reads back as all-`None`, and `None` is the
+    // faithful reading of such a record -- the block predates the vector, so no per-layer codec
+    // was observed. THAT IS NOT "every layer is int8": the scalar `codec` above still says what
+    // the payload is, and the vector only ever REFINES it.
+    std::array<RecallBlockCodec, kRecallBlockLayerAxis> layer_codec{};
 };
 
 // Why a block was not recorded. A refusal is a RETURN VALUE, never a throw: the
@@ -155,6 +246,13 @@ enum class RecallBlockWrite : std::uint8_t {
     BadPageTokens,  // page_tokens != kRecallBlockTokens: the engine's page moved
     BadTokenCount,  // token_count == 0 or > kRecallBlockTokens
     BadShard,       // rank/world_size is not a world (rank >= world_size, or world_size == 0)
+    // [F1172] THE PLURAL REFUSAL, SPLIT.  `NoCodec`'s comment has always been in the PLURAL
+    // ("the block's LAYERS have no cold codec") while the record held ONE byte. Once the payload
+    // is a vector, "no codec at all" and "not ONE codec" are different answers with different
+    // fixes, so they are different values. THE MIXED CASE IS THE ORDER'S TARGET, NOT A FAILURE:
+    // a block whose layers are deliberately at different rungs is a block the mechanism worked.
+    MixedLayers,    // [F1172] the block's layers do not share one codec (the order's target state)
+    BadLayerAxis,   // [F1172] the layer span is longer than kRecallBlockLayerAxis
 };
 
 [[nodiscard]] inline std::string_view recall_block_write_name(RecallBlockWrite result) noexcept {
@@ -165,6 +263,8 @@ enum class RecallBlockWrite : std::uint8_t {
     case RecallBlockWrite::BadPageTokens: return "bad-page-tokens";
     case RecallBlockWrite::BadTokenCount: return "bad-token-count";
     case RecallBlockWrite::BadShard: return "bad-shard";
+    case RecallBlockWrite::MixedLayers: return "mixed-layers";
+    case RecallBlockWrite::BadLayerAxis: return "bad-layer-axis";
     }
     return "?";
 }
@@ -254,6 +354,21 @@ recall_block_span(std::uint32_t logical_page, std::uint32_t valid_tokens) noexce
     std::uint32_t logical_page, std::int32_t row, std::uint32_t row_generation,
     std::int32_t slot, std::int32_t file_slot, RecallBlockCodec codec) noexcept;
 
+// [F1172] THE PER-LAYER SPELLING.  `codecs[layer]` is what the placer ACTUALLY RAN for that
+// layer, in full-attention layer order. This is the UP-PATH payload the seam owes the directory,
+// and it is an OVERLOAD rather than a change to the spelling above so that every existing call
+// site and every record already on disk is unaffected -- the same rule the shard overload
+// follows above ("Kept byte-for-byte as the overload below's identity-world case").
+//
+// THE SCALAR IS DERIVED, NOT TRUSTED: the uniform codec is written into `codec`, so the two
+// spellings cannot disagree. A non-uniform span is recorded under `MixedLayers` and the scalar
+// stays `None`, which is the truthful reading of a mixed payload.
+[[nodiscard]] inline RecallBlockWrite recall_note_block(
+    RecallBlockRecord& out, std::span<const TokenId> ledger, std::uint32_t page_tokens,
+    std::uint32_t logical_page, std::int32_t row, std::uint32_t row_generation,
+    std::int32_t slot, std::int32_t file_slot,
+    std::span<const RecallBlockCodec> codecs) noexcept;
+
 // The sharded spelling. `world_size == 1` must be the identity world (rst 0, wst 1); a
 // sharded world must name a valid rank. A malformed world is refused rather than recorded,
 // because a record stamped with a world that cannot exist is one no reader could accept.
@@ -297,6 +412,45 @@ recall_block_span(std::uint32_t logical_page, std::uint32_t valid_tokens) noexce
     out.content_digest  = recall_block_digest(ledger.subspan(token_begin, token_count));
     out.occupied        = true;
     return RecallBlockWrite::Recorded;
+}
+
+// [F1172] THE PER-LAYER DEFINITION.  It delegates the whole scalar body and only adds the
+// vector, so the record's validity rules (ledger span, page tokens, token count) are evaluated
+// in ONE place and cannot diverge between the two spellings.
+//
+// THE THREE OUTCOMES, AND WHY THE ORDER MATTERS.  `NoCodec`'s comment has always been in the
+// PLURAL, so it was always describing two different situations; they part here:
+//
+//   1. A LAYER WITH NO PACK ARM (including the order's own floor, which has a dtype and no cold
+//      codec today)  ->  `NoCodec`.  Nothing was packed for that layer, so nothing is recorded.
+//   2. ALL LAYERS ONE CODEC          ->  `Recorded`, and the scalar carries it.
+//   3. LAYERS DISAGREE               ->  `MixedLayers`, the vector is written, and the SCALAR IS
+//      CLEARED to `None`.  THE MIXED BLOCK IS THE ORDER'S TARGET STATE, NOT A FAILURE, and
+//      clearing the scalar is not a retreat: the payload genuinely is not one codec, and a
+//      record that claimed otherwise is the conflation this whole change exists to undo.
+//      `occupied` stays true, so a reader knows a payload exists -- the vector is what says
+//      which layers carry it.
+[[nodiscard]] inline RecallBlockWrite recall_note_block(
+    RecallBlockRecord& out, std::span<const TokenId> ledger, std::uint32_t page_tokens,
+    std::uint32_t logical_page, std::int32_t row, std::uint32_t row_generation,
+    std::int32_t slot, std::int32_t file_slot,
+    std::span<const RecallBlockCodec> codecs) noexcept {
+    if (codecs.size() > kRecallBlockLayerAxis) { return RecallBlockWrite::BadLayerAxis; }
+    if (codecs.empty()) { return RecallBlockWrite::NoCodec; }
+    for (std::size_t index = 0; index < codecs.size(); ++index) {
+        if (!recall_block_codec_has_pack_arm(codecs[index])) { return RecallBlockWrite::NoCodec; }
+    }
+    const bool uniform = recall_block_codecs_are_uniform(codecs);
+    const RecallBlockWrite written =
+        recall_note_block(out, ledger, page_tokens, logical_page, row, row_generation, slot,
+                          file_slot, codecs[0]);
+    if (written != RecallBlockWrite::Recorded) { return written; }
+    for (std::size_t index = 0; index < codecs.size(); ++index) {
+        out.layer_codec[index] = codecs[index];
+    }
+    if (uniform) { return RecallBlockWrite::Recorded; }
+    out.codec = RecallBlockCodec::None;
+    return RecallBlockWrite::MixedLayers;
 }
 
 // THE READER'S RULE for the shard axis: empty on acceptance, a reason otherwise. Same shape as

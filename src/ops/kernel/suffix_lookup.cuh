@@ -16,7 +16,8 @@ constexpr int kSuffixLookupBlock = 256;
 
 template <int Block>
 __launch_bounds__(Block) __global__ void suffix_lookup_kernel(
-    const std::int32_t* __restrict__ ids, const std::int32_t* __restrict__ starts,
+    const std::int32_t* __restrict__ ids, std::int32_t history,
+    const std::int32_t* __restrict__ starts,
     const std::int32_t* __restrict__ lengths, std::int32_t batch, std::int32_t query,
     std::int32_t min_len, std::int32_t continuation_tokens, std::int32_t* __restrict__ best_len,
     std::int32_t* __restrict__ best_offset, std::int32_t* __restrict__ continuation) {
@@ -24,7 +25,13 @@ __launch_bounds__(Block) __global__ void suffix_lookup_kernel(
     if (b >= batch) { return; }
     const int tid   = static_cast<int>(threadIdx.x);
     const int start = starts[b];
-    const int len   = lengths[b];
+    // `history` is the length of the caller's accepted-token buffer ids[0, history); a row's
+    // own length is clamped to it so neither the scan below nor the continuation read at the
+    // end can leave that buffer. For a conforming caller lengths[b] <= history and this is the
+    // identity. (It is also what makes suffix_lookup_launch's `history` parameter a used one:
+    // it used to be taken and dropped, see that file.)
+    const int raw_len = lengths[b];
+    const int len     = raw_len < history ? raw_len : history;
     // 只搜严格更早的非重叠窗口: o+query < start 且给续写留空间。边界只有一处定义
     // (suffix_lookup_scan_limit), 宿主参照与两个镜像必须用同一式。
     const int limit = suffix_lookup_scan_limit(start, len, query, continuation_tokens);

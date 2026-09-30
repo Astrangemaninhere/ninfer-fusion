@@ -26,7 +26,14 @@ E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
 def e4m3_to_f32(b):
     b = np.asarray(b, dtype=np.uint16)
     sign = np.where(b & 0x80, -1.0, 1.0)
-    exp = (b >> 3) & 0xF
+    # `exp` MUST be widened BEFORE `exp - 7` is evaluated. As a uint16 field that
+    # subtraction wraps for every exponent field below 7 (exp - 7 -> ~65530) and
+    # np.power(2.0, 65530) is +inf -- a value no KV codec scale can legitimately be.
+    # Measured on one real 32768-byte scale plane: 20620 bytes decoded to +inf here
+    # and 0 after the widening, while every byte that was FINITE decoded to exactly
+    # the same value in both states, so the widening rescues the wrapped bytes and
+    # moves nothing else. Reproduce both states: dl/synwire/py/two_state_fp.py.
+    exp = ((b >> 3) & 0xF).astype(np.int32)
     mant = b & 0x7
     val = np.where(exp == 0, mant * 2.0 ** -9, (1.0 + mant / 8.0) * np.power(2.0, exp - 7))
     val = np.where((exp == 15) & (mant == 7), np.nan, val)
@@ -34,13 +41,31 @@ def e4m3_to_f32(b):
 
 
 def read_meta(path):
+    """These dumps carry TWO line shapes:
+
+        layer=7 dtype=8 head_dim=256 ...      the header: ALL pairs, no tensor NAME
+        k ne=128,64,4,64 nb=... dtype=3       a tensor line: NAME then pairs
+
+    Keying every line on parts[0] filed the header under the key `layer=7`, so the
+    caller's meta.get("layer", {}) was ALWAYS empty and head_dim / num_kv_heads /
+    dtype / quant_group all read their defaults with no error at all. The header is
+    therefore filed under its FIRST FIELD's NAME as well (in these dumps that is
+    `layer`), and each header pair is also filed under its own name, so the existing
+    fld(meta, "tokens", "tokens") reads the same value it read before.
+    """
     meta = {}
     with open(path) as f:
         for line in f:
             parts = line.split()
             if not parts:
                 continue
-            meta[parts[0]] = dict(p.split("=", 1) for p in parts[1:] if "=" in p)
+            if "=" in parts[0]:
+                fields = dict(p.split("=", 1) for p in parts if "=" in p)
+                meta.setdefault(parts[0].split("=", 1)[0], {}).update(fields)
+                for k, v in fields.items():
+                    meta.setdefault(k, {}).setdefault(k, v)
+            else:
+                meta[parts[0]] = dict(p.split("=", 1) for p in parts[1:] if "=" in p)
     return meta
 
 
@@ -157,7 +182,15 @@ def main():
                   % (np.isnan(kn).sum(), np.isinf(kn).sum(), np.nanmax(np.abs(kn)),
                      np.isnan(vv).sum(), np.isinf(vv).sum(), np.nanmax(np.abs(vv)),
                      pos[:6].tolist()))
-            if k_raw is None or dtype != 7:
+            # The stored plane this block decodes is NVFP4, and NVFP4 is dtype code 8
+            # in src/core/dtype.h (`NVFP4 = 8`); 7 is FP8_E4M3FN, which is what the
+            # SCALE plane is (kvdump header: `ks ... dtype=7`). While read_meta
+            # mis-keyed the header this test read dtype = 1 and was unconditionally
+            # TRUE, so the comparison below had never run on a real dump; with the
+            # header read correctly it reads 8 and this guard SKIPS it instead.
+            # Named constant rather than a bare 8, so the next reader can see what
+            # the number is: NVFP4 = 8, FP8_E4M3FN = 7.
+            if k_raw is None or dtype != 8:
                 for t in range(min(MAX_TOKENS, T)):
                     col = kn[:, :, t]
                     print("      src tok %2d: maxabs=%.4g nan=%d" % (t, np.nanmax(np.abs(col)), np.isnan(col).sum()))

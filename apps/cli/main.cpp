@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/kv_options.h"
+#include "product/ple_sidecar_carrier.h"
 #include "product/kv_plane_census.h"
 #include "product/kv_storage_dtype.h"
 #include "product/load_progress/load_progress.h"
@@ -13,6 +14,7 @@
 #include "ninfer/engine.h"
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <cstdint>
 #include <ctime>
@@ -20,8 +22,10 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace {
 
@@ -177,6 +181,54 @@ std::string format_kv_plane_census(const ninfer::MemorySummary& memory) {
 
 std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
     return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+}
+
+// `--kv-row-scale FILE`: the file has to exist, and "the file is not there" is the one
+// state this switch cannot recover from.  The engine's own loader DOES refuse it by
+// throwing "KVRS open: <path>" (src/ops/kernel/gqa_isoquant_row_scale_loader.cu:78), but
+// it does so from the row-scale COMMIT POINT -- inside the engine's plan
+// (src/targets/qwen3_6/impl/state/decoder_state.cpp), after the artifact has been opened
+// and the weights mapped.  A typo in a path therefore cost a full artifact load before it
+// was answered, and the `--kv-row-scale <dir>` spelling got as far as fopen and died
+// there.  The stat belongs HERE, next to the flag's own landing, because it is a stat on
+// a path the operator typed and it needs no model, no device and no plan -- the same
+// place and the same reason as validate_ple_sidecar_root below.
+//
+// Tested against the vocabulary's OWN parser rather than against a list of spellings
+// written out again here, so `auto` / `off` stay states (not filenames) exactly as
+// long as the loader says they are, and no legal run can become a refusal.
+void validate_kv_row_scale_path(const std::string& spec) {
+    ninfer::ops::KvRowScaleMode mode = ninfer::ops::KvRowScaleMode::Auto;
+    std::string path;
+    std::string ignored;
+    if (!ninfer::ops::kv_rowscale_mode_from_spec(spec, mode, path, ignored)) { return; }
+    if (mode != ninfer::ops::KvRowScaleMode::Path) { return; }
+    std::error_code error;
+    const bool regular = std::filesystem::is_regular_file(path, error);
+    if (regular && !error) { return; }
+    throw std::invalid_argument(
+        "--kv-row-scale '" + path + "' names a FILE and no readable regular file is "
+        "there" + (error ? std::string(" (") + error.message() + ")" : std::string()) +
+        ". --kv-row-scale accepts auto (the baked table), off (the identity row scale, "
+        "which needs no file) or the path of an NINFERKVRS1 sidecar. The engine refuses a "
+        "missing file as well, but only at the row-scale commit point, i.e. after the "
+        "artifact is already open, so the typo cost a load before it was answered.");
+}
+
+// The two raw-spec parsers that run ahead of Engine construction.  Their verdicts are
+// kept VERBATIM -- they are the one definition of those grammars -- and only the value
+// the operator typed is added, because several of their refusals name the flag without
+// printing the text that failed in it (kv-layer-storage's layer-index bounds say "layer
+// index out of range" with neither the index nor the layer text).
+template <typename Callable>
+auto kv_spec_context(const char* flag, const std::string& spec, Callable&& call)
+    -> decltype(call()) {
+    try {
+        return call();
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(std::string(error.what()) + " [" + flag + " '" + spec +
+                                    "']");
+    }
 }
 
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
@@ -390,6 +442,11 @@ int main(int argc, char** argv) {
         engine_options.artifact_path  = cli.artifact_path;
         engine_options.device         = cli.device;
         engine_options.max_context    = cli.max_context;
+        // The knob the engine already had and no CLI path could set. Same flag spelling, same
+        // [1,16] bound and same refusal wording as ninfer-serve (src/serve/serve_options.cpp
+        // :279-281 the branch, :831-832 the bound). An unset flag leaves the engine default
+        // (1, include/ninfer/types.h:380), so every existing invocation is unchanged.
+        engine_options.max_concurrency = cli.max_concurrency;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         // Only when the operator named a mode: an unset mode defers to NINFER_FT_BW_GOV and then to
@@ -403,14 +460,28 @@ int main(int argc, char** argv) {
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.yarn_enabled  = cli.yarn_enabled;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
+        // --stage-layers: the stage partition the decode loop walks. The spec travels RAW --
+        // the one parser is core/stage_plan.h and it is called in the runtime, where the
+        // artifact's layer count exists and plan_shards() can be asked whether this spec is a
+        // world the rank axis derives. A front end that parsed it into a second form here
+        // would be the second spelling of the grammar this file refuses to be (see the
+        // --kv-layer-storage comment below).
+        if (cli.stage_layers_explicit) {
+            engine_options.stage_layers_spec = cli.stage_layers_spec;
+            engine_options.stage_handoff_dir = cli.stage_handoff_dir;
+            engine_options.stage_handoff_cut = cli.stage_handoff_cut;
+        }
         engine_options.kv_cache_explicit = cli.kv_cache_explicit;
         if (cli.kv_layer_storage_explicit) {
             // Table AND mask. The mask is what makes `0-11:bf16` a real per-layer
             // BF16 baseline: without it BFloat16 is the "unset" sentinel and every
             // one of those layers silently inherits --kv-dtype instead (the old
             // parse_kv_layer_storage() returns only the table).
-            const auto parsed =
-                ninfer::product::parse_kv_layer_storage_spec(cli.kv_layer_storage_spec);
+            const auto parsed = kv_spec_context(
+                "--kv-layer-storage", cli.kv_layer_storage_spec, [&] {
+                    return ninfer::product::parse_kv_layer_storage_spec(
+                        cli.kv_layer_storage_spec);
+                });
             engine_options.kv_layer_storage          = parsed.table;
             engine_options.kv_layer_storage_set      = parsed.set;
             engine_options.kv_layer_storage_explicit = true;
@@ -422,8 +493,11 @@ int main(int argc, char** argv) {
             // is set (layouts_impl.h make_sequence_planner_impl), so an unset flag has to
             // stay "no opinion" -- an all-false table handed over unconditionally would
             // read as "explicitly no residuals" on every other run.
-            const auto parsed =
-                ninfer::product::parse_kv_residual_layers_spec(cli.kv_residual_layers_spec);
+            const auto parsed = kv_spec_context(
+                "--kv-residual-layers", cli.kv_residual_layers_spec, [&] {
+                    return ninfer::product::parse_kv_residual_layers_spec(
+                        cli.kv_residual_layers_spec);
+                });
             engine_options.kv_residual_layers   = parsed.table;
             engine_options.kv_residual_explicit = true;
         }
@@ -443,6 +517,9 @@ int main(int argc, char** argv) {
             engine_options.kv_rotation_explicit = true;
         }
         if (cli.kv_row_scale_explicit) {
+            // A path that is not there is answered HERE, not at the commit point: see
+            // validate_kv_row_scale_path above. auto/off are states and are untouched.
+            validate_kv_row_scale_path(cli.kv_row_scale_spec);
             engine_options.kv_row_scale_spec     = cli.kv_row_scale_spec;
             engine_options.kv_row_scale_explicit = true;
         }
@@ -489,6 +566,12 @@ int main(int argc, char** argv) {
         engine_options.unload_watermark_pages = cli.unload_watermark_pages;
         engine_options.cold_disk_bytes       = cli.cold_disk_bytes;
         engine_options.cold_disk_path        = cli.cold_disk_path;
+        // The FlashNext PLE n-gram sidecar root. Validated HERE rather than at
+        // parse time: the check stats the filesystem, and it has to land before
+        // the engine is constructed so an operator typo stops the run instead of
+        // leaving the PLE residual out of the arithmetic with no other symptom.
+        engine_options.ple_sidecar_root      = cli.ple_sidecar_root;
+        ninfer::product::validate_ple_sidecar_root(engine_options.ple_sidecar_root);
         engine_options.weight_host_offload_bytes = cli.weight_host_offload_bytes;
         engine_options.weight_device_arena_bytes = cli.weight_device_arena_bytes;
         engine_options.weight_prefetch_layers    = cli.weight_prefetch_layers;
@@ -563,6 +646,21 @@ int main(int argc, char** argv) {
             persist.table          = ninfer::product::kv_rowscale_table_path(cli.artifact_path);
             persist.records        = ninfer::product::kv_rowscale_records_path(persist.table);
             persist.fingerprint    = ninfer::product::kv_rowscale_config_fingerprint(knobs);
+            // EXPLICIT INPUT (this line's change). The table's NAME carries the KV
+            // configuration it was baked for, so this run reads its own file first and
+            // writes ONLY that one: the shared legacy name stays readable (priority 2,
+            // and only while its tag still names this configuration) but stops being a
+            // write target, so a capture here cannot overwrite the calibration another
+            // configuration is still using. NINFER_KV_ROWSCALE_SCOPE=off restores the
+            // historical single-file behaviour, and the loop NAMES that choice.
+            // The fingerprint is the one computed on the line above -- the same value the
+            // tag carries -- so the name and the tag cannot disagree.
+            persist.scope_opted_out = ninfer::product::kv_rowscale_scope_opted_out();
+            if (!persist.scope_opted_out) {
+                persist.scoped_table = ninfer::product::kv_rowscale_scoped_table_path(
+                    persist.table, persist.fingerprint);
+                persist.records = ninfer::product::kv_rowscale_records_path(persist.scoped_table);
+            }
             persist.recalibrate    = cli.recalibrate;
             persist.graphs_enabled = cli.use_cuda_graph;
             // One second of slack: the capture only has to out-date the PREVIOUS
@@ -617,6 +715,14 @@ int main(int argc, char** argv) {
 
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
+        // F1094: the prompt ids must be READ HERE. engine.submit() below moves `prompt` away, and
+        // PreparedPrompt::prompt_token_ids() (src/runtime/engine/engine.cpp:288-291) returns an
+        // empty vector once impl_ is null -- which is why --print-prompt-ids printed its label
+        // with nothing after it. Captured before the move; the print site keeps its wording and
+        // its position. When the flag is unset the capture is an empty vector and nothing changes.
+        const std::vector<ninfer::TokenId> prompt_token_ids_before_submit =
+            cli.print_prompt_ids ? prompt.prompt_token_ids() : std::vector<ninfer::TokenId>{};
+
         StreamingSink sink;
         ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
                                                             ninfer::OutputConsumerMode::Streaming);
@@ -642,6 +748,17 @@ int main(int argc, char** argv) {
         // leave a wrong one to be loaded.
         ninfer::product::kv_rowscale_persist_finish();
 
+        // F745 injectbind: the INPUT side. Printed before the generated ids so a reader of stderr
+        // sees the input first, and to stderr so stdout stays the answer.
+        if (cli.print_prompt_ids) {
+            const std::vector<ninfer::TokenId>& prompt_ids = prompt_token_ids_before_submit;
+            std::cerr << std::left << std::setw(12) << "prompt" << std::setw(26) << "prompt ids";
+            for (std::size_t i = 0; i < prompt_ids.size(); ++i) {
+                if (i != 0) { std::cerr << ' '; }
+                std::cerr << prompt_ids[i];
+            }
+            std::cerr << '\n';
+        }
         if (cli.print_token_ids) {
             std::cerr << std::left << std::setw(12) << "tokens" << std::setw(26) << "generated ids";
             for (std::size_t i = 0; i < result.generated_token_ids.size(); ++i) {

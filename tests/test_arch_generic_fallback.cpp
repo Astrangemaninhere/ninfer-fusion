@@ -102,16 +102,33 @@ void test_fallback_selects_on_both_hardware_rungs() {
                       choice.why.find("sm_75") != std::string::npos,
                   "the reason must name the rung it is answering for");
         }
-        // THE WITHDRAWN ROW, pinned. fp8 on a hardware rung with the kernel in the build still
-        // refuses, and the reason names the ABSENT HOST ENTRY rather than the mma channel --
-        // because the channel is proven to work there by the nvfp4 arm.
+        // THE WITHDRAWN ROW, RE-PINNED BY dl/floorfix (F-720), AND THE PIN MOVED ON A
+        // MEASUREMENT RATHER THAN ON A PREFERENCE. It used to read "sm_70/75 x fp8 must REFUSE:
+        // the fp8 QPN kernels exist as templates but gemm_qpn has no fp8 dispatch". That is
+        // still TRUE of the QPN arm -- and F-719 proposed adding the dispatch, which dl/floorfix
+        // did NOT do, because the measurement says the dispatch would be a phantom with a NEW
+        // failure mode: skinny_fp8_qpn8/_mt2 read their epilogue scale as `const float* tscale`
+        // indexed by the 32-output-column TILE (qpn_kernels.cuh:1258/:1273, :1358/:1372), while
+        // FP8_E4M3FN_ROW_BF16S carries ONE BF16 SCALE PER OUTPUT ROW (fp8_format.cpp:46/:58 ->
+        // scale_ne[0] == n, scale_nb[0] == 2). Thirty-two distinct row scales would be read as
+        // one reinterpreted fp32 pair: silent numerical corruption.
+        // WHAT REPLACES IT IS A ROUTE, NOT A REFUSAL, and it is a DIFFERENT one from the QPN
+        // family: the load-time gate now admits fp8 through the row-scale-aware CUDA-core kernels
+        // (ops/linear/fp8/fp8_gemv.cuh / fp8_small_t.cuh, whose simt_kernel_evidence column
+        // names them and whose census is dl/floorfix/out/tc_free_census/census.txt), and this
+        // selector must agree with the gate or the two surfaces contradict one another. The
+        // QPN arm above is NOT weakened: it is simply not the route fp8 takes on these rungs.
         const RouteChoice fp8 =
             select_route(sm, NumericFormat::FP8_E4M3FN_ROW_BF16S, kVerify, true);
-        check(fp8.outcome == RouteOutcome::NoKernelInTree &&
-                  fp8.route == KernelRoute::None,
-              "sm_" + std::to_string(sm) + " x fp8 must REFUSE: the fp8 QPN kernels exist as "
-              "templates but gemm_qpn has no fp8 dispatch, so there is no host entry to "
-              "launch, got " + describe_choice(sm, NumericFormat::FP8_E4M3FN_ROW_BF16S, fp8));
+        check(fp8.outcome == RouteOutcome::Selected &&
+                  fp8.route == KernelRoute::ConservativeSimt,
+              "sm_" + std::to_string(sm) + " x fp8 must SELECT the tensor-core-free route: the "
+              "QPN fp8 arm still has no host entry AND its per-tile scale model does not match "
+              "this format's per-row one, so the row-scale-aware CUDA-core kernels are the "
+              "answer, got " + describe_choice(sm, NumericFormat::FP8_E4M3FN_ROW_BF16S, fp8));
+        check(fp8.kernel.find("fp8_gemv") != std::string_view::npos,
+              "the selected route must NAME the fp8 CUDA-core kernel, got '" +
+                  std::string(fp8.kernel) + "'");
     }
     // The M split is preserved exactly, and it is the BAND that is named: the same table
     // the refusing version pinned, now as the selected kernel.
@@ -342,7 +359,12 @@ void test_soundness_with_the_fallback_clause() {
                     const bool via_fallback =
                         choice.route == KernelRoute::QpnW4a16 &&
                         fp16_fallback_executable(rung.sm, format, qpn);
-                    check(via_floor || via_fallback,
+                    // The tensor-core-free floor (dl/oldkernel): the SAME fail-closed predicate
+                    // the SELECTING ARM calls, so this invariant and the arm cannot disagree.
+                    const bool via_simt =
+                        choice.route == KernelRoute::ConservativeSimt &&
+                        simt_floor_executable(rung.sm, format);
+                    check(via_floor || via_fallback || via_simt,
                           "SOUNDNESS: neither the floor nor the fallback justifies a Selected "
                           "route: qpn_in_build=" + std::to_string(qpn) + " sm=" +
                               std::to_string(rung.sm) + " fmt=" +

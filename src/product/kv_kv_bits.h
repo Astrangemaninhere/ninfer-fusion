@@ -105,6 +105,9 @@
 #include "core/dtype.h"
 #include "ninfer/types.h"
 #include "product/kv_bit_budget.h"
+#include "product/kv_options.h"        // parse_kv_layer_storage_spec: the plan -> storages
+#include "product/kv_storage_dtype.h"  // kv_dtype_for_storage: the ONE deploy decision point
+// kvreach-e6-includes
 
 #include <algorithm>
 #include <array>
@@ -297,10 +300,76 @@ inline constexpr std::string_view kKvFormatI4        = "i4";
     return out;
 }
 
+// ===========================================================================
+// [dl/e8vaxis F1166] THE E8 FAMILY'S OWN PLANE AXIS, AND WHY IT IS NOT A LADDER ROW
+// ===========================================================================
+// THE DEFECT THIS ANSWERS. Every pair printed above is derived from a LADDER ROW, and the e8
+// rows are KV-BOUND: `kv_bits_tier_v_format()` returns i4 for all three of them, because the
+// family's ONE input was a K width. So this file could not even EXPRESS the pair the owner asked
+// for -- "e8 on both planes at 2 bits" -- and the reason was not the mathematics and not the
+// engine: the VOCABULARY had no width on the e8 tokens at all. `kKvFormatE8Lattice` is ONE string
+// for the 4-, 3- and 2-bit K planes alike, and the pair (e8-lattice, e8-lattice) is therefore
+// genuinely NOT realizable -- there is no 4-bit lattice PLANE, because the codeword has a 16-bit
+// form and a 24-bit form and no 32-bit form.
+//
+// THE TOKENS BELOW CARRY THE WIDTH. That is the smallest edit that makes the question askable.
+// They are deliberately NOT added to the ladder: the ladder's numeric floor is its own decision
+// (product/kv_bit_budget.h, kKvBitBudgetE8LayerLimit, and the pins that move with it), and a
+// planner oracle that invented a tier the solver cannot choose is exactly the
+// "deployed=1 refused=0 over a plan the build layer refuses" defect this file's honest counter
+// exists to catch.
+//
+// WHAT THE ORACLE ANSWERS, and it is answered from the GEOMETRY rather than from a table of
+// opinions. The codec (src/ops/kv/e8_lattice_plane_codec.cuh), the byte geometry
+// (src/product/kv_e8_width.h) and the WRITER (src/ops/kv_cache/append/e8_lattice_narrow_kernel.cuh)
+// all carry a V plane at B3/B2 today; what does not exist is a ladder row that PRICES it and a
+// READER that decodes it on a runtime path. So this predicate answers for what the family can
+// BUILD, and it does not widen what the solver may CHOOSE.
+inline constexpr std::string_view kKvFormatE8B3 = "e8-lattice-3";
+inline constexpr std::string_view kKvFormatE8B2 = "e8-lattice-2";
+
+// True when (k_format, v_format) is a pair the e8 family can build on the plane axis.
+// `kKvFormatE8Lattice` is the 4-bit K plane and its V is i4 -- the shipped rk4v4 row, and the
+// only e8 pair the LADDER carries.
+[[nodiscard]] inline constexpr bool kv_e8_plane_pair_realizable(
+    std::string_view k_format, std::string_view v_format) noexcept {
+    // The three K-only rows the ladder already carries, restated here so that ONE predicate
+    // answers for the whole family and a caller does not have to ask two questions.
+    const bool k_lattice = (k_format == kKvFormatE8B3 || k_format == kKvFormatE8B2);
+    if (k_format == kKvFormatE8Lattice || k_lattice) {
+        if (v_format == kKvFormatI4) { return true; }   // rk4v4 / rk3v4 / rk2v4
+    }
+    // THE PLANE AXIS: K and V are chosen INDEPENDENTLY from the same two lattice widths.
+    // (B2,B2) is the owner's floor; (B3,B3) is the same statement one width up; the two mixed
+    // pairs are what "independent" means as soon as it is not an accident.
+    const bool v_lattice = (v_format == kKvFormatE8B3 || v_format == kKvFormatE8B2);
+    if (k_lattice && v_lattice) { return true; }
+    // EVERYTHING ELSE IS A REFUSAL, and both directions are deliberate. The 4-bit K plane may
+    // not take a lattice V (there is no 4-bit lattice), and a lattice K plane may not take a
+    // 4-bit V. A default here would be a plan the build layer refuses one layer down, which is
+    // the shape the honest counter in this same file was added to make impossible.
+    return false;
+}
+
+// The realizable plane-axis pairs, as one string, for a report. DELIBERATELY a separate spelling
+// from kv_bits_realizable_pairs() below: that one is the LADDER and must keep meaning the ladder,
+// or a report would claim a tier is deployable on the strength of a geometry no row prices.
+[[nodiscard]] inline std::string kv_e8_plane_pairs() {
+    return "(e8-lattice, i4)=rk4v4, (e8-lattice-3, i4)=rk3v4, (e8-lattice-2, i4)=rk2v4, "
+           "(e8-lattice-3, e8-lattice-3), (e8-lattice-2, e8-lattice-2)=THE FLOOR, "
+           "(e8-lattice-3, e8-lattice-2), (e8-lattice-2, e8-lattice-3)";
+}
+
 // THE REALIZABILITY ORACLE. Returns the ladder index of a tier that builds exactly
 // (k_format, v_format), or -1. This is the single place that answers "can one tier
 // carry this layer's K requirement AND V requirement", so the planner, the CLI and
 // the test cannot disagree about it.
+//
+// ⚠ IT IS THE LADDER'S ORACLE AND NOT THE FAMILY'S (marker F1166): it answers out of
+// `kKvBitBudgetTiers`, so it does not know about the e8 plane axis and is right not to -- no
+// ladder row prices a V-carrying pair. `kv_e8_plane_pair_realizable()` above is the e8 family's
+// own question, and the two are kept apart on purpose: a caller that conflated them would
+// report a geometry as a deployed tier.
 [[nodiscard]] inline std::int32_t kv_kv_bits_pair_tier(std::string_view k_format,
                                                        std::string_view v_format,
                                                        KvVCodec codec) noexcept {
@@ -464,7 +533,101 @@ struct KvBitsPlan {
 
 namespace detail {
 
+// ===========================================================================
+// THE HONEST COUNTER -- `refused` MAY NOT SAY 0 WHILE THE DEPLOY LAYER THROWS
+// ===========================================================================
+// WHY THIS EXISTS. `KvBitsPlan::refused` meant "some layer's K and V requirements met no
+// single tier", i.e. the SPLIT reading's reconciliation. It did NOT mean "the plan cannot be
+// built", so `kv_kv_bits_entry_joint` set `deployed = true` unconditionally after a
+// successful DP run -- and one measured request answered `deployed=1 refused=0` with a spec
+// the build layer refuses by name (dl/kdslider/logs/21_probe_v2_baseline.txt section D:
+// `--kv-bits 4.50`, spec `0-2:rk2v4,3-4:rk4v4,5:rk3v4,6-7:rk2v4,8-9:int8,10-15:nvfp4`). A
+// counter that can be 0 while the next layer throws is not a counter.
+//
+// WHAT IT IS: the produced plan is WALKED THROUGH THE DEPLOY LAYER'S OWN TWO CALLS
+// (`kv_bit_budget_spec_is_deployable`, product/kv_bit_budget.h, which uses
+// product/kv_options.h parse_kv_layer_storage_spec + product/kv_storage_dtype.h
+// kv_dtype_for_storage) and the first layer the deploy layer refuses makes the plan REFUSED,
+// carrying that refusal's own words. Nothing here restates which rows are runnable.
+//
+// WHERE IT SITS. Item 3 of this line makes the solver FALL BACK to a runnable plan when its
+// first answer is one the build refuses (kv_bit_budget.h's gated funnel), so on the shipped
+// ladder this counter is a SECOND GUARD rather than the only one. That is deliberate: the
+// two failure directions are different. The funnel keeps a runnable plan reachable; the
+// counter makes an UNrunnable one impossible to report as deployed -- for the cold path,
+// for the split path's reconciliation, for any future row that gains or loses a reader
+// asymmetrically, and for any plan that reaches this entry from outside the funnel. Both
+// directions are exercised in dl/kvreach: the counter by a two-direction control on the
+// predicate and by a mask-off mutation arm (which must make the joint entry report
+// refused=1 while the AFTER image reports refused on none of the 932 landings), the funnel
+// by the landing table over 3.05..16.05 x {absent, 0.0, 0.5, 1.0}.
+[[nodiscard]] inline std::string kv_bits_undeployable_refusal(const char* entry,
+                                                              std::string_view plan_spec,
+                                                              std::string_view deploy_why,
+                                                              std::int32_t bad_layer) {
+    std::string out = "kv-kv-bits: ";
+    out += entry;
+    out += " produced the plan '" + std::string(plan_spec) +
+           "', and THE DEPLOY LAYER REFUSES IT: this plan is NOT DEPLOYABLE. The request is "
+           "therefore counted as REFUSED rather than deployed -- a plan the next layer throws "
+           "on is not a plan.";
+    if (bad_layer >= 0) {
+        out += " The first refused layer is " + std::to_string(bad_layer) +
+               " (the walk is in ascending layer order).";
+    }
+    out += "\n  The deploy layer's own words: ";
+    out += deploy_why;
+    out += "\n  The rows this build CAN build (the solver's candidate set): ";
+    out += kv_bit_budget_deployable_list();
+    out += "\n  The rows it cannot (withheld -- see product/kv_bit_budget.h "
+           "kv_bit_budget_deployable_rows): ";
+    out += kv_bit_budget_withheld_rows().empty() ? std::string("none")
+                                                 : kv_bit_budget_withheld_rows();
+    out += "\n  This counter reads the deploy layer's two calls "
+           "(product/kv_options.h parse_kv_layer_storage_spec + product/kv_storage_dtype.h "
+           "kv_dtype_for_storage) on the plan the solver itself produced, so it cannot "
+           "disagree with what the build does.";
+    return out;
+}
+
+// The cheapest row the solver is allowed to choose. NOT kv_bits_cheapest_tier(): that one
+// reads `selectable`, which is still true for the two rows the deploy layer refuses, so it
+// would name a floor no plan can reach -- and a refusal naming the wrong floor sends the
+// operator to raise a ceiling that was already high enough.
+[[nodiscard]] inline double kv_bits_deployable_cheapest_tier() noexcept {
+    const std::array<bool, 8>& ok = kv_bit_budget_deployable_rows();
+    double cheapest = 0.0;
+    bool any = false;
+    for (std::size_t i = 0; i < kKvBitBudgetTiers.size() && i < ok.size(); ++i) {
+        if (!ok[i] || !kKvBitBudgetTiers[i].selectable) { continue; }
+        const double cost = kv_bits_tier_bits(i);
+        if (!any || cost < cheapest) { cheapest = cost; any = true; }
+    }
+    return any ? cheapest : 0.0;
+}
+
+// The same set as a "tiers reachable at X" list.
+[[nodiscard]] inline std::string kv_bits_deployable_reachable_tiers(double bits) {
+    const std::array<bool, 8>& ok = kv_bit_budget_deployable_rows();
+    std::vector<std::pair<double, std::string>> rows;
+    for (std::size_t i = 0; i < kKvBitBudgetTiers.size() && i < ok.size(); ++i) {
+        if (!ok[i] || !kKvBitBudgetTiers[i].selectable) { continue; }
+        const double cost = kv_bits_tier_bits(i);
+        if (cost <= bits + 1e-9) { rows.emplace_back(cost, kKvBitBudgetTiers[i].spec_name); }
+    }
+    std::sort(rows.begin(), rows.end());
+    std::string out;
+    for (const auto& [cost, name] : rows) {
+        if (!out.empty()) { out += ", "; }
+        char buffer[48];
+        std::snprintf(buffer, sizeof(buffer), "%s %.2f", name.c_str(), cost);
+        out += buffer;
+    }
+    return out.empty() ? std::string("none") : out;
+}
+
 // Expand a DP spec ("0-7:rk4v4,8-15:nvfp4") into per-layer ladder indices. The DP's own
+// kvreach-e7-counter
 // grammar, so it cannot drift from what kv_bit_budget_solve_impl emits -- and it is
 // the DEPLOYED assignment, because the DP's packer decides which layer gets which
 // (product/kv_bit_budget.h:289-297: "the DP only counts tiers, the packing decides
@@ -556,13 +719,18 @@ struct KvPlaneSolve {
                                                           candidate_order = {}) {
     KvPlaneSolve out;
     KvBitBudgetSolution solved;
-    if (quality_weight >= 0.0) {
-        solved = kv_bit_budget_solve_scored(layers, ceiling, scores, quality_weight, rk4v4_limit,
-                                            cold_cap, candidate_order);
-    } else {
-        solved = kv_bit_budget_solve(layers, ceiling, rk4v4_limit, cold_cap, kKvBitBudgetColdBitsX100,
-                                     candidate_order);
-    }
+    // THE ABSENT WEIGHT IS THE QUALITY END (product/kv_bit_budget.h kKvQualityWeightQualityEnd).
+    // It used to select the shipped single-penalty ladder INSTEAD of the scored table, which is
+    // the whole reason every refusal in this tree has to say "add --kv-quality-weight 0".
+    // Resolving the sentinel here is not a behaviour change: both entries funnel into the same
+    // kv_gear_solve(request) and differ ONLY in request.ladder, and the default table's quality
+    // column IS the shipped penalty column row for row (static_assert, product/kv_bit_budget.h).
+    // Measured over 104 budgets in dl/kdslider/probe/w_sweep.cpp section A: 88 differ BEFORE this
+    // alignment, 0 after. ONE edit covers joint, split AND ceiling, because all three reach the
+    // solver through this function.
+    const double weight = kv_quality_weight_resolved(quality_weight);
+    solved = kv_bit_budget_solve_scored(layers, ceiling, scores, weight, rk4v4_limit, cold_cap,
+                                        candidate_order);
     out.spec           = solved.spec;
     out.achieved_bits  = solved.achieved_bits;
     out.penalty        = solved.penalty;
@@ -658,7 +826,9 @@ struct KvPlaneSolve {
     message << "kv-kv-bits: " << flag << " " << ceiling << " b/element over " << layers
             << " full-attention layer(s) has no feasible allocation. The cheapest tier the "
                "ladder builds is "
-            << kv_bits_cheapest_tier() << " b/element (" << kKvBitBudgetTiers[kKvBitsE8Index].spec_name
+            << kv_bits_deployable_cheapest_tier()
+            << " b/element (" << kKvBitBudgetTiers[kKvBitsE8Index].spec_name
+// kvreach-e10-floor
             << ", capped at " << rk4v4_limit
             << " layer(s) by the rk4v4 exposure limit product/kv_bit_budget.h:82; "
             << kKvBitBudgetTiers[kKvBitsNvfp4Index].spec_name << " is "
@@ -666,7 +836,8 @@ struct KvPlaneSolve {
             << " b/element and bounds the layers rk4v4 cannot take). The effective floor at this "
                "layer count is "
             << floor_bits << " b/element; tiers reachable at "
-            << kKvBitsMaxPerPlane << ": " << kv_bits_reachable_tiers(kKvBitsMaxPerPlane)
+            << kKvBitsMaxPerPlane << ": " << kv_bits_deployable_reachable_tiers(kKvBitsMaxPerPlane)
+// kvreach-e10b-reach
             << ". Raise the ceiling, or lower --max-cold-pages / free rk4v4 slots.";
     return std::invalid_argument(message.str());
 }
@@ -680,6 +851,16 @@ struct KvScoresProvenance {
     bool provisional      = true;   // true <=> the shipped PRIOR table is in use
     bool quality_measured = false;
     bool speed_measured   = false;
+    // [dl/backlog item9-pin] WHICH PIN THE COLUMN WAS MEASURED ON. Empty <=> NOT RECORDED,
+    // and that is the honest value for the built-in table: its speed column is a real
+    // measurement (86.2 / 80.7 / 40.3 / 27.1 tok/s, kv_bit_budget.h:1284-1288) taken on a
+    // pin nobody wrote down, and this pin's measured uniform rates on the same formula are
+    // 279.11 / 263.56 / 251.92 / 226.36 tok/s -- 3.2x apart, WITH DIFFERENT RATIOS (prior
+    // nvfp4/int8 = 0.467 -> 114 here; measured = 0.903 -> 11). So `speed_measured` is true
+    // of `a` run and false of the reading a consumer needs. A CONSUMER MUST READ
+    // speed_measured TOGETHER WITH pin: true + empty pin is "a measurement of unknown
+    // provenance" and must not be quoted as this build's.
+    std::string pin;
     std::string source;
     std::string line;               // one report line, ready to print
 };
@@ -692,18 +873,21 @@ struct KvScoresProvenance {
     KvScoresProvenance out;
     if (spec.empty()) {
         out.provisional      = true;
+        // [dl/backlog item9-line] true, AND NOT THIS PIN'S. `pin` stays empty on purpose --
+        // see the field's own note. Read the flag with the pin, never without it.
         out.speed_measured   = true;   // the speed column IS the measured uniform-tier rates
+        out.pin              = {};     // NOT RECORDED: the rates were taken on an unnamed pin
         out.quality_measured = false;
-        out.source = "the built-in table (product/kv_bit_budget.h:723 "
-                     "kv_bit_budget_default_scores)";
-        out.line = "[kv-score] scores: " + out.source +
-                   " -- PROVENANCE: the quality column is the shipped PRIOR (the needle-sweep "
-                   "penalty of product/kv_bit_budget.h:120-127, which :718-725 itself calls "
-                   "\"provisional\"), NOT a measured per-tier error; the speed column IS "
-                   "measured (the uniform-tier decode rates recorded at :728-733). "
-                   "product/kv_bit_budget.h:374 used to describe both as \"measured\"; that sentence "
-                   "is corrected there now. Use --kv-score-table emit=<path> to write the table "
-                   "out, or --kv-tier-scores <file> to fit against a different one.";
+        out.source = "the built-in table (product/kv_bit_budget.h "
+            "kv_bit_budget_default_scores(); = :1277 on 2026-09-26)";
+            out.line = "[kv-score] scores: " + out.source +
+            " -- PROVENANCE: the quality column is the shipped PRIOR (the needle-sweep "
+            "penalty column; = :31-32 on 2026-09-26), NOT a measured per-tier error; the speed "
+            "column IS measured (the uniform-tier decode rates recorded in the comments "
+            "inside kv_bit_budget_default_scores(); = :1282-1283, :1297-1298 on 2026-09-26, "
+            "ranking restated at :277). Its own header calls the table provisional [text: "
+            "\"Provisional default score table\"; = :1270 on 2026-09-26]. The old line said "
+            "\"measured\" for BOTH columns; corrected there now. Use --kv-score-table emit=<path> to write the table out, or --kv-tier-scores <file> to fit against a different one.";
         return out;
     }
     if (spec.find('\n') != std::string_view::npos) {
@@ -781,9 +965,9 @@ struct KvScoresProvenance {
     const KvScoresProvenance provenance  = kv_scores_provenance(tier_scores);
     const std::string text = kv_bits_score_table_text(
         table, provenance.provisional
-                   ? std::string("quality = the shipped PRIOR (product/kv_bit_budget.h:120-127; "
-                                 ":718-725 calls the table itself provisional), speed = the "
-                                 "measured uniform-tier decode rates (:728-733)")
+                   ? std::string("quality = the shipped PRIOR (product/kv_bit_budget.h "
+                       "[text: needle-sweep penalty column; = :31-32 on 2026-09-26]), speed = the measured "
+                       "uniform-tier decode rates (the comments inside kv_bit_budget_default_scores(); = :1282-1283, :1297-1298 on 2026-09-26)")
                    : provenance.source);
     if (is_show) {
         out << text;
@@ -883,12 +1067,42 @@ struct KvScoresProvenance {
     report << "[kv-bits] realizable (K,V) pairs at --kv-v-codec "
            << (codec == KvVCodec::E2M1 ? "e2m1" : "iso4e") << ": "
            << kv_bits_realizable_pairs(codec) << "\n";
+    report << "[kv-bits] candidate rows: this build can build " << kv_bit_budget_deployable_list()
+           << "; it REFUSES "
+           << (kv_bit_budget_withheld_rows().empty() ? std::string("none")
+                                                     : kv_bit_budget_withheld_rows())
+           << " (the fit runs on the full ladder first and falls back to these rows only when "
+              "its answer is a plan the build layer refuses -- product/kv_bit_budget.h "
+              "detail::kv_gear_solve_gated)\n";
     plan.report = report.str();
+
+    // ---------------------------------------------------------------------------
+    // THE HONEST COUNTER (item 2). Everything above is the FIT; this is the walk through the
+    // DEPLOY LAYER on the plan the fit produced. It runs BEFORE `deployed` is allowed to
+    // stand, so the pair (deployed, refused) can never be (1, 0) for a plan
+    // product::kv_dtype_for_storage refuses. The funnel above makes this unreachable for a
+    // bare --kv-bits request on the shipped ladder -- that is the point of having both -- and
+    // the counter's OTHER direction is the one the landed tests already pin: a plan that IS
+    // deployable must still report refused == false, which dl/kvreach measures over every
+    // ceiling in 3.05..16.05 (932 landings, 0 refused).
+    // ---------------------------------------------------------------------------
+    {
+        std::string deploy_why;
+        std::int32_t bad_layer = -1;
+        if (!kv_bit_budget_spec_is_deployable(plan.spec, &deploy_why, &bad_layer)) {
+            plan.refusal  = detail::kv_bits_undeployable_refusal("--kv-bits (joint)", plan.spec,
+                                                                 deploy_why, bad_layer);
+            plan.deployed = false;
+            plan.refused  = true;
+            plan.spec.clear();
+        }
+    }
     return plan;
 }
 
 // ===========================================================================
 // Packing: reconciled rows -> the --kv-layer-storage grammar, with the DP's own
+// kvreach-e8-joint
 // pack order and block layout (product/kv_bit_budget.h:527-555), so a deployed plan
 // is byte-identical to what the allocator emits for the same per-layer tiers.
 // ===========================================================================
@@ -1101,7 +1315,26 @@ struct KvScoresProvenance {
 
     if (plan.deployed) {
         plan.spec = kv_bits_pack_rows(plan.rows, layers);
-        if (plan.spec != plan.joint_spec) {
+        // THE SAME HONEST COUNTER AS THE JOINT ENTRY (item 2, one rule both readings): the
+        // packed plan is walked through the deploy layer's two calls, and a plan the build
+        // refuses is REPORTED AS REFUSED rather than deployed. The reconciliation above
+        // already set `deployed`, so this is the one place that can catch a reconciled plan
+        // whose TIER the engine cannot read. `plan.refusal` and the report are the same shape
+        // the joint entry produces, so one refusal covers both readings.
+        {
+            const std::string packed = plan.spec;
+            std::string deploy_why;
+            std::int32_t bad_layer = -1;
+            if (!kv_bit_budget_spec_is_deployable(packed, &deploy_why, &bad_layer)) {
+                plan.refusal  = detail::kv_bits_undeployable_refusal(
+                    "--kv-k-bits/--kv-v-bits (split)", packed, deploy_why, bad_layer);
+                plan.deployed = false;
+                plan.refused  = true;
+                plan.spec.clear();
+            }
+        }
+        if (plan.deployed && plan.spec != plan.joint_spec) {
+// kvreach-e9-split
             // Cannot happen while the engine has one width per layer, and if it ever
             // does the two readings have diverged: say so instead of choosing one.
             throw std::logic_error(
@@ -1132,14 +1365,14 @@ struct KvScoresProvenance {
                     << kv_bits_realizable_pairs(codec) << "\n";
         }
         refusal << "  Why: a full-attention layer carries exactly ONE DType and that single "
-                   "dtype drives BOTH planes -- product/kv_tier_formats.h:12-22 \"ONE DType "
-                   "per full-attention layer, driving BOTH the K and the V plane\" -- so every "
-                   "tier costs the SAME bits per element on K and on V "
-                   "(product/kv_bit_budget.h:120-127: one bits_x100 column, \"K+V "
-                   "averaged\"). A layer whose K requirement and V requirement name different "
-                   "formats can only be built by a tier whose (K format, V format) pair IS "
-                   "that pair, and the engine has exactly two such pairs; both are listed "
-                   "above.\n";
+            "dtype drives BOTH planes -- product/kv_tier_formats.h:12-22 \"ONE DType "
+            "per full-attention layer, driving BOTH the K and the V plane\" -- so every "
+            "tier costs the SAME bits per element on K and on V (product/kv_bit_budget.h "
+            "[text: \"Bit costs are the ENGINE's plane geometry (per KV element, K+V "
+            "averaged)\"; = :254 on 2026-09-26]: one bits_x100 column). A layer whose K "
+            "requirement and V requirement name different formats can only be built by a "
+            "tier whose (K format, V format) pair IS that pair, and the engine has exactly "
+            "two such pairs; both are listed above.\n";
         refusal << "  (K=ISO4E, V=E2M1) is the cell this build cannot reach, and building it "
                    "would not even change the bit width: decoder_state.cpp kv_layer_v_dtype() "
                    "puts ISO4E V and E2M1 V on the SAME plane geometry (two codes per byte, one "

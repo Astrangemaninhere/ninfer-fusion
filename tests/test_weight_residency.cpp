@@ -76,8 +76,31 @@ public:
     }
     void synchronize() override { ++syncs; }
     std::uint64_t now_ns() const noexcept override { return clock; }
+    // notehook: the join quartet. This backend performs its "H2D" as a synchronous memcpy, so
+    // there is nothing to wait FOR -- but the primitives are COUNTED, so a runtime that stopped
+    // joining, or that joined the wrong layer, moves these numbers on fixtures that do.
+    void* fetch_event_create() override {
+        ++events_created;
+        return std::malloc(1);
+    }
+    void fetch_event_record(void* event) override {
+        (void)event;
+        ++events_recorded;
+    }
+    void consumer_wait(void* event) override {
+        (void)event;
+        ++consumer_waits;
+    }
+    // F1059: the enrolment is COUNTED too, for the same reason as the rest of the quartet -- a
+    // runtime that stopped enrolling would still join, so nothing else would move.
+    void fetch_enroll() override { ++fetches_enrolled; }
+    void fetch_event_destroy(void* event) noexcept override { std::free(event); }
 
-    std::uint64_t clock        = 0;
+    std::uint64_t clock           = 0;
+    std::uint64_t events_created  = 0;
+    std::uint64_t events_recorded = 0;
+    std::uint64_t consumer_waits  = 0;
+    std::uint64_t fetches_enrolled = 0;
     std::uint64_t device_allocs = 0;
     std::uint64_t device_frees  = 0;
     std::uint64_t device_bytes  = 0;
