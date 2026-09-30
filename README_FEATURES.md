@@ -68,7 +68,7 @@ Anthropic 兼容 HTTP API（`README.md:6-7`）。
 **② 分层词汇表的枚举**（`src/kvcfg/kv_formats.h:27-66`）：
 `Auto`、`Bf16`、`Fp16`、`Int8`、`Int4`、`Iso4`、`Iso4e`、`Rk4v4`、`Rk3v4`、`Rk2v4`；
 配 `Nvfp4Mode{Fusion,Pure}`（`src/kvcfg/kv_formats.h:68`）与 `KvTierFormats`（`:70`）。
-语法 `hot=bf16,tail=fp16,cold=iso4e`（`src/kvcfg/kv_formats.h:5`），入口是 `--kv-tier-formats`
+语法 `hot=bf16,cold=iso4e`（`src/kvcfg/kv_formats.h:5`；`tail=` 引擎按名拒绝：无尾层），入口是 `--kv-tier-formats`
 （`apps/cli/options.cpp:502`），解析器 `src/kvcfg/kv_formats.h:329`。
 
 `int8` 与 `fp8` 是**两个不同的 codec**，且 CLI 的 `fp8` 指 `Fp8E4M3Row256` 而不是 `Fp8Group16`
@@ -105,3 +105,51 @@ Anthropic 兼容 HTTP API（`README.md:6-7`）。
 - **实测数字**都给出复现命令，见 [`docs/features/verification.md`](docs/features/verification.md)。
 - 凡**我没能证明**的条目，一条都不写进功能正文，而是按名留在
   [`docs/features/unfinished.md`](docs/features/unfinished.md) 里，并写清卡在哪。
+
+---
+
+## 6. 本轮聚焦（2026-09-28 → 09-30）：块级 KV 与它的当前状态
+
+本节记录**正在处理什么**，每条都给出处；**凡未实测的不写**，凡预留/不可读的**按名写出**。
+
+### 6.1 已落地并已实测
+
+| 项 | 是什么 | 读数 |
+|---|---|---|
+| **逐格降档 + 速率标尺** | 一格 =（64 token 块 × 一个文本层）；`NINFER_KV_BLOCK_BUDGET_RATE_X10000`（读取点 `src/product/kv_block_budget_stage.h:362`） | 可动 **96.94%** 的 cell；计划币 **4.372266 b/el**（少 47% 字节） |
+| **触发量由速率差反推** | `steps_per_call` 每趟按 `budget_bytes` 与 `total_bytes` 的差额算（`src/product/kv_block_descent.h`） | `TOTALS-DISAGREE` 由 26/27 趟 → **0/27** |
+| **carry 按页身份重锚** | `carry_reanchor[kept=.. dropped=.. new=..]` | 窗口翻动时降档不再被整份丢弃 |
+| **水位 cap/pass 分离** | `src/targets/qwen3_6/impl/runtime/program_impl.h:13411`（`pass_holds`） | 水位之上**也执行也打印**（`reason=above-watermark`） |
+| **第三根轴**（平面按自己那一类定页数） | `KVPlaneGeometry::page_group_count`；旋钮 `NINFER_KV_AXIS3_NARROW_PAGES` | `kv cache payload` 4.38 → **3.56 GiB**、`gpu sequence used` 5.71 → **4.88 GiB**，计划币**逐字节一致**（884,736,000 B），prefill **+0.013%**（不可分辨） |
+| **K/V 成对** | `CellPair` / `cell_pair_bytes` / `cell_pair_read_side`；任意对定价 `e8_kv_pair_bytes(K,V)`（`src/product/kv_e8_width.h`） | 计费与次序**按对为真**；每平面 B4=8704 / B3=6656 / B2=4608；⚠ **读侧仍是 `Reserved`** |
+| **冷层（KVMem）** | `--cold-policy window\|host\|disk\|host-then-disk` | disk 落盘实测 **1,198,443,776 B**、`write_failures=0`、`drain_ms=933`；⚠ **回读（refetch）至今零行** |
+
+### 6.2 正在处理
+
+1. **窄档区填充**（线 `kvfill`）：上面那根轴今天是**预留**、不是已用；缺的一环是读侧（按类寻址 + int8 重编码驱动 + 块表 class 标签）。验收用引擎自己的设备读数在压力下证明。
+2. **V 承载 E8**：今天部署的窄形态把 V 钉在 128 B 的 i4 平面，所以 `e8-2bit` 的对价是 **13,312 B/格**；V 能承载 E8 之后对称对是 **9,216 B/格（−30.8%）**。几何与任意对定价**已有**，缺的是**解码侧消费者**（`e8_kv_lattice_decode_group<2>` 无调用者）。
+3. **KVMem × 文本 prefill 的协作**（线 `kvmpf`）：卸载腿在 prefill 的 chunk 循环里的行为，以及它按长度付出的代价。
+4. **一个"未借鉴"的对照基线**（线 `oursbase`）：8k / 64k / 128k 上的质量、速度与两个设备币，先有我们自己的数，再谈任何外来机制。
+5. **按"克服之后的收益"排序的候选**（见 `docs/features/`）：运行期 KLT 基 + 反水填、给 E8 平面选一个长度约束下的熵容器、KVarN 的通道轴。**收益诚实地为零的，就写零**，不写成"难"。
+
+### 6.3 已知的、没有藏起来的问题
+
+- **prefill 对未改动引擎偏低 4.11% / 5.31% / 5.54%**（三次独立读数、区间不交）。判据是"快或等、绝不更慢"，所以这是**唯一未过的验收项**，而它的机制**尚未识别**。
+- **长上下文侵蚀混档**：降档占比 8k **9.32%** → 64k **2.68%** → 128k **0.60%**；128k 下**单条 `retired=1024`** 把 `rk4v4 672→16` 一次抹掉；且走道**欠报**自己的降档 2.05×–2.41×。
+- **decode 列不作验收**：实测仪器噪声 **30.7%**。
+- **1M 被三道环挡住**：原生上下文门 **262,144**（`--yarn` 放 4×）、设备**缺 10.43 GiB**、冷层**亏 8,457 页 = 8.86 GiB**；已实测跑到的最长上下文是 **260,096 token**。
+
+### 6.4 新机制的旋钮表
+
+| 旋钮 | 选什么 |
+|---|---|
+| `NINFER_KV_BLOCK_BUDGET_RATE_X10000` | **速率**预算（本趟要达成的 bits/element） |
+| `NINFER_KV_BLOCK_BUDGET_BYTES` / `_BLOCKS` | 同一预算的绝对字节 / 计费块口径 |
+| `NINFER_KV_BUDGET_RULER_F1231` | 绝对预算按哪把尺读 |
+| `NINFER_KV_DESCENT_CHAIN` | 档位链（`lattice` = 4/3/2-bit 阶梯） |
+| `NINFER_KV_DESCENT_MAX_TIER` | 任何格最深能到哪一档（0 = 不许动） |
+| `NINFER_KV_DESCENT_ALLOC` | `solve` 选无状态逐格求解（⚠ **今天按构造塌回原像：没有代价表生产者**） |
+| `NINFER_KV_DESCENT_KEEP_RECENT_PAGES` | 年龄闸的 K（**热窗保持 int8**） |
+| `NINFER_KV_AXIS3_NARROW_PAGES` | 第三根轴：每层按窄类定尺寸的页数 |
+| `NINFER_KV_UNLOAD_WATERMARK_PAGES` | 卸载的**通行**；`0` 是关，未设=由 `--prefill-chunk` 推导 |
+| `NINFER_KV_QUALITY_WEIGHT` | **只在**天花板/分离求解器上生效的速度质量滑块——**没有接到逐格走道** |

@@ -94,3 +94,68 @@ See [Astrangemaninhere/ninfer-5090-windows](https://github.com/Astrangemaninhere
 Apache-2.0. Third-party contributions and attribution: see
 [THIRD-PARTY.md](THIRD-PARTY.md) — E8 codec lineage (PR #35 →
 ninfer-4090 → ninfer-3090), IsoQuant tables (nvfp4rtx calibration).
+
+---
+
+## What this pack is working on (2026-09-30)
+
+This section records the KV-allocation plan and its **current** state. Every claim below is a
+reading from this working tree; nothing here is a promise. The block-KV machinery is per-cell:
+one cell is one (64-token block, text layer) pair, and a cell moves one rung at a time.
+
+### Landed and measured
+
+| item | what it is | reading |
+|---|---|---|
+| Per-cell demotion with a **rate** ruler | `NINFER_KV_BLOCK_BUDGET_RATE_X10000` (`src/product/kv_block_budget_stage.h:362` reader) | 96.94% of cells movable; plan coin 4.372266 b/el (47% fewer bytes) |
+| Trigger derived from the rate gap | `steps_per_call` computed per pass from `budget_bytes` vs `total_bytes` (`src/product/kv_block_descent.h`) | `TOTALS-DISAGREE` 26/27 passes -> 0/27 |
+| Carry re-anchored by **page identity** | `carry_reanchor[kept=.. dropped=.. new=..]` | demotions survive a moving window |
+| Cap/pass separation in the unload trigger | `program_impl.h:13411` (`pass_holds`) | above the watermark the pass now **runs and prints** (`reason=above-watermark`) |
+| **Third axis**: a plane may be sized for its own class' pages | `KVPlaneGeometry::page_group_count`; knob `NINFER_KV_AXIS3_NARROW_PAGES` | `kv cache payload` 4.38 -> 3.56 GiB, `gpu sequence used` 5.71 -> 4.88 GiB, plan coin byte-identical (884,736,000 B), prefill +0.013% (indistinguishable) |
+| K/V as an independent **pair** | `CellPair` / `cell_pair_bytes` / `cell_pair_read_side` (`src/product/kv_e8_width.h`) | charge and order are pair-true; arbitrary-pair pricing `e8_kv_pair_bytes(K,V)` exists (B4=8704, B3=6656, B2=4608 per plane) |
+| Cold tiers (KVMem) | `--cold-policy window|host|disk|host-then-disk` | disk spill measured: 1,198,443,776 B, `write_failures=0`, `drain_ms=933`; **cold refetch is still never exercised** |
+
+### Being worked on now
+
+1. **Fill the narrow region** (`kvfill`): the third axis above is a **reservation**, not yet a used
+   region; the read side (per-page class addressing + the int8 requant driver + the block-table
+   class label) is the missing link. Acceptance is the engine's own device readings under pressure.
+2. **E8 on the V plane**: today the deployed narrow form keeps V at the 128-byte i4 plate, so the
+   `e8-2bit` pair costs **13,312 B/cell**; with V able to carry E8 the symmetric pair is
+   **9,216 B/cell** (-30.8%). The geometry and the arbitrary-pair pricing already exist; the
+   **decode-side consumer does not** (`e8_kv_lattice_decode_group<2>` has no caller).
+3. **KVMem x text-prefill cooperation**: how the offload legs behave inside the prefill chunk loop,
+   and what that costs per length.
+4. **An un-borrowed baseline**: quality / speed / both device currencies at 8k / 64k / 128k, so any
+   later mechanism is measured against our own numbers first.
+5. Mechanisms evaluated by **value after overcoming the obstacles** (see `docs/features/`): a
+   runtime KLT basis + reverse water-filling, a choosable entropy container for the E8 plane, and
+   KVarN's channel axis. Methods whose honest value is zero are recorded as **zero**, not as "hard".
+
+### Known standing problems (not hidden)
+
+- Prefill against the unmodified engine is **lower** by 4.11% / 5.31% / 5.54% in three independent
+  readings with disjoint intervals. The no-regression rule is "faster or equal, never slower", so
+  this is the one open acceptance blocker, and its mechanism is **not yet identified**.
+- Long context erodes the mixing: the demoted share is 9.32% at 8k, 2.68% at 64k and 0.60% at 128k;
+  at 128k a single `retired=1024` wipes demotions (`rk4v4 672 -> 16`), and the walk under-reports its
+  own demotions by 2.05x-2.41x.
+- The **decode** column cannot be used as acceptance: its measured instrument noise is **30.7%**.
+- 1M context is blocked by three separate rings: the native context gate (262,144, `--yarn` for 4x),
+  a device shortfall of 10.43 GiB, and a cold-tier deficit of 8,457 pages (8.86 GiB) against a
+  longest actually-run context of 260,096 tokens.
+
+### Knob map for the new machinery
+
+| knob | what it selects |
+|---|---|
+| `NINFER_KV_BLOCK_BUDGET_RATE_X10000` | the **rate** budget (bits per element this pass must reach) |
+| `NINFER_KV_BLOCK_BUDGET_BYTES` / `_BLOCKS` | the same budget in absolute bytes / charge-blocks |
+| `NINFER_KV_BUDGET_RULER_F1231` | which ruler an absolute budget is read in |
+| `NINFER_KV_DESCENT_CHAIN` | the rung chain (`lattice` for the 4/3/2-bit ladder) |
+| `NINFER_KV_DESCENT_MAX_TIER` | how deep any cell may go (0 = nothing may move) |
+| `NINFER_KV_DESCENT_ALLOC` | `solve` selects the stateless per-cell solve (**collapses to the pre-image today: no cost-table producer exists**) |
+| `NINFER_KV_DESCENT_KEEP_RECENT_PAGES` | the age gate's K (the hot window stays int8) |
+| `NINFER_KV_AXIS3_NARROW_PAGES` | the third axis: pages per layer sized for the narrow class |
+| `NINFER_KV_UNLOAD_WATERMARK_PAGES` | the unload **pass**; `0` is OFF, unset means "derive from `--prefill-chunk`" |
+| `NINFER_KV_QUALITY_WEIGHT` | the speed/quality slider of the **ceiling/split solver** only - it is NOT wired into the per-cell walk |
