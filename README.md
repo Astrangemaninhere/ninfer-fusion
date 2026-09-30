@@ -10,6 +10,29 @@ C++/CUDA 单卡推理引擎，跑显式注册的 Qwen 系列 checkpoint，并在
 本 README 不含未标定的性能读数：需要读数的地方给的是可复现的命令或文档入口。上游的完整 README 逐字
 保留在 [docs/upstream-NInfer-README.md](docs/upstream-NInfer-README.md)。
 
+## 本发行版的特色
+
+相对上游，这个发行版把重量放在 KV 与长上下文这一侧，并把"谁能被引擎接受"写清楚：
+
+- **块级 KV**：降档粒度不是"整层"，而是逐格——一个 token 块乘一个文本层，每趟对每格只降一档；预算
+  可以按每元素位数给，也可以按字节给。见「块 KV 与逐块降档」。
+- **K 与 V 各自成对**：两个平面各自选编解码器、按对定价，读侧标签与定价出自同一张表
+  （`--kv-v-codec`、`--kv-tier-scores`、`--kv-k-tier-scores` / `--kv-v-tier-scores`）。
+- **E8 格点与位宽轴**：E8 格点形式的窄档把位宽做成一根连续的轴（`rk4v4`、`rk3v4`、`rk2v4`），并带一组
+  按对定价；窄档的解码与追加内核尚缺，解析到它的计划会在求解器处按名拒绝，而不是被宽档读法误读。
+- **冷层、卸载与召回**：冷层可落主机与磁盘、按水位触发卸载、可召回并按窗口判据具名拒绝；权重量化
+  卸载与按层预取在同一套水位里。见「冷层 / 卸载 / 水位 / 预取」。
+- **运行时行尺度校准**：一次采集、写回、跨运行持久化，指纹失效时重采（`--kv-row-scale`、
+  `--recalibrate`、`NINFER_KV_ROWSCALE`）。
+- **子代理机制（设计，接线中）**：KV 里放纯索引，一个索引对应一条界限分明的并发，并发的工作直接注入
+  前向而不是被当成文本读回来；指令与回复走非文字通道（`src/spec/inject_channel.h`）。见「服务与并发」。
+- **服务面**：`ninfer-serve` 同时给 OpenAI Chat Completions、OpenAI Responses Core 与 Anthropic
+  Messages 的路由与模型清单，都支持流式。
+- **导入链与产物身份**：封闭的转换器契约、逐对象比对、GGUF 那一路的拆件、以及 `tools/archkit/` 的
+  适配与几何/参数两道会红闸；制品自身内嵌 tokenizer、chat template 与媒体前端资源。见「导入与产物」。
+- **平台与边界**：构建只接受 `sm_120a`；AMD/ROCm 的适配层与模拟器在树里，但未在真卡上跑过；`sm_70`
+  是设计地板。见「平台与构建」与「已知限制」。
+
 ## 特性
 
 以下按功能域分组，每组的旋钮都可以单独使用；新机制的旋钮不设时，跑的就是不设它的那条路径
@@ -226,12 +249,23 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   --local-dir models
 ```
 
-`src/targets/` 下的族按构建归属分两档：编进 engine 的核心族有 `qwen3_6`、`qwen3_6_27b`、
-`qwen3_6_35b_a3b`、`muse_glimmer_30b`、`qwen3_5_9b`、`qwen4_exp`、`gemma4_31b`；`qwen3_vision` 与
-`qwen3_8_flash_next` 不进默认构建（须点名才建），`spark_x2_5_4b` 有条件加入。registry 认识的
-package 是 `qwen3_6_27b`、`qwen3_6_35b_a3b`、`muse_glimmer_30b`、`qwen3_5_9b`、`spark_x2_5_4b`。
-其中 `qwen4_exp` 是只有身份注册的骨架，`qwen3_8_flash_next` 有完整实现但未注册进 engine，视觉族在
-本树也是骨架：这三种都不能算作在引擎路径上跑过的目标。
+除上表已发布的制品外，`src/targets/` 下的族按构建归属与注册状态一起列在这里——**部分支持的
+也在表内**，并注明它到哪一步：
+
+| 族 | 构建归属 | registry | 备注 |
+|---|---|---|---|
+| `qwen3_6` | 编进 engine（核心族） | — | |
+| `qwen3_6_27b` | 编进 engine | 认识 | |
+| `qwen3_6_35b_a3b` | 编进 engine | 认识 | |
+| `muse_glimmer_30b` | 编进 engine | 认识 | |
+| `qwen3_5_9b` | 编进 engine | 认识 | |
+| `spark_x2_5_4b` | 有条件加入（在条件分支里） | 认识 | |
+| `qwen4_exp` | 编进 engine | — | 只有身份注册的骨架 |
+| `gemma4_31b` | 编进 engine | — | 骨架 |
+| `qwen3_vision` | 不默认构建（须点名才建） | — | 骨架 |
+| `qwen3_8_flash_next` | 不默认构建（须点名才建） | — | 有完整实现，但未注册进 engine |
+
+骨架与未注册的这几族**不能算作在引擎路径上跑过的目标**；发布出来、可下载的是上表那三族的五种制品。
 
 ## 构建
 
