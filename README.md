@@ -1,3 +1,14 @@
+<!-- ==========================================================================================
+     THIS IS THE INHERITED UPSTREAM README, AND IT IS OUT OF DATE FOR THIS TREE.
+     It describes the upstream NInfer engine, NOT the state of this working tree.
+     FOR THE CURRENT STATE, READ:
+       * README.en.md        -- the fusion English README (mechanisms, defaults, evidence pointers)
+       * README_FEATURES.md  -- the Chinese feature overview (per-item source coordinates)
+     Both were rewritten on 2026-09-30 and are the versions pushed as the branch
+     sync/2026-09-30. Published tables in this file are upstream measurements; this tree own
+     readings live with their evidence under dl/<line>/ and are NOT reproduced here.
+     ========================================================================================== -->
+
 # NInfer
 
 > Selected checkpoints. Maximum single-GPU inference performance.
