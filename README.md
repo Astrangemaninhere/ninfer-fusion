@@ -630,6 +630,394 @@ std::string usage_text(const char* argv0) {
 
 ---
 
+# 功能与机制（按被反复提出的频次排序）
+
+这一部分按**本项目记录里被反复提出的次数**降序排列：越靠前，是这轮工作里被追问得越多的机制。
+例外只有一处：被当天两次点名的「子代理机制」放在首位。每节只写三件事：
+
+- **是什么** —— 机制在引擎里干什么；
+- **怎么用** —— 对应的旗标与环境旋钮，名字全部取自源码；
+- **现状** —— 四档之一：**已落地可跑** / **在测** / **定价存在但读侧未接**（读侧标 `Reserved`）/ **未验证**。
+  "预留"不写成"可用"，"定价"不写成"能读"，"能表达"不写成"能跑"。
+
+**这一部分不给读数**：凡需要一个数的地方，本文件不写，读数留在各自的证据路径里（边界见
+「本文档的边界（明说）」一节）。两条不在这里重复：**AMD / ROCm 与多平台**已经写在上面
+「平台与路线（今天能核实的，与还没有实测的）」一节，这里只作交叉引用；**构建与流程**不是引擎机制。
+
+---
+
+## 子代理机制（索引与并发，主对话接力）
+
+**是什么**：这是记录里被点名的一项**设计**，要先与另一种模式分清楚：把引擎当编码代理后端、主代理靠
+"读报告"交接的那条路，他原话说**协作效率远低于**下面这个设计。设计本身是：
+
+- **KV 里放纯粹的索引**，**每一条索引对应一条独立且界限分明的并发**；
+- **主对话与并发接力混合**：主 KV **只记载每一条并发所承担的部分**；
+- 并发的工作**直接注入主过程**（不是把它当报告再读回来），并且**指令与回复不经过文字**；
+- 目的是把**并发带来的 decode 效率**做上去，而不是把并行摊成若干条分支。
+
+**怎么用**：
+
+- **索引作为草稿来源**：`NINFER_INDEX_DRAFTS` 是进程级开关（读一次，运行中不可改）；**未设 = 关，而
+  "关"就是今天的引擎**——那次咨询根本不会被调用，每个草稿槽保持引擎自己会写的值。打开后是**每条车道、
+  每轮解码一次咨询**，发生在 host 上、在该轮的入口循环里、在该轮发射之前，并且**在任何图捕获体之外**；
+  它返回的是索引**从头填上的草稿槽数**，返回 `0` 就意味着这一轮的草稿逐字节仍是引擎自己的。这条链上的
+  名字是 `index_query_term()`（查询构造）、`index_draft_fill()`（填槽）、`index_draft_census()`（账）、
+  `index_drafts_armed()`（是否武装）；代码在 `src/targets/qwen3_6/impl/runtime/program_impl.h` 的
+  `[IDXWIRE]` 段。它与链式草稿的关系是硬的：**索引只能提供一条链**——树回合里它会被按名记成 `refused_tree`，
+  因为把索引 token 当树列去验证，会报出一棵从未建过的树。
+- **非文字通道**：`src/spec/inject_channel.h` 是**声明面**（host-only、可用普通 `g++` 单测：每个字段、
+  每个拒绝名、摘要与 dtype 算术都在那里）；`src/targets/qwen3_6/impl/runtime/inject_ingress.h` 是**引擎侧**，
+  也就是"**一份声明在那里变成一次写进前向的写**"：每个预填充分块做一次连续的拷贝，写进 input-embedding
+  矩阵的声明列（ingest）或从其中拷出（egress），并在消费任何东西之前**按名拒绝**与声明列冲突的分块，
+  并在结尾报告声明范围是否真的被覆盖。命令行面是 `--inject-spec`，环境拼写 `NINFER_INJECT_SPEC`；**未设时
+  它第一行就返回**，不写任何字节——所以这条通道对既有路径的代价是一个分支。
+- **并发宽度**：`--max-concurrency`（启动期给定）；车道之间共享的资源与排队见「服务 / HTTP / API / 批与并发」一节。
+
+**现状**：**部分接线已落地**，**模式未成**。已在树里的是"索引可以当这一轮的草稿来源"这一层（选路与它的账），
+以及注入通道的声明面与引擎侧入口面；**"索引 = 一条独立并发 + 与主对话接力混合 + 并发结果直接注入主过程"
+作为一个可跑的模式，今天并不存在**。另有一条按记录的实测：把索引草稿与其他全开项一起打开时，引擎在短提示上
+**按名失败**（`phase=decode reason: index query start`），关掉它则正常。⇒ 读法是：接线在、模式未成、
+全开时会红；这是设计中的机制，**不是加速手段**。
+
+## KV 量化格式族（e8 / nvfp4 / int8 / rk 家族）
+
+**是什么**：KV 在这棵树里不是一个全局档，而是几层词汇表叠起来的一族 codec：CLI 的全局档位、
+逐层存储表、以及热 / tail / 冷各档的格式表。带常驻编解码器的档位是 `bf16`、`fp8`（按行给尺度）、
+`int8`（按组给尺度）、`nvfp4`（K 用 E2M1 码字、V 用 ISO 码字），以及引擎打印为 `iso4e` / `rk4v4`
+的那一对；`iso3` 与 `e8` 是它们的废弃别名，只保留一个发布周期。`rk3v4` / `rk2v4` 是 E8 格点形式的窄档。
+引擎里 K 与 V 两个平面**按元素计位是一起付账的**（一个 DType 同时驱动两个平面）。另有几条独立的
+成分开关：旋转、行尺度、以及整层平面丢弃。
+
+**怎么用**：
+
+- 全局档与逐层表：`--kv-dtype`、`--kv-layer-storage`、`--kv-tier-formats`、`--nvfp4-mode`、`--kv-v-codec`。
+- 位预算与求解：`--kv-bit-budget`、`--kv-bits`、`--kv-k-bits` / `--kv-v-bits`、`--kv-bits-mode`、
+  `--kv-codec-preference`、`--kv-quality-weight`、`--kv-tier-scores` / `--kv-k-tier-scores` / `--kv-v-tier-scores`、
+  `--kv-score-table`。
+- 成分开关与校准：`--kv-rotation`、`--kv-row-scale auto|off|FILE`、`--recalibrate`、`NINFER_KV_ROWSCALE`、
+  `NINFER_KV_ROWSCALE_IDENTITY`、`NINFER_KV_CALIB_DIR`、`NINFER_KV_CALIB_MAX_TOKENS`。
+- 逐层丢弃与页池：`NINFER_KV_DROP_LAYERS`、`NINFER_KV_PAGING_PREALLOC`。
+- 残余平面：`--kv-residual-layers`（只对 `nvfp4` 有作用）。
+
+**现状**：带常驻 codec 的那几个档位**已落地可跑**（写入与解码内核都在）；`rk3v4` / `rk2v4` 的
+词汇表、档梯成本与平面几何都在，但**没有读窄码板的解码与追加内核**，所以解析成它们的计划会在
+求解器处按名拒绝，而不是被拿去用宽档读法误读（与「支持哪些 KV 格式」一节合读）。**行尺度校准闭环
+已落地**：`auto` 是唯一跑闭环的态，表存在就加载并跳过采集，为别的模型或别的 KV 配置烤的表不被采用；
+首次校准要求关掉图捕获。**残余平面是部分实现**：非默认路径，CLI 与 serve 都解析它，`nvfp4` 之外按名
+惰性，且带残余平面的层不能再进冷池。**`tail` 档没有尾层**：`--kv-tier-formats` 的 `tail=` 只在重复
+`hot` 时被接受。还有一条读法上的坑：`--kv-dtype fp8` 与 `--kv-layer-storage fp8` 落到**不同名**的
+codec 上，这是源码自述的故意行为，不是抄写错误。求解器自带的**质量列是 PRIOR，不是测量**——
+`--kv-score-table show` 会在输出里自己说明，见「质量与评测仪器」一节。
+
+## KVMem / 冷层 / 卸载 / 水位 / 预取
+
+**是什么**：把 KV 从设备窗口分层放到 host 与磁盘的一整套机制，分三层。**决策层**：谁该冷——按观测窗口
+的 EWMA 与连续稳定性判断 hot/warm/cold 的驻留，**未观测的层永不被降级**，置信不足的窗口也不能把冷层
+提出池。**介质层**：冷层放哪——设备窗口、钉住的 host 冷层、或磁盘；host 冷层是逐页一个钉住的 extent，
+取回免费判定、可取判定、准入判定与"窗口关不上缺口"的具名拒绝都在一处。**衔接层**：策略到分页介质怎么
+接——这条映射的每一态都有自己的臂，另有分页 KV 池一族、host extent store 与逻辑 KV 视图。配套的还有
+几件：**卸载水位**（自由页降到水位时主动卸载语义目录判定不可加载的块，而不是等池溢出）、**权重卸载 W13**
+（把权重放到 host、按层预取回来）、以及**召回/复填**（召回回合允许重新预填充，但预填充量有上限，
+越界在计划期就按名拒绝）。
+
+**怎么用**：
+
+- 冷池策略与介质：`--cold-policy none|off|window|host|disk|host-then-disk`（`host+disk` 是等价拼写）、
+  `--cold-host-bytes`、`--cold-disk-path`、`--cold-disk-bytes`、`--cold-keep-tokens`、`--max-cold-pages`。
+- 水位与预取：`--kv-unload-watermark-pages`（`0` 是关，未设时由预填充单元推导；环境拼写
+  `NINFER_KV_UNLOAD_WATERMARK_PAGES`）、`--weight-host-bytes`、`--weight-device-arena-bytes`、
+  `--weight-prefetch-layers`、`--weight-span-floor-bytes`、`NINFER_W13`、`NINFER_W13_STATS`。
+- 召回与外接：`--recall-prefill-tokens`（`NINFER_RECALL_PREFILL_TOKENS`；越界时 stderr 报
+  `refused-prefill-budget`，在计划期就把想要的量与预算一起打出来）、`NINFER_RECALL_TEXT`、`NINFER_TURN_RECALL`、
+  `--ple-sidecar`、`NINFER_PLE_STATS`。
+- 仪器：`NINFER_COLD_HOST_REFETCH_CENSUS`、`NINFER_COLD_FALLBACK_CENSUS_*`、`NINFER_KV_PAGING_PREALLOC`。
+
+**现状**：介质层与水位**已落地可跑**（准入/取回/窗口带宽与具名拒绝都在；水位按 `CLI > env > 默认`
+三档优先序，超域按名拒绝，不做静默忽略）。**决策层只在 serve 侧可达**：它由 `--kv-auto-relayout`
+的周期驱动，CLI 前端没有决策周期，所以那条闭环在 CLI 上走不到。`NINFER_FT_COLD_MODE` 的 live 档在树里
+自述为**为另一条池线保留**（预留）。落盘路径存在，但**回读（refetch）侧到今天还只是一句注释**——
+状态与坐标见「已知的、没有藏起来的问题」。权重卸载的预取层数有一个**下限拒绝**（低于下限会让正在算的
+层自己的槽被自己的预取覆盖），这条已经落地。
+
+## 导入 / 转换 / 模型适配
+
+**是什么**：把一个外部 checkpoint 变成可跑的 `.ninfer` 制品的整条链路。前门是一支脚本
+（`tools/convert/import_model.py`），"本地模型 → `.ninfer`"收在这一处：**注册的转换器是封闭、字节钉死的
+契约**，各转换器接受什么由前门统一收口。导入之后由编排脚本全自动跑转换；验收闸是一个**逐对象比较**
+两个 `.ninfer` 的工具（按退出码判"这个 build 是否与参考一致"）；另有一支工具测制品的**无损**压缩余量。
+GGUF 族的能力被拆成几件：抽取、K-quant 块格式的尺寸与反量化、旋转契约、"谁施加这个旋转"的唯一决策点，
+以及张量名到本树名字的映射。逐族各有一套转换器与自查脚本。模型适配还有一条工具链侧的路：从 spec 生成
+目标骨架 → 自动适配管线 → **会红的门**（几何覆盖、参数完备是门，不是提示）。KV 侧另有一组**离线镜像**：
+位预算求解、档位×层的标定流水线、覆盖率扫描、以及由 `ft_stats` 观测生成逐层方案（它的消费者是 serve 侧的
+周期重排）。制品还带**自己的身份**：草稿头跑不跑 Markov 头由制品的权重身份决定，而不是由旗标决定。
+
+**怎么用**：
+
+- 转换链路（都在 `tools/convert/`）：`import_model.py`、`convert_runner.py`、`artifact_diff.py`、
+  `compress_probe.py`、`gguf_extract.py` / `gguf_kquant.py` / `gguf_hadamard.py` / `gguf_fold_back.py` /
+  `gguf_fold_route.py` / `gguf_names.py`、逐族目录、`archkit/`（含 `adapt.py`、`adapt_all.py`、`check_geometry.py`、
+  `check_params.py`、`kv_budget_mirror.py`、`kv_tier_matrix.py`、`kv_auto_allocate.py`）、`dequant/`、`lora/`、
+  `ple_sidecar_build.py`、`kv_iso_ref.py`。
+- 引擎侧与之对接的接口：`NINFER_EXPORT_HEAD_DIR`（导出头目录）、`NINFER_KV_CALIB_DIR`、`--ple-sidecar`。
+- 契约文档：`docs/maintainer/modelopt-nvfp4-import.md`、`docs/maintainer/artifact-container.md`、
+  `docs/maintainer/tensor-formats.md`、`docs/features/importers.md`。
+
+**现状**：**已落地可跑**（前门、编排、逐对象验收闸与逐族转换器都在，且各带单测）。边界要写清：注册的
+目标族是**封闭集合**——没有运行期模型发现，也没有未注册 checkpoint 的兜底；`qwen4_exp` 在这棵树里是
+**骨架**（只有 identity 注册）；`qwen3_8_flash_next` 有完整实现但**未注册进 engine**，构建上须点名才建
+（见「支持哪些模型族」一节）：⇒ 视觉族与 flash-next 族在本树的引擎路径上属于**未验证**一档，"有实现"
+不等于"跑过"。
+
+## 速度 / 吞吐 / 延迟（只讲机制，不给读数）
+
+**是什么**：影响单位时间产出的一组彼此独立的机制。
+
+- **预填充单元的归属**：一个带宽治理器在给定上界内自己装一个预填充单元，并在解码延迟高于它自己测得的
+  噪声底时**收缩**它；`manual` 则把单元钉死在上界。
+- **FreeToken 带宽治理**：一组 EMA / 信用 / 份额下限 / 容差 / 窗口旋钮，另有追踪开关把治理器模式与实际
+  装的单元打出来。
+- **图捕获**：解码默认走 CUDA 图，可整体关掉，也可给捕获的层数上限。
+- **投机解码**：MTP / DFlash / DFlash2 / DSpark（见「MTP / 投机解码」一节）。
+- **权重预取**：W13 按层把 host 上的权重取回（见「KVMem / 冷层 / 卸载 / 水位 / 预取」一节）。
+- **流水线分段**：`--stage-layers` 把文本层轴切成阶段，`--stage-handoff` 给边界隐状态的交接目录。
+
+**怎么用**：`--prefill-chunk`、`--prefill-chunk-mode dynamic|manual`、`NINFER_FT_BW_GOV`、`NINFER_FT_BW_TRACE`、
+`NINFER_FT_BW_EMA_ALPHA`、`NINFER_FT_BW_BASE_ALPHA`、`NINFER_FT_BW_MAX_CREDIT`、`NINFER_FT_BW_MIN_SHARE`、
+`NINFER_FT_BW_STREAK`、`NINFER_FT_BW_TOL_HI` / `NINFER_FT_BW_TOL_LO`、`NINFER_FT_BW_WINDOW_MS`、
+`--no-cuda-graph`、`--graph-capture-ceiling`、`--stage-layers SPEC`、`--stage-handoff DIR`、
+`--stage-handoff-cut`、`--ft-stats`、`NINFER_FT_STATS`、`NINFER_FT_PERIOD`。
+
+**现状**：治理器与图捕获**已落地可跑**（`dynamic` 默认让治理器自己装单元，`manual` 钉死上界；
+`NINFER_FT_BW_GOV=0/1` 是同一件事的环境拼写，旗标胜过环境）。**分段是部分可达**：`--stage-layers`
+让流水线并行从命令行**问得到**，但虚拟设备那道守卫仍然拒绝它，所以"能表达"不等于"能跑"；
+`--stage-handoff-cut` 是**负对照**，不是功能——它故意静音生产者，用 id 是否移动来证伪"交接是承重的"。
+
+## 显存 / 内存 / 带宽（只讲机制，不给读数）
+
+**是什么**：把有限内存分到"权重 / KV / 状态 / 媒体"几处，以及把压力从设备挪走的手段。**KV 容量**由
+`--kv-capacity` 定尺寸：`auto` 在启动期按权重之后剩下的内存解出合法容量并留一份定尺寸余量，显式容量在
+进程生命周期内固定；**页池是共享的**（活跃请求与留存前缀共用一个池）。**页池预分配**是一道 opt-in 闸，
+做容量可行性检查。**状态槽**在 serve 侧给定（设备槽与 host 槽各一组），host KV 另有一份钉住的预算。
+**权重驻留**（W13）把权重放到 host，并在设备侧留一个 arena 与一个跨度下限。**媒体**有自己的一份缓存与
+实时预算。**观测面**：工作集转储、headroom 百分比、arena 追踪，以及"每类平面按自己的页数定尺寸"的第三根轴
+（见「块 KV / 逐块降档 / 速率预算 / 第三轴」一节）。
+
+**怎么用**：`--kv-capacity N|auto`、`--max-context`、`NINFER_KV_PAGING_PREALLOC`、`--device-state-slots`、
+`--host-state-slots`、`--host-kv-mib`、`--weight-host-bytes`、`--weight-device-arena-bytes`、
+`--weight-span-floor-bytes`、`--cold-host-bytes`、`--cold-disk-bytes`、`--max-cold-pages`、
+`--kv-unload-watermark-pages`、`--media-cache-mib`、`--media-live-mib`、`--max-request-mib`、
+`NINFER_WS_DUMP`、`NINFER_WS_HEADROOM_PCT`、`NINFER_ARENA_TRACE`、`NINFER_KV_WINDOW_TOKENS`。
+
+**现状**：定尺寸、页池、状态槽与权重 arena **已落地可跑**；水位的主动卸载也已落地（见「KVMem / 冷层 /
+卸载 / 水位 / 预取」一节）。**超长上下文还不是一个内存问题**：设备侧缺口与冷层缺口是并列的，
+状态与坐标见「已知的、没有藏起来的问题」与「长上下文 / 超长上下文的目标」两节；本文件不给任何内存读数。
+
+## 质量 / 困惑度 / 评测（仪器怎么跑，不报数）
+
+**是什么**：一组与引擎**同一份 Text 模型、同一套 KV 档位**的离线仪器与观测面。
+
+- **困惑度工具**：同一 artifact、可切 KV 存储、跑完写一份完整的 JSON 记录。
+- **分数表入口**：`--kv-score-table show|emit=PATH` **不需要模型与提示词**就能跑；`show` 打印规划器会用的表，
+  并打印每一列的**真实出处**。
+- **FreeToken 逐层注意力能量观测**：`--ft-stats`，它的消费者是 serve 侧的周期重排。
+- **接受率仪器**：每个验证轮打一个明细块（不设不打）。
+- **输入侧 id 打印**：提示词被切成什么 id、生成了什么 id。
+- **能力自报**：`--capability-report`，**不需要 artifact** 就能回答"这个构建会拒绝什么、为什么"。
+- **取回核对与基准**：长上下文取回的工具与 oracle、TTFT 基准夹具、逐档位的标定脚本。
+
+**怎么用**：`ninfer-perplexity`（`--corpus`、`--quick`、`--kv-dtype`）、`tools/perplexity/prepare_corpus.py`、
+`--kv-score-table show|emit=PATH`、`--kv-tier-scores` / `--kv-k-tier-scores` / `--kv-v-tier-scores`、
+`--ft-stats` / `NINFER_FT_STATS` / `NINFER_FT_PERIOD`、`NINFER_ACCEPTLOG` / `NINFER_ACCEPTLOG_STREAM_SYNC`、
+`NINFER_SVIP_THRESHOLD`、`--print-prompt-ids`、`--print-token-ids`、`--capability-report`、
+`tools/bench/`、`tools/archkit/longtest_57k.py`、`tools/test_kv/`、`docs/features/instrumentation.md`。
+
+**现状**：仪器**已落地可跑**，但边界必须一起写：其一，**分数表里的质量列是 PRIOR，不是测量**——
+工具自己会在输出里说明这一点；其二，**解码侧那一列的仪器噪声比这套机制能产生的效应还大**，所以它不作验收
+（见「已知的、没有藏起来的问题」）。质量结论的读数不在本文件里：需要读数就沿证据路径读，本节的职责是讲清
+"怎么跑、读数从哪来、哪一列不能拿来当验收"。
+
+## MTP / 投机解码
+
+**是什么**：草稿—验证式解码。后端是一个枚举：`none` / `off`、`mtp`、`dflash`、`dflash2`、`dspark`、`auto`
+（默认 `auto`，所以必须有一个"关回去"的拼写）。**`dspark` 不是第四个后端**：它就是 DFlash 的运行时，
+跑不跑 Markov 头由**制品自己的权重身份**决定（只有那个身份的制品才绑 Markov 权重，没有就按普通 argmax 起草）。
+草稿宽度可以按几种形态给：**钉住一个宽度**、**自适应阶梯**（由生存/代价准则按轮选档）、以及**树**（若干
+rank-path × 若干步，节点预算**就是**这一轮的草稿宽度，所以"树"与"草稿宽度"是同一个量的两种拼写，不能同时给）。
+草稿头可以是完整词表头或优化头；`auto` 的解析在注册表里只有一处，因为它同时喂规划器、装载计划与运行期。
+验证侧有逐轮明细块作为接受率仪器。
+
+**怎么用**：`--spec`、`--draft-tokens`、`--draft-tree L,d`、`NINFER_MTP_ADAPTIVE`、
+`NINFER_MTP_WINDOW_CUT` / `_RATIO` / `_UNOBSERVED` / `_DENOM` / `_TRACE` / `_SHRINK` / `_MINREACH`、
+`--lm-head-draft` / `--no-lm-head-draft`、`NINFER_ACCEPTLOG`、`NINFER_ACCEPTLOG_STREAM_SYNC`、
+`NINFER_SVIP_THRESHOLD`、`NINFER_DFLASH_SVIP_THRESHOLD`、`NINFER_ADAPTIVE_WINDOW`；
+契约文档 `docs/maintainer/mtp-draft-tree.md`、`docs/features/mtp-and-speculation.md`。
+
+**现状**：后端族与自适应阶梯**已落地可跑**；树验证也落地，并且它自带一致性检查——**退化成链的树必须逐 token
+复现同样的链式草稿**，这就是树路径自己的仪器检查。边界：把自适应再按环境变量强行打开的那条路，引擎自己按
+**临时逃生舱**记着（见 `docs/features/unfinished.md`）；每族自己的草稿宽度上限定义在族里，CLI 侧今天仍按公共
+上界硬编码，所以族上限在 CLI 上到不了。`dspark` 这个拼写被接受**并不承诺**制品带 Markov 头——要在没有该头的
+制品上拒绝它，需要制品自身的信息，纯枚举翻译做不到这一点。
+
+## 块 KV / 逐块降档 / 速率预算 / 第三轴
+
+**是什么**：把 KV 的档位下沉到**格子**这一级的机制。一格 = 一个 token 块 × 一个文本层，走道每趟对每格
+**只降一档**。预算有两种给法：**速率标尺**（这一趟要达到的每元素位数）与**绝对口径**（字节 / 计费块）。
+**触发量由速率差反推**：每趟的步数按预算与实际总量之差算。**carry 按页身份重锚**：跨趟保留的东西用页身份
+重新锚定，而不是靠位置。**水位 cap/pass 分离**：水位之上也执行也打印（`reason=above-watermark` 会写出来）。
+**第三根轴**：一个平面可以按**它自己那一类**的页数定尺寸，于是窄类平面不再按宽类的页数付账。
+**K/V 成对**：任意对定价与读侧标签是同一张表的两个面。
+
+**怎么用**：`NINFER_KV_BLOCK_BUDGET_RATE_X10000`、`NINFER_KV_BLOCK_BUDGET_BYTES`、`NINFER_KV_BLOCK_BUDGET_BLOCKS`、
+`NINFER_KV_DESCENT_CHAIN`、`NINFER_KV_DESCENT_MAX_TIER`、`NINFER_KV_DESCENT_ALLOC`、
+`NINFER_KV_DESCENT_KEEP_RECENT_PAGES`、`NINFER_KV_AXIS3_NARROW_PAGES`、`NINFER_KV_QUALITY_WEIGHT`、
+`--kv-quality-weight`、`--kv-unload-watermark-pages`，serve 侧另有 `--kv-auto-relayout SECS`（周期性地从
+观测量重新推导逐层表）。未设旋钮就是原像，这是代码的性质（见「新机制的旋钮表」一节）。
+
+**现状**：走道本体**已落地可跑**（执行、打印、越界按名拒绝都在）。**定价存在但读侧未接**：任意对定价已经
+按构造钉住，但读侧在 `cell_pair_read_side` 里被标成 `Reserved`，宽档的格点解码器**没有调用者**，所以"定价"
+不等于"能读"（与「支持哪些 KV 格式」一节里 `rk3v4` / `rk2v4` 的可选但不可跑一起读）。还有几处**今天按构造
+塌回原像**：无状态逐格求解缺一个代价表生产者；`NINFER_KV_QUALITY_WEIGHT` **没有接到逐格走道**，它只在
+天花板/分离求解器上生效。第三根轴的旋钮有唯一读者，消费者在运行期（程序侧与解码状态侧）。
+
+## 新后端 GDN / 线性注意力（以及 FlashNext 的运行期）
+
+**是什么**：除去 softmax 注意力，这棵树里还有**第二条序列混合器**：门控 delta 网络（GDN）式的线性注意力。
+它以**层**为单位与全注意力交替——一个族里哪些层是 GDN、哪些是全注意力，由族自己的配置函数决定；并且
+**GDN 层不携带分页 KV**，这正是"位预算的区间必须盖住每一层全注意力层"这条约束的来源。实现分两条路：
+**递推**与**分块**；状态另有一套（线性注意力状态），并带**重放记录**，卷积状态有快照与记录两种形态。
+投影侧有独立的输入投影与门控投影算族。另有一族**完全独立的运行期**（FlashNext）：它有自己的注意力、MoE
+路由与超连接内核，以及一大族运行期开关。
+
+**怎么用**：GDN 侧**没有专门的命令行旗标**——它由装载的族决定；可用的旋钮是
+`NINFER_GATED_DELTA_NET_PROPAGATE`、`NINFER_GDN_GATE_FUSED`、`NINFER_GDNDUMP_DIR` / `_LAYERS` / `_MAX_CALLS` /
+`_MAX_ELEMS`。FlashNext 侧是一族 `NINFER_FLASH_NEXT_*`（MoE 分阶与共享 MMA、路由与超连接的 legacy 分支、
+QSA 调度与前填充、阶段台账与追踪、草稿头行数）加 `NINFER_RANKING_PATH`。契约文档：
+`docs/maintainer/replayssm-gdn.md`、`docs/maintainer/qwen3.8-flash-next-model.md`、
+`docs/maintainer/qwen3.8-flash-next-artifact.md`、`docs/flash-next-mtp-speculation.md`。
+
+**现状**：GDN 是**已落地可跑**的族实现（内核、状态、重放与单测都在）。它的 KV 含义是硬的：位预算的区间
+**必须盖住每一层全注意力层**，盖不住就**按索引具名拒绝**并同时打印可部署的方案。FlashNext 是**未验证**的一档：
+运行期与内核在树里存在，但这一族**未注册进 engine**，构建上须点名才建 ⇒ "实现存在"不等于"以引擎路径跑过"。
+
+## 多模态（图 / 视频）
+
+**是什么**：结构化消息内容除了文本，还可以带 image / image_url 与 video / video_url 片段；媒体来源可以是
+本地路径、HTTP(S) URL 或 base64 data URI。`--vision` 打开媒体输入**并把固定的 Vision GPU 分配装上**——
+也就是说视觉相关的驻留是**启动期定死**的，后续请求不能临时开启启动时省掉的能力。serve 侧的媒体取回与前处理
+有自己的缓存、实时预算与前处理线程数，取回路径另有一个**编译期**开关。
+
+**怎么用**：`--vision`；serve 侧 `--media-cache-mib`、`--media-live-mib`、`--media-preprocess-threads`；
+编译期 `NINFER_BUILD_MEDIA_ACQUIRE`（构建开关，不是运行期旋钮）；契约 `docs/sm120a-quantized-kv-vision.md`。
+
+**现状**：媒体获取、前处理与消息解析**已落地可跑**。边界写清：`--vision` **与 DFlash 后端没有被共同验证**，
+CLI 与 serve 都按名拒绝这个组合（`not co-validated` 那句在两个前端里各有一处）；树里另有一个独立的视觉目标族，
+它在本树是**骨架**（须点名才建），所以"有视觉族"不等于"这一族跑过"。
+
+## 服务 / HTTP / API / 批与并发
+
+> 并发与批量与这一节是同一批旋钮，因此合在这里写。
+
+**是什么**：`ninfer-serve` 把引擎包成一个常驻服务。路由族里有 **OpenAI Chat Completions**、
+**OpenAI Responses Core**（含 input_tokens 与 compact）、**Anthropic Messages**（含 count_tokens）与模型清单；
+它们都支持流式、工具调用回传、本地响应状态与用量记账。**批**的性质是启动期定死的：车道数与排队上限在启动期
+给出，运行期**不做请求抢占、不做优先级/QoS、不做活动请求换出**；一批解码走精确批次的图捕获，并配一条
+无 CUDA 图的回退。鉴权、对外模型名、CORS、请求日志落 JSONL、响应存储上限都是启动期参数；**上下文代价预设**
+把代价模型的选择也放到启动期。引擎把解析出的工具调用**交回客户端**，自己**不执行**工具。
+
+**怎么用**：
+
+- 监听与身份：`--host`、`--port`、`--api-key`、`--model-id`、`--cors`。
+- 车道与排队：`--max-concurrency`、`--max-pending-requests`、`--pending-timeout-ms`。
+- 批与预填充：`--prefill-chunk`、`--prefill-chunk-mode`、`--max-context`、`--kv-capacity`。
+- 驻留与状态：`--device-state-slots`、`--host-state-slots`、`--host-kv-mib`、`--context-cost-presets`、`--max-request-mib`。
+- 日志与存储：`--log-stats-interval-ms`、`--request-log-jsonl`、`--response-store-max-records`、`--response-store-max-mib`。
+- 请求未给时的默认：`--default-max-tokens`、`--default-thinking-budget`。
+- **serve 独有**：`--kv-auto-relayout SECS`、`--ft-vram-axis on|off`。
+
+**现状**：**已落地可跑**。两处**要按现状写的边**：其一，两个前端的旗标集**不相等**——`--kv-auto-relayout`
+只在 serve 侧（CLI 前端的用法文本会明说它的消费者是 serve 侧特性）；其二，serve 的 `--help` 用法行
+**漏列了自己 parser 里注册的一批旗标**（冷窗族与权重卸载族），照 `--help` 写文档会以为它们不可达，实测两族
+都能过 parser 并进入装载——这是**用法文本不完整**，不是旗标不存在（见 `docs/features/serve-flags.md`）。
+
+## 前缀复用
+
+**是什么**：一个可复用的前缀检查点 = **KV 加上该提示词前沿的完整续写状态**，所以可复用的单位不是几段文字，
+而是一次检查点。开启后，引擎会在**领先的系统提示**处发布一个共享前缀候选，并在后续请求之间复用相容前缀；
+命中的量与**走了哪条复用路径**都被记账（路径是一个枚举：根、私有端点、私有回合闭合、私有响应重放、
+私有长锚点、共享稳定前缀）。续写与长锚点各有数量上限。压力之下，规划器按**立即恢复的工作量**与**后续复用
+代价**权衡设备驻留、钉住的 host 状态与换出，活动请求保留自己的完成预留。
+
+**怎么用**：serve 侧 `--no-prefix-reuse`（关掉相容前缀缓存，**默认开**）、`--no-auto-system-shared-prefix`
+（关掉自动共享候选）、`--max-private-continuations`、`--max-shared-prefixes`、`--max-long-anchors-per-continuation`；
+观测面是请求结果里的命中量与复用路径，以及 `--request-log-jsonl`。算法见
+`docs/maintainer/resource-scheduling-and-context-cache.md`。
+
+**现状**：**已落地可跑，但只在 serve 侧**——CLI 前端没有这条路径。互斥是按名写的：关掉前缀复用**不能**与
+上下文缓存的容量选项同时给（`--no-prefix-reuse cannot be combined with context-cache capacity options`）。
+
+## 长上下文 / 超长上下文的目标
+
+**是什么**：把上下文推到一族的原生窗口之外，要同时解开几条**并列的约束**：(a) **原生上下文门**——每个族
+自己在 variant 里声明窗口；(b) **设备缺口**——权重之后剩下的设备内存装不下目标长度的 KV；(c) **冷层缺口**——
+把 KV 分层放出去之后，冷层能装下的页数仍然不够。手段里有一条 **`--yarn`**：静态 YaRN 把 rope 域扩到族的原生
+窗口之外，并把 YaRN 的注意力缩放**折进 sincos 表**；它改的是"被采集的 K 经过的 rope 域"，所以它**进入行尺度
+指纹**——没点 `--yarn` 烤的表，不能被点了 `--yarn` 的运行采用。尺寸侧的手段是 `--max-context` 与
+`--kv-capacity`，复填侧是 `--recall-prefill-tokens`。
+
+**怎么用**：`--yarn`、`--max-context`、`--kv-capacity N|auto`、`--recall-prefill-tokens N`、
+`--cold-*` 与 `--weight-*` 两族（见「KVMem / 冷层 / 卸载 / 水位 / 预取」与「显存 / 内存 / 带宽」两节）、
+`--kv-row-scale auto|off|FILE` 与 `--recalibrate`（与 `--yarn` 的指纹耦合）。
+
+**现状**：`--yarn` **已落地可跑**（rope 域与 sincos 表的折入、以及指纹耦合都在）。**超长上下文本身尚未验证**：
+原生门、设备缺口与冷层缺口是并列的几道环，读数与坐标见「已知的、没有藏起来的问题」一节——本文件不给读数。
+另有一处**悬空的文档引用**：树里指向 TP2/YaRN 长上下文的契约文档**不存在**，要写那条接口只能读相关的几个头
+（见 `docs/features/unfinished.md`）。
+
+## 思考 / 推理
+
+**是什么**：模型有思考与非思考两种提示模式。非思考用 `--no-thinking` 关掉思考段；思考模式下
+`--thinking-budget` 给**模型自身产生的思考 token** 设上限，而**插入的控制 token 也算进 `--max-new`**；
+`--reasoning-effort` 在低/中/高之间调推理强度；`--reasoning-stop` 给停止串。采样默认值来自**装载的模型与
+思考模式**，旗标只覆盖被点名的那几个字段。serve 侧另有"保留思考段"与"请求未给时的默认思考预算"，
+并有一条流式约束：推理通道与内容通道**各自守自己的前缀**（Anthropic 风格事件流在两条通道上都会校验已流出的
+前缀与交出的结果一致）。
+
+**怎么用**：`--no-thinking`、`--thinking-budget N`、`--reasoning-effort low|medium|xhigh`、
+`--reasoning-stop <text>`、`--preserve-thinking`、`--default-thinking-budget`；
+`docs/features/cli-flags.md` 与 `docs/features/serve-flags.md` 两册按前端分别列了这组旗标。
+
+**现状**：**已落地可跑**。互斥按名写：`--reasoning-effort` 与 `--thinking-budget` 都**不能**与 `--no-thinking`
+同时给（CLI 里按名拒绝，模板侧另有一句 `reasoning effort cannot be combined with disabled thinking`）；
+助手预填充也**不能**与开启的思考同时给（serve 的翻译层按名拒绝）。
+
+## DFlash / DFlash2
+
+**是什么**：两条草稿路径。**DFlash**（含 `dspark` 拼写）是 v1 路径：它跑不跑 Markov 头由制品身份决定
+（见「MTP / 投机解码」一节）。**DFlash2** 有自己的一整套运行期：树/束走查与 selector、特征链与分数表落盘、
+逐轮调试打印、配对尺度旋钮；它还会让制品带上 `text/draft_head`，于是 profile 解析的 `auto` 选到优化草稿头。
+转换侧另有 DFlash2 的补丁与校验脚本。
+
+**怎么用**：`--spec dflash`、`--spec dflash2`、`--spec dspark`、`--draft-tokens`；运行期旋钮
+`NINFER_DF2FEAT` / `NINFER_DF2FEAT_DIR`、`NINFER_DF2SCORES` / `NINFER_DF2SCORES_DIR`、`NINFER_DF2DBG`、
+`NINFER_DF2SEL`、`NINFER_DF2_PAIR_SCALE`、`NINFER_DFLASH_SVIP_THRESHOLD`；转换侧
+`tools/convert/qwen3_8_27b/patch_dflash2.py` 与 `verify_patch.py`；状态文档
+`docs/maintainer/speculative-dflash2-status.md`。
+
+**现状**：DFlash2 路径**已落地**（实现头、算子头与单测都在），但它的状态文档自己就是一份"进行中"的账，
+值得照着读。按名拒绝的边：**DFlash 与 Vision 没有被共同验证**（前端按名拒绝这个组合）；
+**DFlash 与 DFlash2 的模型视图互斥**（运行期按名抛出，而不是让两个后端叠着跑）。
+
+## KV 方向的论文借鉴（指向文档，不在这里展开）
+
+这条线不产生新旗标，它的产物是**契约文档与机制改动**：外部的注意力/压缩/检索类工作被折成本树里的几条机制——
+FreeToken 风格的逐层注意力能量观测 → 周期重排闭环、E8 格点与 ISO 码字这一对 KV 编码、独立的 KVarn 注意力族、
+以及热/温/冷的驻留闭环。读法的入口在仓库根的研究笔记（`RESEARCH-EXTERNAL.md`、`RESEARCH-FLASHNEXT.md`、
+`RESEARCH-FREETOKEN.md`、`PORT-RK2V4E8.md`、`PREFILL-OPT.md`）与 `docs/maintainer/` 下的契约文档；
+`docs/features/` 下的分册按机制把同一批坐标再列一次。这里不重复它们的读数。
+
+---
+
 # 附：恢复的运维与上游章节
 
 以下是本仓库迁移前首页上原有的章节，**逐字**恢复。它们多数描述的是引擎的构建与运行方式（上游文本），
