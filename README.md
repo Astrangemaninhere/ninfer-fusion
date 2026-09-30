@@ -349,6 +349,285 @@ OpenAI 兼容 HTTP API、Anthropic 兼容 HTTP API（`README.md:6-7`）。
   编辑漂。引用前请重测，并把当天读到的文件 sha256 一起记下
   （[verification.md](docs/features/verification.md) 第 6.3 节）。
 
+
+---
+# 本树的机制索引与平台现状
+
+> 这一节是**对照你的记录逐项补齐**的：此前三份 README 里 AMD/ROCm、V100 地板、Vulkan、`--capability-report`、预取 全是 0 次提及。下面的名字全部取自源码（引擎自己的 usage 文本 `apps/cli/options.cpp` 与 `src/` 里的 `NINFER_*`），不是描述性声明。
+
+## A. 机制 -> 旋钮（按子系统）
+
+### KV 量化与编解码
+- 命令行：`--kv-auto-relayout` `--kv-bit-budget` `--kv-bits` `--kv-bits-mode` `--kv-capacity` `--kv-codec-preference` `--kv-dtype` `--kv-k-bits` `--kv-k-tier-scores` `--kv-layer-storage` `--kv-quality-weight` `--kv-residual-layers` `--kv-rotation` `--kv-row-scale` `--kv-score-table` `--kv-tier-formats` `--kv-tier-scores` `--kv-unload-watermark-pages` `--kv-v-bits` `--kv-v-codec` `--kv-v-tier-scores` `--nvfp4-mode`
+
+### 块 KV / 逐块降档 / 速率与水位
+- 命令行：`--kv-auto-relayout` `--kv-bit-budget` `--kv-bits` `--kv-bits-mode` `--kv-capacity` `--kv-codec-preference` `--kv-dtype` `--kv-k-bits` `--kv-k-tier-scores` `--kv-layer-storage` `--kv-quality-weight` `--kv-residual-layers` `--kv-rotation` `--kv-row-scale` `--kv-score-table` `--kv-tier-formats` `--kv-tier-scores` `--kv-unload-watermark-pages` `--kv-v-bits` `--kv-v-codec` `--kv-v-tier-scores` `--max-cold-pages`
+
+### 冷层 / 卸载 / 磁盘与主机层
+- 命令行：`--cold-disk-bytes` `--cold-disk-path` `--cold-host-bytes` `--cold-keep-tokens` `--cold-policy` `--max-cold-pages` `--ple-sidecar` `--recall-prefill-tokens` `--weight-device-arena-bytes` `--weight-host-bytes` `--weight-prefetch-layers` `--weight-span-floor-bytes`
+
+### 推测解码 / 草稿
+- 命令行：`--draft-tokens` `--draft-tree` `--inject-spec` `--lm-head-draft` `--no-lm-head-draft` `--no-thinking` `--spec` `--thinking-budget`
+
+### 服务 / HTTP / 批与并发
+- 命令行：`--max-concurrency` `--prefill-chunk` `--prefill-chunk-mode` `--recall-prefill-tokens`
+
+### 多模态 / 媒体
+- 命令行：`--vision`
+
+### 构建 / 工具链 / 平台
+- 命令行：`--no-cuda-graph`
+
+### 质量与仪器
+- 命令行：`--ft-stats` `--kv-k-tier-scores` `--kv-quality-weight` `--kv-score-table` `--kv-tier-scores` `--kv-v-tier-scores`
+
+### 运行期 / 图捕获 / 调度
+- 命令行：`--graph-capture-ceiling` `--no-cuda-graph`
+
+## B. 平台与路线（今天能核实的，与还没有实测的）
+
+- **本卡**：构建只接受 `sm_120a`（RTX 5090）；本 README 里所有本树实测都在这一张卡上。
+- **AMD / ROCm**：树里有 AMD 侧的适配层与模拟器（`src/compat/`、模拟用环境变量如 `NINFER_SIM_ARCH` / `NINFER_SIM_VENDOR` / `NINFER_GFX906_COMPAT`），**但从未在真 AMD 卡上跑过**。路线是走 ROCm（不是只走 Vulkan），Vulkan 在本树没有实现。— 这一条按现状写，**不含任何性能声明**。
+- **V100 / `sm_70` 地板**：`sm_70` 是设计地板（低于它的架构不排期），但本树**没有在 V100 上实测过**；DOT/内存模型的模拟覆盖不完整（模拟器停在 `s_lshl_b32`）。
+- **能力自报**：引擎自带 `--capability-report`，打印它自己认为可用的能力面；此前 README 未提。
+- **未实测即不写数字**：上列三平台（AMD/V100/Vulkan）目前**没有本机实测**，所以这里只有范围与目标，没有吞吐、显存或质量数字。
+
+## C. 命令行参考（引擎自己的 usage 文本，逐字）
+
+```text
+std::string usage_text(const char* argv0) {
+    return std::string("usage: ") + argv0 +
+           " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] [--prefill-chunk N] [--max-new N]\n"
+           "       [--prefill-chunk-mode dynamic|manual]\n"
+           "           (who owns the prefill unit. dynamic (default) lets the bandwidth governor\n"
+           "            install a unit inside [128, --prefill-chunk] and shrink it while decode\n"
+           "            latency sits above its measured noise floor; manual pins the unit to\n"
+           "            --prefill-chunk itself for the whole run. NINFER_FT_BW_GOV=0 is the\n"
+           "            environment spelling of manual, =1 of dynamic; the flag wins. Either way\n"
+           "            --prefill-chunk is the ceiling, and NINFER_FT_BW_TRACE=1 prints the mode\n"
+           "            and the unit the engine installed.)\n"
+           "       [--device N]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|iso4e|iso3|rk4v4|e8] [--kv-layer-storage SPEC] [--kv-bit-budget SPEC] [--spec auto|off|mtp|dflash|dflash2|dspark|none --draft-tokens N]\n           (dspark is a spelling of dflash, not a fourth backend: the DSpark drafter IS\n            the DFlash (v1) runtime, and the artifact's own weights identity\n            (weights_id=nvfp4-dspark) is what decides whether its Markov head runs --\n            dflash/markov_w1+w2 are bound only for that identity, and without them the\n            same --spec dflash drafts by plain argmax.)\n           (--kv-dtype names ONE global KV tier: bf16, int8, fp8 (row-scaled E4M3 D256),\n            nvfp4, and the pair this engine prints as iso4e-g16 / rk4v4-g64 -- iso3 and e8\n            are their deprecated aliases, accepted for one release. nvfp4 is the WEIGHT tier\n            the shipped qwen3_8_27b_nvfp4_modelopt artifact records for itself (weights_id:\n            nvfp4-modelopt), i.e. the tier this project ships. It cannot be combined\n            with --kv-bit-budget/--kv-bits, whose ceiling would replace the table it fills.\n           (--kv-bit-budget takes a ceiling per KV element, or per layer range:\n            \"0-7:8,8-15:4.5\" -- the ranges must TILE every\n            FULL-ATTENTION layer (16 here, NOT the 64 the old example assumed: this\n            variant has 48 GDN layers, and they carry no paged KV); it never exceeds the\n            declared ceilings)\n"
+           "       [--stage-layers SPEC] [--stage-handoff DIR] [--stage-handoff-cut]\n"
+           "           (THE PIPELINE STAGE PARTITION of the text-layer axis, and the one\n"
+           "            surface that makes a pp world askable from a command line instead of\n"
+           "            only from a farm probe. SPEC is lo-hi layer ranges, one per STAGE:\n"
+           "            0-17,18-35 is a pp world of 2 over 36 layers, and 0-35 is the\n"
+           "            IDENTITY -- one stage, i.e. axis none, byte-for-byte a run with no\n"
+           "            flag at all. lo-hi is inclusive hi, the same spelling --kv-layer-storage\n"
+           "            documents as 0-7:bf16. The grammar, the cover and the axis check live\n"
+           "            in ONE place, core/stage_plan.h, called by this front door AND by the\n"
+           "            runtime -- a second spelling of the grammar is what this project keeps\n"
+           "            paying for.)\n"
+           "           (REFUSED BY NAME, never accepted and ignored: refused-stage-layers for a\n"
+           "            mis-shaped SPEC; refused-stage-layers-partition for a spec that is not a\n"
+           "            cover of [0, layers); refused-stage-layers-axis for a spec the rank axis\n"
+           "            does not derive -- plan_shards() itself decides, so a layer range that\n"
+           "            is not a shard of the world core/shard_plan.h hands out is refused\n"
+           "            rather than run and reported as something it is not. NOTE what is NOT\n"
+           "            touched: --stage-layers makes pp REACHABLE, it does not make\n"
+           "            validate_virtual_request(pp).active read anything but 0. The virtual\n"
+           "            -device guard still refuses pp, with its own reason, unchanged.)\n"
+           "           (A PARTIAL range is additionally refused by name where the range cannot\n"
+           "            be honoured: refused-stage-layers-spec with speculation on (the drafters\n"
+           "            walk the layer axis themselves -- dflash_impl.h:143/:236,\n"
+           "            dflash2_impl.h:190/:248, mtp_impl.h:264 -- and this range does not bound\n"
+           "            them); refused-stage-layers-w13 with the W13 weight host-offload budget\n"
+           "            set (product/weight_residency.h:374-383 asserts that every pass enters\n"
+           "            every offloaded layer through note_layer(), and a partial pass does not);\n"
+           "            refused-stage-layers-graph with CUDA-graph capture on (the seam is a\n"
+           "            HOST-side write/read, which a captured graph would replay stale -- the\n"
+           "            same reason W13's H2D is prefill-only).)\n"
+           "           (--stage-handoff DIR names the directory the boundary hidden state\n"
+           "            crosses through: stage k writes stage_k.bin, reads stage_{k-1}.bin, as\n"
+           "            raw bytes plus a header carrying a magic, the producing layer, the\n"
+           "            element count and an FNV-1a, so a payload left over from another prompt\n"
+           "            is DETECTABLE rather than silently consumed. --stage-handoff-cut is a\n"
+           "            NEGATIVE CONTROL, not a feature: it silences the producer so the ids\n"
+           "            MOVE, which is how \"the handoff is load-bearing\" is falsified on the\n"
+           "            shipped binary instead of asserted.)\n"
+           "       [--kv-residual-layers SPEC]\n"
+           "           (the per-layer NVFP4 SECOND-STAGE RESIDUAL planes, SPEC = a bare layer\n"
+           "            list over the family-wide 64 slots, \"2-5\" or \"0,3,7\". This is the\n"
+           "            only flag that expresses a real plane SUBSET: an NVFP4 layer goes from\n"
+           "            4 planes to 8. It is NVFP4-only -- naming any other tier is accepted\n"
+           "            and inert -- and a residual-bearing layer is NOT cold-capable, so a\n"
+           "            stack that names this cannot also spill to the cold pool.)\n"
+           "       [--kv-bits B] [--kv-k-bits BK --kv-v-bits BV] [--kv-bits-mode joint|split|ceiling]\n"
+           "       [--kv-codec-preference CODEC[,CODEC...]]\n"
+           "           (the K/V bit-width entries. --kv-bits is the JOINT form: ONE overall\n"
+           "            ceiling for the whole KV stack, one tier per full-attention layer.\n"
+           "            --kv-k-bits/--kv-v-bits are the SPLIT form: K and V each get their own\n"
+           "            ceiling and each plane's PER-LAYER layering is solved on its own, then\n"
+           "            reconciled per layer. A layer whose K and V requirements meet no single\n"
+           "            tier is refused BY INDEX with the missing (K,V) cell named, and the run\n"
+           "            also prints the deployable plan at min(k,v) so a working spec is one\n"
+           "            flag away. --kv-bits-mode split is the default; joint reads the same two\n"
+           "            ceilings as one; ceiling deploys min(k,v) on purpose and reports the\n"
+           "            headroom that could not be spent. Both planes always cost the SAME bits\n"
+           "            per element: one DType drives both planes in this engine.)\n"
+           "           (--kv-codec-preference is the OTHER axis of the same fit: which codec\n"
+           "            is chosen among candidates that cost the SAME bits -- \"同 bit 宽度下\n"
+           "            换一种量化\", NOT fewer bits. The value is an ORDER over the candidate\n"
+           "            grammar " + product::kv_gear_candidate_list() +
+           " (most-wanted first; built from the ladder rows the\n"
+           "            solver actually accepts, not written out by hand here), e.g.\n"
+           "            --kv-codec-preference iso4e or --kv-codec-preference iso4e,nvfp4. It\n"
+           "            makes the solver try the named codecs first, so it decides only a tie\n"
+           "            the fit's own columns already call equal: it cannot lower or raise a\n"
+           "            penalty and cannot change the achieved bits. It needs --kv-bits. An\n"
+           "            unknown name, an empty element, a repeat, a missing --kv-bits, a\n"
+           "            --kv-layer-storage request, and a preference the fit could NOT honour\n"
+           "            are each refused by name with the accepted list attached -- never\n"
+           "            accepted and ignored. Worked example at 16 layers:\n"
+           "              --kv-bits 4.5 --kv-quality-weight 0 --kv-codec-preference iso4e\n"
+           "            returns 0-15:iso4e (dtype iso4e-g16), where the same command without\n"
+           "            the preference returns 0-15:nvfp4 (nvfp4-g16): SAME bit count,\n"
+           "            different codec. Without --kv-quality-weight the shipped ladder's iso4e\n"
+           "            pin (penalty 200 against nvfp4's 30) makes the preference lose, and\n"
+           "            that loss is reported as a refusal rather than silently ignored.)\n"
+           "       [--kv-quality-weight W] [--kv-tier-scores FILE|INLINE]\n"
+           "           (speed/quality slider for the bit-budget fit: W=0 fastest KV path,\n"
+           "            W=1 most accurate. Needs a ceiling to act on (--kv-bits /\n"
+           "            --kv-bit-budget / --kv-k-bits/--kv-v-bits); without one it is refused\n"
+           "            instead of being silently ignored. --kv-tier-scores replaces the score\n"
+           "            table; --kv-k-tier-scores / --kv-v-tier-scores give the split entry one\n"
+           "            table per plane.)\n"
+           "       [--capability-report]\n"
+           "           (the BUILD capability surface's own entry point: like --kv-score-table it\n"
+           "            runs with NO model and NO prompt. It prints the arch list this binary was\n"
+           "            COMPILED for -- or the literal <unreported> plus the reason, when the build\n"
+           "            did not publish one -- then the arch ladder and the per-format tensor-core\n"
+           "            floors THIS build ships, each with its kernel citation, so \"what would\n"
+           "            this build refuse, and why\" is answerable without an artifact. It is NOT\n"
+           "            a device probe: the card in this machine is not queried and no capability\n"
+           "            is claimed for it. A model path given as well continues the run afterwards.)\n"
+           "       [--kv-score-table show|emit=PATH]\n"
+           "           (the penalty table's OWN entry point: it runs with NO model and NO prompt.\n"
+           "            'show' prints the table the planner would use plus the real provenance of\n"
+           "            each column; 'emit=PATH' writes it in the grammar --kv-tier-scores reads,\n"
+           "            so the table can be inspected, edited and fed straight back in. The\n"
+           "            shipped quality column is a PRIOR, not a measurement, and the output says\n"
+           "            so.)\n"
+           "           (--spec defaults to auto; none turns speculation off)\n           (--spec mtp --draft-tokens k > 0 pins one MTP draft width; --spec mtp --draft-tokens 0,\n            or with the width left unset, or NINFER_MTP_ADAPTIVE=1, uses the ADAPTIVE ladder,\n            where the mtp_window_cut criterion picks the rung per round)\n           (--spec mtp --draft-tree L,d verifies a TREE instead of one chain: L rank-paths\n            per depth, d draft steps, one verify column per node plus the anchor, so the node\n            budget L*d <= 15. That budget IS the round's draft width, so --draft-tree and\n            --draft-tokens are two spellings of one number and cannot both be given.\n            --draft-tree 1,d is the degenerate chain and must reproduce --draft-tokens d\n            token-for-token, which is the tree path's instrument check.)\n"
+           "       [--kv-tier-formats hot=auto|bf16|int8,tail=...,cold=...] [--nvfp4-mode fusion|pure]\n"
+           "           (hot = the resident format of every full-attention layer; only bf16 and\n"
+           "            int8 have a resident codec. cold is the aged-out tier format; the cold\n"
+           "            slot codec is derived from the layer dtype and only int8 is reachable\n"
+           "            today. tail is accepted only when it repeats hot: the engine has no\n"
+           "            recent-window tier yet. --nvfp4-mode pure forbids nvfp4/iso4e/rk4v4.)\n"
+           "       [--kv-rotation on|off] [--kv-row-scale auto|off|FILE] [--recalibrate]\n"
+           "       [--kv-v-codec iso4e|e2m1]\n"
+           "           (component switches for the NVFP4/FP8/ISO4E KV tiers.\n"
+           "            --kv-rotation off takes the identity SO(4) map on BOTH the K write\n"
+           "            and the Q read, so QK^T stays exact and only the quantization domain\n"
+           "            changes. --kv-row-scale off takes the identity row scale in the kernel\n"
+           "            (no identity file needed); auto keeps the baked table; FILE loads an\n"
+           "            NINFERKVRS1 sidecar (NINFER_KV_ROWSCALE is the env equivalent).\n"
+           "            auto also runs the calibration loop: a table persisted next to the\n"
+           "            artifact (MODEL.kvrowscale.bin) is loaded and the capture is skipped,\n"
+           "            and when there is none -- or it was baked for another model or another\n"
+           "            KV configuration -- THIS run captures once and writes one. The first\n"
+           "            calibration run needs --no-cuda-graph. --recalibrate ignores the\n"
+           "            persisted table, captures again and overwrites it.\n"
+           "            --kv-v-codec e2m1 stores NVFP4-tier V as E2M1 instead of ISO4E and is\n"
+           "            refused when a V residual plane or the cold pool is active.)\n"
+           "       [--yarn]\n"
+           "           (static YaRN factor-4 rope: the rope domain goes to 4x the variant's native\n"
+           "            context and the yarn4 attention scaling 1.1386 is folded into the sincos\n"
+           "            tables (include/ninfer/ops/rope.h). It moves the rope domain the captured K\n"
+           "            is built through, so it enters the row-scale fingerprint as the\n"
+           "            product/kv_rowscale_persist.h rope_regime knob: mixed in as ;rope=1 when\n"
+           "            not default, the tag itself staying rs1.<12 hex> (NINFERKVRS1 is the\n"
+           "            sidecar magic, not the tag). A table baked by a run that did not name\n"
+           "            --yarn does not validate for a run that does. Off by default.)\n"
+           "       [--lm-head-draft]\n"
+           "       [--no-lm-head-draft]\n"
+           "           (the drafter's proposal head, stated explicitly: --lm-head-draft selects the\n"
+           "            optimized head, --no-lm-head-draft pins the full-vocabulary head\n"
+           "            (ProposalHead::Full). Full is also what the profile-resolved Auto leaves in\n"
+           "            place for an artifact that carries no text/draft_head, so this flag exists to\n"
+           "            make a run's head independent of what the artifact resolves\n"
+           "            (include/ninfer/types.h, ProposalHead).)\n"
+           "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
+           "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
+           "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
+           "       [--print-prompt-ids] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
+           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--cold-policy none|off|window|host|disk|host-then-disk|host+disk] "
+           "(host+disk is an accepted equivalent spelling of host-then-disk; "
+           "docs/cli.md)\n"
+           "[--cold-keep-tokens N]\n"
+           "       [--max-cold-pages N] [--kv-unload-watermark-pages N]\n"
+           "       [--recall-prefill-tokens N]\n"
+           "       [--append-context-text <text>]\n"
+           "       [--cold-host-bytes N[g|m|k]]\n"
+           "       [--cold-disk-path DIR] [--cold-disk-bytes N]\n"
+           "       [--ple-sidecar DIR]\n"
+           "       [--weight-host-bytes N] [--weight-device-arena-bytes N]\n"
+           "       [--weight-prefetch-layers N] [--weight-span-floor-bytes N]\n"
+           "       [--no-cuda-graph] [--graph-capture-ceiling N]\n"
+           "       [--ft-stats on|off] [--inject-spec PATH]\n"
+           "\n"
+           "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
+           "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
+           "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
+           "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
+           "toward --max-new.\n"
+           "--kv-capacity auto leaves " +
+           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
+           " MiB of sizing headroom.\n"
+           "--inject-spec PATH declares a CHOSEN TENSOR and the position range it will "
+           "occupy (src/spec/inject_channel.h): direction=ingest|egress, dtype=bf16|f16|f32, "
+           "layout=token-major, rows, cols, position0, scale, path, digest. The tensor's "
+           "alphabet is the input-embedding space, so it enters the model where a gathered "
+           "token's embedding enters, and an ingress of the engine's own bytes is a no-op "
+           "to the model (the etiquette requirement of src/spec/sum_dir.h:98, made into a "
+           "measurement). The declaration is validated here, with the header's own parser, "
+           "so a wrong field or a wrong dtype refuses by name before the artifact is loaded; "
+           "the checks that need the model (rows, position range) are made at bind time. "
+           "Every admitted ingest is reported on stderr with its shape, dtype, position "
+           "range and ingested digest, and every mismatch with its refusal name. "
+           "NINFER_INJECT_SPEC is the env spelling and the flag beats it.\n"
+           "--print-prompt-ids prints, on stderr, the ids the PROMPT was tokenized to, in order. "
+           "It is the input side of --print-token-ids, and it exists because a `sum_dir` row's "
+           "identity is a digest over its block's token ids (src/spec/sum_dir.h:210-224), so a row "
+           "cannot be NAMED -- and therefore cannot be bound to the inject channel "
+           "(src/spec/sum_dir_inject.h) -- without them. Read-only: the engine already holds the "
+           "sequence (include/ninfer/engine.h:30) and this flag is the surface it never had. "
+           "--ft-stats on enables the FreeToken per-layer attention-energy observation "
+           "(NINFER_FT_STATS=1 is the env spelling); it is off by default and the flag "
+           "beats the env. Its consumer -- the periodic KV relayout -- is a serve-side "
+           "feature (--kv-auto-relayout there), because this front end has no decision "
+           "cycle.\n"
+           "--recall-prefill-tokens N bounds the RE-PREFILL a recall round may do, in TOKENS "
+           "(NINFER_RECALL_PREFILL_TOKENS is the env spelling and the flag beats it; no default, "
+           "0 = off). It is a different dimension from the 256 MiB byte budget, which the tree "
+           "itself calls a MEMORY-SAFETY limit rather than a speed limit. At the edge the round is "
+           "REFUSED, by name: stderr carries `refused-prefill-budget` with the tokens wanted and "
+           "the budget, at plan time and before a single token is re-prefilled. It is never "
+           "truncated to fit -- a truncated run is a prefix of the answer's context, i.e. a "
+           "partial or a confidently wrong answer. `--recall-prefill-tokens 0` is refused by "
+           "name: 0 is the default, so it would be accepted and read by nothing.\n"
+           "--kv-unload-watermark-pages N is the free text-KV pool pages at or below which "
+           "the Engine proactively unloads the blocks its semantic directory judges "
+           "unloadable, instead of waiting for the pool to overflow. 0 = off (the "
+           "pre-watermark behaviour); the default derives the reserve from --prefill-chunk. "
+           "NINFER_KV_UNLOAD_WATERMARK_PAGES is the env spelling and the flag beats it; an "
+           "unparseable value from either is refused by name, never ignored.\n"
+           "--append-context-text <text> encodes <text> with the artifact's own tokenizer (raw: "
+           "no chat template, no implicit special token) and, mid-run, appends that run of tokens "
+           "to the running request and prefills it, so the model can attend to it from the next "
+           "round. It is input, not output: the appended tokens are never reported in the "
+           "generated ids and never consume --max-new. It is armed before the request's first "
+           "decode round, and [context-append] on stderr reports what was serviced. Off when the "
+           "flag is absent.\n"
+           "Sampling defaults come from the loaded model and thinking mode; flags override "
+           "individual fields.\n";
+```
+
 ---
 
 # 附：恢复的运维与上游章节
