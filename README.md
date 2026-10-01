@@ -464,8 +464,7 @@ serve 的 `--help` 用法行没有列全自己 parser 里注册的冷窗族与�
   索引草稿与其他全开项一起打开时，引擎会在短提示上按名失败。
 - **窄档的读侧**：窄档对的定价按构造钉死（代码里由 `static_assert` 保证），但读侧在同一张表里标成
   `Reserved`，宽档的格点解码器没有调用者；`rk3v4` / `rk2v4` 可以选择，不可跑。
-- **逐格走道与质量滑块的接口**：`NINFER_KV_QUALITY_WEIGHT` 只在按层天花板与分离求解器上生效，没有
-  接到逐格走道；`NINFER_KV_DESCENT_ALLOC=solve` 选无状态逐格求解，但没有代价表生产者，所以它按构造
+- **逐格走道与质量滑块的接口**：`NINFER_KV_QUALITY_WEIGHT` 既是按层天花板与分离求解器的质量滑块，也接到逐格秩走道（`src/product/kv_cell_rank.h`）；serve 侧 `--kv-quality-weight` 负责提交，默认路径与秩轴引入前逐字节一致；`NINFER_KV_DESCENT_ALLOC=solve` 选无状态逐格求解，但没有代价表生产者，所以它按构造
   塌回原像；预算标尺头文件（`src/product/kv_block_budget_stage.h`）里还有一个名字看起来像旋钮、其实
   是编译期 `#define` 的标尺，它设不了。
 - **预填充比未改动的引擎慢**：这是唯一未过的验收项，判据是「快或等，绝不更慢」，成因尚未识别。
