@@ -307,11 +307,14 @@ here; follow the path to read them.
    multiplies it by four, `src/targets/qwen3_6/impl/runtime/layouts_impl.h:1333`), a
    device shortfall, and a cold-tier deficit. Evidence: `dl/kv1m/EVIDENCE.txt`,
    `dl/long1m/logs/`, `dl/combo1m/REPORT.md`, `dl/1mmtp/`, `dl/ctxsweep/`.
-7. **`NINFER_KV_QUALITY_WEIGHT` is not wired into the per-cell walk.** It acts only on
-   the ceiling/split solver: the key is defined at `src/product/kv_kv_bits.h:446` and
-   read at `:488`, and it has **no reference at all** in the per-cell walk's files
-   (`src/product/kv_descent_control.h`, `src/product/kv_block_descent.h`,
-   `src/product/kv_cell_alloc_solve.h`). The knob map below says so in its own row.
+7. **`NINFER_KV_QUALITY_WEIGHT` is wired into the per-cell walk.** The key is defined at
+   `src/product/kv_kv_bits.h:446` and read at `:488` for the ceiling/split solver, and
+   the per-cell rank walk reads the same env as its own quality slider
+   (`src/product/kv_cell_rank.h`, the tree's own env name); `--kv-quality-weight`
+   commits it for the serve path (`src/serve/serve_options.cpp`). The walk's default
+   path stays byte-identical to the pre-rank behavior, so the knob moves nothing until
+   the rank axis is live (`NINFER_KV_RANK_SPECTRUM`). The knob map below carries the
+   current row.
 8. **Two mechanisms collapse to their pre-image today, by construction.**
    `NINFER_KV_DESCENT_ALLOC=solve` selects the stateless per-cell solve, but there is
    no cost-table producer, so it collapses (`src/product/kv_cell_alloc_solve.h:1102`);
@@ -336,7 +339,8 @@ Every knob below is unset by default, and unset means the pre-image (see *Defaul
 - `NINFER_KV_UNLOAD_WATERMARK_PAGES` — the unload **pass**; `0` is OFF, unset means
   "derive from `--prefill-chunk`".
 - `NINFER_KV_QUALITY_WEIGHT` — the speed/quality slider of the **ceiling/split solver**
-  only; it is NOT wired into the per-cell walk.
+  and, since the rank-axis land, of the **per-cell rank walk**
+  (`src/product/kv_cell_rank.h`); `--kv-quality-weight` commits it.
 
 **One name in the old knob map was not a knob.** `NINFER_KV_BUDGET_RULER_F1231` is a
 compile-time `#define` (`src/product/kv_block_budget_stage.h:240`), so it has been
